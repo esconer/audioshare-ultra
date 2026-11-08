@@ -153,6 +153,10 @@ impl ClientEngine {
         let device = host
             .default_output_device()
             .ok_or_else(|| "No audio output device available".to_string())?;
+        let default_cfg = device
+            .default_output_config()
+            .map_err(|e| format!("Output config error: {}", e))?;
+        let sample_format = default_cfg.sample_format();
 
         let cfg = cpal::StreamConfig {
             channels: 2,
@@ -161,16 +165,30 @@ impl ClientEngine {
         };
 
         let mut dither_rng = 0x9E37_79B9u32;
-        let stream = device
-            .build_output_stream(
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => device.build_output_stream(
+                &cfg,
+                move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    let mut tmp = [0.0f32; 4096];
+                    let count = out.len().min(4096);
+                    burst_fifo.pop_exact_or_dither(&mut tmp[..count], &mut dither_rng);
+                    for (dst, &s) in out[..count].iter_mut().zip(tmp[..count].iter()) {
+                        *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    }
+                },
+                |_| {},
+                None,
+            ),
+            _ => device.build_output_stream(
                 &cfg,
                 move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     burst_fifo.pop_exact_or_dither(out, &mut dither_rng);
                 },
                 |_| {},
                 None,
-            )
-            .map_err(|e| format!("Failed to open audio output: {}", e))?;
+            ),
+        }
+        .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
         stream
             .play()
@@ -254,10 +272,14 @@ impl ClientEngine {
                 last_feedback = Instant::now();
             }
 
-            let _ = socket.set_nonblocking(true);
             let active_key = *session_key.lock().unwrap();
+            // Block for up to 800us waiting for the first packet (0% idle CPU, <15us wake on arrival),
+            // then switch to non-blocking to drain all queued burst packets immediately.
+            let _ = socket.set_nonblocking(false);
+            let _ = socket.set_read_timeout(Some(Duration::from_micros(800)));
 
             while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
+                let _ = socket.set_nonblocking(true);
                 match ParsedPacket::parse_and_decrypt(&mut recv_buf[..len], active_key.as_ref()) {
                     Ok(parsed) => {
                         telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
@@ -282,11 +304,14 @@ impl ClientEngine {
                             continue;
                         }
 
-                        // Resync sequence immediately when waking from DTX silence or after a large gap
+                        // Signed 16-bit sequence delta (RFC 1982): >0 means future, <0 means past/late duplicate
+                        let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
                         if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
-                            || base_seq.wrapping_sub(next_play_seq) > 32
+                            || seq_delta > 48
+                            || seq_delta < -200
                         {
                             next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
                             prebuffer_ready = false;
                         }
 
@@ -342,13 +367,19 @@ impl ClientEngine {
 
                             if decoded_ok {
                                 let s = base_seq.wrapping_add(sub_idx);
-                                sequencer.push_primary(s, &pcm_f32);
-                                latest_rx_seq = s;
+                                // Only insert if this subframe has not already been played by the DAC
+                                if (s.wrapping_sub(next_play_seq) as i16) >= 0 {
+                                    sequencer.push_primary(s, &pcm_f32);
+                                }
+                                if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
+                                    latest_rx_seq = s;
+                                }
                             }
                             cursor += sub_len;
                         }
 
-                        let buffered = latest_rx_seq.wrapping_sub(next_play_seq) as f32;
+                        let buffered =
+                            (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
                         if buffered >= config.target_buffer_subframes {
                             prebuffer_ready = true;
                         }
@@ -440,7 +471,13 @@ impl ClientEngine {
                 );
 
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
-                let net_subframes = latest_rx_seq.wrapping_sub(next_play_seq) as f32;
+                let mut net_subframes =
+                    (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
+                if net_subframes > target_buf + 8.0 {
+                    // Instant fast-forward if a severe router stall piled up >20ms of stale packets
+                    next_play_seq = latest_rx_seq.wrapping_sub(target_buf as u16);
+                    net_subframes = target_buf;
+                }
                 resampler.update_clock_loop(net_subframes, target_buf);
 
                 let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
@@ -450,9 +487,6 @@ impl ClientEngine {
                 let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
                 burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
             }
-
-            let _ = socket.set_nonblocking(false);
-            let _ = socket.set_read_timeout(Some(Duration::from_micros(800)));
         }
     }
 }
@@ -460,6 +494,82 @@ impl ClientEngine {
 impl Drop for ClientEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_signed_sequence_delta_rfc1982() {
+        // Late duplicate packet arrived after playback moved ahead
+        let next_play_seq = 101u16;
+        let late_seq = 99u16;
+        let delta = late_seq.wrapping_sub(next_play_seq) as i16;
+        assert_eq!(delta, -2);
+        assert!(delta < 0, "Duplicate/past packet must have negative delta");
+
+        // Forward sequence wrap-around across 65535 boundary
+        let next_play_seq = 65535u16;
+        let future_seq = 2u16;
+        let delta = future_seq.wrapping_sub(next_play_seq) as i16;
+        assert_eq!(delta, 3);
+        assert!(
+            delta > 0,
+            "Future packet across wrap boundary must have positive delta"
+        );
+
+        // Past sequence across wrap-around boundary
+        let next_play_seq = 2u16;
+        let past_seq = 65535u16;
+        let delta = past_seq.wrapping_sub(next_play_seq) as i16;
+        assert_eq!(delta, -3);
+        assert!(
+            delta < 0,
+            "Past packet across wrap boundary must have negative delta"
+        );
+
+        // Normal buffered calculation
+        let latest_rx = 50u16;
+        let next_play = 46u16;
+        let buffered = (latest_rx.wrapping_sub(next_play) as i16).max(0) as f32;
+        assert_eq!(buffered, 4.0);
+
+        // Negative buffered (late packet or race condition) clamped to 0
+        let latest_rx = 40u16;
+        let next_play = 45u16;
+        let buffered = (latest_rx.wrapping_sub(next_play) as i16).max(0) as f32;
+        assert_eq!(buffered, 0.0);
+    }
+
+    #[test]
+    fn test_instant_burst_spike_fast_forward() {
+        let latest_rx = 100u16;
+        let mut next_play = 70u16; // 30 subframes lag (>20ms lag)
+        let target_buf = 4.0f32;
+
+        let mut net_subframes = (latest_rx.wrapping_sub(next_play) as i16).max(0) as f32;
+        assert_eq!(net_subframes, 30.0);
+
+        if net_subframes > target_buf + 8.0 {
+            next_play = latest_rx.wrapping_sub(target_buf as u16);
+            net_subframes = target_buf;
+        }
+
+        assert_eq!(net_subframes, 4.0);
+        assert_eq!(next_play, 96);
+    }
+
+    #[test]
+    fn test_i16_output_conversion_clamping() {
+        let f32_samples: [f32; 4] = [1.5, -1.5, 0.0, 0.5];
+        let mut i16_samples = [0i16; 4];
+        for (dst, &s) in i16_samples.iter_mut().zip(f32_samples.iter()) {
+            *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        }
+        assert_eq!(i16_samples[0], 32767);
+        assert_eq!(i16_samples[1], -32767);
+        assert_eq!(i16_samples[2], 0);
+        assert_eq!(i16_samples[3], 16383);
     }
 }
 
@@ -516,6 +626,8 @@ pub mod android_aaudio {
             stream: *mut *mut AAudioStream,
         ) -> i32;
         fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> i32;
+        fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
         fn AAudioStream_requestStart(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_requestStop(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_close(stream: *mut AAudioStream) -> i32;
@@ -622,6 +734,12 @@ pub mod android_aaudio {
                     return None;
                 }
 
+                // Enforce hardware double-buffering (2 * hardware burst = ~4.0ms internal DAC buffer)
+                let burst = AAudioStream_getFramesPerBurst(stream);
+                if burst > 0 {
+                    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
+                }
+
                 AAudioStream_requestStart(stream);
                 Some(Self { stream, ctx_ptr })
             }
@@ -723,6 +841,12 @@ pub mod android_aaudio {
                 if res != 0 || stream.is_null() {
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
+                }
+
+                // Enforce hardware double-buffering (2 * hardware burst = ~4.0ms internal DAC buffer)
+                let burst = AAudioStream_getFramesPerBurst(stream);
+                if burst > 0 {
+                    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
                 }
 
                 AAudioStream_requestStart(stream);
