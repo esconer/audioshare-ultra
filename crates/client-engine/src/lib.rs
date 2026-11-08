@@ -222,6 +222,14 @@ impl ClientEngine {
         let mut last_feedback = Instant::now();
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
+        // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 12.0 (30.0ms) on 2.4GHz!
+        // Ensure >= 5.5 subframes (13.75ms) on Wi-Fi so Packet [K+1]'s FEC always arrives before Packet [K] plays!
+        let initial_wifi_floor = if config.target_buffer_subframes <= 2.5 {
+            config.target_buffer_subframes
+        } else {
+            config.target_buffer_subframes.max(5.5)
+        };
+        let mut adaptive_wifi_subframes = initial_wifi_floor;
 
         while running.load(Ordering::Relaxed) {
             // Auto-recover Android AAudio stream within 25ms when headphones/Bluetooth route changes!
@@ -242,6 +250,13 @@ impl ClientEngine {
                 let fec_permille = ((window_fec * 1000) / total_win) as u16;
                 window_primary = 0;
                 window_fec = 0;
+
+                // If 500ms window had zero drops/late packets, gently decay 2.4GHz cushion back toward floor
+                if fec_permille == 0 && adaptive_wifi_subframes > initial_wifi_floor {
+                    adaptive_wifi_subframes =
+                        (adaptive_wifi_subframes - 0.15).max(initial_wifi_floor);
+                }
+
                 let media_cmd = telemetry.pending_media_command.swap(0, Ordering::Relaxed);
 
                 let gain_db =
@@ -380,7 +395,7 @@ impl ClientEngine {
 
                         let buffered =
                             (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
-                        if buffered >= config.target_buffer_subframes {
+                        if buffered >= initial_wifi_floor {
                             prebuffer_ready = true;
                         }
                     }
@@ -390,12 +405,30 @@ impl ClientEngine {
                 }
             }
 
+            // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
+            let base_target = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
+                2.0
+            } else {
+                adaptive_wifi_subframes
+            };
+            let target_buf = group_sync.aligned_target_subframes(
+                base_target,
+                telemetry.max_group_delay_ms.load(Ordering::Relaxed),
+                telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
+            );
+
             // Demand-driven by the Hardware Audio DAC:
-            // Keep burst_fifo topped up to a strict 2-subframe (5.0ms) hardware cushion.
+            // Keep burst_fifo topped up to 4 subframes (960 floats = 480 stereo frames) so no AAudio burst size ever starves!
+            let fifo_watermark = if target_buf <= 2.5 {
+                SUBFRAME_STEREO_SAMPLES + SUBFRAME_STEREO_SAMPLES / 2 // 360 samples = 1.5 subframes
+            } else {
+                SUBFRAME_STEREO_SAMPLES * 4 // 960 samples = 4 subframes
+            };
+
             while stream_initialized
                 && prebuffer_ready
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
-                && burst_fifo.available_samples() < (SUBFRAME_STEREO_SAMPLES * 2)
+                && burst_fifo.available_samples() < fifo_watermark
             {
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
@@ -410,10 +443,14 @@ impl ClientEngine {
                     }
                     STATUS_HEALED_BY_FEC => {
                         window_fec += 1;
+                        // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 12.0 = 30.0ms)
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(12.0);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
                         window_fec += 1;
+                        // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 12.0 = 30.0ms)
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
                         telemetry
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
@@ -458,27 +495,19 @@ impl ClientEngine {
                     }
                 }
 
-                // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
-                let base_target = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
-                    2.0
-                } else {
-                    config.target_buffer_subframes
-                };
-                let target_buf = group_sync.aligned_target_subframes(
-                    base_target,
-                    telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                    telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
-                );
-
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
+                let fifo_subframes =
+                    (burst_fifo.available_samples() as f32) / (SUBFRAME_STEREO_SAMPLES as f32);
                 let mut net_subframes =
                     (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
-                if net_subframes > target_buf + 8.0 {
-                    // Instant fast-forward if a severe router stall piled up >20ms of stale packets
-                    next_play_seq = latest_rx_seq.wrapping_sub(target_buf as u16);
-                    net_subframes = target_buf;
+                if net_subframes > target_buf + 14.0 {
+                    // Preserve `target_buf` cushion on fast-forward so 2.4GHz doesn't immediately underrun!
+                    let keep = (target_buf.ceil() as u16).max(2);
+                    next_play_seq = latest_rx_seq.wrapping_sub(keep);
+                    net_subframes = keep as f32;
                 }
-                resampler.update_clock_loop(net_subframes, target_buf);
+                // Regulate COMBINED (Sequencer + FIFO) buffer so they never stack in series!
+                resampler.update_clock_loop(net_subframes + fifo_subframes, target_buf);
 
                 let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
                 telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
@@ -550,13 +579,38 @@ mod tests {
         let mut net_subframes = (latest_rx.wrapping_sub(next_play) as i16).max(0) as f32;
         assert_eq!(net_subframes, 30.0);
 
-        if net_subframes > target_buf + 8.0 {
-            next_play = latest_rx.wrapping_sub(target_buf as u16);
-            net_subframes = target_buf;
+        if net_subframes > target_buf + 14.0 {
+            let keep = (target_buf.ceil() as u16).max(2);
+            next_play = latest_rx.wrapping_sub(keep);
+            net_subframes = keep as f32;
         }
 
         assert_eq!(net_subframes, 4.0);
         assert_eq!(next_play, 96);
+    }
+
+    #[test]
+    fn test_adaptive_wifi_cushion_expansion_and_decay() {
+        let mut adaptive_wifi_subframes = 5.5f32;
+        let initial_floor = 5.5f32;
+
+        // On FEC heal: +0.35
+        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(12.0);
+        assert!((adaptive_wifi_subframes - 5.85).abs() < 1e-4);
+
+        // On empty gap (PLC): +0.75
+        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
+        assert!((adaptive_wifi_subframes - 6.60).abs() < 1e-4);
+
+        // On clean 500ms window: decay by 0.15 down to floor
+        adaptive_wifi_subframes = (adaptive_wifi_subframes - 0.15).max(initial_floor);
+        assert!((adaptive_wifi_subframes - 6.45).abs() < 1e-4);
+
+        // Ceiling cap at 12.0
+        for _ in 0..20 {
+            adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
+        }
+        assert_eq!(adaptive_wifi_subframes, 12.0);
     }
 
     #[test]
@@ -590,7 +644,36 @@ pub mod android_aaudio {
     const AAUDIO_SHARING_MODE_EXCLUSIVE: i32 = 0;
     const AAUDIO_SHARING_MODE_SHARED: i32 = 1;
     const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+    const AAUDIO_USAGE_GAME: i32 = 14;
     const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
+
+    #[inline]
+    unsafe fn try_set_aaudio_usage(builder: *mut AAudioStreamBuilder, usage: i32) {
+        type SetUsageFn = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
+        static SET_USAGE: std::sync::OnceLock<Option<SetUsageFn>> = std::sync::OnceLock::new();
+        let func = SET_USAGE.get_or_init(|| {
+            let handle = libc::dlopen(
+                b"libaaudio.so\0".as_ptr() as *const libc::c_char,
+                libc::RTLD_NOW,
+            );
+            if !handle.is_null() {
+                let sym = libc::dlsym(
+                    handle,
+                    b"AAudioStreamBuilder_setUsage\0".as_ptr() as *const libc::c_char,
+                );
+                if !sym.is_null() {
+                    Some(core::mem::transmute::<*mut libc::c_void, SetUsageFn>(sym))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(f) = func {
+            f(builder, usage);
+        }
+    }
 
     type AAudioDataCallback = extern "C" fn(
         stream: *mut AAudioStream,
@@ -710,6 +793,8 @@ pub mod android_aaudio {
                     builder,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                 );
+                // Bypasses Android Dolby/Media DSP post-processing and forces ULL Hardware Fast-Track!
+                try_set_aaudio_usage(builder, AAUDIO_USAGE_GAME);
                 AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 2);

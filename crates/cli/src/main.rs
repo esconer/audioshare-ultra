@@ -79,7 +79,7 @@ fn run_host(args: &[String]) {
     let _beacon = DiscoveryBeacon::start(DEFAULT_PORT, "CLI-AudioShare-Ultra".into());
     let _adb = AdbUsbWatcher::start(DEFAULT_PORT);
     println!(
-        "\n[+] Pacing: {:.1} ms ({} subframe/pkt) | QoS: 802.11e WMM AC_VO (0xB8) | Smart DTX: ON",
+        "\n[+] Pacing: {:.1} ms ({} subframe/pkt) | QoS: 802.11e WMM AC_VI (0xA0) | Smart DTX: ON",
         (cfg.subframes_per_packet as f32) * 2.5,
         cfg.subframes_per_packet
     );

@@ -171,6 +171,32 @@ impl BurstDecouplerRing {
             self.read_idx
                 .store(r.wrapping_add(out.len()), Ordering::Release);
             true
+        } else if (avail & !1) > 0 {
+            // Copy all available samples and smoothly decay the tail (NEVER drop to abrupt silence!)
+            let safe_avail = avail & !1; // Keep stereo L/R alignment
+            let buf_ptr = self.buf.get() as *const f32;
+            let mut last_l = 0.0f32;
+            let mut last_r = 0.0f32;
+            for i in 0..safe_avail {
+                let s = unsafe { *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK) };
+                out[i] = s;
+                if i & 1 == 0 {
+                    last_l = s;
+                } else {
+                    last_r = s;
+                }
+            }
+            self.read_idx
+                .store(r.wrapping_add(safe_avail), Ordering::Release);
+            for i in (safe_avail..out.len()).step_by(2) {
+                last_l *= 0.985;
+                last_r *= 0.985;
+                out[i] = last_l;
+                if i + 1 < out.len() {
+                    out[i + 1] = last_r;
+                }
+            }
+            true
         } else {
             // Inject -90 dBFS TPDF comfort dither so Bluetooth earbuds never sleep during DTX silence
             inject_bluetooth_keepalive_dither(out, dither_rng);
@@ -317,6 +343,18 @@ mod tests {
         assert_eq!(aaudio_burst[0], 0.42);
         assert!(ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
         assert_eq!(ring.available_samples(), 960 - 768);
+
+        // Third pull: only 192 samples remaining (< 384 request).
+        // Partial-read continuity copies all 192 samples and smoothly attenuates the tail!
+        assert!(ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
+        assert_eq!(aaudio_burst[0], 0.42);
+        assert_eq!(aaudio_burst[191], 0.42);
+        assert!(aaudio_burst[192] < 0.42); // Exponential decay started
+        assert!(aaudio_burst[383] < aaudio_burst[192]); // Further decay towards end of tail
+        assert_eq!(ring.available_samples(), 0);
+
+        // Fourth pull: 0 samples remaining -> comfort dither injected and returns false
+        assert!(!ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
     }
 
     #[test]

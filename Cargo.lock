@@ -462,6 +462,7 @@ dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
  "cpal",
+ "libc",
  "socket2",
 ]
 

@@ -129,14 +129,15 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
 
 pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
     let sock_ref = socket2::SockRef::from(socket);
-    let _ = sock_ref.set_tos(0xB8);
-    let _ = sock_ref.set_send_buffer_size(65_536);
-    let _ = sock_ref.set_recv_buffer_size(65_536);
+    // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
+    let _ = sock_ref.set_tos(0xA0);
+    let _ = sock_ref.set_send_buffer_size(262_144);
+    let _ = sock_ref.set_recv_buffer_size(262_144);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         use std::os::fd::AsRawFd;
-        let prio: libc::c_int = 6;
+        let prio: libc::c_int = 5; // Maps to 802.11e AC_VI (Video/Audio High-Throughput Queue)
         libc::setsockopt(
             socket.as_raw_fd(),
             libc::SOL_SOCKET,
@@ -419,13 +420,14 @@ impl HostEngine {
                     let current_monitor = get_default_monitor();
 
                     if let Ok(mut child) = Command::new("parec")
+                        .env("PIPEWIRE_LATENCY", "64/48000")
                         .args([
                             "--raw",
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=2",
-                            "--process-time-msec=2",
+                            "--latency-msec=1",
+                            "--process-time-msec=1",
                             &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())

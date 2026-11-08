@@ -176,7 +176,7 @@ impl AudioShareApp {
                     self.adb_watcher = Some(AdbUsbWatcher::start(DEFAULT_PORT));
                     self.host_engine = Some(engine);
                     self.host_status_msg =
-                        "Broadcasting 48kHz Studio Lossless + [N-1]/[N-2] FEC (802.11e AC_VO)"
+                        "Broadcasting 48kHz Studio Lossless + [N-1]/[N-2] FEC (802.11e AC_VI)"
                             .into();
                 }
                 Err(e) => {
