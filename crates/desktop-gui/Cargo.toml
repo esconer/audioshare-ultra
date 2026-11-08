@@ -12,3 +12,4 @@ audioshare-protocol = { path = "../protocol" }
 audioshare-host-engine = { path = "../host-engine" }
 audioshare-client-engine = { path = "../client-engine" }
 eframe = "0.29"
+qrcode = { version = "0.14", default-features = false }

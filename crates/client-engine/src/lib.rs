@@ -37,6 +37,12 @@ pub struct ClientTelemetry {
     pub auth_failures: AtomicU64,
     pub clock_drift_ppm: AtomicI32,
     pub preamp_gain_db_tenths: AtomicI32,
+    pub eq_bass_db_tenths: AtomicI32,
+    pub eq_presence_db_tenths: AtomicI32,
+    pub eq_treble_db_tenths: AtomicI32,
+    pub channel_role: AtomicU8,
+    pub enable_binaural_crossfeed: AtomicBool,
+    pub gaming_mode_hard_lock: AtomicBool,
     pub downstream_bt_delay_ms: AtomicU16,
     pub host_volume: AtomicU8,
     pub server_dtx_silent: AtomicBool,
@@ -64,6 +70,12 @@ impl ClientEngine {
             auth_failures: AtomicU64::new(0),
             clock_drift_ppm: AtomicI32::new(0),
             preamp_gain_db_tenths: AtomicI32::new((config.preamp_gain_db * 10.0) as i32),
+            eq_bass_db_tenths: AtomicI32::new(0),
+            eq_presence_db_tenths: AtomicI32::new(0),
+            eq_treble_db_tenths: AtomicI32::new(0),
+            channel_role: AtomicU8::new(0),
+            enable_binaural_crossfeed: AtomicBool::new(false),
+            gaming_mode_hard_lock: AtomicBool::new(false),
             downstream_bt_delay_ms: AtomicU16::new(0),
             host_volume: AtomicU8::new(100),
             server_dtx_silent: AtomicBool::new(false),
@@ -171,6 +183,8 @@ impl ClientEngine {
         let mut sequencer = ZeroJitterSequencer::new();
         let mut resampler = ClockDriftResampler::new();
         let mut limiter = TruePeakLimiter::new(config.preamp_gain_db);
+        let mut studio_eq = audioshare_protocol::sync_and_eq::StudioEqualizer::new();
+        let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
@@ -326,14 +340,40 @@ impl ClientEngine {
                         _ => {}
                     }
 
+                    // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay)
+                    studio_eq.update_if_changed(
+                        telemetry.eq_bass_db_tenths.load(Ordering::Relaxed),
+                        telemetry.eq_presence_db_tenths.load(Ordering::Relaxed),
+                        telemetry.eq_treble_db_tenths.load(Ordering::Relaxed),
+                    );
+                    studio_eq.process(&mut raw_subframe);
+
+                    // 2. Apply Spatial Channel Role (Stereo / Left / Right / Center / Surround)
+                    let role = audioshare_protocol::sync_and_eq::ChannelRole::from_u8(
+                        telemetry.channel_role.load(Ordering::Relaxed),
+                    );
+                    role.apply_in_place(&mut raw_subframe);
+
+                    // 3. Apply Audiophile Bauer Headphone Crossfeed if enabled (0.00ms delay)
+                    if telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed) {
+                        crossfeed.process_in_place(&mut raw_subframe);
+                    }
+
                     let gain_db =
                         (telemetry.preamp_gain_db_tenths.load(Ordering::Relaxed) as f32) / 10.0;
                     limiter.set_gain_db(gain_db);
                     limiter.process_in_place(&mut raw_subframe);
 
+                    // 4. Competitive Gaming Hard-Lock (Pins jitter buffer to 5.0ms floor)
+                    let target_buf = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
+                        2.0
+                    } else {
+                        config.target_buffer_subframes
+                    };
+
                     let queued_subframes =
                         (burst_fifo.available_samples() as f32) / (SUBFRAME_STEREO_SAMPLES as f32);
-                    resampler.update_clock_loop(queued_subframes, config.target_buffer_subframes);
+                    resampler.update_clock_loop(queued_subframes, target_buf);
 
                     let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
                     telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);

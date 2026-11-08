@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-android-jni"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-client-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
@@ -467,17 +467,18 @@ dependencies = [
 
 [[package]]
 name = "audioshare-desktop-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
  "audioshare-protocol",
  "eframe",
+ "qrcode",
 ]
 
 [[package]]
 name = "audioshare-host-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "audioshare-protocol",
  "cpal",
@@ -489,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-protocol"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "autocfg"
@@ -2696,6 +2697,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-xml"

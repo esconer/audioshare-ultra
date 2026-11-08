@@ -21,6 +21,7 @@ use audioshare_protocol::{
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 pub mod app_routing;
+pub mod bt_optimization;
 pub mod discovery_and_os;
 pub mod virtual_mic;
 

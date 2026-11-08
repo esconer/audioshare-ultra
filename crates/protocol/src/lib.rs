@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod dsp;
 pub mod lpc_lossless;
 pub mod sequencer;
+pub mod sync_and_eq;
 pub mod wire;
 
 /// Standard real-time operating sample rate (48,000 Hz)
