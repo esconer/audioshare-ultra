@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/host-engine",
+    "crates/client-engine",
+    "crates/cli",
+    "crates/desktop-gui",
+    "crates/android-jni",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+authors = ["AudioShare Ultra Contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

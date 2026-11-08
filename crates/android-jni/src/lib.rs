@@ -1,0 +1,323 @@
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use audioshare_client_engine::{ClientConfig, ClientEngine};
+#[cfg(target_os = "android")]
+use audioshare_client_engine::android_aaudio::AAudioInputGuard;
+use audioshare_host_engine::discovery_and_os::DiscoveryScanner;
+use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
+use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
+use audioshare_protocol::dsp::BurstDecouplerRing;
+use audioshare_protocol::lpc_lossless::{
+    encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
+};
+use audioshare_protocol::wire::{pack_datagram, CodecMode, WireHeader};
+use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
+
+static GLOBAL_ANDROID_CLIENT: Mutex<Option<ClientEngine>> = Mutex::new(None);
+static GLOBAL_PHONE_MIC_TX: Mutex<Option<PhoneMicTransmitter>> = Mutex::new(None);
+static GLOBAL_SCANNER: OnceLock<DiscoveryScanner> = OnceLock::new();
+
+pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
+    GLOBAL_SCANNER.get_or_init(DiscoveryScanner::start)
+}
+
+pub struct PhoneMicTransmitter {
+    running: Arc<AtomicBool>,
+    pub mic_input_ring: Arc<BurstDecouplerRing>,
+    #[cfg(target_os = "android")]
+    _mic_input_stream: Option<AAudioInputGuard>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PhoneMicTransmitter {
+    pub fn start(host_ip: &str) -> Result<Self, String> {
+        let host_only = host_ip.split(':').next().unwrap_or(host_ip);
+        let target: SocketAddr = format!("{}:{}", host_only, PHONE_MIC_PORT)
+            .parse()
+            .map_err(|e| format!("Invalid Mic target IP: {}", e))?;
+
+        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mic_input_ring = Arc::new(BurstDecouplerRing::new());
+
+        #[cfg(target_os = "android")]
+        let _mic_input_stream = match AAudioInputGuard::open_low_latency_mic(Arc::clone(
+            &mic_input_ring,
+        )) {
+            Some(stream) => Some(stream),
+            None => return Err("Failed to open AAudio microphone input".into()),
+        };
+
+        let run_clone = Arc::clone(&running);
+        let ring_clone = Arc::clone(&mic_input_ring);
+
+        let handle = std::thread::Builder::new()
+            .name("as-ultra-phone-mic-tx".into())
+            .spawn(move || {
+                promote_thread_realtime();
+                let start = Instant::now();
+                let mut seq: u16 = 0;
+                let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
+                let mut has_fec = false;
+                let mut dither_rng = 1u32;
+
+                while run_clone.load(Ordering::Relaxed) {
+                    if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES {
+                        let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                        ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
+
+                        let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
+                        for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
+                            *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        }
+
+                        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                        let enc_len = encode_lossless_subframe(&i16_buf, &mut enc);
+
+                        let mut primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES + 2];
+                        let len_be = (enc_len as u16).to_be_bytes();
+                        primary[0] = len_be[0];
+                        primary[1] = len_be[1];
+                        primary[2..2 + enc_len].copy_from_slice(&enc[..enc_len]);
+
+                        let hdr = WireHeader {
+                            mode: CodecMode::StudioLosslessLpc,
+                            subframe_count: 1,
+                            encrypted: false,
+                            sequence: seq,
+                            tx_timestamp_us: start.elapsed().as_micros() as u32,
+                            primary_len: 0,
+                            fec_n1_len: 0,
+                            fec_n2_len: 0,
+                            host_volume: 100,
+                            stream_id: 2,
+                            header_crc16: 0,
+                        };
+
+                        let mut dgram = [0u8; MAX_SAFE_UDP_PAYLOAD];
+                        let f1 = if has_fec { &fec_n1[..] } else { &[] };
+                        if let Ok(pkt_len) =
+                            pack_datagram(hdr, &primary[..2 + enc_len], f1, &[], &mut dgram)
+                        {
+                            let _ = socket.send_to(&dgram[..pkt_len], target);
+                        }
+
+                        encode_fec_subframe(&i16_buf, &mut fec_n1);
+                        has_fec = true;
+                        seq = seq.wrapping_add(1);
+                    } else {
+                        std::thread::sleep(Duration::from_micros(800));
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            running,
+            mic_input_ring,
+            #[cfg(target_os = "android")]
+            _mic_input_stream,
+            handle: Some(handle),
+        })
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        #[cfg(target_os = "android")]
+        if let Some(stream) = self._mic_input_stream.take() {
+            drop(stream);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+pub fn android_start_stream(
+    host_ip_port: &str,
+    is_usb: bool,
+    gain_db: f32,
+    pin: Option<&str>,
+) -> Result<(), String> {
+    let addr: SocketAddr = host_ip_port
+        .parse()
+        .map_err(|e| format!("Invalid SocketAddr {}: {}", host_ip_port, e))?;
+
+    let mut guard = GLOBAL_ANDROID_CLIENT.lock().unwrap();
+    if let Some(mut existing) = guard.take() {
+        existing.stop();
+    }
+
+    let cfg = ClientConfig {
+        server_addr: addr,
+        target_buffer_subframes: if is_usb { 2.0 } else { 3.5 },
+        preamp_gain_db: gain_db,
+    };
+
+    let client = ClientEngine::connect_with_pin(cfg, pin)?;
+    *guard = Some(client);
+    Ok(())
+}
+
+pub fn android_stop_stream() {
+    if let Some(mut client) = GLOBAL_ANDROID_CLIENT.lock().unwrap().take() {
+        client.stop();
+    }
+    android_stop_phone_mic();
+}
+
+pub fn android_stop_phone_mic() {
+    if let Some(mut mic) = GLOBAL_PHONE_MIC_TX.lock().unwrap().take() {
+        mic.stop();
+    }
+}
+
+pub fn android_set_gain_db(gain_db: f32) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        client
+            .telemetry
+            .preamp_gain_db_tenths
+            .store((gain_db * 10.0) as i32, Ordering::Relaxed);
+    }
+}
+
+pub fn android_report_bt_delay_ms(delay_ms: u16) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        client
+            .telemetry
+            .downstream_bt_delay_ms
+            .store(delay_ms, Ordering::Relaxed);
+    }
+}
+
+/// Returns newline-delimited list of auto-discovered hosts: "Hostname|IP:Port|USB_or_WiFi"
+pub fn android_get_discovered_hosts_csv() -> String {
+    let hosts = get_or_start_scanner().discovered_hosts();
+    let mut out = String::new();
+    for h in hosts {
+        let mode = if h.is_usb { "USB" } else { "WiFi" };
+        out.push_str(&format!("{}|{}|{}\n", h.hostname, h.addr, mode));
+    }
+    out
+}
+
+#[cfg(target_os = "android")]
+pub mod android_native {
+    use super::*;
+    use jni::objects::{JClass, JString};
+    use jni::sys::{jboolean, jfloat, jint, jlongArray, jstring};
+    use jni::JNIEnv;
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetDiscoveredHosts(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        let csv = android_get_discovered_hosts_csv();
+        env.new_string(csv).unwrap().into_raw()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStartClient(
+        mut env: JNIEnv,
+        _class: JClass,
+        host_addr: JString,
+        is_usb: jboolean,
+        gain_db: jfloat,
+        pin: JString,
+    ) -> jboolean {
+        let Ok(addr_str) = env.get_string(&host_addr) else {
+            return 0;
+        };
+        let addr_rust: String = addr_str.into();
+        let pin_rust: String = env
+            .get_string(&pin)
+            .map(|value| value.into())
+            .unwrap_or_default();
+        let pin_opt = if pin_rust.is_empty() {
+            None
+        } else {
+            Some(pin_rust.as_str())
+        };
+        match android_start_stream(&addr_rust, is_usb != 0, gain_db, pin_opt) {
+            Ok(()) => 1,
+            Err(_) => 0,
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStopClient(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        android_stop_stream();
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeSetGainDb(
+        _env: JNIEnv,
+        _class: JClass,
+        gain_db: jfloat,
+    ) {
+        android_set_gain_db(gain_db);
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeReportBluetoothDelayMs(
+        _env: JNIEnv,
+        _class: JClass,
+        delay_ms: jint,
+    ) {
+        android_report_bt_delay_ms(delay_ms.max(0) as u16);
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStartPhoneMic(
+        mut env: JNIEnv,
+        _class: JClass,
+        host_ip: JString,
+    ) -> jboolean {
+        let Ok(ip_str) = env.get_string(&host_ip) else {
+            return 0;
+        };
+        let ip_rust: String = ip_str.into();
+        android_stop_phone_mic();
+        if let Ok(tx) = PhoneMicTransmitter::start(&ip_rust) {
+            *GLOBAL_PHONE_MIC_TX.lock().unwrap() = Some(tx);
+            1
+        } else {
+            0
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStopPhoneMic(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        android_stop_phone_mic();
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetTelemetry(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jlongArray {
+        let mut stats = [0i64; 5];
+        if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+            stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
+            stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
+            stats[2] = c.telemetry.fec_healed_frames.load(Ordering::Relaxed) as i64;
+            stats[3] = c.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed) as i64;
+            stats[4] = c.telemetry.clock_drift_ppm.load(Ordering::Relaxed) as i64;
+        }
+        let arr = env.new_long_array(5).unwrap();
+        let _ = env.set_long_array_region(&arr, 0, &stats);
+        arr.into_raw()
+    }
+}

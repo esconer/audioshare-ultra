@@ -1,0 +1,122 @@
+name: Build & Release (Linux, Windows, Android APK)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 1. Build Linux x86_64 GUI & CLI
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Audio & GUI Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Workspace Tests
+        run: cargo test --workspace
+
+      - name: Build Linux Release Binaries
+        run: |
+          cargo build --release -p audioshare-desktop-gui -p audioshare-cli
+          mkdir -p dist-linux
+          cp target/release/audioshare-gui dist-linux/
+          cp target/release/as-ultra dist-linux/
+          tar -czvf audioshare-ultra-linux-x86_64.tar.gz -C dist-linux .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audioshare-ultra-linux-x86_64
+          path: audioshare-ultra-linux-x86_64.tar.gz
+
+  # 2. Build Windows x86_64 GUI & CLI
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows Release Binaries
+        run: |
+          cargo build --release -p audioshare-desktop-gui -p audioshare-cli
+          mkdir dist-win
+          cp target/release/audioshare-gui.exe dist-win/
+          cp target/release/as-ultra.exe dist-win/
+          Compress-Archive -Path dist-win/* -DestinationPath audioshare-ultra-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audioshare-ultra-windows-x86_64
+          path: audioshare-ultra-windows-x86_64.zip
+
+  # 3. Build Signed Android APK (Rust NDK AAudio + Jetpack Compose)
+  build-android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r26d & Rust Targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install cargo-ndk and Build Native .so Libraries
+        run: |
+          echo "y" | sdkmanager --install "ndk;26.3.11579264"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.3.11579264"
+          cargo install cargo-ndk
+          cargo ndk --platform 26 -t arm64-v8a -t x86_64 -o ./android/app/src/main/jniLibs build --release -p audioshare-android-jni
+
+      - name: Setup Gradle & Assemble Signed Release APK
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build APK
+        working-directory: ./android
+        run: |
+          gradle assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../audioshare-ultra-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audioshare-ultra-android-apk
+          path: audioshare-ultra-android.apk
+
+  # 4. Publish GitHub Release automatically when a tag (e.g. v0.1.0) is pushed
+  publish-release:
+    needs: [build-linux, build-windows, build-android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz
+            release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip
+            release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk

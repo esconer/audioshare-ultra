@@ -1,0 +1,36 @@
+# Rust
+/target/
+
+# Scratch specifications and working notes
+/.scratch/
+
+# Android / Gradle
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/.kotlin/
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Editors and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Logs, local environment & secrets
+*.log
+.env
+.env.*
+!.env.example
+
+# Local databases / test artifacts
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

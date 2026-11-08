@@ -1,0 +1,14 @@
+[package]
+name = "audioshare-desktop-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "audioshare-gui"
+path = "src/main.rs"
+
+[dependencies]
+audioshare-protocol = { path = "../protocol" }
+audioshare-host-engine = { path = "../host-engine" }
+audioshare-client-engine = { path = "../client-engine" }
+eframe = "0.29"

@@ -1,0 +1,17 @@
+[package]
+name = "audioshare-android-jni"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "audioshare_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+audioshare-protocol = { path = "../protocol" }
+audioshare-host-engine = { path = "../host-engine" }
+audioshare-client-engine = { path = "../client-engine" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+libc = "0.2"

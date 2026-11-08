@@ -1,0 +1,13 @@
+[package]
+name = "audioshare-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "as-ultra"
+path = "src/main.rs"
+
+[dependencies]
+audioshare-protocol = { path = "../protocol" }
+audioshare-host-engine = { path = "../host-engine" }
+audioshare-client-engine = { path = "../client-engine" }

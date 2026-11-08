@@ -1,0 +1,7 @@
+[package]
+name = "audioshare-protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Zero mandatory external dependencies for instant cross-compilation on Windows, Linux, and Android NDK

@@ -1,0 +1,12 @@
+[package]
+name = "audioshare-client-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+audioshare-protocol = { path = "../protocol" }
+audioshare-host-engine = { path = "../host-engine" }
+socket2 = { version = "0.5", features = ["all"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = "0.15"

@@ -1,0 +1,714 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use audioshare_protocol::crypto::SessionKey;
+use audioshare_protocol::dsp::BurstDecouplerRing;
+#[cfg(not(target_os = "android"))]
+use audioshare_protocol::dsp::downmix_to_stereo;
+use audioshare_protocol::lpc_lossless::{
+    encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
+};
+use audioshare_protocol::wire::{
+    pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
+};
+use audioshare_protocol::{
+    MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES,
+};
+#[cfg(not(target_os = "android"))]
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+pub mod app_routing;
+pub mod discovery_and_os;
+pub mod virtual_mic;
+
+pub const DEFAULT_PORT: u16 = 65530;
+const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
+
+#[cfg(not(target_os = "android"))]
+pub(crate) struct ClientPreviewSink;
+#[cfg(not(target_os = "android"))]
+impl ClientPreviewSink {
+    pub fn spawn(fifo: Arc<BurstDecouplerRing>) -> Result<cpal::Stream, String> {
+        Self::spawn_preferred(fifo, None)
+    }
+
+    /// Spawn playback on the first output device whose name contains
+    /// `preferred_name` (e.g. "CABLE Input"), falling back to the default.
+    pub fn spawn_preferred(
+        fifo: Arc<BurstDecouplerRing>,
+        preferred_name: Option<&str>,
+    ) -> Result<cpal::Stream, String> {
+        let host = cpal::default_host();
+        let preferred = preferred_name.and_then(|needle| {
+            host.output_devices().ok().and_then(|mut devices| {
+                devices.find(|device| {
+                    device
+                        .name()
+                        .map(|name| name.contains(needle))
+                        .unwrap_or(false)
+                })
+            })
+        });
+        let dev = preferred
+            .or_else(|| host.default_output_device())
+            .ok_or("No output device")?;
+        let cfg = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        let mut rng = 12345u32;
+        let stream = dev
+            .build_output_stream(
+                &cfg,
+                move |out: &mut [f32], _| {
+                    fifo.pop_exact_or_dither(out, &mut rng);
+                },
+                |_| {},
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| e.to_string())?;
+        Ok(stream)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkInterfaceInfo {
+    pub name: String,
+    pub ip: IpAddr,
+    pub is_usb_tethering: bool,
+}
+
+pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
+    let mut valid = Vec::new();
+    if let Ok(addrs) = if_addrs::get_if_addrs() {
+        for iface in addrs {
+            if iface.is_loopback() {
+                continue;
+            }
+            let ip = iface.ip();
+            if !ip.is_ipv4() {
+                continue;
+            }
+            let lower = iface.name.to_lowercase();
+            let is_virtual = lower.contains("docker")
+                || lower.contains("wsl")
+                || lower.contains("vethernet")
+                || lower.contains("vmware")
+                || lower.contains("vmnet")
+                || lower.contains("vbox")
+                || lower.contains("virbr")
+                || lower.contains("br-");
+            if is_virtual {
+                continue;
+            }
+
+            let ip_str = ip.to_string();
+            let is_usb = lower.contains("rndis")
+                || lower.contains("usb")
+                || lower.contains("ncm")
+                || ip_str.starts_with("192.168.42.")
+                || ip_str.starts_with("192.168.137.");
+
+            valid.push(NetworkInterfaceInfo {
+                name: iface.name,
+                ip,
+                is_usb_tethering: is_usb,
+            });
+        }
+    }
+    valid.sort_by_key(|i| !i.is_usb_tethering);
+    valid
+}
+
+pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(socket);
+    let _ = sock_ref.set_tos(0xB8);
+    let _ = sock_ref.set_send_buffer_size(65_536);
+    let _ = sock_ref.set_recv_buffer_size(65_536);
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::fd::AsRawFd;
+        let prio: libc::c_int = 6;
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PRIORITY,
+            &prio as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&prio) as libc::socklen_t,
+        );
+    }
+    Ok(())
+}
+
+pub fn promote_thread_realtime() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+        libc::setpriority(libc::PRIO_PROCESS, 0, -19);
+        // Hard real-time SCHED_FIFO for the audio TX/RX loops. Requires
+        // CAP_SYS_NICE/root; failure is non-fatal and falls back to nice -19.
+        let param = libc::sched_param { sched_priority: 50 };
+        let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+    }
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
+            THREAD_PRIORITY_TIME_CRITICAL,
+        };
+        let mut task_idx = 0u32;
+        let name: [u16; 10] = [
+            b'P' as u16, b'r' as u16, b'o' as u16, b' ' as u16, b'A' as u16,
+            b'u' as u16, b'd' as u16, b'i' as u16, b'o' as u16, 0,
+        ];
+        AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task_idx);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectedClient {
+    pub addr: SocketAddr,
+    pub last_seen: Instant,
+    pub is_usb: bool,
+    pub muted: bool,
+    pub fec_rate_permille: u16,
+    pub bluetooth_delay_ms: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HostConfig {
+    pub bind_port: u16,
+    pub subframes_per_packet: u8,
+    pub use_test_tone: bool,
+    pub enable_smart_dtx: bool,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            bind_port: DEFAULT_PORT,
+            subframes_per_packet: 2,
+            use_test_tone: false,
+            enable_smart_dtx: true,
+        }
+    }
+}
+
+pub struct HostTelemetry {
+    pub packets_sent: AtomicU64,
+    pub bytes_sent: AtomicU64,
+    pub dtx_silent_mode: AtomicBool,
+    pub active_codec_mode: AtomicU8,
+    pub host_volume: AtomicU8,
+    pub active_clients_count: AtomicU8,
+    pub max_client_bt_delay_ms: AtomicU16,
+    pub hotplug_rebinds: AtomicU16,
+}
+
+pub struct HostEngine {
+    running: Arc<AtomicBool>,
+    pub telemetry: Arc<HostTelemetry>,
+    clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+    session_key: Arc<Mutex<Option<SessionKey>>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostEngine {
+    pub fn start(config: HostConfig, initial_targets: Vec<SocketAddr>) -> Result<Self, String> {
+        let running = Arc::new(AtomicBool::new(true));
+        let telemetry = Arc::new(HostTelemetry {
+            packets_sent: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            dtx_silent_mode: AtomicBool::new(false),
+            active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
+            host_volume: AtomicU8::new(100),
+            active_clients_count: AtomicU8::new(initial_targets.len() as u8),
+            max_client_bt_delay_ms: AtomicU16::new(0),
+            hotplug_rebinds: AtomicU16::new(0),
+        });
+
+        let mut client_map = HashMap::new();
+        for addr in initial_targets {
+            let is_usb = addr.ip().to_string().starts_with("192.168.42.")
+                || addr.ip().to_string().starts_with("127.0.0.1");
+            client_map.insert(
+                addr,
+                ConnectedClient {
+                    addr,
+                    last_seen: Instant::now(),
+                    is_usb,
+                    muted: false,
+                    fec_rate_permille: 0,
+                    bluetooth_delay_ms: 0,
+                },
+            );
+        }
+        let clients = Arc::new(Mutex::new(client_map));
+        let session_key = Arc::new(Mutex::new(None));
+
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.bind_port));
+        let socket = UdpSocket::bind(bind_addr)
+            .map_err(|e| format!("Failed to bind UDP port {}: {}", config.bind_port, e))?;
+        configure_realtime_udp_socket(&socket)
+            .map_err(|e| format!("Failed to set real-time socket options: {}", e))?;
+        let _ = socket.set_nonblocking(true);
+
+        let ring = Arc::new(BurstDecouplerRing::new());
+        let last_capture_heartbeat_ms = Arc::new(AtomicU64::new(0));
+
+        let running_clone = Arc::clone(&running);
+        let telemetry_clone = Arc::clone(&telemetry);
+        let clients_clone = Arc::clone(&clients);
+        let key_clone = Arc::clone(&session_key);
+
+        let worker_handle = std::thread::Builder::new()
+            .name("as-ultra-host-tx".into())
+            .spawn(move || {
+                promote_thread_realtime();
+
+                Self::realtime_tx_loop(
+                    socket,
+                    config,
+                    ring,
+                    last_capture_heartbeat_ms,
+                    running_clone,
+                    telemetry_clone,
+                    clients_clone,
+                    key_clone,
+                );
+            })
+            .map_err(|e| format!("Failed to spawn real-time TX thread: {}", e))?;
+
+        Ok(Self {
+            running,
+            telemetry,
+            clients,
+            session_key,
+            worker_handle: Some(worker_handle),
+        })
+    }
+
+    pub fn set_encryption_pin(&self, pin: Option<&str>) {
+        let mut guard = self.session_key.lock().unwrap();
+        *guard = pin.map(SessionKey::from_pin);
+    }
+
+    pub fn connected_clients(&self) -> Vec<ConnectedClient> {
+        self.clients.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn set_client_muted(&self, addr: SocketAddr, muted: bool) {
+        if let Some(client) = self.clients.lock().unwrap().get_mut(&addr) {
+            client.muted = muted;
+        }
+    }
+
+    pub fn kick_client(&self, addr: SocketAddr) {
+        let mut map = self.clients.lock().unwrap();
+        map.remove(&addr);
+        self.telemetry
+            .active_clients_count
+            .store(map.len() as u8, Ordering::Relaxed);
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn spawn_loopback_capture(
+        ring: Arc<BurstDecouplerRing>,
+        heartbeat_ms: Arc<AtomicU64>,
+        start_epoch: Instant,
+    ) -> Result<cpal::Stream, String> {
+        let host = cpal::default_host();
+
+        #[cfg(target_os = "windows")]
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "No Windows audio output endpoint found".to_string())?;
+
+        #[cfg(not(target_os = "windows"))]
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| "No Linux audio capture endpoint found".to_string())?;
+
+        let supported_cfg = if cfg!(target_os = "windows") {
+            device
+                .default_output_config()
+                .map_err(|e| format!("Output config error: {}", e))?
+        } else {
+            device
+                .default_input_config()
+                .map_err(|e| format!("Input config error: {}", e))?
+        };
+
+        let channels = supported_cfg.channels() as usize;
+        let src_rate = supported_cfg.sample_rate().0;
+
+        let stream_cfg = cpal::StreamConfig {
+            channels: channels as u16,
+            sample_rate: cpal::SampleRate(src_rate),
+            buffer_size: cpal::BufferSize::Fixed(SUBFRAME_FRAMES as u32),
+        };
+
+        // Use our 4-Point Hermite Cubic Fractional Interpolator for alias-free 44.1k/96k -> 48k conversion
+        let mut host_resampler = audioshare_protocol::dsp::ClockDriftResampler::new();
+        host_resampler.ratio = (src_rate as f64) / (SAMPLE_RATE as f64);
+
+        let stream = device
+            .build_input_stream(
+                &stream_cfg,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    heartbeat_ms.store(
+                        start_epoch.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                    let in_frames = data.len() / channels.max(1);
+                    let mut stereo_buf = [0.0f32; 2048];
+                    let safe_frames = in_frames.min(1024);
+
+                    downmix_to_stereo(
+                        &data[..safe_frames * channels],
+                        channels,
+                        &mut stereo_buf[..safe_frames * 2],
+                    );
+
+                    if src_rate == SAMPLE_RATE {
+                        ring.push_samples(&stereo_buf[..safe_frames * 2]);
+                    } else {
+                        let mut resampled = [0.0f32; 4096];
+                        let out_frames = host_resampler
+                            .process(&stereo_buf[..safe_frames * 2], &mut resampled);
+                        ring.push_samples(&resampled[..out_frames * 2]);
+                    }
+                },
+                |_| {},
+                None,
+            )
+            .map_err(|e| format!("Failed to build loopback stream: {}", e))?;
+
+        stream
+            .play()
+            .map_err(|e| format!("Failed to start loopback stream: {}", e))?;
+        Ok(stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn realtime_tx_loop(
+        socket: UdpSocket,
+        config: HostConfig,
+        ring: Arc<BurstDecouplerRing>,
+        capture_heartbeat_ms: Arc<AtomicU64>,
+        running: Arc<AtomicBool>,
+        telemetry: Arc<HostTelemetry>,
+        clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+        session_key: Arc<Mutex<Option<SessionKey>>>,
+    ) {
+        #[cfg(target_os = "android")]
+        let _ = &capture_heartbeat_ms;
+        let start_instant = Instant::now();
+        #[cfg(not(target_os = "android"))]
+        let mut active_stream = if !config.use_test_tone {
+            Self::spawn_loopback_capture(
+                Arc::clone(&ring),
+                Arc::clone(&capture_heartbeat_ms),
+                start_instant,
+            )
+            .ok()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "android"))]
+        let mut last_watchdog_check = Instant::now();
+
+        let subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+        let packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
+        let mut next_tick = start_instant + packet_interval;
+
+        let mut seq: u16 = 0;
+        let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
+        let mut fec_n2 = [0u8; ADPCM_FEC_BYTES];
+        let mut has_fec_n1 = false;
+        let mut has_fec_n2 = false;
+
+        let mut silent_subframes: u32 = 0;
+        let mut tone_phase: f32 = 0.0;
+        let mut ctrl_buf = [0u8; 64];
+        let mut dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+        let mut last_client_sweep = Instant::now();
+
+        while running.load(Ordering::Relaxed) {
+            // 1. Hot-Plug Audio Device Watchdog (USB unplug / HDMI sleep recovery)
+            #[cfg(not(target_os = "android"))]
+            {
+                if !config.use_test_tone
+                    && last_watchdog_check.elapsed() >= Duration::from_millis(500)
+                {
+                    last_watchdog_check = Instant::now();
+                    let now_ms = start_instant.elapsed().as_millis() as u64;
+                    let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
+                    if active_stream.is_none() || now_ms.saturating_sub(last_cb) > 1500 {
+                        // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
+                        active_stream = Self::spawn_loopback_capture(
+                            Arc::clone(&ring),
+                            Arc::clone(&capture_heartbeat_ms),
+                            start_instant,
+                        )
+                        .ok();
+                        if active_stream.is_some() {
+                            capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
+                            telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
+            // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
+            while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
+                let is_usb = src_addr.ip().to_string().starts_with("192.168.42.")
+                    || src_addr.ip().to_string().starts_with("127.0.0.1");
+
+                if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
+                    let mut map = clients.lock().unwrap();
+                    map.entry(src_addr).or_insert(ConnectedClient {
+                        addr: src_addr,
+                        last_seen: Instant::now(),
+                        is_usb,
+                        muted: false,
+                        fec_rate_permille: 0,
+                        bluetooth_delay_ms: 0,
+                    }).last_seen = Instant::now();
+                    telemetry
+                        .active_clients_count
+                        .store(map.len() as u8, Ordering::Relaxed);
+                } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
+                    if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                        let mut map = clients.lock().unwrap();
+                        let entry = map.entry(src_addr).or_insert(ConnectedClient {
+                            addr: src_addr,
+                            last_seen: Instant::now(),
+                            is_usb,
+                            muted: false,
+                            fec_rate_permille: fb.fec_rate_permille,
+                            bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                        });
+                        entry.last_seen = Instant::now();
+                        entry.fec_rate_permille = fb.fec_rate_permille;
+                        entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                        telemetry
+                            .active_clients_count
+                            .store(map.len() as u8, Ordering::Relaxed);
+
+                        // Dynamic Link Governor: Switch to CompressedLowDelay if any client experiences >4% loss
+                        let max_loss = map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
+                        let max_bt = map
+                            .values()
+                            .map(|c| c.bluetooth_delay_ms)
+                            .max()
+                            .unwrap_or(0);
+                        telemetry
+                            .max_client_bt_delay_ms
+                            .store(max_bt, Ordering::Relaxed);
+
+                        dynamic_codec_mode = if max_loss > 40 {
+                            CodecMode::CompressedLowDelay
+                        } else {
+                            CodecMode::StudioLosslessLpc
+                        };
+                        telemetry
+                            .active_codec_mode
+                            .store(dynamic_codec_mode as u8, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            // 2b. Expire clients that stopped sending HELLO/feedback, so stale
+            // entries do not keep receiving packets or appear in the GUI.
+            if last_client_sweep.elapsed() >= Duration::from_secs(1) {
+                last_client_sweep = Instant::now();
+                let mut map = clients.lock().unwrap();
+                let before = map.len();
+                map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(5));
+                if map.len() != before {
+                    telemetry
+                        .active_clients_count
+                        .store(map.len() as u8, Ordering::Relaxed);
+                }
+            }
+
+            // 3. Encode Subframes
+            let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
+            let mut primary_cursor = 0usize;
+            let base_seq = seq;
+            let prev_n1_copy = fec_n1;
+            let prev_n2_copy = fec_n2;
+            let send_n1 = has_fec_n1;
+            let send_n2 = has_fec_n2;
+            let mut packet_is_silent = true;
+
+            for _ in 0..subframes_per_pkt {
+                let mut f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                let mut dummy_rng = 1u32;
+
+                if config.use_test_tone {
+                    for i in 0..SUBFRAME_FRAMES {
+                        let l = (tone_phase * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.25;
+                        let r = (tone_phase * 2.0 * std::f32::consts::PI * 554.37).sin() * 0.25;
+                        f32_subframe[i * 2] = l;
+                        f32_subframe[i * 2 + 1] = r;
+                        tone_phase += 1.0 / (SAMPLE_RATE as f32);
+                        if tone_phase >= 1.0 {
+                            tone_phase -= 1.0;
+                        }
+                    }
+                } else if !ring.pop_exact_or_dither(&mut f32_subframe, &mut dummy_rng) {
+                    f32_subframe.fill(0.0);
+                }
+
+                let mut i16_subframe = [0i16; SUBFRAME_STEREO_SAMPLES];
+                let mut max_abs: i16 = 0;
+                for (dst, &s) in i16_subframe.iter_mut().zip(f32_subframe.iter()) {
+                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                    *dst = v;
+                    let abs = v.saturating_abs();
+                    if abs > max_abs {
+                        max_abs = abs;
+                    }
+                }
+
+                if max_abs > 3 {
+                    packet_is_silent = false;
+                    silent_subframes = 0;
+                } else {
+                    silent_subframes = silent_subframes.saturating_add(1);
+                }
+
+                fec_n2 = fec_n1;
+                has_fec_n2 = has_fec_n1;
+                encode_fec_subframe(&i16_subframe, &mut fec_n1);
+                has_fec_n1 = true;
+
+                if dynamic_codec_mode == CodecMode::CompressedLowDelay {
+                    // Weak Wi-Fi fallback: Use compact 124-byte ADPCM frame as primary payload (75% smaller!)
+                    let len_be = (ADPCM_FEC_BYTES as u16).to_be_bytes();
+                    primary_bundle[primary_cursor] = len_be[0];
+                    primary_bundle[primary_cursor + 1] = len_be[1];
+                    primary_cursor += 2;
+                    primary_bundle[primary_cursor..primary_cursor + ADPCM_FEC_BYTES]
+                        .copy_from_slice(&fec_n1);
+                    primary_cursor += ADPCM_FEC_BYTES;
+                } else {
+                    let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                    let enc_len = encode_lossless_subframe(&i16_subframe, &mut enc_sub);
+                    let len_be = (enc_len as u16).to_be_bytes();
+                    primary_bundle[primary_cursor] = len_be[0];
+                    primary_bundle[primary_cursor + 1] = len_be[1];
+                    primary_cursor += 2;
+                    primary_bundle[primary_cursor..primary_cursor + enc_len]
+                        .copy_from_slice(&enc_sub[..enc_len]);
+                    primary_cursor += enc_len;
+                }
+
+                seq = seq.wrapping_add(1);
+            }
+
+            let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
+            let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
+            let active_key = *session_key.lock().unwrap();
+
+            let is_dtx_active =
+                config.enable_smart_dtx && packet_is_silent && silent_subframes > 200;
+            telemetry
+                .dtx_silent_mode
+                .store(is_dtx_active, Ordering::Relaxed);
+
+            let maybe_pkt_len = if is_dtx_active {
+                if (base_seq % 80) == 0 {
+                    let hdr = WireHeader {
+                        mode: CodecMode::SilenceHeartbeat,
+                        subframe_count: subframes_per_pkt as u8,
+                        encrypted: active_key.is_some(),
+                        sequence: base_seq,
+                        tx_timestamp_us,
+                        primary_len: 0,
+                        fec_n1_len: 0,
+                        fec_n2_len: 0,
+                        host_volume: telemetry.host_volume.load(Ordering::Relaxed),
+                        stream_id: 1,
+                        header_crc16: 0,
+                    };
+                    pack_datagram_with_key(hdr, &[], &[], &[], active_key.as_ref(), &mut datagram)
+                        .ok()
+                } else {
+                    None
+                }
+            } else {
+                let hdr = WireHeader {
+                    mode: dynamic_codec_mode,
+                    subframe_count: subframes_per_pkt as u8,
+                    encrypted: active_key.is_some(),
+                    sequence: base_seq,
+                    tx_timestamp_us,
+                    primary_len: 0,
+                    fec_n1_len: 0,
+                    fec_n2_len: 0,
+                    host_volume: telemetry.host_volume.load(Ordering::Relaxed),
+                    stream_id: 1,
+                    header_crc16: 0,
+                };
+                let f1_slice = if send_n1 { &prev_n1_copy[..] } else { &[] };
+                let f2_slice = if send_n2 { &prev_n2_copy[..] } else { &[] };
+                pack_datagram_with_key(
+                    hdr,
+                    &primary_bundle[..primary_cursor],
+                    f1_slice,
+                    f2_slice,
+                    active_key.as_ref(),
+                    &mut datagram,
+                )
+                .ok()
+            };
+
+            if let Some(pkt_len) = maybe_pkt_len {
+                let map = clients.lock().unwrap();
+                for client in map.values() {
+                    if !client.muted
+                        && socket.send_to(&datagram[..pkt_len], client.addr).is_ok()
+                    {
+                        telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        telemetry
+                            .bytes_sent
+                            .fetch_add(pkt_len as u64, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if next_tick > now {
+                std::thread::sleep(next_tick - now);
+            }
+            next_tick += packet_interval;
+            if now > next_tick + Duration::from_millis(20) {
+                next_tick = now + packet_interval;
+            }
+        }
+    }
+}
+
+impl Drop for HostEngine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
