@@ -66,6 +66,7 @@ class PhoneAudioCaster(
             while (running) {
                 val read = audioRecord?.read(subframe, 0, subframe.size, AudioRecord.READ_BLOCKING) ?: 0
                 if (read <= 0) break
+                AudioEngineService.nativePushCapturedAudio(subframe)
             }
         }
     }

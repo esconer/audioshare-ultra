@@ -34,6 +34,9 @@ fun MainScreen() {
     }
     var isConnected by remember { mutableStateOf(AudioEngineService.isStreaming) }
     var preampGainDb by remember { mutableFloatStateOf(0.0f) }
+    var nightMode by remember { mutableStateOf(false) }
+    var crossfeed by remember { mutableStateOf(false) }
+    var channelRole by remember { mutableIntStateOf(0) }
     var sharePhoneMic by remember { mutableStateOf(false) }
     var telemetry by remember { mutableStateOf(LongArray(5)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
@@ -185,6 +188,48 @@ fun MainScreen() {
                         },
                         valueRange = -12.0f..24.0f
                     )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        FilterChip(
+                            selected = nightMode,
+                            onClick = {
+                                nightMode = !nightMode
+                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                            },
+                            label = { Text("🌙 Night Mode") }
+                        )
+                        FilterChip(
+                            selected = crossfeed,
+                            onClick = {
+                                crossfeed = !crossfeed
+                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                            },
+                            label = { Text("🎧 Binaural 3D") }
+                        )
+                        FilterChip(
+                            selected = channelRole != 0,
+                            onClick = {
+                                channelRole = (channelRole + 1) % 5
+                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                            },
+                            label = {
+                                val roleName = listOf("Stereo", "Left", "Right", "Vocal", "Surround")[channelRole]
+                                Text("🔊 $roleName")
+                            }
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(12) }) { Text("⏮ Prev") }
+                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(10) }) { Text("⏯ Play/Pause PC") }
+                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(11) }) { Text("⏭ Next") }
+                    }
                 }
             }
 

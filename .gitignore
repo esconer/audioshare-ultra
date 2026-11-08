@@ -1,5 +1,7 @@
 # Rust
 /target/
+/.cargo/
+/.pkgconfig/
 
 # Scratch specifications and working notes
 /.scratch/

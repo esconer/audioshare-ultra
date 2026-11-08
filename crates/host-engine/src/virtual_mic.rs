@@ -105,6 +105,7 @@ pub struct PhoneMicReceiver {
     running: Arc<AtomicBool>,
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
+    pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
     #[cfg(target_os = "linux")]
     pactl_mic_module_id: Option<String>,
     #[cfg(target_os = "linux")]
@@ -168,6 +169,7 @@ impl PhoneMicReceiver {
         let running = Arc::new(AtomicBool::new(true));
         let mic_packets_received = Arc::new(AtomicU64::new(0));
         let mic_peak_level_pct = Arc::new(AtomicU64::new(0));
+        let last_chirp_rx_timestamp_us = Arc::new(AtomicU64::new(0));
 
         let mic_fifo = Arc::new(BurstDecouplerRing::new());
 
@@ -182,6 +184,7 @@ impl PhoneMicReceiver {
         let run_clone = Arc::clone(&running);
         let pkts_clone = Arc::clone(&mic_packets_received);
         let peak_clone = Arc::clone(&mic_peak_level_pct);
+        let chirp_clone = Arc::clone(&last_chirp_rx_timestamp_us);
         let mic_fifo_thread = Arc::clone(&mic_fifo);
 
         let handle = std::thread::Builder::new()
@@ -190,6 +193,7 @@ impl PhoneMicReceiver {
                 promote_thread_realtime();
                 let mut sequencer = ZeroJitterSequencer::new();
                 let mut limiter = TruePeakLimiter::new(6.0); // +6 dB clean mic pre-amp
+                let mut mic_gate = audioshare_protocol::sync_and_eq::MicRumbleAndNoiseGate::new();
 
                 // On Linux the pacat writer consumes the FIFO and feeds the
                 // AudioShare_Phone_Mic_Sink. On Windows, prefer VB-Cable's
@@ -264,6 +268,13 @@ impl PhoneMicReceiver {
                                             ((max_peak * 100.0).min(100.0)) as u64,
                                             Ordering::Relaxed,
                                         );
+                                        if audioshare_protocol::sync_and_eq::LatencySonar::detect_chirp_return(&pcm_f32) {
+                                            let now_us = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_micros() as u64;
+                                            chirp_clone.store(now_us, Ordering::Relaxed);
+                                        }
                                         sequencer.push_primary(base_seq, &pcm_f32);
                                     }
                                 }
@@ -278,6 +289,7 @@ impl PhoneMicReceiver {
                             let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             sequencer.pop_next(next_seq, &mut frame);
                             next_seq = next_seq.wrapping_add(1);
+                            mic_gate.process_in_place(&mut frame);
                             limiter.process_in_place(&mut frame);
                             mic_fifo_thread.push_samples(&frame);
                         }
@@ -292,6 +304,7 @@ impl PhoneMicReceiver {
             running,
             mic_packets_received,
             mic_peak_level_pct,
+            last_chirp_rx_timestamp_us,
             #[cfg(target_os = "linux")]
             pactl_mic_module_id,
             #[cfg(target_os = "linux")]

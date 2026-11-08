@@ -195,6 +195,33 @@ pub fn android_report_bt_delay_ms(delay_ms: u16) {
     }
 }
 
+pub fn android_send_media_command(cmd_code: u8) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        client
+            .telemetry
+            .pending_media_command
+            .store(cmd_code, Ordering::Relaxed);
+    }
+}
+
+pub fn android_configure_dsp(
+    bass_db: f32,
+    pres_db: f32,
+    treb_db: f32,
+    role: u8,
+    crossfeed: bool,
+    night_mode: bool,
+) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        client.telemetry.eq_bass_db_tenths.store((bass_db * 10.0) as i32, Ordering::Relaxed);
+        client.telemetry.eq_presence_db_tenths.store((pres_db * 10.0) as i32, Ordering::Relaxed);
+        client.telemetry.eq_treble_db_tenths.store((treb_db * 10.0) as i32, Ordering::Relaxed);
+        client.telemetry.channel_role.store(role, Ordering::Relaxed);
+        client.telemetry.enable_binaural_crossfeed.store(crossfeed, Ordering::Relaxed);
+        client.telemetry.enable_night_mode.store(night_mode, Ordering::Relaxed);
+    }
+}
+
 /// Returns newline-delimited list of auto-discovered hosts: "Hostname|IP:Port|USB_or_WiFi"
 pub fn android_get_discovered_hosts_csv() -> String {
     let hosts = get_or_start_scanner().discovered_hosts();
@@ -274,6 +301,50 @@ pub mod android_native {
         delay_ms: jint,
     ) {
         android_report_bt_delay_ms(delay_ms.max(0) as u16);
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeSendMediaCommand(
+        _env: JNIEnv,
+        _class: JClass,
+        cmd_code: jint,
+    ) {
+        android_send_media_command(cmd_code as u8);
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeConfigureDsp(
+        _env: JNIEnv,
+        _class: JClass,
+        bass_db: jfloat,
+        pres_db: jfloat,
+        treb_db: jfloat,
+        role: jint,
+        crossfeed: jboolean,
+        night_mode: jboolean,
+    ) {
+        android_configure_dsp(
+            bass_db,
+            pres_db,
+            treb_db,
+            role as u8,
+            crossfeed != 0,
+            night_mode != 0,
+        );
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativePushCapturedAudio(
+        env: JNIEnv,
+        _class: JClass,
+        pcm_float: jni::objects::JFloatArray,
+    ) {
+        let mut buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        if env.get_float_array_region(&pcm_float, 0, &mut buf).is_ok() {
+            if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+                tx.mic_input_ring.push_samples(&buf);
+            }
+        }
     }
 
     #[no_mangle]

@@ -42,8 +42,10 @@ pub struct ClientTelemetry {
     pub eq_treble_db_tenths: AtomicI32,
     pub channel_role: AtomicU8,
     pub enable_binaural_crossfeed: AtomicBool,
+    pub enable_night_mode: AtomicBool,
     pub gaming_mode_hard_lock: AtomicBool,
     pub downstream_bt_delay_ms: AtomicU16,
+    pub pending_media_command: AtomicU8,
     pub host_volume: AtomicU8,
     pub server_dtx_silent: AtomicBool,
 }
@@ -75,8 +77,10 @@ impl ClientEngine {
             eq_treble_db_tenths: AtomicI32::new(0),
             channel_role: AtomicU8::new(0),
             enable_binaural_crossfeed: AtomicBool::new(false),
+            enable_night_mode: AtomicBool::new(false),
             gaming_mode_hard_lock: AtomicBool::new(false),
             downstream_bt_delay_ms: AtomicU16::new(0),
+            pending_media_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
             server_dtx_silent: AtomicBool::new(false),
         });
@@ -105,13 +109,15 @@ impl ClientEngine {
                 let _audio_stream = Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo)).ok();
 
                 #[cfg(target_os = "android")]
-                let _android_aaudio =
+                let mut _android_aaudio =
                     android_aaudio::AAudioOutputGuard::open_low_latency(Arc::clone(&burst_fifo));
 
                 Self::realtime_rx_and_dsp_loop(
                     socket,
                     config,
                     burst_fifo,
+                    #[cfg(target_os = "android")]
+                    &mut _android_aaudio,
                     running_clone,
                     telemetry_clone,
                     key_clone,
@@ -176,6 +182,7 @@ impl ClientEngine {
         socket: UdpSocket,
         config: ClientConfig,
         burst_fifo: Arc<BurstDecouplerRing>,
+        #[cfg(target_os = "android")] aaudio_guard: &mut Option<android_aaudio::AAudioOutputGuard>,
         running: Arc<AtomicBool>,
         telemetry: Arc<ClientTelemetry>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
@@ -185,28 +192,44 @@ impl ClientEngine {
         let mut limiter = TruePeakLimiter::new(config.preamp_gain_db);
         let mut studio_eq = audioshare_protocol::sync_and_eq::StudioEqualizer::new();
         let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
+        let mut night_compressor = audioshare_protocol::sync_and_eq::NightModeCompressor::new();
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
+        let mut prebuffer_ready = false;
         let mut next_play_seq: u16 = 0;
+        let mut latest_rx_seq: u16 = 0;
 
         let mut last_feedback = Instant::now();
-        let mut next_dsp_tick = Instant::now() + Duration::from_micros(2500);
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
 
         while running.load(Ordering::Relaxed) {
-            if last_feedback.elapsed() >= Duration::from_millis(500) {
+            // Auto-recover Android AAudio stream within 25ms when headphones/Bluetooth route changes!
+            #[cfg(target_os = "android")]
+            if aaudio_guard
+                .as_ref()
+                .map(|g| g.needs_reopen())
+                .unwrap_or(true)
+            {
+                *aaudio_guard =
+                    android_aaudio::AAudioOutputGuard::open_low_latency(Arc::clone(&burst_fifo));
+            }
+
+            if last_feedback.elapsed() >= Duration::from_millis(500)
+                || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
+            {
                 let total_win = (window_primary + window_fec).max(1);
                 let fec_permille = ((window_fec * 1000) / total_win) as u16;
                 window_primary = 0;
                 window_fec = 0;
+                let media_cmd = telemetry.pending_media_command.swap(0, Ordering::Relaxed);
 
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
                     bluetooth_delay_ms: telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
                     client_volume: 100,
-                    requested_mode: 0,
+                    requested_mode: media_cmd,
                     auth_mac32: 0,
                 };
                 let mut fb_bytes = [0u8; CONTROL_FEEDBACK_LEN];
@@ -236,16 +259,24 @@ impl ClientEngine {
                         let base_seq = parsed.header.sequence;
                         if !stream_initialized {
                             next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
                             stream_initialized = true;
                         }
 
                         if parsed.header.mode == CodecMode::SilenceHeartbeat {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
+                            prebuffer_ready = false;
                             next_play_seq = base_seq;
                             continue;
                         }
 
-                        telemetry.server_dtx_silent.store(false, Ordering::Relaxed);
+                        // Resync sequence immediately when waking from DTX silence or after a large gap
+                        if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
+                            || base_seq.wrapping_sub(next_play_seq) > 32
+                        {
+                            next_play_seq = base_seq;
+                            prebuffer_ready = false;
+                        }
 
                         if !parsed.fec_n1_payload.is_empty() {
                             let mut fec1_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
@@ -298,9 +329,16 @@ impl ClientEngine {
                             };
 
                             if decoded_ok {
-                                sequencer.push_primary(base_seq.wrapping_add(sub_idx), &pcm_f32);
+                                let s = base_seq.wrapping_add(sub_idx);
+                                sequencer.push_primary(s, &pcm_f32);
+                                latest_rx_seq = s;
                             }
                             cursor += sub_len;
+                        }
+
+                        let buffered = latest_rx_seq.wrapping_sub(next_play_seq) as f32;
+                        if buffered >= config.target_buffer_subframes {
+                            prebuffer_ready = true;
                         }
                     }
                     Err(_) => {
@@ -309,82 +347,89 @@ impl ClientEngine {
                 }
             }
 
-            let now = Instant::now();
-            while now >= next_dsp_tick {
-                next_dsp_tick += Duration::from_micros(2500);
+            // Demand-driven by the Hardware Audio DAC:
+            // Keep burst_fifo topped up to a strict 2-subframe (5.0ms) hardware cushion.
+            while stream_initialized
+                && prebuffer_ready
+                && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
+                && burst_fifo.available_samples() < (SUBFRAME_STEREO_SAMPLES * 2)
+            {
+                let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
+                next_play_seq = next_play_seq.wrapping_add(1);
 
-                if stream_initialized && !telemetry.server_dtx_silent.load(Ordering::Relaxed) {
-                    let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                    let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
-                    next_play_seq = next_play_seq.wrapping_add(1);
-
-                    match status {
-                        STATUS_PRIMARY_LOSSLESS => {
-                            window_primary += 1;
-                            telemetry
-                                .primary_frames_played
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        STATUS_HEALED_BY_FEC => {
-                            window_fec += 1;
-                            telemetry
-                                .fec_healed_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        STATUS_EMPTY => {
-                            window_fec += 1;
-                            telemetry
-                                .plc_extrapolated_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        _ => {}
+                match status {
+                    STATUS_PRIMARY_LOSSLESS => {
+                        window_primary += 1;
+                        telemetry
+                            .primary_frames_played
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-
-                    // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay)
-                    studio_eq.update_if_changed(
-                        telemetry.eq_bass_db_tenths.load(Ordering::Relaxed),
-                        telemetry.eq_presence_db_tenths.load(Ordering::Relaxed),
-                        telemetry.eq_treble_db_tenths.load(Ordering::Relaxed),
-                    );
-                    studio_eq.process(&mut raw_subframe);
-
-                    // 2. Apply Spatial Channel Role (Stereo / Left / Right / Center / Surround)
-                    let role = audioshare_protocol::sync_and_eq::ChannelRole::from_u8(
-                        telemetry.channel_role.load(Ordering::Relaxed),
-                    );
-                    role.apply_in_place(&mut raw_subframe);
-
-                    // 3. Apply Audiophile Bauer Headphone Crossfeed if enabled (0.00ms delay)
-                    if telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed) {
-                        crossfeed.process_in_place(&mut raw_subframe);
+                    STATUS_HEALED_BY_FEC => {
+                        window_fec += 1;
+                        telemetry
+                            .fec_healed_frames
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-
-                    let gain_db =
-                        (telemetry.preamp_gain_db_tenths.load(Ordering::Relaxed) as f32) / 10.0;
-                    limiter.set_gain_db(gain_db);
-                    limiter.process_in_place(&mut raw_subframe);
-
-                    // 4. Competitive Gaming Hard-Lock (Pins jitter buffer to 5.0ms floor)
-                    let target_buf = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
-                        2.0
-                    } else {
-                        config.target_buffer_subframes
-                    };
-
-                    let queued_subframes =
-                        (burst_fifo.available_samples() as f32) / (SUBFRAME_STEREO_SAMPLES as f32);
-                    resampler.update_clock_loop(queued_subframes, target_buf);
-
-                    let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
-                    telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
-
-                    let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
-                    let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
-                    burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
+                    STATUS_EMPTY => {
+                        window_fec += 1;
+                        telemetry
+                            .plc_extrapolated_frames
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
+
+                // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay)
+                studio_eq.update_if_changed(
+                    telemetry.eq_bass_db_tenths.load(Ordering::Relaxed),
+                    telemetry.eq_presence_db_tenths.load(Ordering::Relaxed),
+                    telemetry.eq_treble_db_tenths.load(Ordering::Relaxed),
+                );
+                studio_eq.process(&mut raw_subframe);
+
+                // 2. Apply Spatial Channel Role (Stereo / Left / Right / Center / Surround)
+                let role = audioshare_protocol::sync_and_eq::ChannelRole::from_u8(
+                    telemetry.channel_role.load(Ordering::Relaxed),
+                );
+                role.apply_in_place(&mut raw_subframe);
+
+                // 3. Apply Audiophile Bauer Headphone Crossfeed if enabled (0.00ms delay)
+                if telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed) {
+                    crossfeed.process_in_place(&mut raw_subframe);
+                }
+
+                // 3b. Apply Night-Mode Upward Whisper Compressor & Explosion Tamer (0.00ms delay)
+                if telemetry.enable_night_mode.load(Ordering::Relaxed) {
+                    night_compressor.process_in_place(&mut raw_subframe);
+                }
+
+                let gain_db =
+                    (telemetry.preamp_gain_db_tenths.load(Ordering::Relaxed) as f32) / 10.0;
+                limiter.set_gain_db(gain_db);
+                limiter.process_in_place(&mut raw_subframe);
+
+                // 4. Competitive Gaming Hard-Lock (Pins jitter buffer to 5.0ms floor)
+                let target_buf = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
+                    2.0
+                } else {
+                    config.target_buffer_subframes
+                };
+
+                // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
+                let net_subframes = latest_rx_seq.wrapping_sub(next_play_seq) as f32;
+                resampler.update_clock_loop(net_subframes, target_buf);
+
+                let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
+                telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
+
+                let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
+                let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
+                burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
             }
 
-            std::thread::sleep(Duration::from_micros(600));
+            let _ = socket.set_nonblocking(false);
+            let _ = socket.set_read_timeout(Some(Duration::from_micros(800)));
         }
     }
 }
@@ -421,6 +466,12 @@ pub mod android_aaudio {
         num_frames: i32,
     ) -> i32;
 
+    type AAudioErrorCallback = extern "C" fn(
+        stream: *mut AAudioStream,
+        user_data: *mut c_void,
+        error: i32,
+    );
+
     #[link(name = "aaudio")]
     extern "C" {
         fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> i32;
@@ -433,6 +484,11 @@ pub mod android_aaudio {
         fn AAudioStreamBuilder_setDataCallback(
             builder: *mut AAudioStreamBuilder,
             callback: AAudioDataCallback,
+            user_data: *mut c_void,
+        );
+        fn AAudioStreamBuilder_setErrorCallback(
+            builder: *mut AAudioStreamBuilder,
+            callback: AAudioErrorCallback,
             user_data: *mut c_void,
         );
         fn AAudioStreamBuilder_openStream(
@@ -448,6 +504,7 @@ pub mod android_aaudio {
     struct CallbackContext {
         fifo: Arc<BurstDecouplerRing>,
         dither_rng: u32,
+        disconnected: AtomicBool,
     }
 
     extern "C" fn aaudio_output_callback(
@@ -470,6 +527,19 @@ pub mod android_aaudio {
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
 
+    extern "C" fn aaudio_error_callback(
+        _stream: *mut AAudioStream,
+        user_data: *mut c_void,
+        _error: i32,
+    ) {
+        if !user_data.is_null() {
+            unsafe {
+                let ctx = &*(user_data as *const CallbackContext);
+                ctx.disconnected.store(true, Ordering::Release);
+            }
+        }
+    }
+
     pub struct AAudioOutputGuard {
         stream: *mut AAudioStream,
         ctx_ptr: *mut CallbackContext,
@@ -478,6 +548,14 @@ pub mod android_aaudio {
     unsafe impl Send for AAudioOutputGuard {}
 
     impl AAudioOutputGuard {
+        #[inline]
+        pub fn needs_reopen(&self) -> bool {
+            if self.ctx_ptr.is_null() {
+                return true;
+            }
+            unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
+        }
+
         pub fn open_low_latency(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
@@ -488,6 +566,7 @@ pub mod android_aaudio {
                 let ctx = Box::new(CallbackContext {
                     fifo,
                     dither_rng: 0x1357_9BDF,
+                    disconnected: AtomicBool::new(false),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
 
@@ -503,6 +582,11 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,
+                    ctx_ptr as *mut c_void,
+                );
+                AAudioStreamBuilder_setErrorCallback(
+                    builder,
+                    aaudio_error_callback,
                     ctx_ptr as *mut c_void,
                 );
 

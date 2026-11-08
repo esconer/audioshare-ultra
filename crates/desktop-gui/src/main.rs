@@ -89,6 +89,8 @@ struct AudioShareApp {
     eq_treble_db: f32,
     channel_role: ChannelRole,
     binaural_crossfeed: bool,
+    night_mode_drc: bool,
+    measured_sonar_ms: Option<f32>,
     gaming_hard_lock: bool,
     usb_buffer_mode: bool,
     drift_history: VecDeque<f32>,
@@ -131,6 +133,8 @@ impl AudioShareApp {
             eq_treble_db: 0.0,
             channel_role: ChannelRole::Stereo,
             binaural_crossfeed: false,
+            night_mode_drc: false,
+            measured_sonar_ms: None,
             gaming_hard_lock: false,
             usb_buffer_mode: false,
             drift_history: VecDeque::from(vec![0.0; 120]),
@@ -226,6 +230,9 @@ impl AudioShareApp {
         c.telemetry
             .enable_binaural_crossfeed
             .store(self.binaural_crossfeed, Ordering::Relaxed);
+        c.telemetry
+            .enable_night_mode
+            .store(self.night_mode_drc, Ordering::Relaxed);
         c.telemetry
             .gaming_mode_hard_lock
             .store(self.gaming_hard_lock, Ordering::Relaxed);
@@ -453,6 +460,24 @@ impl AudioShareApp {
                     pkts, kb, rebinds, mode_str
                 ));
 
+                // Live 60 FPS Audio Capture VU Peak Bar
+                let vu_pct = host.telemetry.host_vu_peak_pct.load(Ordering::Relaxed);
+                ui.horizontal(|ui| {
+                    ui.label("Live Audio Peak:");
+                    let bar_color = if vu_pct > 92 {
+                        egui::Color32::RED
+                    } else if vu_pct > 70 {
+                        egui::Color32::GOLD
+                    } else {
+                        egui::Color32::LIGHT_GREEN
+                    };
+                    ui.add(
+                        egui::ProgressBar::new((vu_pct as f32) / 100.0)
+                            .fill(bar_color)
+                            .text(format!("{}% Peak", vu_pct)),
+                    );
+                });
+
                 if bt_delay > 40 {
                     ui.colored_label(
                         egui::Color32::YELLOW,
@@ -573,6 +598,23 @@ impl AudioShareApp {
                     let pkts = mic.mic_packets_received.load(Ordering::Relaxed);
                     let peak = mic.mic_peak_level_pct.load(Ordering::Relaxed);
                     ui.monospace(format!("RX Phone Pkts: {} | Level: {}%", pkts, peak));
+
+                    if let Some(ref host) = self.host_engine {
+                        if ui.button("📡 Ping True Acoustic Latency (Sonar)").clicked() {
+                            host.telemetry.trigger_sonar_ping.store(true, Ordering::Relaxed);
+                        }
+                        let tx_us = host.telemetry.sonar_tx_timestamp_us.load(Ordering::Relaxed);
+                        let rx_us = mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
+                        if rx_us > tx_us && (rx_us - tx_us) < 500_000 {
+                            self.measured_sonar_ms = Some(((rx_us - tx_us) as f32) / 2000.0);
+                        }
+                    }
+                }
+                if let Some(ms) = self.measured_sonar_ms {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        format!("⚡ Measured One-Way Latency: {:.1} ms", ms),
+                    );
                 }
             });
         });
@@ -688,6 +730,12 @@ impl AudioShareApp {
                     .checkbox(
                         &mut self.binaural_crossfeed,
                         "🎧 Audiophile Bauer Binaural Headphone Crossfeed (0.00ms delay, 270µs ITD)",
+                    )
+                    .changed();
+                dsp_changed |= ui
+                    .checkbox(
+                        &mut self.night_mode_drc,
+                        "🌙 Night Mode (Boost Whispers/Footsteps +11.5dB, Tame Explosions)",
                     )
                     .changed();
             });

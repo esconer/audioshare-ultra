@@ -209,9 +209,12 @@ pub struct HostTelemetry {
     pub dtx_silent_mode: AtomicBool,
     pub active_codec_mode: AtomicU8,
     pub host_volume: AtomicU8,
+    pub host_vu_peak_pct: AtomicU8,
     pub active_clients_count: AtomicU8,
     pub max_client_bt_delay_ms: AtomicU16,
     pub hotplug_rebinds: AtomicU16,
+    pub trigger_sonar_ping: AtomicBool,
+    pub sonar_tx_timestamp_us: AtomicU64,
 }
 
 pub struct HostEngine {
@@ -231,9 +234,12 @@ impl HostEngine {
             dtx_silent_mode: AtomicBool::new(false),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             host_volume: AtomicU8::new(100),
+            host_vu_peak_pct: AtomicU8::new(0),
             active_clients_count: AtomicU8::new(initial_targets.len() as u8),
             max_client_bt_delay_ms: AtomicU16::new(0),
             hotplug_rebinds: AtomicU16::new(0),
+            trigger_sonar_ping: AtomicBool::new(false),
+            sonar_tx_timestamp_us: AtomicU64::new(0),
         });
 
         let mut client_map = HashMap::new();
@@ -333,6 +339,12 @@ impl HostEngine {
         heartbeat_ms: Arc<AtomicU64>,
         start_epoch: Instant,
     ) -> Result<cpal::Stream, String> {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("PULSE_SOURCE").is_none() {
+            // Automatically tell PipeWire-Pulse / PulseAudio to capture desktop speaker loopback
+            std::env::set_var("PULSE_SOURCE", "@DEFAULT_MONITOR@");
+        }
+
         let host = cpal::default_host();
 
         #[cfg(target_os = "windows")]
@@ -448,6 +460,8 @@ impl HostEngine {
         let mut tone_phase: f32 = 0.0;
         let mut ctrl_buf = [0u8; 64];
         let mut dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+        let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
+        let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
         let mut last_client_sweep = Instant::now();
 
         while running.load(Ordering::Relaxed) {
@@ -494,8 +508,25 @@ impl HostEngine {
                     telemetry
                         .active_clients_count
                         .store(map.len() as u8, Ordering::Relaxed);
+                    cached_targets.clear();
+                    for c in map.values() {
+                        if !c.muted {
+                            cached_targets.push(c.addr);
+                        }
+                    }
                 } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
                     if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present
+                        if fb.requested_mode >= 10 {
+                            let cmd = match fb.requested_mode {
+                                10 => bt_optimization::RemoteMediaCommand::PlayPause,
+                                11 => bt_optimization::RemoteMediaCommand::NextTrack,
+                                12 => bt_optimization::RemoteMediaCommand::PrevTrack,
+                                _ => bt_optimization::RemoteMediaCommand::None,
+                            };
+                            bt_optimization::execute_remote_media_command(cmd);
+                        }
+
                         let mut map = clients.lock().unwrap();
                         let entry = map.entry(src_addr).or_insert(ConnectedClient {
                             addr: src_addr,
@@ -512,7 +543,7 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
 
-                        // Dynamic Link Governor: Switch to CompressedLowDelay if any client experiences >4% loss
+                        // Dynamic Link Governor: Switch to CompressedLowDelay if any client experiences >15% catastrophic loss
                         let max_loss = map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
                         let max_bt = map
                             .values()
@@ -523,7 +554,7 @@ impl HostEngine {
                             .max_client_bt_delay_ms
                             .store(max_bt, Ordering::Relaxed);
 
-                        dynamic_codec_mode = if max_loss > 40 {
+                        dynamic_codec_mode = if max_loss > 150 {
                             CodecMode::CompressedLowDelay
                         } else {
                             CodecMode::StudioLosslessLpc
@@ -531,21 +562,46 @@ impl HostEngine {
                         telemetry
                             .active_codec_mode
                             .store(dynamic_codec_mode as u8, Ordering::Relaxed);
+
+                        cached_targets.clear();
+                        for c in map.values() {
+                            if !c.muted {
+                                cached_targets.push(c.addr);
+                            }
+                        }
                     }
                 }
             }
 
-            // 2b. Expire clients that stopped sending HELLO/feedback, so stale
-            // entries do not keep receiving packets or appear in the GUI.
+            // 2b. Expire clients that stopped sending HELLO/feedback, and refresh lock-free cached_targets
             if last_client_sweep.elapsed() >= Duration::from_secs(1) {
                 last_client_sweep = Instant::now();
-                let mut map = clients.lock().unwrap();
-                let before = map.len();
-                map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(5));
-                if map.len() != before {
-                    telemetry
-                        .active_clients_count
-                        .store(map.len() as u8, Ordering::Relaxed);
+                if let Ok(mut map) = clients.try_lock() {
+                    let before = map.len();
+                    map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(10));
+                    if map.len() != before {
+                        telemetry
+                            .active_clients_count
+                            .store(map.len() as u8, Ordering::Relaxed);
+                    }
+                    cached_targets.clear();
+                    for c in map.values() {
+                        if !c.muted {
+                            cached_targets.push(c.addr);
+                        }
+                    }
+                }
+            }
+
+            // Wait until soundcard pushes a full packet of samples into `ring`,
+            // or fall back to silence synthesis if capture endpoint is idle >15ms
+            let needed_samples = subframes_per_pkt * SUBFRAME_STEREO_SAMPLES;
+            if !config.use_test_tone && ring.available_samples() < needed_samples {
+                let now_ms = start_instant.elapsed().as_millis() as u64;
+                let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
+                if now_ms.saturating_sub(last_cb) <= 15 {
+                    std::thread::sleep(Duration::from_micros(400));
+                    continue;
                 }
             }
 
@@ -578,16 +634,20 @@ impl HostEngine {
                     f32_subframe.fill(0.0);
                 }
 
-                let mut i16_subframe = [0i16; SUBFRAME_STEREO_SAMPLES];
-                let mut max_abs: i16 = 0;
-                for (dst, &s) in i16_subframe.iter_mut().zip(f32_subframe.iter()) {
-                    let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    *dst = v;
-                    let abs = v.saturating_abs();
-                    if abs > max_abs {
-                        max_abs = abs;
-                    }
+                // Inject 2.5ms Acoustic Latency Sonar Chirp if requested by user
+                if telemetry.trigger_sonar_ping.swap(false, Ordering::Relaxed) {
+                    audioshare_protocol::sync_and_eq::LatencySonar::inject_chirp(&mut f32_subframe);
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    telemetry.sonar_tx_timestamp_us.store(now_us, Ordering::Relaxed);
                 }
+
+                let mut i16_subframe = [0i16; SUBFRAME_STEREO_SAMPLES];
+                let max_abs = noise_shaper.quantize_stereo_subframe(&f32_subframe, &mut i16_subframe);
+                let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
+                telemetry.host_vu_peak_pct.store(vu_pct, Ordering::Relaxed);
 
                 if max_abs > 3 {
                     packet_is_silent = false;
@@ -683,11 +743,8 @@ impl HostEngine {
             };
 
             if let Some(pkt_len) = maybe_pkt_len {
-                let map = clients.lock().unwrap();
-                for client in map.values() {
-                    if !client.muted
-                        && socket.send_to(&datagram[..pkt_len], client.addr).is_ok()
-                    {
+                for &target_addr in &cached_targets {
+                    if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
                         telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
                         telemetry
                             .bytes_sent
@@ -696,13 +753,12 @@ impl HostEngine {
                 }
             }
 
-            let now = Instant::now();
-            if next_tick > now {
-                std::thread::sleep(next_tick - now);
-            }
-            next_tick += packet_interval;
-            if now > next_tick + Duration::from_millis(20) {
-                next_tick = now + packet_interval;
+            if config.use_test_tone || ring.available_samples() < needed_samples {
+                let now = Instant::now();
+                if next_tick > now {
+                    std::thread::sleep(next_tick - now);
+                }
+                next_tick = Instant::now() + packet_interval;
             }
         }
     }

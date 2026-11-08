@@ -40,6 +40,22 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativeReportBluetoothDelayMs(delayMs: Int)
 
         @JvmStatic
+        external fun nativeSendMediaCommand(cmdCode: Int)
+
+        @JvmStatic
+        external fun nativeConfigureDsp(
+            bassDb: Float,
+            presDb: Float,
+            trebDb: Float,
+            role: Int,
+            crossfeed: Boolean,
+            nightMode: Boolean
+        )
+
+        @JvmStatic
+        external fun nativePushCapturedAudio(pcmFloat: FloatArray)
+
+        @JvmStatic
         external fun nativeStartPhoneMic(hostIp: String): Boolean
 
         @JvmStatic
