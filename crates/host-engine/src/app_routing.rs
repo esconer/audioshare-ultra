@@ -128,11 +128,7 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             .output();
 
         let status = Command::new("pactl")
-            .args([
-                "move-sink-input",
-                &app.id.to_string(),
-                "AudioShare_Ultra",
-            ])
+            .args(["move-sink-input", &app.id.to_string(), "AudioShare_Ultra"])
             .status()
             .map_err(|e| format!("Failed to move sink-input: {}", e))?;
 

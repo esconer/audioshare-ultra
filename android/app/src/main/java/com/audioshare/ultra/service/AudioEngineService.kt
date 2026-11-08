@@ -7,6 +7,8 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -69,6 +71,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var wakeLock: PowerManager.WakeLock? = null
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
+    private var mediaSession: MediaSession? = null
     private var currentGainDb = 0.0f
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -85,10 +88,36 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         startForegroundNotification(hostAddr, isUsb)
         acquireRealtimeHardwareLocks()
+        setupHardwareBluetoothMediaSession()
         requestAudioFocus()
 
         isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin)
         return START_STICKY
+    }
+
+    private fun setupHardwareBluetoothMediaSession() {
+        if (mediaSession != null) return
+        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() { nativeSendMediaCommand(10) }
+                override fun onPause() { nativeSendMediaCommand(10) }
+                override fun onSkipToNext() { nativeSendMediaCommand(11) }
+                override fun onSkipToPrevious() { nativeSendMediaCommand(12) }
+            })
+            setPlaybackState(
+                PlaybackState.Builder()
+                    .setActions(
+                        PlaybackState.ACTION_PLAY or
+                            PlaybackState.ACTION_PAUSE or
+                            PlaybackState.ACTION_PLAY_PAUSE or
+                            PlaybackState.ACTION_SKIP_TO_NEXT or
+                            PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                    )
+                    .setState(PlaybackState.STATE_PLAYING, 0L, 1.0f)
+                    .build()
+            )
+            isActive = true
+        }
     }
 
     private fun requestAudioFocus() {
@@ -194,6 +223,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopPhoneMic()
         nativeStopClient()
         isStreaming = false
+        mediaSession?.isActive = false
+        mediaSession?.release()
+        mediaSession = null
         wifiLock?.let { if (it.isHeld) it.release() }
         wakeLock?.let { if (it.isHeld) it.release() }
         stopForeground(STOP_FOREGROUND_REMOVE)

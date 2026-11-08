@@ -13,9 +13,7 @@ use audioshare_protocol::sequencer::{
 use audioshare_protocol::wire::{
     ClientFeedbackPacket, CodecMode, ParsedPacket, CONTROL_FEEDBACK_LEN,
 };
-use audioshare_protocol::{
-    MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_STEREO_SAMPLES,
-};
+use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_STEREO_SAMPLES};
 
 #[cfg(not(target_os = "android"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -47,6 +45,7 @@ pub struct ClientTelemetry {
     pub downstream_bt_delay_ms: AtomicU16,
     pub pending_media_command: AtomicU8,
     pub host_volume: AtomicU8,
+    pub max_group_delay_ms: AtomicU16,
     pub server_dtx_silent: AtomicBool,
 }
 
@@ -82,6 +81,7 @@ impl ClientEngine {
             downstream_bt_delay_ms: AtomicU16::new(0),
             pending_media_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
+            max_group_delay_ms: AtomicU16::new(0),
             server_dtx_silent: AtomicBool::new(false),
         });
 
@@ -193,6 +193,7 @@ impl ClientEngine {
         let mut studio_eq = audioshare_protocol::sync_and_eq::StudioEqualizer::new();
         let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
         let mut night_compressor = audioshare_protocol::sync_and_eq::NightModeCompressor::new();
+        let group_sync = audioshare_protocol::sync_and_eq::GroupSyncEstimator::new();
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
@@ -225,10 +226,18 @@ impl ClientEngine {
                 window_fec = 0;
                 let media_cmd = telemetry.pending_media_command.swap(0, Ordering::Relaxed);
 
+                let gain_db =
+                    (telemetry.preamp_gain_db_tenths.load(Ordering::Relaxed) as f32) / 10.0;
+                let client_vol = if gain_db <= -40.0 {
+                    0u8
+                } else {
+                    (10.0f32.powf(gain_db / 20.0) * 100.0).clamp(0.0, 100.0) as u8
+                };
+
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
                     bluetooth_delay_ms: telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
-                    client_volume: 100,
+                    client_volume: client_vol,
                     requested_mode: media_cmd,
                     auth_mac32: 0,
                 };
@@ -255,6 +264,9 @@ impl ClientEngine {
                         telemetry
                             .host_volume
                             .store(parsed.header.host_volume, Ordering::Relaxed);
+                        telemetry
+                            .max_group_delay_ms
+                            .store((parsed.header.stream_id as u16) * 2, Ordering::Relaxed);
 
                         let base_seq = parsed.header.sequence;
                         if !stream_initialized {
@@ -367,9 +379,7 @@ impl ClientEngine {
                     }
                     STATUS_HEALED_BY_FEC => {
                         window_fec += 1;
-                        telemetry
-                            .fec_healed_frames
-                            .fetch_add(1, Ordering::Relaxed);
+                        telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
                         window_fec += 1;
@@ -409,12 +419,25 @@ impl ClientEngine {
                 limiter.set_gain_db(gain_db);
                 limiter.process_in_place(&mut raw_subframe);
 
-                // 4. Competitive Gaming Hard-Lock (Pins jitter buffer to 5.0ms floor)
-                let target_buf = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
+                // Apply Host Master Volume (0..=100%)
+                let host_vol = (telemetry.host_volume.load(Ordering::Relaxed) as f32) / 100.0;
+                if (host_vol - 1.0).abs() > 0.005 {
+                    for s in &mut raw_subframe {
+                        *s *= host_vol;
+                    }
+                }
+
+                // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
+                let base_target = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
                     2.0
                 } else {
                     config.target_buffer_subframes
                 };
+                let target_buf = group_sync.aligned_target_subframes(
+                    base_target,
+                    telemetry.max_group_delay_ms.load(Ordering::Relaxed),
+                    telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
+                );
 
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
                 let net_subframes = latest_rx_seq.wrapping_sub(next_play_seq) as f32;
@@ -466,11 +489,8 @@ pub mod android_aaudio {
         num_frames: i32,
     ) -> i32;
 
-    type AAudioErrorCallback = extern "C" fn(
-        stream: *mut AAudioStream,
-        user_data: *mut c_void,
-        error: i32,
-    );
+    type AAudioErrorCallback =
+        extern "C" fn(stream: *mut AAudioStream, user_data: *mut c_void, error: i32);
 
     #[link(name = "aaudio")]
     extern "C" {
@@ -519,10 +539,8 @@ pub mod android_aaudio {
         unsafe {
             let ctx = &mut *(user_data as *mut CallbackContext);
             let total_samples = (num_frames as usize) * 2;
-            let out_slice =
-                core::slice::from_raw_parts_mut(audio_data as *mut f32, total_samples);
-            ctx.fifo
-                .pop_exact_or_dither(out_slice, &mut ctx.dither_rng);
+            let out_slice = core::slice::from_raw_parts_mut(audio_data as *mut f32, total_samples);
+            ctx.fifo.pop_exact_or_dither(out_slice, &mut ctx.dither_rng);
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
@@ -557,6 +575,11 @@ pub mod android_aaudio {
         }
 
         pub fn open_low_latency(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
+            Self::open_internal(Arc::clone(&fifo), AAUDIO_SHARING_MODE_EXCLUSIVE)
+                .or_else(|| Self::open_internal(fifo, AAUDIO_SHARING_MODE_SHARED))
+        }
+
+        fn open_internal(fifo: Arc<BurstDecouplerRing>, sharing_mode: i32) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
                 if AAudio_createStreamBuilder(&mut builder) != 0 || builder.is_null() {
@@ -575,7 +598,7 @@ pub mod android_aaudio {
                     builder,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                 );
-                AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_EXCLUSIVE);
+                AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
@@ -664,6 +687,11 @@ pub mod android_aaudio {
         /// Open a low-latency mono microphone stream and expand it to the
         /// stereo ring consumed by `PhoneMicTransmitter`.
         pub fn open_low_latency_mic(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
+            Self::open_internal(Arc::clone(&fifo), AAUDIO_SHARING_MODE_EXCLUSIVE)
+                .or_else(|| Self::open_internal(fifo, AAUDIO_SHARING_MODE_SHARED))
+        }
+
+        fn open_internal(fifo: Arc<BurstDecouplerRing>, sharing_mode: i32) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
                 if AAudio_createStreamBuilder(&mut builder) != 0 || builder.is_null() {
@@ -678,9 +706,7 @@ pub mod android_aaudio {
                     builder,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                 );
-                // Exclusive input is frequently unavailable; shared mode still
-                // uses the low-latency fast path when the device supports it.
-                AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
+                AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 1);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);

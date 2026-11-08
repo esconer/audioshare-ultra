@@ -132,8 +132,7 @@ impl DiscoveryScanner {
     }
 
     pub fn discovered_hosts(&self) -> Vec<DiscoveredHost> {
-        let mut list: Vec<DiscoveredHost> =
-            self.hosts.lock().unwrap().values().cloned().collect();
+        let mut list: Vec<DiscoveredHost> = self.hosts.lock().unwrap().values().cloned().collect();
         list.sort_by_key(|h| !h.is_usb);
         list
     }
@@ -212,21 +211,16 @@ impl DirectHotspotController {
         {
             let output = Command::new("nmcli")
                 .args([
-                    "device",
-                    "wifi",
-                    "hotspot",
-                    "ssid",
-                    ssid,
-                    "password",
-                    password,
-                    "band",
-                    "a",
+                    "device", "wifi", "hotspot", "ssid", ssid, "password", password, "band", "a",
                 ])
                 .output()
                 .map_err(|e| format!("Failed to invoke nmcli: {}", e))?;
 
             if output.status.success() {
-                Ok(format!("1-Hop 5GHz Direct Link '{}' Active (IP: 10.42.0.1)", ssid))
+                Ok(format!(
+                    "1-Hop 5GHz Direct Link '{}' Active (IP: 10.42.0.1)",
+                    ssid
+                ))
             } else {
                 Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
             }
@@ -383,9 +377,7 @@ impl Drop for VirtualSpeakerAndRadioGuard {
                 pactl_set_default("source", &source);
             }
             if let Some(ref id) = self.pactl_module_id {
-                let _ = Command::new("pactl")
-                    .args(["unload-module", id])
-                    .output();
+                let _ = Command::new("pactl").args(["unload-module", id]).output();
             }
         }
 
@@ -426,12 +418,19 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
     #[link(name = "kernel32")]
     extern "system" {
         fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
-        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+        fn GetProcAddress(
+            module: *mut core::ffi::c_void,
+            name: *const u8,
+        ) -> *mut core::ffi::c_void;
         fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
     }
 
-    type FnWlanOpenHandle =
-        unsafe extern "system" fn(u32, *mut core::ffi::c_void, *mut u32, *mut *mut core::ffi::c_void) -> u32;
+    type FnWlanOpenHandle = unsafe extern "system" fn(
+        u32,
+        *mut core::ffi::c_void,
+        *mut u32,
+        *mut *mut core::ffi::c_void,
+    ) -> u32;
     type FnWlanEnumInterfaces = unsafe extern "system" fn(
         *mut core::ffi::c_void,
         *mut core::ffi::c_void,
@@ -476,7 +475,12 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
             let mut negotiated_version = 0u32;
             let mut client_handle: *mut core::ffi::c_void = core::ptr::null_mut();
 
-            if wlan_open(2, core::ptr::null_mut(), &mut negotiated_version, &mut client_handle) == 0
+            if wlan_open(
+                2,
+                core::ptr::null_mut(),
+                &mut negotiated_version,
+                &mut client_handle,
+            ) == 0
             {
                 let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
                 if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0

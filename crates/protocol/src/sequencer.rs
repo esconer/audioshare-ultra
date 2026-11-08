@@ -123,11 +123,7 @@ impl ZeroJitterSequencer {
 
     /// Consumer (Real-Time Audio Thread): Pop next 2.5ms subframe with WSOLA Pitch-Period PLC
     #[inline]
-    pub fn pop_next(
-        &mut self,
-        expected_seq: u16,
-        out: &mut [f32; SUBFRAME_STEREO_SAMPLES],
-    ) -> u32 {
+    pub fn pop_next(&mut self, expected_seq: u16, out: &mut [f32; SUBFRAME_STEREO_SAMPLES]) -> u32 {
         let slot = &self.slots[(expected_seq as usize) & RING_MASK];
         let cur = slot.state.load(Ordering::Acquire);
         let cur_seq = (cur >> 16) as u16;
@@ -137,8 +133,10 @@ impl ZeroJitterSequencer {
             unsafe {
                 *out = *slot.samples.get();
             }
-            slot.state
-                .store(((expected_seq as u32) << 16) | STATUS_EMPTY, Ordering::Release);
+            slot.state.store(
+                ((expected_seq as u32) << 16) | STATUS_EMPTY,
+                Ordering::Release,
+            );
 
             // If recovering from a PLC event, crossfade the first 32 frames to prevent phase click!
             if self.consecutive_plc_count > 0 {
@@ -206,7 +204,10 @@ mod tests {
         let mut plc_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(seq.pop_next(3, &mut plc_out), STATUS_EMPTY);
         let energy: f32 = plc_out.iter().map(|x| x * x).sum();
-        assert!(energy > 1.0, "WSOLA PLC must extrapolate non-zero harmonic energy");
+        assert!(
+            energy > 1.0,
+            "WSOLA PLC must extrapolate non-zero harmonic energy"
+        );
 
         // Recover at seq = 4 and verify smooth crossfade
         seq.push_primary(4, &sine_frame);

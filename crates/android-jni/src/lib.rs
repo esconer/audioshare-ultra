@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use audioshare_client_engine::{ClientConfig, ClientEngine};
 #[cfg(target_os = "android")]
 use audioshare_client_engine::android_aaudio::AAudioInputGuard;
+use audioshare_client_engine::{ClientConfig, ClientEngine};
 use audioshare_host_engine::discovery_and_os::DiscoveryScanner;
 use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
@@ -32,12 +32,29 @@ pub struct PhoneMicTransmitter {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    for item in target_hosts.split([',', ';', ' ']) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let host_only = item.split(':').next().unwrap_or(item);
+        if let Ok(addr) = format!("{}:{}", host_only, PHONE_MIC_PORT).parse::<SocketAddr>() {
+            if !targets.contains(&addr) {
+                targets.push(addr);
+            }
+        }
+    }
+    targets
+}
+
 impl PhoneMicTransmitter {
-    pub fn start(host_ip: &str) -> Result<Self, String> {
-        let host_only = host_ip.split(':').next().unwrap_or(host_ip);
-        let target: SocketAddr = format!("{}:{}", host_only, PHONE_MIC_PORT)
-            .parse()
-            .map_err(|e| format!("Invalid Mic target IP: {}", e))?;
+    pub fn start(target_hosts: &str) -> Result<Self, String> {
+        let targets = parse_target_endpoints(target_hosts);
+        if targets.is_empty() {
+            return Err("No valid target endpoints found for transmitter".into());
+        }
 
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
         configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
@@ -46,12 +63,7 @@ impl PhoneMicTransmitter {
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
 
         #[cfg(target_os = "android")]
-        let _mic_input_stream = match AAudioInputGuard::open_low_latency_mic(Arc::clone(
-            &mic_input_ring,
-        )) {
-            Some(stream) => Some(stream),
-            None => return Err("Failed to open AAudio microphone input".into()),
-        };
+        let _mic_input_stream = AAudioInputGuard::open_low_latency_mic(Arc::clone(&mic_input_ring));
 
         let run_clone = Arc::clone(&running);
         let ring_clone = Arc::clone(&mic_input_ring);
@@ -104,7 +116,9 @@ impl PhoneMicTransmitter {
                         if let Ok(pkt_len) =
                             pack_datagram(hdr, &primary[..2 + enc_len], f1, &[], &mut dgram)
                         {
-                            let _ = socket.send_to(&dgram[..pkt_len], target);
+                            for target in &targets {
+                                let _ = socket.send_to(&dgram[..pkt_len], *target);
+                            }
                         }
 
                         encode_fec_subframe(&i16_buf, &mut fec_n1);
@@ -213,12 +227,27 @@ pub fn android_configure_dsp(
     night_mode: bool,
 ) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
-        client.telemetry.eq_bass_db_tenths.store((bass_db * 10.0) as i32, Ordering::Relaxed);
-        client.telemetry.eq_presence_db_tenths.store((pres_db * 10.0) as i32, Ordering::Relaxed);
-        client.telemetry.eq_treble_db_tenths.store((treb_db * 10.0) as i32, Ordering::Relaxed);
+        client
+            .telemetry
+            .eq_bass_db_tenths
+            .store((bass_db * 10.0) as i32, Ordering::Relaxed);
+        client
+            .telemetry
+            .eq_presence_db_tenths
+            .store((pres_db * 10.0) as i32, Ordering::Relaxed);
+        client
+            .telemetry
+            .eq_treble_db_tenths
+            .store((treb_db * 10.0) as i32, Ordering::Relaxed);
         client.telemetry.channel_role.store(role, Ordering::Relaxed);
-        client.telemetry.enable_binaural_crossfeed.store(crossfeed, Ordering::Relaxed);
-        client.telemetry.enable_night_mode.store(night_mode, Ordering::Relaxed);
+        client
+            .telemetry
+            .enable_binaural_crossfeed
+            .store(crossfeed, Ordering::Relaxed);
+        client
+            .telemetry
+            .enable_night_mode
+            .store(night_mode, Ordering::Relaxed);
     }
 }
 
@@ -390,5 +419,38 @@ pub mod android_native {
         let arr = env.new_long_array(5).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_target_endpoints_party_mode() {
+        let input = "192.168.1.100, 192.168.1.101:65532; 10.0.0.5  192.168.1.100";
+        let addrs = parse_target_endpoints(input);
+        assert_eq!(addrs.len(), 3);
+        assert_eq!(addrs[0], "192.168.1.100:65532".parse().unwrap());
+        assert_eq!(addrs[1], "192.168.1.101:65532".parse().unwrap());
+        assert_eq!(addrs[2], "10.0.0.5:65532".parse().unwrap());
+    }
+
+    #[test]
+    fn test_client_volume_feedback_roundtrip() {
+        use audioshare_protocol::wire::{ClientFeedbackPacket, CONTROL_FEEDBACK_LEN};
+        let fb = ClientFeedbackPacket {
+            fec_rate_permille: 45,
+            bluetooth_delay_ms: 120,
+            client_volume: 85,
+            requested_mode: 0,
+            auth_mac32: 0,
+        };
+        let mut bytes = [0u8; CONTROL_FEEDBACK_LEN];
+        fb.encode(&mut bytes);
+        let decoded = ClientFeedbackPacket::decode(&bytes).expect("Failed to decode feedback");
+        assert_eq!(decoded.client_volume, 85);
+        assert_eq!(decoded.fec_rate_permille, 45);
+        assert_eq!(decoded.bluetooth_delay_ms, 120);
     }
 }

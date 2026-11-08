@@ -77,8 +77,8 @@ pub fn encode_lossless_subframe(
             };
 
             let block_bytes = bit_width as usize; // 8 samples * bit_width bits / 8 = bit_width bytes!
-            // The u128 block accumulator holds at most 8 * 16 = 128 bits. Any
-            // wider residual block must use the raw PCM16 fallback.
+                                                  // The u128 block accumulator holds at most 8 * 16 = 128 bits. Any
+                                                  // wider residual block must use the raw PCM16 fallback.
             if bit_width > 16 || cursor + 1 + block_bytes >= 480 {
                 // Incompressible noise: fall back to uncompressed raw PCM16 (481 bytes total)
                 out[0] = TAG_RAW_PCM16;

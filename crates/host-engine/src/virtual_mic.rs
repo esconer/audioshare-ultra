@@ -1,6 +1,6 @@
-use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::io::Write;
+use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -174,10 +174,8 @@ impl PhoneMicReceiver {
         let mic_fifo = Arc::new(BurstDecouplerRing::new());
 
         #[cfg(target_os = "linux")]
-        let linux_output = LinuxVirtualMicOutput::start(
-            Arc::clone(&mic_fifo),
-            Arc::clone(&running),
-        );
+        let linux_output =
+            LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo), Arc::clone(&running));
         #[cfg(target_os = "linux")]
         let linux_output_active = linux_output.is_some();
 
@@ -325,14 +323,10 @@ impl PhoneMicReceiver {
             // Stop pacat first, then remove the remap source and sink.
             drop(self.linux_output.take());
             if let Some(id) = self.pactl_mic_source_module_id.take() {
-                let _ = Command::new("pactl")
-                    .args(["unload-module", &id])
-                    .output();
+                let _ = Command::new("pactl").args(["unload-module", &id]).output();
             }
             if let Some(id) = self.pactl_mic_module_id.take() {
-                let _ = Command::new("pactl")
-                    .args(["unload-module", &id])
-                    .output();
+                let _ = Command::new("pactl").args(["unload-module", &id]).output();
             }
         }
     }

@@ -1,10 +1,14 @@
 package com.audioshare.ultra.ui
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.projection.MediaProjectionManager
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -16,6 +20,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.audioshare.ultra.service.AudioEngineService
+import com.audioshare.ultra.service.PhoneAudioCaster
 import kotlinx.coroutines.delay
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -34,12 +39,33 @@ fun MainScreen() {
     }
     var isConnected by remember { mutableStateOf(AudioEngineService.isStreaming) }
     var preampGainDb by remember { mutableFloatStateOf(0.0f) }
+    var bassDb by remember { mutableFloatStateOf(0.0f) }
+    var vocalDb by remember { mutableFloatStateOf(0.0f) }
+    var trebleDb by remember { mutableFloatStateOf(0.0f) }
     var nightMode by remember { mutableStateOf(false) }
     var crossfeed by remember { mutableStateOf(false) }
     var channelRole by remember { mutableIntStateOf(0) }
     var sharePhoneMic by remember { mutableStateOf(false) }
+    var castPhoneInternalAudio by remember { mutableStateOf(false) }
+    var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
     var telemetry by remember { mutableStateOf(LongArray(5)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
+
+    val projectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val proj = mgr.getMediaProjection(result.resultCode, result.data!!)
+            if (proj != null) {
+                val targets = hostAddress.split(',', ';', ' ').map { it.trim() }.filter { it.isNotEmpty() }
+                activeCaster = PhoneAudioCaster(proj, if (targets.isEmpty()) listOf(hostAddress) else targets).also { it.startCasting() }
+                castPhoneInternalAudio = true
+            }
+        } else {
+            castPhoneInternalAudio = false
+        }
+    }
 
     // 1-Tap auto-discovery: the native UDP beacon scanner runs in the Rust JNI layer
     var discoveredHosts by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -197,7 +223,7 @@ fun MainScreen() {
                             selected = nightMode,
                             onClick = {
                                 nightMode = !nightMode
-                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
                             },
                             label = { Text("🌙 Night Mode") }
                         )
@@ -205,7 +231,7 @@ fun MainScreen() {
                             selected = crossfeed,
                             onClick = {
                                 crossfeed = !crossfeed
-                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
                             },
                             label = { Text("🎧 Binaural 3D") }
                         )
@@ -213,7 +239,7 @@ fun MainScreen() {
                             selected = channelRole != 0,
                             onClick = {
                                 channelRole = (channelRole + 1) % 5
-                                AudioEngineService.nativeConfigureDsp(0f, 0f, 0f, channelRole, crossfeed, nightMode)
+                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
                             },
                             label = {
                                 val roleName = listOf("Stereo", "Left", "Right", "Vocal", "Surround")[channelRole]
@@ -233,6 +259,90 @@ fun MainScreen() {
                 }
             }
 
+            // 3. Studio 3-Band Parametric Equalizer Card
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Studio 3-Band Parametric EQ", style = MaterialTheme.typography.titleMedium)
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Sub-Bass (80 Hz)", style = MaterialTheme.typography.bodySmall)
+                        Text("${"%.1f".format(bassDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    }
+                    Slider(
+                        value = bassDb,
+                        onValueChange = {
+                            bassDb = it
+                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
+                        },
+                        valueRange = -12.0f..12.0f
+                    )
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Vocal Presence (2.5 kHz)", style = MaterialTheme.typography.bodySmall)
+                        Text("${"%.1f".format(vocalDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    }
+                    Slider(
+                        value = vocalDb,
+                        onValueChange = {
+                            vocalDb = it
+                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
+                        },
+                        valueRange = -12.0f..12.0f
+                    )
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Treble Air (10 kHz)", style = MaterialTheme.typography.bodySmall)
+                        Text("${"%.1f".format(trebleDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                    }
+                    Slider(
+                        value = trebleDb,
+                        onValueChange = {
+                            trebleDb = it
+                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
+                        },
+                        valueRange = -12.0f..12.0f
+                    )
+                }
+            }
+
+            // 4. Cast Phone Internal Media & Games (PhoneAudioCaster - Party Mode)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Cast Phone Internal Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                "Broadcasts media & games directly from this phone to PC headphones or multiple phones",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                        Switch(
+                            checked = castPhoneInternalAudio,
+                            onCheckedChange = { enabled ->
+                                if (enabled) {
+                                    val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                    projectionLauncher.launch(mgr.createScreenCaptureIntent())
+                                } else {
+                                    activeCaster?.stopCasting()
+                                    activeCaster = null
+                                    castPhoneInternalAudio = false
+                                    AudioEngineService.nativeStopPhoneMic()
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
             // 3. Bidirectional Phone-as-PC-Microphone Card (#27)
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                 Row(
@@ -243,9 +353,9 @@ fun MainScreen() {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("Share Phone Microphone to PC", style = MaterialTheme.typography.titleMedium)
+                        Text("Share Phone Microphone / Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "Streams 48kHz low-latency AAudio Mic back to PC Port 65532",
+                            "Streams 48kHz low-latency AAudio Mic or Internal Cast to PC or multiple phones (Port 65532)",
                             style = MaterialTheme.typography.bodySmall
                         )
                     }

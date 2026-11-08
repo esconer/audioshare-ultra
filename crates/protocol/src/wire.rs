@@ -353,8 +353,7 @@ mod tests {
 
         let primary = [0xAAu8; 100];
         let fec1 = [0xBBu8; 124];
-        let len =
-            pack_datagram_with_key(hdr, &primary, &fec1, &[], Some(&key), &mut buf).unwrap();
+        let len = pack_datagram_with_key(hdr, &primary, &fec1, &[], Some(&key), &mut buf).unwrap();
 
         // Wrong key must fail authentication
         let mut copy_wrong = buf;

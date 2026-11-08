@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
-use audioshare_protocol::dsp::BurstDecouplerRing;
 #[cfg(not(target_os = "android"))]
 use audioshare_protocol::dsp::downmix_to_stereo;
+use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
 };
@@ -166,8 +166,16 @@ pub fn promote_thread_realtime() {
         };
         let mut task_idx = 0u32;
         let name: [u16; 10] = [
-            b'P' as u16, b'r' as u16, b'o' as u16, b' ' as u16, b'A' as u16,
-            b'u' as u16, b'd' as u16, b'i' as u16, b'o' as u16, 0,
+            b'P' as u16,
+            b'r' as u16,
+            b'o' as u16,
+            b' ' as u16,
+            b'A' as u16,
+            b'u' as u16,
+            b'd' as u16,
+            b'i' as u16,
+            b'o' as u16,
+            0,
         ];
         AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task_idx);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -182,6 +190,7 @@ pub struct ConnectedClient {
     pub muted: bool,
     pub fec_rate_permille: u16,
     pub bluetooth_delay_ms: u16,
+    pub client_volume: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +224,36 @@ pub struct HostTelemetry {
     pub hotplug_rebinds: AtomicU16,
     pub trigger_sonar_ping: AtomicBool,
     pub sonar_tx_timestamp_us: AtomicU64,
+}
+
+#[cfg(not(target_os = "android"))]
+pub enum HostCaptureStream {
+    #[cfg(target_os = "linux")]
+    Process {
+        stream_active: Arc<AtomicBool>,
+        child_pid: Arc<std::sync::atomic::AtomicU32>,
+    },
+    Cpal(cpal::Stream),
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for HostCaptureStream {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let HostCaptureStream::Process {
+            stream_active,
+            child_pid,
+        } = self
+        {
+            stream_active.store(false, Ordering::Release);
+            let pid = child_pid.load(Ordering::Relaxed);
+            if pid != 0 {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
 }
 
 pub struct HostEngine {
@@ -255,6 +294,7 @@ impl HostEngine {
                     muted: false,
                     fec_rate_permille: 0,
                     bluetooth_delay_ms: 0,
+                    client_volume: 100,
                 },
             );
         }
@@ -333,16 +373,121 @@ impl HostEngine {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn spawn_linux_parec_monitor(
+        ring: Arc<BurstDecouplerRing>,
+        heartbeat_ms: Arc<AtomicU64>,
+        running: Arc<AtomicBool>,
+        start_epoch: Instant,
+    ) -> Result<HostCaptureStream, String> {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+
+        let stream_active = Arc::new(AtomicBool::new(true));
+        let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let stream_active_clone = Arc::clone(&stream_active);
+        let child_pid_clone = Arc::clone(&child_pid);
+
+        std::thread::Builder::new()
+            .name("as-ultra-linux-parec".into())
+            .spawn(move || {
+                promote_thread_realtime();
+                let mut byte_buf = [0u8; SUBFRAME_STEREO_SAMPLES * 4]; // 960 bytes = 2.5ms stereo f32
+                let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+                while stream_active_clone.load(Ordering::Relaxed) && running.load(Ordering::Relaxed)
+                {
+                    // Resolve default sink monitor name via `pactl get-default-sink`
+                    let monitor_dev = Command::new("pactl")
+                        .arg("get-default-sink")
+                        .output()
+                        .ok()
+                        .and_then(|o| {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(format!("{}.monitor", s))
+                            }
+                        })
+                        .unwrap_or_else(|| "@DEFAULT_MONITOR@".to_string());
+
+                    if let Ok(mut child) = Command::new("parec")
+                        .args([
+                            "--raw",
+                            "--format=float32le",
+                            "--rate=48000",
+                            "--channels=2",
+                            "--latency-msec=3",
+                            "--process-time-msec=2",
+                            &format!("--device={}", monitor_dev),
+                        ])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        child_pid_clone.store(child.id(), Ordering::Relaxed);
+                        if let Some(mut stdout) = child.stdout.take() {
+                            while stream_active_clone.load(Ordering::Relaxed)
+                                && running.load(Ordering::Relaxed)
+                            {
+                                if stdout.read_exact(&mut byte_buf).is_ok() {
+                                    heartbeat_ms.store(
+                                        start_epoch.elapsed().as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    for (i, chunk) in byte_buf.chunks_exact(4).enumerate() {
+                                        f32_buf[i] = f32::from_le_bytes([
+                                            chunk[0], chunk[1], chunk[2], chunk[3],
+                                        ]);
+                                    }
+                                    ring.push_samples(&f32_buf);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        child_pid_clone.store(0, Ordering::Relaxed);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+
+                    if stream_active_clone.load(Ordering::Relaxed)
+                        && running.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+
+                stream_active_clone.store(false, Ordering::Release);
+            })
+            .map_err(|e| format!("Failed to spawn parec reader thread: {}", e))?;
+
+        Ok(HostCaptureStream::Process {
+            stream_active,
+            child_pid,
+        })
+    }
+
     #[cfg(not(target_os = "android"))]
     fn spawn_loopback_capture(
         ring: Arc<BurstDecouplerRing>,
         heartbeat_ms: Arc<AtomicU64>,
+        running: Arc<AtomicBool>,
         start_epoch: Instant,
-    ) -> Result<cpal::Stream, String> {
+    ) -> Result<HostCaptureStream, String> {
         #[cfg(target_os = "linux")]
-        if std::env::var_os("PULSE_SOURCE").is_none() {
-            // Automatically tell PipeWire-Pulse / PulseAudio to capture desktop speaker loopback
-            std::env::set_var("PULSE_SOURCE", "@DEFAULT_MONITOR@");
+        {
+            // Spawn native PipeWire / PulseAudio 3ms desktop speaker monitor stream (`@DEFAULT_MONITOR@`)
+            if let Ok(stream) = Self::spawn_linux_parec_monitor(
+                Arc::clone(&ring),
+                Arc::clone(&heartbeat_ms),
+                Arc::clone(&running),
+                start_epoch,
+            ) {
+                return Ok(stream);
+            }
         }
 
         let host = cpal::default_host();
@@ -373,7 +518,7 @@ impl HostEngine {
         let stream_cfg = cpal::StreamConfig {
             channels: channels as u16,
             sample_rate: cpal::SampleRate(src_rate),
-            buffer_size: cpal::BufferSize::Fixed(SUBFRAME_FRAMES as u32),
+            buffer_size: cpal::BufferSize::Default,
         };
 
         // Use our 4-Point Hermite Cubic Fractional Interpolator for alias-free 44.1k/96k -> 48k conversion
@@ -384,10 +529,7 @@ impl HostEngine {
             .build_input_stream(
                 &stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    heartbeat_ms.store(
-                        start_epoch.elapsed().as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
+                    heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                     let in_frames = data.len() / channels.max(1);
                     let mut stereo_buf = [0.0f32; 2048];
                     let safe_frames = in_frames.min(1024);
@@ -402,8 +544,8 @@ impl HostEngine {
                         ring.push_samples(&stereo_buf[..safe_frames * 2]);
                     } else {
                         let mut resampled = [0.0f32; 4096];
-                        let out_frames = host_resampler
-                            .process(&stereo_buf[..safe_frames * 2], &mut resampled);
+                        let out_frames =
+                            host_resampler.process(&stereo_buf[..safe_frames * 2], &mut resampled);
                         ring.push_samples(&resampled[..out_frames * 2]);
                     }
                 },
@@ -415,7 +557,7 @@ impl HostEngine {
         stream
             .play()
             .map_err(|e| format!("Failed to start loopback stream: {}", e))?;
-        Ok(stream)
+        Ok(HostCaptureStream::Cpal(stream))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -432,19 +574,33 @@ impl HostEngine {
         #[cfg(target_os = "android")]
         let _ = &capture_heartbeat_ms;
         let start_instant = Instant::now();
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "windows")]
         let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
                 Arc::clone(&capture_heartbeat_ms),
+                Arc::clone(&running),
                 start_instant,
             )
             .ok()
         } else {
             None
         };
-        #[cfg(not(target_os = "android"))]
+        #[cfg(target_os = "windows")]
         let mut last_watchdog_check = Instant::now();
+
+        #[cfg(target_os = "linux")]
+        let _active_stream = if !config.use_test_tone {
+            Self::spawn_loopback_capture(
+                Arc::clone(&ring),
+                Arc::clone(&capture_heartbeat_ms),
+                Arc::clone(&running),
+                start_instant,
+            )
+            .ok()
+        } else {
+            None
+        };
 
         let subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
         let packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
@@ -465,27 +621,25 @@ impl HostEngine {
         let mut last_client_sweep = Instant::now();
 
         while running.load(Ordering::Relaxed) {
-            // 1. Hot-Plug Audio Device Watchdog (USB unplug / HDMI sleep recovery)
-            #[cfg(not(target_os = "android"))]
+            // 1. Hot-Plug Audio Device Watchdog (Solves Issues #173, #122, #103)
+            #[cfg(target_os = "windows")]
+            if !config.use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500)
             {
-                if !config.use_test_tone
-                    && last_watchdog_check.elapsed() >= Duration::from_millis(500)
-                {
-                    last_watchdog_check = Instant::now();
-                    let now_ms = start_instant.elapsed().as_millis() as u64;
-                    let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                    if active_stream.is_none() || now_ms.saturating_sub(last_cb) > 1500 {
-                        // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
-                        active_stream = Self::spawn_loopback_capture(
-                            Arc::clone(&ring),
-                            Arc::clone(&capture_heartbeat_ms),
-                            start_instant,
-                        )
-                        .ok();
-                        if active_stream.is_some() {
-                            capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
-                            telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
-                        }
+                last_watchdog_check = Instant::now();
+                let now_ms = start_instant.elapsed().as_millis() as u64;
+                let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
+                if active_stream.is_none() || now_ms.saturating_sub(last_cb) > 2500 {
+                    // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
+                    active_stream = Self::spawn_loopback_capture(
+                        Arc::clone(&ring),
+                        Arc::clone(&capture_heartbeat_ms),
+                        Arc::clone(&running),
+                        start_instant,
+                    )
+                    .ok();
+                    if active_stream.is_some() {
+                        capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
+                        telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -497,14 +651,17 @@ impl HostEngine {
 
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
                     let mut map = clients.lock().unwrap();
-                    map.entry(src_addr).or_insert(ConnectedClient {
-                        addr: src_addr,
-                        last_seen: Instant::now(),
-                        is_usb,
-                        muted: false,
-                        fec_rate_permille: 0,
-                        bluetooth_delay_ms: 0,
-                    }).last_seen = Instant::now();
+                    map.entry(src_addr)
+                        .or_insert(ConnectedClient {
+                            addr: src_addr,
+                            last_seen: Instant::now(),
+                            is_usb,
+                            muted: false,
+                            fec_rate_permille: 0,
+                            bluetooth_delay_ms: 0,
+                            client_volume: 100,
+                        })
+                        .last_seen = Instant::now();
                     telemetry
                         .active_clients_count
                         .store(map.len() as u8, Ordering::Relaxed);
@@ -535,10 +692,12 @@ impl HostEngine {
                             muted: false,
                             fec_rate_permille: fb.fec_rate_permille,
                             bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                            client_volume: fb.client_volume,
                         });
                         entry.last_seen = Instant::now();
                         entry.fec_rate_permille = fb.fec_rate_permille;
                         entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                        entry.client_volume = fb.client_volume;
                         telemetry
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
@@ -641,11 +800,14 @@ impl HostEngine {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_micros() as u64;
-                    telemetry.sonar_tx_timestamp_us.store(now_us, Ordering::Relaxed);
+                    telemetry
+                        .sonar_tx_timestamp_us
+                        .store(now_us, Ordering::Relaxed);
                 }
 
                 let mut i16_subframe = [0i16; SUBFRAME_STEREO_SAMPLES];
-                let max_abs = noise_shaper.quantize_stereo_subframe(&f32_subframe, &mut i16_subframe);
+                let max_abs =
+                    noise_shaper.quantize_stereo_subframe(&f32_subframe, &mut i16_subframe);
                 let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
                 telemetry.host_vu_peak_pct.store(vu_pct, Ordering::Relaxed);
 
@@ -707,7 +869,9 @@ impl HostEngine {
                         fec_n1_len: 0,
                         fec_n2_len: 0,
                         host_volume: telemetry.host_volume.load(Ordering::Relaxed),
-                        stream_id: 1,
+                        // Broadcast max group delay (in 2ms units) so fast phones align with slower phones!
+                        stream_id: (telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) / 2)
+                            .min(255) as u8,
                         header_crc16: 0,
                     };
                     pack_datagram_with_key(hdr, &[], &[], &[], active_key.as_ref(), &mut datagram)
@@ -726,7 +890,9 @@ impl HostEngine {
                     fec_n1_len: 0,
                     fec_n2_len: 0,
                     host_volume: telemetry.host_volume.load(Ordering::Relaxed),
-                    stream_id: 1,
+                    // Broadcast max group delay (in 2ms units) so fast phones align with slower phones!
+                    stream_id: (telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) / 2)
+                        .min(255) as u8,
                     header_crc16: 0,
                 };
                 let f1_slice = if send_n1 { &prev_n1_copy[..] } else { &[] };

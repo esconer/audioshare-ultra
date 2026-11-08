@@ -20,7 +20,9 @@ impl SessionKey {
         ];
 
         for (i, b) in pin.as_bytes().iter().enumerate() {
-            state[i % 8] ^= (*b as u32).wrapping_mul(0x9E37_79B9).rotate_left((i as u32) * 5);
+            state[i % 8] ^= (*b as u32)
+                .wrapping_mul(0x9E37_79B9)
+                .rotate_left((i as u32) * 5);
         }
 
         // 1,000 mixing rounds to harden short PINs
@@ -78,7 +80,10 @@ impl SessionKey {
             let mut word_bytes = [0u8; 4];
             word_bytes[..chunk.len()].copy_from_slice(chunk);
             let v = u32::from_le_bytes(word_bytes);
-            acc1 = acc1.wrapping_add(v).wrapping_mul(poly_key[2] | 1).rotate_left(13);
+            acc1 = acc1
+                .wrapping_add(v)
+                .wrapping_mul(poly_key[2] | 1)
+                .rotate_left(13);
             acc2 = (acc2 ^ acc1).wrapping_mul(poly_key[3] | 1).rotate_right(11);
         }
 
@@ -183,6 +188,9 @@ mod tests {
 
         // Decrypt in place
         key_correct.apply_keystream(&hdr, &mut buf);
-        assert_eq!(buf, original, "Decrypted payload must match original bit-for-bit");
+        assert_eq!(
+            buf, original,
+            "Decrypted payload must match original bit-for-bit"
+        );
     }
 }

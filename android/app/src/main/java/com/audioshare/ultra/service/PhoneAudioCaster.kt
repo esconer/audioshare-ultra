@@ -55,10 +55,9 @@ class PhoneAudioCaster(
 
         audioRecord?.startRecording()
 
-        // Start our Rust lossless transmitter for each target phone / PC
-        targetEndpoints.firstOrNull()?.let { primaryTarget ->
-            AudioEngineService.nativeStartPhoneMic(primaryTarget)
-        }
+        // Start our Rust lossless transmitter for all target phones / PCs (Party Mode!)
+        val targetListStr = targetEndpoints.joinToString(",")
+        AudioEngineService.nativeStartPhoneMic(targetListStr)
 
         thread(name = "as-ultra-phone-caster", isDaemon = true) {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)

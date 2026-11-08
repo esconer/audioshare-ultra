@@ -266,7 +266,8 @@ impl StudioEqualizer {
             self.last_bass_tenths = bass_tenths;
             self.last_pres_tenths = pres_tenths;
             self.last_treb_tenths = treb_tenths;
-            self.bass.set_peaking_eq(90.0, 0.707, (bass_tenths as f32) / 10.0);
+            self.bass
+                .set_peaking_eq(90.0, 0.707, (bass_tenths as f32) / 10.0);
             self.presence
                 .set_peaking_eq(2500.0, 1.0, (pres_tenths as f32) / 10.0);
             self.treble
@@ -301,9 +302,9 @@ impl NightModeCompressor {
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
         const NOISE_FLOOR: f32 = 0.0018; // -55 dBFS gate threshold
-        const WHISPER_ZONE: f32 = 0.16;  // -16 dBFS upward boost target
-        const LOUD_THRESH: f32 = 0.25;   // -12 dBFS downward 4:1 compression start
-        const MAX_BOOST: f32 = 3.75;     // +11.5 dB max whisper/footstep boost
+        const WHISPER_ZONE: f32 = 0.16; // -16 dBFS upward boost target
+        const LOUD_THRESH: f32 = 0.25; // -12 dBFS downward 4:1 compression start
+        const MAX_BOOST: f32 = 3.75; // +11.5 dB max whisper/footstep boost
 
         for frame in stereo.chunks_exact_mut(2) {
             let l = frame[0];
@@ -328,7 +329,9 @@ impl NightModeCompressor {
                 let target = LOUD_THRESH + (self.env - LOUD_THRESH) * 0.25;
                 (target / self.env).min(1.0)
             } else {
-                1.0 + (MAX_BOOST - 1.0) * 0.3 * ((LOUD_THRESH - self.env) / (LOUD_THRESH - WHISPER_ZONE))
+                1.0 + (MAX_BOOST - 1.0)
+                    * 0.3
+                    * ((LOUD_THRESH - self.env) / (LOUD_THRESH - WHISPER_ZONE))
             };
 
             frame[0] = (l * gain).clamp(-0.89, 0.89);
@@ -349,7 +352,8 @@ impl LatencySonar {
             // Hann window envelope so the chirp has zero click artifacts
             let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * t).cos());
             let freq = 3500.0 + 3500.0 * t;
-            let sample = ((i as f32) * 2.0 * std::f32::consts::PI * freq / 48_000.0).sin() * window * 0.80;
+            let sample =
+                ((i as f32) * 2.0 * std::f32::consts::PI * freq / 48_000.0).sin() * window * 0.80;
             stereo_subframe[i * 2] = sample;
             stereo_subframe[i * 2 + 1] = sample;
         }
@@ -394,7 +398,11 @@ impl NoiseShapedQuantizer {
     }
 
     #[inline]
-    pub fn quantize_stereo_subframe(&mut self, src_f32: &[f32; 240], dst_i16: &mut [i16; 240]) -> i16 {
+    pub fn quantize_stereo_subframe(
+        &mut self,
+        src_f32: &[f32; 240],
+        dst_i16: &mut [i16; 240],
+    ) -> i16 {
         let mut max_abs: i16 = 0;
         for i in 0..120 {
             self.rng ^= self.rng << 13;
@@ -418,7 +426,9 @@ impl NoiseShapedQuantizer {
 
             dst_i16[i * 2] = out_l;
             dst_i16[i * 2 + 1] = out_r;
-            max_abs = max_abs.max(out_l.saturating_abs()).max(out_r.saturating_abs());
+            max_abs = max_abs
+                .max(out_l.saturating_abs())
+                .max(out_r.saturating_abs());
         }
         max_abs
     }
@@ -475,7 +485,9 @@ impl MicRumbleAndNoiseGate {
 /// 10. QR Code Connection URI Builder (`asultra://connect?host=...&pin=...`)
 pub fn build_qr_connect_uri(host_ip: &str, port: u16, pin: Option<&str>) -> String {
     match pin {
-        Some(p) if !p.is_empty() => format!("asultra://connect?host={}:{}&pin={}", host_ip, port, p),
+        Some(p) if !p.is_empty() => {
+            format!("asultra://connect?host={}:{}&pin={}", host_ip, port, p)
+        }
         _ => format!("asultra://connect?host={}:{}", host_ip, port),
     }
 }

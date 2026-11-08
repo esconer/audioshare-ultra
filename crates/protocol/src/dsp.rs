@@ -205,7 +205,8 @@ impl TruePeakLimiter {
 
             if self.envelope > THRESHOLD {
                 let over = self.envelope - THRESHOLD;
-                let compressed = THRESHOLD + (CEILING - THRESHOLD) * (over / (over + (CEILING - THRESHOLD)));
+                let compressed =
+                    THRESHOLD + (CEILING - THRESHOLD) * (over / (over + (CEILING - THRESHOLD)));
                 let scale = compressed / self.envelope;
                 l *= scale;
                 r *= scale;
@@ -334,7 +335,10 @@ mod tests {
         );
 
         // The 4-point history has filled long before the tail; DC must survive.
-        for frame in output[..out_frames * 2].chunks_exact(2).skip(out_frames - 100) {
+        for frame in output[..out_frames * 2]
+            .chunks_exact(2)
+            .skip(out_frames - 100)
+        {
             assert!((frame[0] - 0.25).abs() < 1e-4, "L drift: {}", frame[0]);
             assert!((frame[1] + 0.5).abs() < 1e-4, "R drift: {}", frame[1]);
         }

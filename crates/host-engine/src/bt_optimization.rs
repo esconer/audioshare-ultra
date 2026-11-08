@@ -99,9 +99,18 @@ mod tests {
 
     #[test]
     fn test_remote_media_command() {
-        assert_eq!(RemoteMediaCommand::from_u8(1), RemoteMediaCommand::PlayPause);
-        assert_eq!(RemoteMediaCommand::from_u8(2), RemoteMediaCommand::NextTrack);
-        assert_eq!(RemoteMediaCommand::from_u8(3), RemoteMediaCommand::PrevTrack);
+        assert_eq!(
+            RemoteMediaCommand::from_u8(1),
+            RemoteMediaCommand::PlayPause
+        );
+        assert_eq!(
+            RemoteMediaCommand::from_u8(2),
+            RemoteMediaCommand::NextTrack
+        );
+        assert_eq!(
+            RemoteMediaCommand::from_u8(3),
+            RemoteMediaCommand::PrevTrack
+        );
         assert_eq!(RemoteMediaCommand::from_u8(0), RemoteMediaCommand::None);
         execute_remote_media_command(RemoteMediaCommand::None);
     }

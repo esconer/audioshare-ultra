@@ -163,8 +163,9 @@ impl AudioShareApp {
                     if self.enable_pin_encryption {
                         engine.set_encryption_pin(Some(&self.pairing_pin));
                     }
-                    self.os_guard =
-                        Some(VirtualSpeakerAndRadioGuard::acquire(self.enable_virtual_speaker));
+                    self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
+                        self.enable_virtual_speaker,
+                    ));
                     self.beacon = Some(DiscoveryBeacon::start(
                         DEFAULT_PORT,
                         "PC-AudioShare-Ultra".into(),
@@ -172,7 +173,8 @@ impl AudioShareApp {
                     self.adb_watcher = Some(AdbUsbWatcher::start(DEFAULT_PORT));
                     self.host_engine = Some(engine);
                     self.host_status_msg =
-                        "Broadcasting 48kHz Studio Lossless + [N-1]/[N-2] FEC (802.11e AC_VO)".into();
+                        "Broadcasting 48kHz Studio Lossless + [N-1]/[N-2] FEC (802.11e AC_VO)"
+                            .into();
                 }
                 Err(e) => {
                     self.host_status_msg = format!("Error: {}", e);
@@ -261,8 +263,7 @@ impl AudioShareApp {
                             ((x + quiet_zone) as f32) * module_px,
                             ((y + quiet_zone) as f32) * module_px,
                         );
-                    let cell =
-                        egui::Rect::from_min_size(min, egui::vec2(module_px, module_px));
+                    let cell = egui::Rect::from_min_size(min, egui::vec2(module_px, module_px));
                     painter.rect_filled(cell, 0.0, egui::Color32::BLACK);
                 }
             }
@@ -279,7 +280,11 @@ impl eframe::App for AudioShareApp {
             ui.horizontal(|ui| {
                 ui.heading("🎧 AudioShare Ultra");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, AppTab::HostSender, "📡 Host Server (Send Audio)");
+                ui.selectable_value(
+                    &mut self.tab,
+                    AppTab::HostSender,
+                    "📡 Host Server (Send Audio)",
+                );
                 ui.selectable_value(
                     &mut self.tab,
                     AppTab::ClientReceiver,
@@ -352,11 +357,13 @@ impl AudioShareApp {
                 if ui.add_sized([200.0, 38.0], btn).clicked() {
                     self.toggle_host();
                 }
-                ui.label(egui::RichText::new(&self.host_status_msg).color(if is_running {
-                    egui::Color32::LIGHT_GREEN
-                } else {
-                    egui::Color32::GRAY
-                }));
+                ui.label(
+                    egui::RichText::new(&self.host_status_msg).color(if is_running {
+                        egui::Color32::LIGHT_GREEN
+                    } else {
+                        egui::Color32::GRAY
+                    }),
+                );
             });
 
             ui.add_space(6.0);
@@ -398,7 +405,10 @@ impl AudioShareApp {
                 } else {
                     "📶 [Wi-Fi / Ethernet]"
                 };
-                ui.monospace(format!("{} {}:{} ({})", tag, iface.ip, DEFAULT_PORT, iface.name));
+                ui.monospace(format!(
+                    "{} {}:{} ({})",
+                    tag, iface.ip, DEFAULT_PORT, iface.name
+                ));
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -497,9 +507,10 @@ impl AudioShareApp {
                         ui.horizontal(|ui| {
                             let badge = if client.is_usb { "[USB]" } else { "[Wi-Fi]" };
                             ui.monospace(format!(
-                                "{} {} (Loss: {:.1}% | BT Delay: {}ms)",
+                                "{} {} (Vol: {}% | Loss: {:.1}% | BT Delay: {}ms)",
                                 badge,
                                 client.addr,
+                                client.client_volume,
                                 (client.fec_rate_permille as f32) / 10.0,
                                 client.bluetooth_delay_ms
                             ));
@@ -601,7 +612,9 @@ impl AudioShareApp {
 
                     if let Some(ref host) = self.host_engine {
                         if ui.button("📡 Ping True Acoustic Latency (Sonar)").clicked() {
-                            host.telemetry.trigger_sonar_ping.store(true, Ordering::Relaxed);
+                            host.telemetry
+                                .trigger_sonar_ping
+                                .store(true, Ordering::Relaxed);
                         }
                         let tx_us = host.telemetry.sonar_tx_timestamp_us.load(Ordering::Relaxed);
                         let rx_us = mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
@@ -753,9 +766,15 @@ impl AudioShareApp {
             ui.heading("Real-Time WSOLA Sequencer & Clock Drift Telemetry");
             if let Some(ref client) = self.client_engine {
                 let pkts = client.telemetry.packets_received.load(Ordering::Relaxed);
-                let prim = client.telemetry.primary_frames_played.load(Ordering::Relaxed);
+                let prim = client
+                    .telemetry
+                    .primary_frames_played
+                    .load(Ordering::Relaxed);
                 let fec = client.telemetry.fec_healed_frames.load(Ordering::Relaxed);
-                let plc = client.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed);
+                let plc = client
+                    .telemetry
+                    .plc_extrapolated_frames
+                    .load(Ordering::Relaxed);
                 let auth_err = client.telemetry.auth_failures.load(Ordering::Relaxed);
                 let drift = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
                 let dtx = client.telemetry.server_dtx_silent.load(Ordering::Relaxed);

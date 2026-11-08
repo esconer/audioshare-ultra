@@ -3,9 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
-use audioshare_host_engine::{
-    list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT,
-};
+use audioshare_host_engine::{list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT};
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_subframe, encode_fec_subframe,
     encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
@@ -47,7 +45,10 @@ fn run_host(args: &[String]) {
 
     let interfaces = list_valid_host_interfaces();
     if interfaces.is_empty() {
-        println!("[!] No external LAN/USB interfaces detected (listening on 0.0.0.0:{})", DEFAULT_PORT);
+        println!(
+            "[!] No external LAN/USB interfaces detected (listening on 0.0.0.0:{})",
+            DEFAULT_PORT
+        );
     } else {
         println!("Available Endpoints (Docker/WSL virtual bridges filtered out):");
         for iface in &interfaces {
@@ -56,7 +57,10 @@ fn run_host(args: &[String]) {
             } else {
                 "[WIFI / LAN]"
             };
-            println!("  • {:<18} -> {}:{} {}", iface.name, iface.ip, DEFAULT_PORT, badge);
+            println!(
+                "  • {:<18} -> {}:{} {}",
+                iface.name, iface.ip, DEFAULT_PORT, badge
+            );
         }
     }
 
@@ -73,7 +77,9 @@ fn run_host(args: &[String]) {
         (cfg.subframes_per_packet as f32) * 2.5,
         cfg.subframes_per_packet
     );
-    println!("[+] Waiting for clients (or run `as-ultra client 127.0.0.1` in another terminal)...\n");
+    println!(
+        "[+] Waiting for clients (or run `as-ultra client 127.0.0.1` in another terminal)...\n"
+    );
 
     loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -87,7 +93,11 @@ fn run_host(args: &[String]) {
             clients,
             pkts,
             bytes / 1024,
-            if dtx { "SMART-DTX (0.6kbps)" } else { "LOSSLESS-ACTIVE" }
+            if dtx {
+                "SMART-DTX (0.6kbps)"
+            } else {
+                "LOSSLESS-ACTIVE"
+            }
         );
         use std::io::Write;
         let _ = std::io::stdout().flush();
@@ -95,7 +105,10 @@ fn run_host(args: &[String]) {
 }
 
 fn run_client(args: &[String]) {
-    let raw_target = args.first().map(|s| s.as_str()).unwrap_or("127.0.0.1:65530");
+    let raw_target = args
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("127.0.0.1:65530");
     let target_str = if raw_target.contains(':') {
         raw_target.to_string()
     } else {
@@ -124,9 +137,15 @@ fn run_client(args: &[String]) {
     loop {
         std::thread::sleep(Duration::from_millis(500));
         let pkts = client.telemetry.packets_received.load(Ordering::Relaxed);
-        let prim = client.telemetry.primary_frames_played.load(Ordering::Relaxed);
+        let prim = client
+            .telemetry
+            .primary_frames_played
+            .load(Ordering::Relaxed);
         let fec = client.telemetry.fec_healed_frames.load(Ordering::Relaxed);
-        let plc = client.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed);
+        let plc = client
+            .telemetry
+            .plc_extrapolated_frames
+            .load(Ordering::Relaxed);
         let drift = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
         let dtx = client.telemetry.server_dtx_silent.load(Ordering::Relaxed);
 
@@ -236,13 +255,34 @@ fn run_wifi_torture_benchmark() {
     let ratio = 100.0 * (1.0 - (total_compressed_bytes as f64) / (total_raw_bytes as f64));
 
     println!("  • Total Audio Processed     : 2,500 ms (1,000 x 2.5ms subframes)");
-    println!("  • Total CPU Time (Enc+Dec)  : {:.2?} ({:.2?} per 2.5ms frame!)", elapsed, elapsed / total_subframes as u32);
+    println!(
+        "  • Total CPU Time (Enc+Dec)  : {:.2?} ({:.2?} per 2.5ms frame!)",
+        elapsed,
+        elapsed / total_subframes as u32
+    );
     println!("  • Codec Lookahead Delay     : 0.00 ms (Causal 2nd-Order LPC)");
-    println!("  • Lossless Size Reduction   : {:.1}% smaller than Raw PCM16 ({} KB -> {} KB)", ratio, total_raw_bytes / 1024, total_compressed_bytes / 1024);
-    println!("  • Simulated Wi-Fi Drops     : {} dropped packets", simulated_network_drops);
-    println!("  • Lossless Frames Played    : {} frames (bit-exact)", lossless_played);
-    println!("  • Healed by [N-1]/[N-2] FEC : {} frames (100% seamless recovery)", fec_healed);
-    println!("  • Audible Dropouts/Clicks   : {} dropouts", unrecovered_drops);
+    println!(
+        "  • Lossless Size Reduction   : {:.1}% smaller than Raw PCM16 ({} KB -> {} KB)",
+        ratio,
+        total_raw_bytes / 1024,
+        total_compressed_bytes / 1024
+    );
+    println!(
+        "  • Simulated Wi-Fi Drops     : {} dropped packets",
+        simulated_network_drops
+    );
+    println!(
+        "  • Lossless Frames Played    : {} frames (bit-exact)",
+        lossless_played
+    );
+    println!(
+        "  • Healed by [N-1]/[N-2] FEC : {} frames (100% seamless recovery)",
+        fec_healed
+    );
+    println!(
+        "  • Audible Dropouts/Clicks   : {} dropouts",
+        unrecovered_drops
+    );
     println!("================================================================");
     assert_eq!(unrecovered_drops, 0, "Zero audible dropouts SLA violated!");
     println!("  [PASS] All Hard Real-Time & Zero-Jitter SLAs Verified!");
