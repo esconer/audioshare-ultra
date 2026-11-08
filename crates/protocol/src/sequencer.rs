@@ -9,6 +9,7 @@ const RING_MASK: usize = RING_SLOTS - 1;
 pub const STATUS_EMPTY: u32 = 0;
 pub const STATUS_PRIMARY_LOSSLESS: u32 = 1;
 pub const STATUS_HEALED_BY_FEC: u32 = 2;
+const STATUS_BUSY: u32 = 3;
 
 const HISTORY_FRAMES: usize = 360; // 7.5ms pitch search window (down to 133Hz fundamental)
 const HISTORY_STEREO_SAMPLES: usize = HISTORY_FRAMES * 2;
@@ -51,7 +52,18 @@ impl ZeroJitterSequencer {
         let cur_seq = (cur >> 16) as u16;
         let cur_status = cur & 0xFFFF;
 
-        if cur_seq == seq && cur_status == STATUS_PRIMARY_LOSSLESS {
+        // Ignore if busy or if primary lossless frame already arrived via faster path (e.g. USB)
+        if cur_status == STATUS_BUSY || (cur_seq == seq && cur_status == STATUS_PRIMARY_LOSSLESS) {
+            return false;
+        }
+
+        // Atomically claim exclusive write access to prevent data races with pop_next()
+        let busy_state = ((seq as u32) << 16) | STATUS_BUSY;
+        if slot
+            .state
+            .compare_exchange(cur, busy_state, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
 
@@ -76,7 +88,16 @@ impl ZeroJitterSequencer {
         let cur_seq = (cur >> 16) as u16;
         let cur_status = cur & 0xFFFF;
 
-        if cur_seq == target_seq && cur_status != STATUS_EMPTY {
+        if cur_status == STATUS_BUSY || (cur_seq == target_seq && cur_status != STATUS_EMPTY) {
+            return false;
+        }
+
+        let busy_state = ((target_seq as u32) << 16) | STATUS_BUSY;
+        if slot
+            .state
+            .compare_exchange(cur, busy_state, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
 
@@ -129,53 +150,62 @@ impl ZeroJitterSequencer {
         let cur_seq = (cur >> 16) as u16;
         let cur_status = cur & 0xFFFF;
 
-        if cur_seq == expected_seq && cur_status != STATUS_EMPTY {
-            unsafe {
-                *out = *slot.samples.get();
-            }
-            slot.state.store(
-                ((expected_seq as u32) << 16) | STATUS_EMPTY,
-                Ordering::Release,
-            );
-
-            // If recovering from a PLC event, crossfade the first 32 frames to prevent phase click!
-            if self.consecutive_plc_count > 0 {
-                for i in 0..CROSSFADE_FRAMES {
-                    let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
-                    let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
-                    let w_plc = 1.0 - w_in;
-                    out[i * 2] = out[i * 2] * w_in + self.plc_recovery_tail[i * 2] * w_plc;
-                    out[i * 2 + 1] =
-                        out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
+        if cur_seq == expected_seq
+            && (cur_status == STATUS_PRIMARY_LOSSLESS || cur_status == STATUS_HEALED_BY_FEC)
+        {
+            let busy_state = ((expected_seq as u32) << 16) | STATUS_BUSY;
+            if slot
+                .state
+                .compare_exchange(cur, busy_state, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                unsafe {
+                    *out = *slot.samples.get();
                 }
-                self.consecutive_plc_count = 0;
+                slot.state.store(
+                    ((expected_seq as u32) << 16) | STATUS_EMPTY,
+                    Ordering::Release,
+                );
+
+                // If recovering from a PLC event, crossfade the first 32 frames to prevent phase click!
+                if self.consecutive_plc_count > 0 {
+                    for i in 0..CROSSFADE_FRAMES {
+                        let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
+                        let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                        let w_plc = 1.0 - w_in;
+                        out[i * 2] = out[i * 2] * w_in + self.plc_recovery_tail[i * 2] * w_plc;
+                        out[i * 2 + 1] =
+                            out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
+                    }
+                    self.consecutive_plc_count = 0;
+                }
+
+                self.append_to_history(out);
+                return cur_status;
             }
-
-            self.append_to_history(out);
-            cur_status
-        } else {
-            // WSOLA Pitch-Period Waveform Extrapolation
-            self.consecutive_plc_count += 1;
-            let pitch_lag = self.find_best_pitch_period();
-            let attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
-
-            let copy_start = HISTORY_FRAMES - pitch_lag;
-            for i in 0..SUBFRAME_FRAMES {
-                let src_frame = copy_start + (i % pitch_lag);
-                out[i * 2] = self.history[src_frame * 2] * attenuation;
-                out[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
-            }
-
-            // Prepare continuation tail for seamless crossfade when next good packet arrives
-            for i in 0..CROSSFADE_FRAMES {
-                let src_frame = copy_start + ((SUBFRAME_FRAMES + i) % pitch_lag);
-                self.plc_recovery_tail[i * 2] = self.history[src_frame * 2] * attenuation;
-                self.plc_recovery_tail[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
-            }
-
-            self.append_to_history(out);
-            STATUS_EMPTY
         }
+
+        // WSOLA Pitch-Period Waveform Extrapolation
+        self.consecutive_plc_count += 1;
+        let pitch_lag = self.find_best_pitch_period();
+        let attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
+
+        let copy_start = HISTORY_FRAMES - pitch_lag;
+        for i in 0..SUBFRAME_FRAMES {
+            let src_frame = copy_start + (i % pitch_lag);
+            out[i * 2] = self.history[src_frame * 2] * attenuation;
+            out[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
+        }
+
+        // Prepare continuation tail for seamless crossfade when next good packet arrives
+        for i in 0..CROSSFADE_FRAMES {
+            let src_frame = copy_start + ((SUBFRAME_FRAMES + i) % pitch_lag);
+            self.plc_recovery_tail[i * 2] = self.history[src_frame * 2] * attenuation;
+            self.plc_recovery_tail[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
+        }
+
+        self.append_to_history(out);
+        STATUS_EMPTY
     }
 }
 

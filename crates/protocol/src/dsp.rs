@@ -38,8 +38,13 @@ impl ClockDriftResampler {
             let err = (self.min_queue_frames_window - target_min_subframes) as f64;
             self.integral_err = (self.integral_err + err * 0.5).clamp(-10.0, 10.0);
 
-            // Max +/- 500 ppm adjustment (completely inaudible <0.8 cent pitch shift)
-            let corr = (0.00005 * err + 0.000005 * self.integral_err).clamp(-0.0005, 0.0005);
+            // Dual-slope catch-up: +/- 500 ppm for normal drift, up to +2500 ppm after a Wi-Fi burst spike
+            let (kp, max_clamp) = if err > 2.0 {
+                (0.00025, 0.0025)
+            } else {
+                (0.00005, 0.0005)
+            };
+            let corr = (kp * err + 0.000005 * self.integral_err).clamp(-0.0005, max_clamp);
             self.ratio = 1.0 + corr;
             self.min_queue_frames_window = 999.0;
             self.window_ticks = 0;
@@ -169,20 +174,23 @@ impl BurstDecouplerRing {
 
 /// 3. Studio Pre-Amp + Soft-Knee True-Peak Limiter (distortion-free loudness boost)
 pub struct TruePeakLimiter {
-    gain_linear: f32,
+    current_gain_linear: f32,
+    target_gain_linear: f32,
     envelope: f32,
 }
 
 impl TruePeakLimiter {
     pub fn new(gain_db: f32) -> Self {
+        let g = 10.0f32.powf(gain_db.clamp(-24.0, 24.0) / 20.0);
         Self {
-            gain_linear: 10.0f32.powf(gain_db / 20.0),
+            current_gain_linear: g,
+            target_gain_linear: g,
             envelope: 0.0,
         }
     }
 
     pub fn set_gain_db(&mut self, gain_db: f32) {
-        self.gain_linear = 10.0f32.powf(gain_db.clamp(-24.0, 24.0) / 20.0);
+        self.target_gain_linear = 10.0f32.powf(gain_db.clamp(-24.0, 24.0) / 20.0);
     }
 
     #[inline]
@@ -193,8 +201,9 @@ impl TruePeakLimiter {
         const RELEASE: f32 = 0.0005;
 
         for frame in stereo_samples.chunks_exact_mut(2) {
-            let mut l = frame[0] * self.gain_linear;
-            let mut r = frame[1] * self.gain_linear;
+            self.current_gain_linear += 0.01 * (self.target_gain_linear - self.current_gain_linear);
+            let mut l = frame[0] * self.current_gain_linear;
+            let mut r = frame[1] * self.current_gain_linear;
             let peak = l.abs().max(r.abs());
 
             if peak > self.envelope {
@@ -342,5 +351,39 @@ mod tests {
             assert!((frame[0] - 0.25).abs() < 1e-4, "L drift: {}", frame[0]);
             assert!((frame[1] + 0.5).abs() < 1e-4, "R drift: {}", frame[1]);
         }
+    }
+
+    #[test]
+    fn test_dual_slope_clock_controller_accelerates_on_spikes() {
+        let mut resampler = ClockDriftResampler::new();
+        // Normal drift: err = 1.0 (<= 2.0 subframes)
+        for _ in 0..200 {
+            resampler.update_clock_loop(3.0, 2.0);
+        }
+        let normal_corr = resampler.ratio - 1.0;
+        assert!(normal_corr > 0.0 && normal_corr <= 0.0005);
+
+        // Burst spike: err = 6.0 (> 2.0 subframes)
+        for _ in 0..200 {
+            resampler.update_clock_loop(8.0, 2.0);
+        }
+        let spike_corr = resampler.ratio - 1.0;
+        assert!(
+            spike_corr > 0.0005 && spike_corr <= 0.0025,
+            "Spike correction must accelerate up to +2500 ppm: {}",
+            spike_corr
+        );
+    }
+
+    #[test]
+    fn test_true_peak_limiter_gain_smoothing() {
+        let mut limiter = TruePeakLimiter::new(0.0);
+        limiter.set_gain_db(12.0); // Step up target
+        let mut samples = [0.1f32; 240];
+        limiter.process_in_place(&mut samples);
+        // First sample should not immediately jump to full 12dB (3.98x)
+        assert!(samples[0] < 0.1 * 3.9);
+        // Later samples should smoothly ramp upward
+        assert!(samples[238] > samples[0]);
     }
 }

@@ -102,18 +102,20 @@ pub enum WireError {
 }
 
 impl WireHeader {
+    /// Branchless L1-cache nibble lookup table for CRC-16-CCITT (poly 0x1021)
+    const CRC16_LUT: [u16; 16] = [
+        0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50A5, 0x60C6, 0x70E7, 0x8108, 0x9129, 0xA14A,
+        0xB16B, 0xC18C, 0xD1AD, 0xE1CE, 0xF1EF,
+    ];
+
     #[inline]
     pub fn compute_crc16(bytes_14: &[u8; 14]) -> u16 {
         let mut crc: u16 = 0xFFFF;
         for &b in bytes_14 {
-            crc ^= (b as u16) << 8;
-            for _ in 0..8 {
-                if (crc & 0x8000) != 0 {
-                    crc = (crc << 1) ^ 0x1021;
-                } else {
-                    crc <<= 1;
-                }
-            }
+            let idx_hi = ((crc >> 12) ^ ((b >> 4) as u16)) & 0x0F;
+            crc = (crc << 4) ^ Self::CRC16_LUT[idx_hi as usize];
+            let idx_lo = ((crc >> 12) ^ ((b & 0x0F) as u16)) & 0x0F;
+            crc = (crc << 4) ^ Self::CRC16_LUT[idx_lo as usize];
         }
         crc
     }
@@ -366,5 +368,29 @@ mod tests {
         let parsed = ParsedPacket::parse_and_decrypt(&mut buf[..len], Some(&key)).unwrap();
         assert_eq!(parsed.primary_payload, &primary);
         assert_eq!(parsed.fec_n1_payload, &fec1);
+    }
+
+    #[test]
+    fn test_crc16_lut_equivalence() {
+        let bytes: [u8; 14] = [
+            0x41, 0x53, 0x01, 0x00, 0x2A, 0x00, 0x01, 0xE2, 0x40, 0x00, 0x78, 0x00, 0x64, 0x01,
+        ];
+        // Bit-by-bit reference calculation
+        let mut ref_crc: u16 = 0xFFFF;
+        for &b in &bytes {
+            ref_crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                if (ref_crc & 0x8000) != 0 {
+                    ref_crc = (ref_crc << 1) ^ 0x1021;
+                } else {
+                    ref_crc <<= 1;
+                }
+            }
+        }
+        let lut_crc = WireHeader::compute_crc16(&bytes);
+        assert_eq!(
+            lut_crc, ref_crc,
+            "Nibble LUT CRC must match bitwise CRC-16-CCITT exactly"
+        );
     }
 }

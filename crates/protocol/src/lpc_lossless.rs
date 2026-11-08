@@ -274,11 +274,21 @@ pub fn encode_fec_subframe(
 ) {
     let mut pred_l = pcm_stereo[0] as i32;
     let mut pred_r = pcm_stereo[1] as i32;
-    let mut idx_l = 16i8;
-    let mut idx_r = 16i8;
 
-    out[0..2].copy_from_slice(&pcm_stereo[0].to_le_bytes());
+    // Estimate initial signal slope to prevent ADPCM slope-overload distortion on frame start
+    let diff_l = ((pcm_stereo[2] as i32) - pred_l).abs();
+    let diff_r = ((pcm_stereo[3] as i32) - pred_r).abs();
+    let init_idx = IMA_STEP_TABLE
+        .iter()
+        .position(|&s| s >= diff_l.max(diff_r).max(60))
+        .unwrap_or(42) as i8;
+    let mut idx_l = init_idx;
+    let mut idx_r = init_idx;
+
+    let l_tagged = (pcm_stereo[0] & !0x007F) | ((init_idx as i16) & 0x007F);
+    out[0..2].copy_from_slice(&l_tagged.to_le_bytes());
     out[2..4].copy_from_slice(&pcm_stereo[1].to_le_bytes());
+    pred_l = l_tagged as i32;
 
     for i in 0..SUBFRAME_FRAMES {
         let nib_l = encode_adpcm_sample(pcm_stereo[i * 2], &mut pred_l, &mut idx_l);
@@ -295,10 +305,12 @@ pub fn decode_fec_subframe_to_f32(
     if fec_bytes.len() < ADPCM_FEC_BYTES {
         return false;
     }
-    let mut pred_l = i16::from_le_bytes([fec_bytes[0], fec_bytes[1]]) as i32;
+    let l_tagged = i16::from_le_bytes([fec_bytes[0], fec_bytes[1]]);
+    let init_idx = ((l_tagged & 0x007F) as i8).clamp(0, 88);
+    let mut pred_l = l_tagged as i32;
     let mut pred_r = i16::from_le_bytes([fec_bytes[2], fec_bytes[3]]) as i32;
-    let mut idx_l = 16i8;
-    let mut idx_r = 16i8;
+    let mut idx_l = init_idx;
+    let mut idx_r = init_idx;
 
     for i in 0..SUBFRAME_FRAMES {
         let packed = fec_bytes[4 + i];
@@ -350,5 +362,27 @@ mod tests {
         let mut decoded = [0i16; SUBFRAME_STEREO_SAMPLES];
         decode_lossless_subframe(&encoded[..enc_len], &mut decoded).unwrap();
         assert_eq!(extreme, decoded);
+    }
+
+    #[test]
+    fn test_fec_adpcm_slope_tracking() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let phase = (i as f32) * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0;
+            pcm[i * 2] = (phase.sin() * 20_000.0) as i16;
+            pcm[i * 2 + 1] = (phase.cos() * 20_000.0) as i16;
+        }
+
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+
+        let mut decoded_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut decoded_f32));
+
+        // Initial sample recovery must be highly accurate with slope tracking
+        let orig_l = (pcm[0] as f32) / 32768.0;
+        let orig_r = (pcm[1] as f32) / 32768.0;
+        assert!((decoded_f32[0] - orig_l).abs() < 0.05);
+        assert!((decoded_f32[1] - orig_r).abs() < 0.05);
     }
 }
