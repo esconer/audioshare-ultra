@@ -11,8 +11,8 @@ use audioshare_host_engine::app_routing::{
 };
 use audioshare_host_engine::bt_optimization::apply_automatic_video_lipsync_offset_ms;
 use audioshare_host_engine::discovery_and_os::{
-    AdbUsbWatcher, DirectHotspotController, DiscoveryBeacon, DiscoveryScanner,
-    VirtualSpeakerAndRadioGuard,
+    open_os_firewall_ports, AdbUsbWatcher, DirectHotspotController, DiscoveryBeacon,
+    DiscoveryScanner, VirtualSpeakerAndRadioGuard,
 };
 use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PHONE_MIC_PORT};
 use audioshare_host_engine::{
@@ -453,6 +453,12 @@ impl AudioShareApp {
                             Err(e) => self.hotspot_status = format!("Hotspot notice: {}", e),
                         }
                     }
+                }
+                if ui
+                    .button("🛡️ 1-Click Open Firewall (65530-65532)")
+                    .clicked()
+                {
+                    self.hotspot_status = open_os_firewall_ports();
                 }
                 ui.monospace(&self.hotspot_status);
             });

@@ -7,6 +7,7 @@ pub struct ClockDriftResampler {
     pub ratio: f64,
     hist_l: [f32; 4],
     hist_r: [f32; 4],
+    short_ema_queue: f32,
     min_queue_frames_window: f32,
     window_ticks: u32,
     integral_err: f64,
@@ -19,6 +20,7 @@ impl ClockDriftResampler {
             ratio: 1.0,
             hist_l: [0.0; 4],
             hist_r: [0.0; 4],
+            short_ema_queue: -1.0,
             min_queue_frames_window: 999.0,
             window_ticks: 0,
             integral_err: 0.0,
@@ -29,8 +31,13 @@ impl ClockDriftResampler {
     /// Uses a 200-subframe (500ms) minimum envelope to reject Wi-Fi arrival jitter completely.
     #[inline]
     pub fn update_clock_loop(&mut self, current_queued_subframes: f32, target_min_subframes: f32) {
-        if current_queued_subframes < self.min_queue_frames_window {
-            self.min_queue_frames_window = current_queued_subframes;
+        if self.short_ema_queue < 0.0 {
+            self.short_ema_queue = current_queued_subframes;
+        } else {
+            self.short_ema_queue = 0.85 * self.short_ema_queue + 0.15 * current_queued_subframes;
+        }
+        if self.short_ema_queue < self.min_queue_frames_window {
+            self.min_queue_frames_window = self.short_ema_queue;
         }
         self.window_ticks += 1;
 
@@ -364,10 +371,11 @@ mod tests {
         assert!(normal_corr > 0.0 && normal_corr <= 0.0005);
 
         // Burst spike: err = 6.0 (> 2.0 subframes)
+        let mut spike_resampler = ClockDriftResampler::new();
         for _ in 0..200 {
-            resampler.update_clock_loop(8.0, 2.0);
+            spike_resampler.update_clock_loop(8.0, 2.0);
         }
-        let spike_corr = resampler.ratio - 1.0;
+        let spike_corr = spike_resampler.ratio - 1.0;
         assert!(
             spike_corr > 0.0005 && spike_corr <= 0.0025,
             "Spike correction must accelerate up to +2500 ppm: {}",
@@ -385,5 +393,22 @@ mod tests {
         assert!(samples[0] < 0.1 * 3.9);
         // Later samples should smoothly ramp upward
         assert!(samples[238] > samples[0]);
+    }
+
+    #[test]
+    fn test_clock_drift_resampler_ema_smoothing() {
+        let mut resampler = ClockDriftResampler::new();
+        // Prime loop at 4.0 subframes
+        for _ in 0..50 {
+            resampler.update_clock_loop(4.0, 4.0);
+        }
+        // Inject a single-tick sudden packet arrival dip to 0.0
+        resampler.update_clock_loop(0.0, 4.0);
+        // EMA smoothing must prevent min_queue_frames_window from crashing directly to 0.0
+        assert!(
+            resampler.min_queue_frames_window > 2.0,
+            "EMA must cushion against single-tick packet arrival dips: {}",
+            resampler.min_queue_frames_window
+        );
     }
 }

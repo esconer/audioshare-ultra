@@ -50,7 +50,7 @@ pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
 }
 
 impl PhoneMicTransmitter {
-    pub fn start(target_hosts: &str) -> Result<Self, String> {
+    pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
         let targets = parse_target_endpoints(target_hosts);
         if targets.is_empty() {
             return Err("No valid target endpoints found for transmitter".into());
@@ -61,9 +61,14 @@ impl PhoneMicTransmitter {
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
+        let _ = use_hardware_mic;
 
         #[cfg(target_os = "android")]
-        let _mic_input_stream = AAudioInputGuard::open_low_latency_mic(Arc::clone(&mic_input_ring));
+        let _mic_input_stream = if use_hardware_mic {
+            AAudioInputGuard::open_low_latency_mic(Arc::clone(&mic_input_ring))
+        } else {
+            None
+        };
 
         let run_clone = Arc::clone(&running);
         let ring_clone = Arc::clone(&mic_input_ring);
@@ -381,13 +386,14 @@ pub mod android_native {
         mut env: JNIEnv,
         _class: JClass,
         host_ip: JString,
+        use_hardware_mic: jboolean,
     ) -> jboolean {
         let Ok(ip_str) = env.get_string(&host_ip) else {
             return 0;
         };
         let ip_rust: String = ip_str.into();
         android_stop_phone_mic();
-        if let Ok(tx) = PhoneMicTransmitter::start(&ip_rust) {
+        if let Ok(tx) = PhoneMicTransmitter::start(&ip_rust, use_hardware_mic != 0) {
             *GLOBAL_PHONE_MIC_TX.lock().unwrap() = Some(tx);
             1
         } else {
@@ -452,5 +458,13 @@ mod tests {
         assert_eq!(decoded.client_volume, 85);
         assert_eq!(decoded.fec_rate_permille, 45);
         assert_eq!(decoded.bluetooth_delay_ms, 120);
+    }
+
+    #[test]
+    fn test_phone_mic_transmitter_no_hardware_mic_start_stop() {
+        let tx = PhoneMicTransmitter::start("127.0.0.1", false);
+        assert!(tx.is_ok());
+        let mut tx = tx.unwrap();
+        tx.stop();
     }
 }

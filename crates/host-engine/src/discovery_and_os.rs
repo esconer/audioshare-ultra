@@ -273,6 +273,42 @@ impl DirectHotspotController {
     }
 }
 
+/// Opens UDP ports 65530..65532 in Linux (ufw / firewalld) or Windows Defender Firewall
+pub fn open_os_firewall_ports() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let cmd = "ufw allow 65530:65532/udp || (firewall-cmd --add-port=65530-65532/udp && firewall-cmd --runtime-to-permanent)";
+        match Command::new("pkexec").args(["sh", "-c", cmd]).status() {
+            Ok(s) if s.success() => "Firewall ports 65530-65532/UDP opened successfully!".into(),
+            _ => "Firewall rule skipped or no active firewall detected.".into(),
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let status = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                "name=AudioShare_Ultra_UDP",
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                "localport=65530-65532",
+            ])
+            .status();
+        match status {
+            Ok(s) if s.success() => "Windows Firewall UDP ports 65530-65532 opened!".into(),
+            _ => "Run as Administrator once to add Windows Firewall rule.".into(),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        "Unsupported OS".into()
+    }
+}
+
 /// Virtual Speaker & OS Wi-Fi Scan Suppressor Guard
 pub struct VirtualSpeakerAndRadioGuard {
     #[cfg(target_os = "linux")]

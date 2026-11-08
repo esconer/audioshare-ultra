@@ -59,7 +59,7 @@ fun MainScreen() {
     ) { granted ->
         if (granted && isConnected) {
             sharePhoneMic = true
-            AudioEngineService.nativeStartPhoneMic(hostAddress)
+            AudioEngineService.nativeStartPhoneMic(hostAddress, true)
         } else {
             sharePhoneMic = false
         }
@@ -400,7 +400,7 @@ fun MainScreen() {
                                 ) == PackageManager.PERMISSION_GRANTED
                                 if (hasPerm) {
                                     sharePhoneMic = true
-                                    AudioEngineService.nativeStartPhoneMic(hostAddress)
+                                    AudioEngineService.nativeStartPhoneMic(hostAddress, true)
                                 } else {
                                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }

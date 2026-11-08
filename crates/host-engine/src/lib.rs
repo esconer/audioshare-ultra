@@ -432,7 +432,20 @@ impl HostEngine {
                         .stderr(Stdio::null())
                         .spawn()
                     {
-                        child_pid_clone.store(child.id(), Ordering::Relaxed);
+                        let pid = child.id();
+                        child_pid_clone.store(pid, Ordering::Relaxed);
+                        let run_watch = Arc::clone(&running);
+                        let stream_watch = Arc::clone(&stream_active_clone);
+                        std::thread::spawn(move || {
+                            while run_watch.load(Ordering::Relaxed)
+                                && stream_watch.load(Ordering::Relaxed)
+                            {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGTERM);
+                            }
+                        });
                         if let Some(mut stdout) = child.stdout.take() {
                             let mut frames_read = 0u32;
                             while stream_active_clone.load(Ordering::Relaxed)

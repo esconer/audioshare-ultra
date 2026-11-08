@@ -58,7 +58,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativePushCapturedAudio(pcmFloat: FloatArray)
 
         @JvmStatic
-        external fun nativeStartPhoneMic(hostIp: String): Boolean
+        external fun nativeStartPhoneMic(hostIp: String, useHardwareMic: Boolean): Boolean
 
         @JvmStatic
         external fun nativeStopPhoneMic()
