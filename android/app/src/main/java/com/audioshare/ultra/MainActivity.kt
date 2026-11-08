@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -16,11 +17,20 @@ import com.audioshare.ultra.service.AudioEngineService
 import com.audioshare.ultra.ui.MainScreen
 
 class MainActivity : ComponentActivity() {
+    private var multicastLock: WifiManager.MulticastLock? = null
     private val recordAudioPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Allow Android Wi-Fi hardware filter to receive UDP Auto-Discovery Beacons (Port 65531)
+        val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        multicastLock = wifiMgr?.createMulticastLock("AudioShareUltra::DiscoveryBroadcastLock")?.apply {
+            setReferenceCounted(false)
+            if (!isHeld) acquire()
+        }
+
         if (ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.RECORD_AUDIO
@@ -59,5 +69,10 @@ class MainActivity : ComponentActivity() {
                 MainScreen()
             }
         }
+    }
+
+    override fun onDestroy() {
+        multicastLock?.let { if (it.isHeld) it.release() }
+        super.onDestroy()
     }
 }

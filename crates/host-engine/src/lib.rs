@@ -133,7 +133,7 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     let _ = sock_ref.set_send_buffer_size(65_536);
     let _ = sock_ref.set_recv_buffer_size(65_536);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         use std::os::fd::AsRawFd;
         let prio: libc::c_int = 6;
@@ -149,8 +149,9 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
 }
 
 pub fn promote_thread_realtime() {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
+        #[cfg(target_os = "linux")]
         libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
         libc::setpriority(libc::PRIO_PROCESS, 0, -19);
         // Hard real-time SCHED_FIFO for the audio TX/RX loops. Requires

@@ -1,8 +1,10 @@
 package com.audioshare.ultra.ui
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
@@ -19,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.audioshare.ultra.service.AudioEngineService
 import com.audioshare.ultra.service.PhoneAudioCaster
 import kotlinx.coroutines.delay
@@ -50,6 +53,17 @@ fun MainScreen() {
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
     var telemetry by remember { mutableStateOf(LongArray(5)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
+
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && isConnected) {
+            sharePhoneMic = true
+            AudioEngineService.nativeStartPhoneMic(hostAddress)
+        } else {
+            sharePhoneMic = false
+        }
+    }
 
     val projectionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -137,10 +151,24 @@ fun MainScreen() {
                             val addr = parts.getOrNull(1) ?: entry
                             val mode = parts.getOrNull(2) ?: "WiFi"
                             OutlinedButton(
-                                onClick = { hostAddress = addr },
+                                onClick = {
+                                    hostAddress = addr
+                                    prefs.edit().putString("last_host_addr", hostAddress).putString("pin_code", pinCode).apply()
+                                    val intent = Intent(context, AudioEngineService::class.java).apply {
+                                        putExtra("HOST_ADDR", hostAddress)
+                                        putExtra("GAIN_DB", preampGainDb)
+                                        putExtra("PIN", pinCode)
+                                    }
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                        context.startForegroundService(intent)
+                                    } else {
+                                        context.startService(intent)
+                                    }
+                                    isConnected = true
+                                },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("$name • $mode • $addr")
+                                Text("⚡ 1-Tap Connect: [$mode] $name ($addr)")
                             }
                         }
                     }
@@ -362,11 +390,20 @@ fun MainScreen() {
                     Switch(
                         checked = sharePhoneMic,
                         onCheckedChange = { enabled ->
-                            sharePhoneMic = enabled
-                            if (enabled && isConnected) {
-                                AudioEngineService.nativeStartPhoneMic(hostAddress)
-                            } else if (!enabled) {
+                            if (!enabled) {
+                                sharePhoneMic = false
                                 AudioEngineService.nativeStopPhoneMic()
+                            } else if (isConnected) {
+                                val hasPerm = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (hasPerm) {
+                                    sharePhoneMic = true
+                                    AudioEngineService.nativeStartPhoneMic(hostAddress)
+                                } else {
+                                    micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                }
                             }
                         }
                     )
