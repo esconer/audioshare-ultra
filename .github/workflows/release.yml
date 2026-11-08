@@ -5,6 +5,12 @@ on:
     branches: [main, master]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (leave blank to auto-detect from Cargo.toml)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write
@@ -111,10 +117,10 @@ jobs:
           name: audioshare-ultra-android-apk
           path: audioshare-ultra-android.apk
 
-  # 4. Publish GitHub Release automatically when a tag (e.g. v0.1.0) is pushed
+  # 4. Publish GitHub Release (Runs on tags, pushes to main, and manual workflow dispatch)
   publish-release:
     needs: [build-linux, build-windows, build-android]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always() && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' && needs.build-android.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -125,17 +131,36 @@ jobs:
         with:
           path: release-assets
 
-      - name: Create GitHub Release via Native GH CLI
+      - name: Create or Update GitHub Release via Native GH CLI
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.release_tag }}
         run: |
-          gh release create "${{ github.ref_name }}" \
+          TAG="${INPUT_TAG}"
+          if [ -z "$TAG" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              TAG="${{ github.ref_name }}"
+            else
+              VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
+              TAG="v${VERSION}"
+            fi
+          fi
+          echo "Publishing release for tag: ${TAG}"
+
+          # Ensure the tag exists locally and on remote
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "${TAG}" HEAD
+          git push origin "${TAG}" --force || true
+
+          gh release create "${TAG}" \
             release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
             release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
             release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
+            --title "AudioShare Ultra ${TAG}" \
             --generate-notes || \
-          gh release upload "${{ github.ref_name }}" \
+          gh release upload "${TAG}" \
             release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
             release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
             release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
