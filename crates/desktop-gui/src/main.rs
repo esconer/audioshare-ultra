@@ -62,6 +62,7 @@ struct AudioShareApp {
     enable_virtual_speaker: bool,
     auto_bt_video_lipsync: bool,
     last_applied_bt_delay: u16,
+    host_master_volume: u8,
     use_test_tone: bool,
     host_status_msg: String,
 
@@ -112,6 +113,7 @@ impl AudioShareApp {
             enable_virtual_speaker: false,
             auto_bt_video_lipsync: true,
             last_applied_bt_delay: 0,
+            host_master_volume: 100,
             use_test_tone: false,
             host_status_msg: "Stopped. Click 'Start Host Server' to broadcast.".into(),
             direct_hotspot_active: false,
@@ -158,14 +160,15 @@ impl AudioShareApp {
                 enable_smart_dtx: self.enable_smart_dtx,
             };
 
+            // 1. Create Virtual Speaker & suppress 60s Wi-Fi scan BEFORE opening audio capture!
+            let guard = VirtualSpeakerAndRadioGuard::acquire(self.enable_virtual_speaker);
+
             match HostEngine::start(cfg, vec![]) {
                 Ok(engine) => {
                     if self.enable_pin_encryption {
                         engine.set_encryption_pin(Some(&self.pairing_pin));
                     }
-                    self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
-                        self.enable_virtual_speaker,
-                    ));
+                    self.os_guard = Some(guard);
                     self.beacon = Some(DiscoveryBeacon::start(
                         DEFAULT_PORT,
                         "PC-AudioShare-Ultra".into(),
@@ -340,6 +343,22 @@ impl eframe::App for AudioShareApp {
             });
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut host) = self.host_engine.take() {
+            host.stop();
+        }
+        if let Some(mut client) = self.client_engine.take() {
+            client.stop();
+        }
+        if let Some(mut mic) = self.phone_mic_receiver.take() {
+            mic.stop();
+        }
+        self.beacon = None;
+        self.adb_watcher = None;
+        // Explicitly drop VirtualSpeakerAndRadioGuard to restore physical PC speakers on window close!
+        self.os_guard = None;
+    }
 }
 
 impl AudioShareApp {
@@ -486,6 +505,16 @@ impl AudioShareApp {
                             .fill(bar_color)
                             .text(format!("{}% Peak", vu_pct)),
                     );
+                    ui.separator();
+                    ui.label("Master Vol:");
+                    if ui
+                        .add(egui::Slider::new(&mut self.host_master_volume, 0..=100).suffix("%"))
+                        .changed()
+                    {
+                        host.telemetry
+                            .host_volume
+                            .store(self.host_master_volume, Ordering::Relaxed);
+                    }
                 });
 
                 if bt_delay > 40 {
@@ -801,6 +830,37 @@ impl AudioShareApp {
                     } else {
                         "STREAMING LIVE AUDIO"
                     }
+                ));
+
+                // Render 60 FPS Real-Time Clock-Drift Sparkline Graph (-500 ppm .. +500 ppm)
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 44.0),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+                let mid_y = rect.center().y;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left(), mid_y),
+                        egui::pos2(rect.right(), mid_y),
+                    ],
+                    egui::Stroke::new(1.0f32, egui::Color32::DARK_GRAY),
+                );
+                let step_x = rect.width() / (self.drift_history.len().max(2) as f32 - 1.0);
+                let points: Vec<egui::Pos2> = self
+                    .drift_history
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ppm)| {
+                        let x = rect.left() + (i as f32) * step_x;
+                        let norm_y = (ppm / 500.0).clamp(-1.0, 1.0);
+                        egui::pos2(x, mid_y - norm_y * (rect.height() * 0.42))
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(
+                    points,
+                    egui::Stroke::new(1.5f32, egui::Color32::LIGHT_GREEN),
                 ));
             } else {
                 ui.label("Connect to a Host to view real-time jitter & clock recovery telemetry.");

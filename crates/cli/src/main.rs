@@ -3,6 +3,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
+use audioshare_host_engine::discovery_and_os::{
+    AdbUsbWatcher, DiscoveryBeacon, VirtualSpeakerAndRadioGuard,
+};
 use audioshare_host_engine::{list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT};
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_subframe, encode_fec_subframe,
@@ -71,7 +74,10 @@ fn run_host(args: &[String]) {
         enable_smart_dtx: true,
     };
 
+    let _os_guard = VirtualSpeakerAndRadioGuard::acquire(false);
     let host = HostEngine::start(cfg, vec![]).expect("Failed to start HostEngine");
+    let _beacon = DiscoveryBeacon::start(DEFAULT_PORT, "CLI-AudioShare-Ultra".into());
+    let _adb = AdbUsbWatcher::start(DEFAULT_PORT);
     println!(
         "\n[+] Pacing: {:.1} ms ({} subframe/pkt) | QoS: 802.11e WMM AC_VO (0xB8) | Smart DTX: ON",
         (cfg.subframes_per_packet as f32) * 2.5,
