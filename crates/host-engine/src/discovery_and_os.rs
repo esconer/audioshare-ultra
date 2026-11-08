@@ -85,9 +85,21 @@ impl DiscoveryScanner {
         let handle = std::thread::Builder::new()
             .name("as-ultra-scanner".into())
             .spawn(move || {
-                let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
+                let Ok(raw_sock) = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                ) else {
                     return;
                 };
+                let _ = raw_sock.set_reuse_address(true);
+                #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+                let _ = raw_sock.set_reuse_port(true);
+                let bind_addr = SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT));
+                if raw_sock.bind(&bind_addr.into()).is_err() {
+                    return;
+                }
+                let sock: UdpSocket = raw_sock.into();
                 let _ = sock.set_read_timeout(Some(Duration::from_millis(250)));
                 let mut buf = [0u8; 256];
 
@@ -509,5 +521,29 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
             }
         }
         FreeLibrary(hmod);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_discovery_scanner_reuse_address() {
+        let scanner1 = DiscoveryScanner::start();
+        // Spawning a second scanner or socket with reuse_address should not crash or panic
+        let raw_sock = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        );
+        if let Ok(sock) = raw_sock {
+            let _ = sock.set_reuse_address(true);
+            #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+            let _ = sock.set_reuse_port(true);
+            let bind_addr = SocketAddr::from(([0, 0, 0, 0], DISCOVERY_PORT));
+            let _ = sock.bind(&bind_addr.into());
+        }
+        drop(scanner1);
     }
 }

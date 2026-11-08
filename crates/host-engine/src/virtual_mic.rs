@@ -200,10 +200,15 @@ impl PhoneMicReceiver {
                 let _mic_out = {
                     #[cfg(target_os = "linux")]
                     {
+                        std::env::set_var("PULSE_SINK", "AudioShare_Phone_Mic_Sink");
                         if linux_output_active {
                             None
                         } else {
-                            crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
+                            crate::ClientPreviewSink::spawn_preferred(
+                                Arc::clone(&mic_fifo_thread),
+                                Some("AudioShare_Phone_Mic_Sink"),
+                            )
+                            .ok()
                         }
                     }
                     #[cfg(target_os = "windows")]

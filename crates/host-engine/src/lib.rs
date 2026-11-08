@@ -32,6 +32,7 @@ const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
 pub(crate) struct ClientPreviewSink;
 #[cfg(not(target_os = "android"))]
 impl ClientPreviewSink {
+    #[allow(dead_code)]
     pub fn spawn(fifo: Arc<BurstDecouplerRing>) -> Result<cpal::Stream, String> {
         Self::spawn_preferred(fifo, None)
     }
@@ -396,10 +397,8 @@ impl HostEngine {
                 let mut byte_buf = [0u8; SUBFRAME_STEREO_SAMPLES * 4]; // 960 bytes = 2.5ms stereo f32
                 let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
 
-                while stream_active_clone.load(Ordering::Relaxed) && running.load(Ordering::Relaxed)
-                {
-                    // Resolve default sink monitor name via `pactl get-default-sink`
-                    let monitor_dev = Command::new("pactl")
+                let get_default_monitor = || -> String {
+                    Command::new("pactl")
                         .arg("get-default-sink")
                         .output()
                         .ok()
@@ -411,7 +410,12 @@ impl HostEngine {
                                 Some(format!("{}.monitor", s))
                             }
                         })
-                        .unwrap_or_else(|| "@DEFAULT_MONITOR@".to_string());
+                        .unwrap_or_else(|| "@DEFAULT_MONITOR@".to_string())
+                };
+
+                while stream_active_clone.load(Ordering::Relaxed) && running.load(Ordering::Relaxed)
+                {
+                    let current_monitor = get_default_monitor();
 
                     if let Ok(mut child) = Command::new("parec")
                         .args([
@@ -419,9 +423,9 @@ impl HostEngine {
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=3",
+                            "--latency-msec=2",
                             "--process-time-msec=2",
-                            &format!("--device={}", monitor_dev),
+                            &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
@@ -429,6 +433,7 @@ impl HostEngine {
                     {
                         child_pid_clone.store(child.id(), Ordering::Relaxed);
                         if let Some(mut stdout) = child.stdout.take() {
+                            let mut frames_read = 0u32;
                             while stream_active_clone.load(Ordering::Relaxed)
                                 && running.load(Ordering::Relaxed)
                             {
@@ -443,6 +448,15 @@ impl HostEngine {
                                         ]);
                                     }
                                     ring.push_samples(&f32_buf);
+
+                                    // Every 2 seconds (800 x 2.5ms subframes), check if default sink changed
+                                    frames_read += 1;
+                                    if frames_read >= 800 {
+                                        frames_read = 0;
+                                        if get_default_monitor() != current_monitor {
+                                            break; // Re-open parec on the newly selected sink monitor!
+                                        }
+                                    }
                                 } else {
                                     break;
                                 }
@@ -456,7 +470,7 @@ impl HostEngine {
                     if stream_active_clone.load(Ordering::Relaxed)
                         && running.load(Ordering::Relaxed)
                     {
-                        std::thread::sleep(Duration::from_millis(500));
+                        std::thread::sleep(Duration::from_millis(150));
                     }
                 }
 
@@ -514,6 +528,7 @@ impl HostEngine {
 
         let channels = supported_cfg.channels() as usize;
         let src_rate = supported_cfg.sample_rate().0;
+        let sample_format = supported_cfg.sample_format();
 
         let stream_cfg = cpal::StreamConfig {
             channels: channels as u16,
@@ -525,34 +540,118 @@ impl HostEngine {
         let mut host_resampler = audioshare_protocol::dsp::ClockDriftResampler::new();
         host_resampler.ratio = (src_rate as f64) / (SAMPLE_RATE as f64);
 
-        let stream = device
-            .build_input_stream(
-                &stream_cfg,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    let in_frames = data.len() / channels.max(1);
-                    let mut stereo_buf = [0.0f32; 2048];
-                    let safe_frames = in_frames.min(1024);
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let in_frames = data.len() / channels.max(1);
+                        let safe_frames = in_frames.min(1024);
+                        let mut stereo_buf = [0.0f32; 2048];
+                        let mut f32_tmp = [0.0f32; 2048];
+                        let total_samples = (safe_frames * channels).min(2048);
+                        for (dst, &s) in f32_tmp[..total_samples]
+                            .iter_mut()
+                            .zip(data[..total_samples].iter())
+                        {
+                            *dst = (s as f32) * (1.0 / 32768.0);
+                        }
 
-                    downmix_to_stereo(
-                        &data[..safe_frames * channels],
-                        channels,
-                        &mut stereo_buf[..safe_frames * 2],
-                    );
+                        downmix_to_stereo(
+                            &f32_tmp[..safe_frames * channels],
+                            channels,
+                            &mut stereo_buf[..safe_frames * 2],
+                        );
 
-                    if src_rate == SAMPLE_RATE {
-                        ring.push_samples(&stereo_buf[..safe_frames * 2]);
-                    } else {
-                        let mut resampled = [0.0f32; 4096];
-                        let out_frames =
-                            host_resampler.process(&stereo_buf[..safe_frames * 2], &mut resampled);
-                        ring.push_samples(&resampled[..out_frames * 2]);
-                    }
-                },
-                |_| {},
-                None,
-            )
-            .map_err(|e| format!("Failed to build loopback stream: {}", e))?;
+                        if src_rate == SAMPLE_RATE {
+                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
+                        } else {
+                            let mut resampled = [0.0f32; 4096];
+                            let out_frames = host_resampler
+                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
+                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        }
+                    },
+                    |_| {},
+                    None,
+                )
+            }
+            cpal::SampleFormat::U16 => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let in_frames = data.len() / channels.max(1);
+                        let safe_frames = in_frames.min(1024);
+                        let mut stereo_buf = [0.0f32; 2048];
+                        let mut f32_tmp = [0.0f32; 2048];
+                        let total_samples = (safe_frames * channels).min(2048);
+                        for (dst, &s) in f32_tmp[..total_samples]
+                            .iter_mut()
+                            .zip(data[..total_samples].iter())
+                        {
+                            *dst = ((s as f32) - 32768.0) * (1.0 / 32768.0);
+                        }
+
+                        downmix_to_stereo(
+                            &f32_tmp[..safe_frames * channels],
+                            channels,
+                            &mut stereo_buf[..safe_frames * 2],
+                        );
+
+                        if src_rate == SAMPLE_RATE {
+                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
+                        } else {
+                            let mut resampled = [0.0f32; 4096];
+                            let out_frames = host_resampler
+                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
+                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        }
+                    },
+                    |_| {},
+                    None,
+                )
+            }
+            _ => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let in_frames = data.len() / channels.max(1);
+                        let mut stereo_buf = [0.0f32; 2048];
+                        let safe_frames = in_frames.min(1024);
+
+                        downmix_to_stereo(
+                            &data[..safe_frames * channels],
+                            channels,
+                            &mut stereo_buf[..safe_frames * 2],
+                        );
+
+                        if src_rate == SAMPLE_RATE {
+                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
+                        } else {
+                            let mut resampled = [0.0f32; 4096];
+                            let out_frames = host_resampler
+                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
+                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        }
+                    },
+                    |_| {},
+                    None,
+                )
+            }
+        }
+        .map_err(|e| format!("Failed to build loopback stream: {}", e))?;
 
         stream
             .play()
@@ -618,6 +717,13 @@ impl HostEngine {
         let mut dynamic_codec_mode = CodecMode::StudioLosslessLpc;
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
+        if let Ok(map) = clients.lock() {
+            for c in map.values() {
+                if !c.muted {
+                    cached_targets.push(c.addr);
+                }
+            }
+        }
         let mut last_client_sweep = Instant::now();
 
         while running.load(Ordering::Relaxed) {
@@ -933,5 +1039,53 @@ impl HostEngine {
 impl Drop for HostEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_i16_to_f32_conversion_and_downmix() {
+        let raw_i16: [i16; 4] = [32767, -32768, 0, 16384];
+        let mut f32_tmp = [0.0f32; 4];
+        for (dst, &s) in f32_tmp.iter_mut().zip(raw_i16.iter()) {
+            *dst = (s as f32) * (1.0 / 32768.0);
+        }
+        assert!((f32_tmp[0] - 0.9999695).abs() < 1e-4);
+        assert!((f32_tmp[1] - (-1.0)).abs() < 1e-6);
+        assert_eq!(f32_tmp[2], 0.0);
+        assert!((f32_tmp[3] - 0.5).abs() < 1e-4);
+
+        let mut stereo_buf = [0.0f32; 4];
+        downmix_to_stereo(&f32_tmp, 2, &mut stereo_buf);
+        assert_eq!(stereo_buf[0], f32_tmp[0]);
+        assert_eq!(stereo_buf[1], f32_tmp[1]);
+    }
+
+    #[test]
+    fn test_host_engine_start_stop() {
+        let config = HostConfig {
+            bind_port: 0, // OS assigned ephemeral port for test
+            use_test_tone: true,
+            subframes_per_packet: 1,
+            enable_smart_dtx: false,
+        };
+        let dummy_target: SocketAddr = "127.0.0.1:65530".parse().unwrap();
+        let engine = HostEngine::start(config, vec![dummy_target]);
+        assert!(engine.is_ok());
+        let mut engine = engine.unwrap();
+        let clients = engine.connected_clients();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].addr, dummy_target);
+        assert_eq!(
+            engine
+                .telemetry
+                .active_clients_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        engine.stop();
     }
 }
