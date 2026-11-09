@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
-pub const RING_SLOTS: usize = 64;
+pub const RING_SLOTS: usize = 128; // 128 * 2.5ms = 320ms capacity for Wired + Bluetooth Group Sync!
 const RING_MASK: usize = RING_SLOTS - 1;
 
 pub const STATUS_EMPTY: u32 = 0;

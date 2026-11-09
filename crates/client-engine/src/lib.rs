@@ -331,17 +331,18 @@ impl ClientEngine {
                     (10.0f32.powf(gain_db / 20.0) * 100.0).clamp(0.0, 100.0) as u8
                 };
 
-                // Use the larger of the Kotlin A2DP estimate and the measured
-                // AAudio hardware/DAC delay, so wired output also reports real
-                // hardware latency while Bluetooth keeps its full codec delay.
+                // Report Total Pipeline Delay (Hardware/BT Delay + Client Network Buffer)
+                // so the Host aligns devices across USB, 5GHz, 2.4GHz, and Bluetooth.
                 let downstream_delay_ms = telemetry
                     .downstream_bt_delay_ms
                     .load(Ordering::Relaxed)
                     .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
+                let net_buf_ms = (adaptive_wifi_subframes * 2.5) as u16;
+                let my_total_delay_ms = downstream_delay_ms.saturating_add(net_buf_ms);
 
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
-                    bluetooth_delay_ms: downstream_delay_ms,
+                    bluetooth_delay_ms: my_total_delay_ms,
                     client_volume: client_vol,
                     requested_mode: media_cmd,
                     auth_mac32: 0,
@@ -526,10 +527,11 @@ impl ClientEngine {
                 .downstream_bt_delay_ms
                 .load(Ordering::Relaxed)
                 .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
+            let my_total_ms = downstream_delay_ms.saturating_add((base_target * 2.5) as u16);
             let target_buf = group_sync.aligned_target_subframes(
                 base_target,
                 telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                downstream_delay_ms,
+                my_total_ms,
             );
 
             // Demand-driven by the Hardware Audio DAC:

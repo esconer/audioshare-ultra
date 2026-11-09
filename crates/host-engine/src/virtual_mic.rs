@@ -17,6 +17,14 @@ use crate::{configure_realtime_udp_socket, promote_thread_realtime};
 
 pub const PHONE_MIC_PORT: u16 = 65532;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhoneRxRoutingMode {
+    /// Routes phone mic into a dedicated Virtual Microphone for Zoom / Discord / Google Meet calls (no self-echo!)
+    VirtualMicForCalls = 0,
+    /// Plays incoming phone audio directly on PC Speakers / Headphones (Phone-to-PC media streaming!)
+    PlayOnPcSpeakers = 1,
+}
+
 /// Feeds the received phone-mic PCM into a PulseAudio/PipeWire null sink with
 /// `pacat`, while `module-remap-source` exposes that sink's monitor as the
 /// `AudioShare_Phone_Mic` recording device.
@@ -117,6 +125,11 @@ pub struct PhoneMicReceiver {
 
 impl PhoneMicReceiver {
     pub fn start(port: u16) -> Result<Self, String> {
+        Self::start_with_mode(port, PhoneRxRoutingMode::VirtualMicForCalls)
+    }
+
+    pub fn start_with_mode(port: u16, mode: PhoneRxRoutingMode) -> Result<Self, String> {
+        let _ = mode;
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
         configure_realtime_udp_socket(&socket)
@@ -124,47 +137,53 @@ impl PhoneMicReceiver {
         let _ = socket.set_nonblocking(true);
 
         #[cfg(target_os = "linux")]
-        let pactl_mic_module_id = {
-            // Create the sink that pacat feeds.
-            Command::new("pactl")
-                .args([
-                    "load-module",
-                    "module-null-sink",
-                    "sink_name=AudioShare_Phone_Mic_Sink",
-                    "sink_properties=device.description=AudioShare_Phone_Microphone",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-        };
+        let (pactl_mic_module_id, pactl_mic_source_module_id) =
+            if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                // 1. Create underlying null sink to receive the phone's audio stream silently
+                let sink_id = Command::new("pactl")
+                    .args([
+                        "load-module",
+                        "module-null-sink",
+                        "sink_name=AudioShare_Phone_Mic_Sink",
+                        "sink_properties=device.description=AudioShare_Phone_Sink",
+                    ])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    });
 
-        #[cfg(target_os = "linux")]
-        let pactl_mic_source_module_id = {
-            // Expose the sink's monitor as a normal recording device.
-            Command::new("pactl")
-                .args([
-                    "load-module",
-                    "module-remap-source",
-                    "master=AudioShare_Phone_Mic_Sink.monitor",
-                    "source_name=AudioShare_Phone_Mic",
-                    "source_properties=device.description=AudioShare_Phone_Microphone",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    } else {
-                        None
-                    }
-                })
-        };
+                // 2. Create a true non-monitor Virtual Microphone (`module-remap-source`)
+                //    so Zoom, Discord, Google Meet, Teams & Chrome show it as a real Microphone Input!
+                let remap_id = Command::new("pactl")
+                    .args([
+                        "load-module",
+                        "module-remap-source",
+                        "master=AudioShare_Phone_Mic_Sink.monitor",
+                        "source_name=AudioShare_Phone_Mic",
+                        "source_properties=device.description=AudioShare_Phone_Microphone",
+                    ])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                let _ = Command::new("pactl")
+                    .args(["set-default-source", "AudioShare_Phone_Mic"])
+                    .output();
+                (sink_id, remap_id)
+            } else {
+                (None, None)
+            };
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_packets_received = Arc::new(AtomicU64::new(0));
@@ -174,8 +193,11 @@ impl PhoneMicReceiver {
         let mic_fifo = Arc::new(BurstDecouplerRing::new());
 
         #[cfg(target_os = "linux")]
-        let linux_output =
-            LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo), Arc::clone(&running));
+        let linux_output = if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+            LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo), Arc::clone(&running))
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
         let linux_output_active = linux_output.is_some();
 
@@ -200,24 +222,33 @@ impl PhoneMicReceiver {
                 let _mic_out = {
                     #[cfg(target_os = "linux")]
                     {
-                        std::env::set_var("PULSE_SINK", "AudioShare_Phone_Mic_Sink");
-                        if linux_output_active {
-                            None
+                        if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                            std::env::set_var("PULSE_SINK", "AudioShare_Phone_Mic_Sink");
+                            if linux_output_active {
+                                None
+                            } else {
+                                crate::ClientPreviewSink::spawn_preferred(
+                                    Arc::clone(&mic_fifo_thread),
+                                    Some("AudioShare_Phone_Mic_Sink"),
+                                )
+                                .ok()
+                            }
                         } else {
-                            crate::ClientPreviewSink::spawn_preferred(
-                                Arc::clone(&mic_fifo_thread),
-                                Some("AudioShare_Phone_Mic_Sink"),
-                            )
-                            .ok()
+                            std::env::remove_var("PULSE_SINK");
+                            crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
                         }
                     }
                     #[cfg(target_os = "windows")]
                     {
-                        crate::ClientPreviewSink::spawn_preferred(
-                            Arc::clone(&mic_fifo_thread),
-                            Some("CABLE Input"),
-                        )
-                        .ok()
+                        if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                            crate::ClientPreviewSink::spawn_preferred(
+                                Arc::clone(&mic_fifo_thread),
+                                Some("CABLE Input"),
+                            )
+                            .ok()
+                        } else {
+                            crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
+                        }
                     }
                     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                     {

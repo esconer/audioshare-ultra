@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -6,14 +7,16 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "android")]
 use audioshare_client_engine::android_aaudio::AAudioInputGuard;
 use audioshare_client_engine::{ClientConfig, ClientEngine};
-use audioshare_host_engine::discovery_and_os::DiscoveryScanner;
+use audioshare_host_engine::discovery_and_os::{DiscoveryBeacon, DiscoveryScanner};
 use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
 use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::wire::{pack_datagram, CodecMode, WireHeader};
+use audioshare_protocol::wire::{
+    pack_datagram, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
+};
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 
 static GLOBAL_ANDROID_CLIENT: Mutex<Option<ClientEngine>> = Mutex::new(None);
@@ -27,6 +30,7 @@ pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
 pub struct PhoneMicTransmitter {
     running: Arc<AtomicBool>,
     pub mic_input_ring: Arc<BurstDecouplerRing>,
+    _party_beacon: Option<DiscoveryBeacon>,
     #[cfg(target_os = "android")]
     _mic_input_stream: Option<AAudioInputGuard>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -85,7 +89,13 @@ impl PhoneMicTransmitter {
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
-        let _ = use_hardware_mic;
+
+        // When casting internal phone audio (Party Mode), broadcast DiscoveryBeacon so other phones discover this phone in 1 tap!
+        let _party_beacon = if !use_hardware_mic {
+            Some(DiscoveryBeacon::start(65530, "Android-Party-Host".into()))
+        } else {
+            None
+        };
 
         #[cfg(target_os = "android")]
         let _mic_input_stream = if use_hardware_mic {
@@ -104,66 +114,92 @@ impl PhoneMicTransmitter {
                 let start = Instant::now();
                 let mut seq: u16 = 0;
                 let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
-                let mut has_fec = false;
+                let mut fec_n2 = [0u8; ADPCM_FEC_BYTES];
+                let mut has_fec_n1 = false;
+                let mut has_fec_n2 = false;
                 let mut dither_rng = 1u32;
                 let mut ctrl_buf = [0u8; 64];
+                let mut peer_delays: HashMap<SocketAddr, u16> = HashMap::new();
+                let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
 
                 while run_clone.load(Ordering::Relaxed) {
+                    // Accept incoming HELLO & ClientFeedbackPacket from peer phones for Multi-Phone Group Sync!
                     while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
-                        if len >= 8
-                            && (&ctrl_buf[..8] == b"ASULTRA1" || &ctrl_buf[..8] == b"ASULCTRL")
-                        {
+                        if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
                             if !targets.contains(&src_addr) {
                                 targets.push(src_addr);
+                            }
+                        } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
+                            if !targets.contains(&src_addr) {
+                                targets.push(src_addr);
+                            }
+                            if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                                peer_delays.insert(src_addr, fb.bluetooth_delay_ms);
                             }
                         }
                     }
 
-                    if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES {
-                        let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                        ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
+                    if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES * subframes_per_pkt
+                    {
+                        let base_seq = seq;
+                        let prev_n1 = fec_n1;
+                        let prev_n2 = fec_n2;
+                        let send_n1 = has_fec_n1;
+                        let send_n2 = has_fec_n2;
+                        let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
+                        let mut cursor = 0usize;
 
-                        let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
-                        for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
-                            *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                        for _ in 0..subframes_per_pkt {
+                            let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                            ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
+
+                            let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
+                            for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
+                                *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                            }
+
+                            let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                            let enc_len = encode_lossless_subframe(&i16_buf, &mut enc);
+                            let len_be = (enc_len as u16).to_be_bytes();
+                            primary_bundle[cursor] = len_be[0];
+                            primary_bundle[cursor + 1] = len_be[1];
+                            cursor += 2;
+                            primary_bundle[cursor..cursor + enc_len]
+                                .copy_from_slice(&enc[..enc_len]);
+                            cursor += enc_len;
+
+                            fec_n2 = fec_n1;
+                            has_fec_n2 = has_fec_n1;
+                            encode_fec_subframe(&i16_buf, &mut fec_n1);
+                            has_fec_n1 = true;
+                            seq = seq.wrapping_add(1);
                         }
 
-                        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                        let enc_len = encode_lossless_subframe(&i16_buf, &mut enc);
-
-                        let mut primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES + 2];
-                        let len_be = (enc_len as u16).to_be_bytes();
-                        primary[0] = len_be[0];
-                        primary[1] = len_be[1];
-                        primary[2..2 + enc_len].copy_from_slice(&enc[..enc_len]);
-
+                        let max_peer_delay_ms = peer_delays.values().copied().max().unwrap_or(0);
                         let hdr = WireHeader {
                             mode: CodecMode::StudioLosslessLpc,
-                            subframe_count: 1,
+                            subframe_count: subframes_per_pkt as u8,
                             encrypted: false,
-                            sequence: seq,
+                            sequence: base_seq,
                             tx_timestamp_us: start.elapsed().as_micros() as u32,
                             primary_len: 0,
                             fec_n1_len: 0,
                             fec_n2_len: 0,
                             host_volume: 100,
-                            stream_id: 2,
+                            stream_id: (max_peer_delay_ms / 2).min(255) as u8,
                             header_crc16: 0,
                         };
 
                         let mut dgram = [0u8; MAX_SAFE_UDP_PAYLOAD];
-                        let f1 = if has_fec { &fec_n1[..] } else { &[] };
+                        let f1 = if send_n1 { &prev_n1[..] } else { &[] };
+                        let f2 = if send_n2 { &prev_n2[..] } else { &[] };
                         if let Ok(pkt_len) =
-                            pack_datagram(hdr, &primary[..2 + enc_len], f1, &[], &mut dgram)
+                            pack_datagram(hdr, &primary_bundle[..cursor], f1, f2, &mut dgram)
                         {
                             for target in &targets {
                                 let _ = socket.send_to(&dgram[..pkt_len], *target);
                             }
                         }
-
-                        encode_fec_subframe(&i16_buf, &mut fec_n1);
-                        has_fec = true;
-                        seq = seq.wrapping_add(1);
                     } else {
                         std::thread::sleep(Duration::from_micros(800));
                     }
@@ -174,6 +210,7 @@ impl PhoneMicTransmitter {
         Ok(Self {
             running,
             mic_input_ring,
+            _party_beacon,
             #[cfg(target_os = "android")]
             _mic_input_stream,
             handle: Some(handle),
@@ -182,6 +219,7 @@ impl PhoneMicTransmitter {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        drop(self._party_beacon.take());
         #[cfg(target_os = "android")]
         if let Some(stream) = self._mic_input_stream.take() {
             drop(stream);

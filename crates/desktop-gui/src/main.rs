@@ -15,7 +15,7 @@ use audioshare_host_engine::discovery_and_os::{
     open_os_firewall_ports, set_os_boot_autostart, AdbUsbWatcher, DirectHotspotController,
     DiscoveryBeacon, DiscoveryScanner, VirtualSpeakerAndRadioGuard,
 };
-use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PHONE_MIC_PORT};
+use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PhoneRxRoutingMode, PHONE_MIC_PORT};
 use audioshare_host_engine::{
     list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo, DEFAULT_PORT,
 };
@@ -98,6 +98,7 @@ struct AudioShareApp {
     selected_app_idx: Option<usize>,
     app_route_status: String,
     phone_mic_receiver: Option<PhoneMicReceiver>,
+    phone_rx_mode: PhoneRxRoutingMode,
 
     // Client & Studio DSP State
     scanner: DiscoveryScanner,
@@ -157,6 +158,7 @@ impl AudioShareApp {
             selected_app_idx: None,
             app_route_status: "Capturing Full System Audio".into(),
             phone_mic_receiver: None,
+            phone_rx_mode: PhoneRxRoutingMode::VirtualMicForCalls,
             scanner: DiscoveryScanner::start(),
             client_engine: None,
             manual_server_ip: format!("127.0.0.1:{}", DEFAULT_PORT),
@@ -226,7 +228,8 @@ impl AudioShareApp {
              channel_role={}\n\
              binaural_crossfeed={}\n\
              night_mode_drc={}\n\
-             gaming_hard_lock={}\n",
+             gaming_hard_lock={}\n\
+             phone_rx_mode={}\n",
             self.dark_mode,
             self.minimize_on_close,
             self.autostart_stream_on_launch,
@@ -251,6 +254,7 @@ impl AudioShareApp {
             self.binaural_crossfeed,
             self.night_mode_drc,
             self.gaming_hard_lock,
+            self.phone_rx_mode as u8,
         );
         let _ = std::fs::write(Self::config_file_path(), content);
     }
@@ -323,6 +327,13 @@ impl AudioShareApp {
                     "binaural_crossfeed" => self.binaural_crossfeed = v.trim() == "true",
                     "night_mode_drc" => self.night_mode_drc = v.trim() == "true",
                     "gaming_hard_lock" => self.gaming_hard_lock = v.trim() == "true",
+                    "phone_rx_mode" => {
+                        if v.trim() == "1" || v.trim().eq_ignore_ascii_case("speakers") {
+                            self.phone_rx_mode = PhoneRxRoutingMode::PlayOnPcSpeakers;
+                        } else {
+                            self.phone_rx_mode = PhoneRxRoutingMode::VirtualMicForCalls;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1005,17 +1016,31 @@ impl AudioShareApp {
             ui.monospace(&self.app_route_status);
 
             ui.separator();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("📲 Phone -> PC Mode:");
+                ui.selectable_value(
+                    &mut self.phone_rx_mode,
+                    PhoneRxRoutingMode::VirtualMicForCalls,
+                    "🎙️ Virtual Mic (Zoom / Discord / Meet)",
+                );
+                ui.selectable_value(
+                    &mut self.phone_rx_mode,
+                    PhoneRxRoutingMode::PlayOnPcSpeakers,
+                    "🔊 Play Phone Audio on PC Speakers",
+                );
+
                 let mic_active = self.phone_mic_receiver.is_some();
                 let btn_label = if mic_active {
-                    "🎙️ Stop Phone-to-PC Audio/Mic Receiver"
+                    "⏹ Stop Phone Receiver"
                 } else {
-                    "🎙️ Enable Phone-to-PC Audio/Mic Receiver (Port 65532)"
+                    "▶ Start Phone Receiver (Port 65532)"
                 };
                 if ui.button(btn_label).clicked() {
                     if let Some(mut m) = self.phone_mic_receiver.take() {
                         m.stop();
-                    } else if let Ok(rx) = PhoneMicReceiver::start(PHONE_MIC_PORT) {
+                    } else if let Ok(rx) =
+                        PhoneMicReceiver::start_with_mode(PHONE_MIC_PORT, self.phone_rx_mode)
+                    {
                         self.phone_mic_receiver = Some(rx);
                     }
                 }
@@ -1328,6 +1353,7 @@ channel_role=1
 binaural_crossfeed=true
 night_mode_drc=true
 gaming_hard_lock=true
+phone_rx_mode=1
 ";
         app.parse_config_string(config_sample);
         assert!(!app.dark_mode);
@@ -1353,5 +1379,6 @@ gaming_hard_lock=true
         assert!(app.binaural_crossfeed);
         assert!(app.night_mode_drc);
         assert!(app.gaming_hard_lock);
+        assert_eq!(app.phone_rx_mode, PhoneRxRoutingMode::PlayOnPcSpeakers);
     }
 }
