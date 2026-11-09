@@ -506,8 +506,8 @@ impl HostEngine {
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=1",
-                            "--process-time-msec=1",
+                            "--latency-msec=3",
+                            "--process-time-msec=2",
                             &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())
@@ -657,7 +657,9 @@ impl HostEngine {
                 channels: 2,
             };
             let attr = PaBufferAttr {
-                maxlength: (SUBFRAME_STEREO_SAMPLES * 4 * 2) as u32, // 5.0ms max buffer
+                // CRITICAL: Must be >= 64KB so PipeWire/PulseAudio 10-20ms app quantums
+                // never overflow the server ringbuffer while we drain 960B (2.5ms) fragments!
+                maxlength: 65_536,
                 tlength: u32::MAX,
                 prebuf: u32::MAX,
                 minreq: u32::MAX,

@@ -14,7 +14,8 @@ use audioshare_protocol::sequencer::{
     ZeroJitterSequencer, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
 };
 use audioshare_protocol::wire::{
-    ClientFeedbackPacket, CodecMode, ParsedPacket, CONTROL_FEEDBACK_LEN,
+    ClientFeedbackPacket, CodecMode, ParsedPacket, WireError, CONTROL_FEEDBACK_LEN,
+    CONTROL_FEEDBACK_MAGIC,
 };
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_STEREO_SAMPLES};
 
@@ -352,11 +353,6 @@ impl ClientEngine {
                 fb.encode(&mut fb_bytes);
 
                 let _ = socket.send_to(&fb_bytes, config.server_addr);
-                if !config.server_addr.ip().is_loopback() {
-                    let usb_adb_addr =
-                        SocketAddr::from(([127, 0, 0, 1], config.server_addr.port()));
-                    let _ = socket.send_to(&fb_bytes, usb_adb_addr);
-                }
 
                 last_feedback = Instant::now();
             }
@@ -369,6 +365,14 @@ impl ClientEngine {
                     let _ = socket.set_nonblocking(true);
                 }
                 packets_drained = packets_drained.saturating_add(1);
+
+                // Ignore control packets (ASULTRA1 / ASULCTRL) if received on shared port 65530
+                if len >= 8
+                    && (&recv_buf[..8] == CONTROL_MAGIC_HELLO
+                        || &recv_buf[..8] == CONTROL_FEEDBACK_MAGIC)
+                {
+                    continue;
+                }
                 match ParsedPacket::parse_and_decrypt(&mut recv_buf[..len], active_key.as_ref()) {
                     Ok(parsed) => {
                         last_packet_instant = Instant::now();
@@ -519,9 +523,10 @@ impl ClientEngine {
                             prebuffer_ready = true;
                         }
                     }
-                    Err(_) => {
+                    Err(WireError::AuthenticationFailed) => {
                         telemetry.auth_failures.fetch_add(1, Ordering::Relaxed);
                     }
+                    Err(_) => {}
                 }
                 if packets_drained >= 16 {
                     break;
