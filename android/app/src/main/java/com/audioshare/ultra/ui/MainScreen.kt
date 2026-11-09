@@ -9,6 +9,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
@@ -55,7 +56,8 @@ fun MainScreen() {
     var sharePhoneMic by remember { mutableStateOf(false) }
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
-    var telemetry by remember { mutableStateOf(LongArray(6)) }
+    var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
+    var telemetry by remember { mutableStateOf(LongArray(7)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -85,6 +87,19 @@ fun MainScreen() {
         }
     }
 
+    // Sleep Timer Countdown Coroutine (Auto-stops stream after 15/30/60 minutes)
+    LaunchedEffect(sleepTimerMinutes, isConnected) {
+        if (sleepTimerMinutes > 0 && isConnected) {
+            delay(sleepTimerMinutes * 60_000L)
+            val stopIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_STOP"
+            }
+            context.startService(stopIntent)
+            isConnected = false
+            sleepTimerMinutes = 0
+        }
+    }
+
     // 1-Tap auto-discovery: the native UDP beacon scanner runs in the Rust JNI layer
     var discoveredHosts by remember { mutableStateOf<List<String>>(emptyList()) }
     LaunchedEffect(Unit) {
@@ -101,6 +116,17 @@ fun MainScreen() {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         while (isConnected) {
             telemetry = AudioEngineService.nativeGetTelemetry()
+
+            // Auto-disconnect if PC host has been silent/unreachable for 5 minutes (300 seconds)
+            val silenceSec = telemetry.getOrElse(6) { 0L }
+            if (silenceSec >= 300L) {
+                val stopIntent = Intent(context, AudioEngineService::class.java).apply {
+                    action = "ACTION_STOP"
+                }
+                context.startService(stopIntent)
+                isConnected = false
+                break
+            }
 
             val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
             val hasBt = devices.any {
@@ -220,6 +246,21 @@ fun MainScreen() {
                         ) {
                             Text("USB ADB")
                         }
+
+                        // In-App 1-Tap QR Camera Launcher
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    val qrIntent = Intent("com.google.zxing.client.android.SCAN")
+                                    context.startActivity(qrIntent)
+                                } catch (_: Exception) {
+                                    val camIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+                                    context.startActivity(camIntent)
+                                }
+                            }
+                        ) {
+                            Text("📷 QR")
+                        }
                     }
                 }
             }
@@ -316,6 +357,22 @@ fun MainScreen() {
                         OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(12) }) { Text("⏮ Prev") }
                         OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(10) }) { Text("⏯ Play/Pause PC") }
                         OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(11) }) { Text("⏭ Next") }
+                    }
+
+                    // Sleep Timer Selector (Off / 15m / 30m / 60m)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("⏲️ Sleep Timer:", style = MaterialTheme.typography.labelMedium)
+                        listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
+                            FilterChip(
+                                selected = sleepTimerMinutes == mins,
+                                onClick = { sleepTimerMinutes = mins },
+                                label = { Text(lbl) }
+                            )
+                        }
                     }
                 }
             }
@@ -456,6 +513,7 @@ fun MainScreen() {
                     Text("WSOLA PLC Frames  : ${telemetry[3]}", fontFamily = FontFamily.Monospace)
                     Text("Clock Drift Lock  : ${telemetry[4]} ppm", fontFamily = FontFamily.Monospace)
                     Text("AAudio HW Latency : ${telemetry[5]} ms", fontFamily = FontFamily.Monospace)
+                    Text("Host Silence      : ${telemetry.getOrElse(6) { 0L }} s", fontFamily = FontFamily.Monospace)
                     if (btEarbudsDetected) {
                         Text(
                             "🎧 Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",

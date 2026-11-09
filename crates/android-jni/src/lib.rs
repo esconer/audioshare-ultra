@@ -51,12 +51,33 @@ pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
 
 impl PhoneMicTransmitter {
     pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
-        let targets = parse_target_endpoints(target_hosts);
+        let mut targets = parse_target_endpoints(target_hosts);
+        if !use_hardware_mic {
+            // When casting internal phone system audio (Party Mode), also stream to port 65530 for other phones
+            for item in target_hosts.split([',', ';', ' ']) {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let host_only = item.split(':').next().unwrap_or(item);
+                if let Ok(phone_peer_addr) = format!("{}:65530", host_only).parse::<SocketAddr>() {
+                    if !targets.contains(&phone_peer_addr) {
+                        targets.push(phone_peer_addr);
+                    }
+                }
+            }
+            // Include LAN/Hotspot broadcast on port 65530 so multiple phones can tune in simultaneously!
+            let bcast = SocketAddr::from(([255, 255, 255, 255], 65530));
+            if !targets.contains(&bcast) {
+                targets.push(bcast);
+            }
+        }
         if targets.is_empty() {
             return Err("No valid target endpoints found for transmitter".into());
         }
 
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        let _ = socket.set_broadcast(true);
         configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
 
         let running = Arc::new(AtomicBool::new(true));
@@ -414,7 +435,7 @@ pub mod android_native {
         env: JNIEnv,
         _class: JClass,
     ) -> jlongArray {
-        let mut stats = [0i64; 6];
+        let mut stats = [0i64; 7];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
@@ -422,8 +443,12 @@ pub mod android_native {
             stats[3] = c.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed) as i64;
             stats[4] = c.telemetry.clock_drift_ppm.load(Ordering::Relaxed) as i64;
             stats[5] = c.telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed) as i64;
+            stats[6] = c
+                .telemetry
+                .seconds_since_last_packet
+                .load(Ordering::Relaxed) as i64;
         }
-        let arr = env.new_long_array(6).unwrap();
+        let arr = env.new_long_array(7).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
     }

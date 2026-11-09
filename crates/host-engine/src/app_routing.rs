@@ -144,6 +144,17 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
 
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(target_os = "windows")]
+        {
+            // Boost priority & isolate target media process on Windows
+            let script = format!(
+                "$p = Get-Process -Id {} -ErrorAction SilentlyContinue; if ($p) {{ $p.PriorityClass = 'AboveNormal' }}",
+                app.pid
+            );
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-Command", &script])
+                .output();
+        }
         Ok(format!(
             "Target Process Loopback locked to '{}' (PID {})",
             app.name, app.pid

@@ -103,7 +103,7 @@ struct AudioShareApp {
 
 impl AudioShareApp {
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             tab: AppTab::HostSender,
             interfaces: list_valid_host_interfaces(),
             show_qr_modal: false,
@@ -146,6 +146,136 @@ impl AudioShareApp {
             usb_buffer_mode: false,
             drift_history: VecDeque::from(vec![0.0; 120]),
             client_status_msg: "Idle. Select a discovered host or enter IP.".into(),
+        };
+        app.load_persistent_config();
+        app
+    }
+
+    fn config_file_path() -> std::path::PathBuf {
+        if let Ok(cfg_dir) = std::env::var("XDG_CONFIG_HOME") {
+            let p = std::path::PathBuf::from(cfg_dir);
+            if p.is_dir() {
+                return p.join("audioshare-ultra.conf");
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let config_dir = std::path::Path::new(&home).join(".config");
+            if config_dir.is_dir() {
+                return config_dir.join("audioshare-ultra.conf");
+            }
+            return std::path::Path::new(&home).join(".audioshare-ultra.conf");
+        }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return std::path::Path::new(&appdata).join("audioshare-ultra.conf");
+        }
+        std::path::PathBuf::from(".audioshare-ultra.conf")
+    }
+
+    fn save_persistent_config(&self) {
+        let content = format!(
+            "quality_profile={}\n\
+             target_bitrate_kbps={}\n\
+             usb_low_latency_pacing={}\n\
+             enable_smart_dtx={}\n\
+             enable_virtual_speaker={}\n\
+             auto_bt_video_lipsync={}\n\
+             host_master_volume={}\n\
+             enable_pin_encryption={}\n\
+             pairing_pin={}\n\
+             manual_server_ip={}\n\
+             preamp_gain_db={}\n\
+             eq_bass_db={}\n\
+             eq_presence_db={}\n\
+             eq_treble_db={}\n\
+             channel_role={}\n\
+             binaural_crossfeed={}\n\
+             night_mode_drc={}\n\
+             gaming_hard_lock={}\n",
+            self.quality_profile as u8,
+            self.target_bitrate_kbps,
+            self.usb_low_latency_pacing,
+            self.enable_smart_dtx,
+            self.enable_virtual_speaker,
+            self.auto_bt_video_lipsync,
+            self.host_master_volume,
+            self.enable_pin_encryption,
+            self.pairing_pin,
+            self.manual_server_ip,
+            self.preamp_gain_db,
+            self.eq_bass_db,
+            self.eq_presence_db,
+            self.eq_treble_db,
+            self.channel_role as u8,
+            self.binaural_crossfeed,
+            self.night_mode_drc,
+            self.gaming_hard_lock,
+        );
+        let _ = std::fs::write(Self::config_file_path(), content);
+    }
+
+    fn load_persistent_config(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(Self::config_file_path()) {
+            self.parse_config_string(&text);
+        }
+    }
+
+    fn parse_config_string(&mut self, text: &str) {
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "quality_profile" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            self.quality_profile = QualityProfile::from_u8(n);
+                        }
+                    }
+                    "target_bitrate_kbps" => {
+                        if let Ok(n) = v.trim().parse::<u16>() {
+                            self.target_bitrate_kbps = n;
+                        }
+                    }
+                    "usb_low_latency_pacing" => self.usb_low_latency_pacing = v.trim() == "true",
+                    "enable_smart_dtx" => self.enable_smart_dtx = v.trim() == "true",
+                    "enable_virtual_speaker" => self.enable_virtual_speaker = v.trim() == "true",
+                    "auto_bt_video_lipsync" => self.auto_bt_video_lipsync = v.trim() == "true",
+                    "host_master_volume" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            self.host_master_volume = n.min(100);
+                        }
+                    }
+                    "enable_pin_encryption" => self.enable_pin_encryption = v.trim() == "true",
+                    "pairing_pin" => self.pairing_pin = v.trim().to_string(),
+                    "manual_server_ip" => self.manual_server_ip = v.trim().to_string(),
+                    "preamp_gain_db" => {
+                        if let Ok(f) = v.trim().parse::<f32>() {
+                            self.preamp_gain_db = f.clamp(-12.0, 24.0);
+                        }
+                    }
+                    "eq_bass_db" => {
+                        if let Ok(f) = v.trim().parse::<f32>() {
+                            self.eq_bass_db = f.clamp(-12.0, 12.0);
+                        }
+                    }
+                    "eq_presence_db" => {
+                        if let Ok(f) = v.trim().parse::<f32>() {
+                            self.eq_presence_db = f.clamp(-12.0, 12.0);
+                        }
+                    }
+                    "eq_treble_db" => {
+                        if let Ok(f) = v.trim().parse::<f32>() {
+                            self.eq_treble_db = f.clamp(-12.0, 12.0);
+                        }
+                    }
+                    "channel_role" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            self.channel_role = ChannelRole::from_u8(n);
+                        }
+                    }
+                    "binaural_crossfeed" => self.binaural_crossfeed = v.trim() == "true",
+                    "night_mode_drc" => self.night_mode_drc = v.trim() == "true",
+                    "gaming_hard_lock" => self.gaming_hard_lock = v.trim() == "true",
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -380,6 +510,7 @@ impl eframe::App for AudioShareApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_persistent_config();
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
         }
@@ -991,5 +1122,53 @@ impl AudioShareApp {
                 ui.label("Connect to a Host to view real-time jitter & clock recovery telemetry.");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_desktop_config_string_parser() {
+        let mut app = AudioShareApp::new();
+        let config_sample = "\
+quality_profile=4
+target_bitrate_kbps=320
+usb_low_latency_pacing=true
+enable_smart_dtx=false
+enable_virtual_speaker=true
+auto_bt_video_lipsync=true
+host_master_volume=75
+enable_pin_encryption=true
+pairing_pin=9999
+manual_server_ip=192.168.1.50:65530
+preamp_gain_db=6.5
+eq_bass_db=3.0
+eq_presence_db=-2.0
+eq_treble_db=4.5
+channel_role=1
+binaural_crossfeed=true
+night_mode_drc=true
+gaming_hard_lock=true
+";
+        app.parse_config_string(config_sample);
+        assert_eq!(app.quality_profile, QualityProfile::StudioLossless24Bit);
+        assert_eq!(app.target_bitrate_kbps, 320);
+        assert!(app.usb_low_latency_pacing);
+        assert!(!app.enable_smart_dtx);
+        assert!(app.enable_virtual_speaker);
+        assert_eq!(app.host_master_volume, 75);
+        assert!(app.enable_pin_encryption);
+        assert_eq!(app.pairing_pin, "9999");
+        assert_eq!(app.manual_server_ip, "192.168.1.50:65530");
+        assert!((app.preamp_gain_db - 6.5).abs() < 1e-4);
+        assert!((app.eq_bass_db - 3.0).abs() < 1e-4);
+        assert!((app.eq_presence_db - (-2.0)).abs() < 1e-4);
+        assert!((app.eq_treble_db - 4.5).abs() < 1e-4);
+        assert_eq!(app.channel_role, ChannelRole::LeftMono);
+        assert!(app.binaural_crossfeed);
+        assert!(app.night_mode_drc);
+        assert!(app.gaming_hard_lock);
     }
 }

@@ -53,6 +53,7 @@ pub struct ClientTelemetry {
     pub pending_media_command: AtomicU8,
     pub host_volume: AtomicU8,
     pub max_group_delay_ms: AtomicU16,
+    pub seconds_since_last_packet: AtomicU16,
     pub server_dtx_silent: AtomicBool,
 }
 
@@ -90,6 +91,7 @@ impl ClientEngine {
             pending_media_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
             max_group_delay_ms: AtomicU16::new(0),
+            seconds_since_last_packet: AtomicU16::new(0),
             server_dtx_silent: AtomicBool::new(false),
         });
 
@@ -228,6 +230,7 @@ impl ClientEngine {
         let mut latest_rx_seq: u16 = 0;
 
         let mut last_feedback = Instant::now();
+        let mut last_packet_instant = Instant::now();
         #[cfg(target_os = "android")]
         let mut last_hw_latency_poll = Instant::now();
         let mut window_primary = 0u32;
@@ -274,6 +277,11 @@ impl ClientEngine {
             if last_feedback.elapsed() >= Duration::from_millis(500)
                 || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
             {
+                telemetry.seconds_since_last_packet.store(
+                    last_packet_instant.elapsed().as_secs().min(65535) as u16,
+                    Ordering::Relaxed,
+                );
+
                 let total_win = (window_primary + window_fec).max(1);
                 let fec_permille = ((window_fec * 1000) / total_win) as u16;
                 window_primary = 0;
@@ -333,6 +341,7 @@ impl ClientEngine {
                 let _ = socket.set_nonblocking(true);
                 match ParsedPacket::parse_and_decrypt(&mut recv_buf[..len], active_key.as_ref()) {
                     Ok(parsed) => {
+                        last_packet_instant = Instant::now();
                         telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
                         telemetry
                             .host_volume
