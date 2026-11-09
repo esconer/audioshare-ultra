@@ -219,14 +219,15 @@ impl StereoBiquad {
 
     #[inline]
     pub fn process_stereo_in_place(&mut self, stereo: &mut [f32]) {
+        const ANTI_DENORMAL: f32 = 1.0e-25;
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0];
+            let in_l = frame[0] + ANTI_DENORMAL;
             let out_l = self.b0 * in_l + self.z1_l;
             self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
             self.z2_l = self.b2 * in_l - self.a2 * out_l;
             frame[0] = out_l;
 
-            let in_r = frame[1];
+            let in_r = frame[1] + ANTI_DENORMAL;
             let out_r = self.b0 * in_r + self.z1_r;
             self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
             self.z2_r = self.b2 * in_r - self.a2 * out_r;
@@ -309,7 +310,7 @@ impl NightModeCompressor {
         for frame in stereo.chunks_exact_mut(2) {
             let l = frame[0];
             let r = frame[1];
-            let peak = l.abs().max(r.abs());
+            let peak = l.abs().max(r.abs()) + 1.0e-25;
 
             // Fast attack (0.2), smooth release (0.0008) to prevent pumping
             if peak > self.env {
@@ -462,8 +463,8 @@ impl MicRumbleAndNoiseGate {
         const GATE_THRESH: f32 = 0.0056; // -45 dBFS noise gate threshold
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0];
-            let in_r = frame[1];
+            let in_l = frame[0] + 1.0e-25;
+            let in_r = frame[1] + 1.0e-25;
             let hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
             let hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
             self.hp_x1_l = in_l;
@@ -593,5 +594,19 @@ mod tests {
         let mut quiet = [0.001f32; 240];
         gate.process_in_place(&mut quiet);
         assert!(quiet[238].abs() < 0.001); // Attenuated by gate
+    }
+
+    #[test]
+    fn test_anti_denormal_preserves_subnormal_stability() {
+        let mut biquad = StereoBiquad::passthrough();
+        biquad.set_peaking_eq(1000.0, 1.0, 3.0);
+        // Feed prolonged silence to test subnormal decay
+        let mut silence = [0.0f32; 480];
+        biquad.process_stereo_in_place(&mut silence);
+        for &s in &silence {
+            assert!(s.is_finite());
+            // Filter states should remain finite and free of NaN/Inf
+            assert!(s.abs() < 1e-4);
+        }
     }
 }

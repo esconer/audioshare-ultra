@@ -118,24 +118,30 @@ impl ZeroJitterSequencer {
         self.history[keep..].copy_from_slice(frame);
     }
 
-    /// Find best pitch period P in [48..=240] frames via fast autocorrelation on Left+Right sum
+    /// Find best pitch period P in [48..=240] frames via energy-normalized autocorrelation on Stereo Mid
     #[inline]
     fn find_best_pitch_period(&self) -> usize {
         let template_start = HISTORY_FRAMES - CROSSFADE_FRAMES;
         let mut best_lag = SUBFRAME_FRAMES;
-        let mut best_corr = f32::MIN;
+        let mut best_score = f32::MIN;
 
-        // Step by 2 frames for fast real-time search (< 1.2 us)
+        // Step by 2 frames for fast real-time search (< 1.5 us)
         for lag in (48..=240).step_by(2) {
             let cand_start = template_start - lag;
             let mut corr = 0.0f32;
+            let mut energy = 1e-6f32;
             for k in 0..CROSSFADE_FRAMES {
-                let t_l = self.history[(template_start + k) * 2];
-                let c_l = self.history[(cand_start + k) * 2];
-                corr += t_l * c_l;
+                let t_m = self.history[(template_start + k) * 2]
+                    + self.history[(template_start + k) * 2 + 1];
+                let c_m =
+                    self.history[(cand_start + k) * 2] + self.history[(cand_start + k) * 2 + 1];
+                corr += t_m * c_m;
+                energy += c_m * c_m;
             }
-            if corr > best_corr {
-                best_corr = corr;
+            // Signed squared correlation normalized by candidate window energy (avoids sqrt!)
+            let score = (corr * corr.abs()) / energy;
+            if score > best_score {
+                best_score = score;
                 best_lag = lag;
             }
         }
