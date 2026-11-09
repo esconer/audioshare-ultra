@@ -14,6 +14,7 @@ import android.media.session.PlaybackState
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PerformanceHintManager
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 
@@ -72,6 +73,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var perfHintSession: PerformanceHintManager.Session? = null
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private var mediaSession: MediaSession? = null
@@ -201,6 +203,17 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             setReferenceCounted(false)
             if (!isHeld) acquire()
         }
+
+        // Android 12+ ADPF (Dynamic Performance Framework): Request 2.5ms real-time scheduler boost
+        // to prevent ARM CPU cores from entering deep C3 sleep between Wi-Fi packets!
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val hintMgr = getSystemService(PerformanceHintManager::class.java)
+                val tids = intArrayOf(android.os.Process.myTid())
+                perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L) // 2.5ms deadline
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun startForegroundNotification(hostAddr: String, isUsb: Boolean) {
@@ -282,6 +295,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         mediaSession?.isActive = false
         mediaSession?.release()
         mediaSession = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try { perfHintSession?.close() } catch (_: Exception) {}
+            perfHintSession = null
+        }
         wifiLock?.let { if (it.isHeld) it.release() }
         wakeLock?.let { if (it.isHeld) it.release() }
         stopForeground(STOP_FOREGROUND_REMOVE)

@@ -881,6 +881,10 @@ pub mod android_aaudio {
         fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, rate: i32);
         fn AAudioStreamBuilder_setChannelCount(builder: *mut AAudioStreamBuilder, channels: i32);
         fn AAudioStreamBuilder_setFormat(builder: *mut AAudioStreamBuilder, format: i32);
+        fn AAudioStreamBuilder_setBufferCapacityInFrames(
+            builder: *mut AAudioStreamBuilder,
+            num_frames: i32,
+        );
         fn AAudioStreamBuilder_setDataCallback(
             builder: *mut AAudioStreamBuilder,
             callback: AAudioDataCallback,
@@ -1019,6 +1023,8 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+                // Pre-clamp hardware DMA ring capacity to 384 frames (8.0ms) to force ULL MMAP allocation!
+                AAudioStreamBuilder_setBufferCapacityInFrames(builder, 384);
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,

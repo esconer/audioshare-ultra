@@ -8,8 +8,11 @@ import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.MediaStore
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
@@ -34,6 +37,18 @@ fun MainScreen() {
     val context = LocalContext.current
     val prefs = remember {
         context.getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+    }
+    val powerManager = remember {
+        context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    }
+    var isBatteryUnrestricted by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                powerManager.isIgnoringBatteryOptimizations(context.packageName)
+            } else {
+                true
+            }
+        )
     }
 
     var hostAddress by remember {
@@ -207,6 +222,32 @@ fun MainScreen() {
             }
 
             if (selectedTab == 0) {
+                // 0. 1-Tap OEM Battery / Doze Exemption Banner (Prevents screen-off 2.4GHz packet coalescing!)
+                if (!isBatteryUnrestricted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "⚡ Disable Battery Throttling for 0-Jitter Screen-Off Audio",
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            OutlinedButton(onClick = {
+                                try {
+                                    val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                        data = Uri.parse("package:${context.packageName}")
+                                    }
+                                    context.startActivity(i)
+                                    isBatteryUnrestricted = true
+                                } catch (_: Exception) {}
+                            }) { Text("Allow") }
+                        }
+                    }
+                }
+
                 // 1. Host Connection Card
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                     Column(
