@@ -121,7 +121,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val hostAddr = intent?.getStringExtra("HOST_ADDR")
             ?: prefs.getString("last_host_addr", "192.168.42.129:65530")
             ?: "192.168.42.129:65530"
-        val isUsb = hostAddr.startsWith("192.168.42.") || hostAddr.startsWith("127.0.0.1")
+        val isUsb = intent?.getBooleanExtra("IS_USB", false)
+            ?: isUsbHost(hostAddr)
         val gainDb = intent?.getFloatExtra("GAIN_DB", prefs.getFloat("gain_db", 0.0f)) ?: 0.0f
         val pin = intent?.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: ""
         currentGainDb = gainDb
@@ -223,6 +224,31 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L) // 2.5ms deadline
             } catch (_: Exception) {
             }
+        }
+    }
+
+    private fun isUsbHost(hostAddr: String): Boolean {
+        if (hostAddr.startsWith("127.0.0.1") || hostAddr.startsWith("192.168.42.")) {
+            return true
+        }
+        val hostIp = hostAddr.substringBefore(':')
+        return try {
+            val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
+            for (iface in ifaces) {
+                val name = iface.name.lowercase()
+                if ((name.contains("rndis") || name.contains("usb") || name.contains("ncm")) && iface.isUp) {
+                    for (addr in iface.interfaceAddresses) {
+                        val ip = addr.address?.hostAddress ?: continue
+                        val prefix = ip.substringBeforeLast('.')
+                        if (hostIp.startsWith("$prefix.")) {
+                            return true
+                        }
+                    }
+                }
+            }
+            false
+        } catch (_: Exception) {
+            false
         }
     }
 

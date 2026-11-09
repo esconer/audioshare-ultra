@@ -119,30 +119,6 @@ pub fn vbr_encoded_len(bitrate_kbps: u16) -> usize {
 }
 
 #[inline(always)]
-fn ceil_log2_u32(v: u32) -> u8 {
-    if v <= 1 {
-        0
-    } else {
-        (32 - (v - 1).leading_zeros()) as u8
-    }
-}
-
-/// Choose a per-block binary exponent (step = 1 << shift) for the quantizer.
-#[inline(always)]
-fn choose_vbr_shift(peak: i32, max_width: u8) -> u8 {
-    let peak = peak.max(1) as u32;
-    if max_width <= 1 {
-        // One-bit delta modulation tracks a slope of roughly half the peak.
-        ceil_log2_u32(peak).saturating_sub(1).min(17)
-    } else {
-        // Mid-riser codes for `max_width` bits span +/- (2^(w-1) - 0.5) steps.
-        let denominator = (1u32 << max_width) - 1;
-        let needed_step = (2 * peak).div_ceil(denominator);
-        ceil_log2_u32(needed_step.max(1)).min(17)
-    }
-}
-
-#[inline(always)]
 fn write_bits(buf: &mut [u8], bit_pos: &mut usize, value: u32, bits: u8) {
     for i in 0..bits as usize {
         let byte = *bit_pos >> 3;
@@ -187,7 +163,7 @@ impl CvsdState {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            step: 32,
+            step: 256,
             history: 0b101,
         }
     }
@@ -200,9 +176,45 @@ impl CvsdState {
             self.step = (self.step + (self.step >> 2) + 1).min(16_384);
         } else {
             // Leaky decay keeps granular noise under control.
-            self.step = (self.step - (self.step >> 4)).max(1);
+            self.step = (self.step - (self.step >> 3)).max(32);
         }
         self.step
+    }
+}
+
+/// Adaptive Jayant step update shared identically by encoder and decoder.
+#[inline(always)]
+fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8) -> i32 {
+    match width {
+        1 => {
+            let b = (code & 1) as u8;
+            let next = if b == *prev_bit {
+                (step * 5) >> 2
+            } else {
+                (step * 7) >> 3
+            };
+            *prev_bit = b;
+            next.clamp(64, 8192)
+        }
+        2 => {
+            *prev_bit = (code >> 1) as u8;
+            if code == 0 || code == 3 {
+                ((step * 5) >> 2).clamp(32, 8192)
+            } else {
+                ((step * 15) >> 4).clamp(32, 8192)
+            }
+        }
+        _ => {
+            *prev_bit = (code >> (width - 1)) as u8;
+            let max_c = (1u32 << width) - 1;
+            if code <= 1 || code >= max_c - 1 {
+                ((step * 5) >> 2).clamp(16, 8192)
+            } else if code == 2 || code == max_c - 2 {
+                step
+            } else {
+                ((step * 15) >> 4).clamp(16, 8192)
+            }
+        }
     }
 }
 
@@ -257,34 +269,27 @@ pub fn encode_vbr_subframe(
     let blocks_per_channel = SUBFRAME_FRAMES.checked_div(spec.block_len).unwrap_or(0);
     let exponent_start = 2usize;
     let payload_start = exponent_start + 2 * blocks_per_channel;
-    let max_width = *spec.widths.iter().max().unwrap_or(&1);
 
-    // Pass 1: open-loop residual peaks -> one exponent byte per block/channel.
+    // Store top 8 bits of initial sample per channel in `out[2..4]` so `prev1`
+    // starts within +/-128 of `pcm_stereo[ch]` instead of jumping from 0!
     for ch in 0..2 {
-        let mut prev1 = 0i32;
         for block in 0..blocks_per_channel {
-            let mut peak = 0i32;
-            for k in 0..spec.block_len {
-                let i = block * spec.block_len + k;
-                let s = pcm_stereo[i * 2 + ch] as i32;
-                peak = peak.max((s - prev1).abs());
-                prev1 = s;
-            }
+            let first_idx = (block * spec.block_len) * 2 + ch;
             out[exponent_start + ch * blocks_per_channel + block] =
-                choose_vbr_shift(peak, max_width);
+                (pcm_stereo[first_idx] >> 8) as u8;
         }
     }
 
     out[payload_start..encoded_len].fill(0);
     let mut bit_pos = payload_start * 8;
 
-    // Pass 2: closed-loop quantization using reconstructed predictor state.
+    // Closed-loop adaptive DPCM quantization using reconstructed predictor + Jayant step.
     for ch in 0..2 {
-        let mut prev1 = 0i32;
-
         for block in 0..blocks_per_channel {
-            let shift = out[exponent_start + ch * blocks_per_channel + block].min(17);
-            let step = 1i32 << shift;
+            let seed_i8 = out[exponent_start + ch * blocks_per_channel + block] as i8;
+            let mut prev1 = (seed_i8 as i32) << 8;
+            let mut step = 256i32;
+            let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
                 let i = block * spec.block_len + k;
@@ -299,6 +304,7 @@ pub fn encode_vbr_subframe(
                 write_bits(out, &mut bit_pos, code, width);
                 let recon = (prev1 + dequant).clamp(-32_768, 32_767);
                 prev1 = recon;
+                step = adapt_vbr_step(step, code, width, &mut prev_bit);
             }
         }
     }
@@ -364,11 +370,11 @@ pub fn decode_vbr_subframe_to_f32(
     let mut bit_pos = (exponent_start + 2 * blocks_per_channel) * 8;
 
     for ch in 0..2 {
-        let mut prev1 = 0i32;
-
         for block in 0..blocks_per_channel {
-            let shift = encoded[exponent_start + ch * blocks_per_channel + block].min(17);
-            let step = 1i32 << shift;
+            let seed_i8 = encoded[exponent_start + ch * blocks_per_channel + block] as i8;
+            let mut prev1 = (seed_i8 as i32) << 8;
+            let mut step = 256i32;
+            let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
                 let i = block * spec.block_len + k;
@@ -381,6 +387,7 @@ pub fn decode_vbr_subframe_to_f32(
                 let recon = (prev1 + dequant).clamp(-32_768, 32_767);
                 out_f32[i * 2 + ch] = (recon as f32) * (1.0 / 32_768.0);
                 prev1 = recon;
+                step = adapt_vbr_step(step, code, width, &mut prev_bit);
             }
         }
     }

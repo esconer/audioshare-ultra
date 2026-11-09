@@ -256,12 +256,11 @@ impl ClientEngine {
         let mut last_hw_latency_poll = Instant::now();
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
-        // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 12.0 (30.0ms) on 2.4GHz!
-        // Ensure >= 5.5 subframes (13.75ms) on Wi-Fi so Packet [K+1]'s FEC always arrives before Packet [K] plays!
-        let initial_wifi_floor = if config.target_buffer_subframes <= 2.5 {
-            config.target_buffer_subframes
+        // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
+        let mut initial_wifi_floor = if config.target_buffer_subframes <= 2.5 {
+            4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
         } else {
-            config.target_buffer_subframes.max(5.5)
+            config.target_buffer_subframes.max(6.0)
         };
         let mut adaptive_wifi_subframes = initial_wifi_floor;
         let mut consecutive_holds: u8 = 0;
@@ -271,6 +270,8 @@ impl ClientEngine {
         let mut prev_tx_us: u32 = 0;
         let mut jitter_estimate_us: f32 = 2500.0;
         let start_instant = Instant::now();
+        let _ = socket.set_nonblocking(false);
+        let _ = socket.set_read_timeout(Some(Duration::from_micros(1000)));
 
         while running.load(Ordering::Relaxed) {
             // Auto-recover Android AAudio stream within 25ms when headphones/Bluetooth route changes!
@@ -361,13 +362,13 @@ impl ClientEngine {
             }
 
             let active_key = *session_key.lock().unwrap();
-            // Block for up to 800us waiting for the first packet (0% idle CPU, <15us wake on arrival),
-            // then switch to non-blocking to drain all queued burst packets immediately.
-            let _ = socket.set_nonblocking(false);
-            let _ = socket.set_read_timeout(Some(Duration::from_micros(800)));
+            let mut packets_drained = 0u8;
 
             while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
-                let _ = socket.set_nonblocking(true);
+                if packets_drained == 0 {
+                    let _ = socket.set_nonblocking(true);
+                }
+                packets_drained = packets_drained.saturating_add(1);
                 match ParsedPacket::parse_and_decrypt(&mut recv_buf[..len], active_key.as_ref()) {
                     Ok(parsed) => {
                         last_packet_instant = Instant::now();
@@ -383,9 +384,15 @@ impl ClientEngine {
                         }
                         prev_rx_us = Some(rx_now_us);
                         prev_tx_us = tx_now_us;
+                        // Ensure floor is always at least 2.5 packets for the sender's bundling mode
+                        let pkt_subframes =
+                            (parsed.header.subframe_count.max(1) as f32) * 2.5 + 1.0;
+                        if pkt_subframes > initial_wifi_floor {
+                            initial_wifi_floor = pkt_subframes;
+                        }
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
                         let proactive_floor =
-                            ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 11.0);
+                            ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
                         adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
 
                         telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
@@ -505,8 +512,9 @@ impl ClientEngine {
                             cursor += sub_len;
                         }
 
-                        let buffered =
-                            (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
+                        let buffered = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
+                            as i16)
+                            .max(0) as f32;
                         if buffered >= initial_wifi_floor {
                             prebuffer_ready = true;
                         }
@@ -515,11 +523,17 @@ impl ClientEngine {
                         telemetry.auth_failures.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                if packets_drained >= 16 {
+                    break;
+                }
+            }
+            if packets_drained > 0 {
+                let _ = socket.set_nonblocking(false);
             }
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let base_target = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
-                2.0
+                initial_wifi_floor.min(4.0)
             } else {
                 adaptive_wifi_subframes
             };
@@ -534,20 +548,27 @@ impl ClientEngine {
                 my_total_ms,
             );
 
-            // Demand-driven by the Hardware Audio DAC:
-            // Keep burst_fifo at a tight adapter cushion (1.5 subframes in gaming mode, 2 subframes = 5.0ms normally)
-            // to eliminate dead buffering while preventing AAudio hardware DAC starvation.
-            let fifo_watermark = if target_buf <= 2.5 {
-                SUBFRAME_STEREO_SAMPLES + SUBFRAME_STEREO_SAMPLES / 2 // 360 samples = 1.5 subframes
-            } else {
-                SUBFRAME_STEREO_SAMPLES * 2 // 480 samples = 2 subframes = 5.0ms
-            };
+            // Two-Level DAC Watermark:
+            // 1. `fifo_watermark` holds enough ready PCM (4 to 12 subframes = 10-30ms) so neither
+            //    Desktop CPAL (480-1024 frame callbacks) nor Android AAudio ever starves.
+            // 2. `plc_emergency_watermark` (2 subframes = 5.0ms): If `next_play_seq` is missing in
+            //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 2 subframes!
+            //    We wait for the delayed packet or Packet [K+1]'s FEC to arrive first!
+            let target_fifo_subframes = (target_buf.ceil() as usize).clamp(4, 12);
+            let fifo_watermark = target_fifo_subframes * SUBFRAME_STEREO_SAMPLES;
+            let plc_emergency_watermark = SUBFRAME_STEREO_SAMPLES * 2;
 
             while stream_initialized
                 && prebuffer_ready
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
                 && burst_fifo.available_samples() < fifo_watermark
             {
+                if sequencer.is_slot_missing(next_play_seq)
+                    && burst_fifo.available_samples() >= plc_emergency_watermark
+                {
+                    // Wait for in-flight packet or [N-1]/[N-2] FEC before triggering WSOLA PLC!
+                    break;
+                }
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
 
@@ -566,8 +587,8 @@ impl ClientEngine {
                         consecutive_holds = 0;
                         consecutive_empty_ticks = 0;
                         window_fec += 1;
-                        // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 12.0 = 30.0ms)
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(12.0);
+                        // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 14.0 = 35.0ms)
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(14.0);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
@@ -584,8 +605,8 @@ impl ClientEngine {
                             consecutive_holds += 1;
                         }
                         window_fec += 1;
-                        // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 12.0 = 30.0ms)
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
+                        // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(14.0);
                         telemetry
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
@@ -643,12 +664,13 @@ impl ClientEngine {
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
                 let fifo_subframes =
                     (burst_fifo.available_samples() as f32) / (SUBFRAME_STEREO_SAMPLES as f32);
-                let mut net_subframes =
-                    (latest_rx_seq.wrapping_sub(next_play_seq) as i16).max(0) as f32;
-                if net_subframes > target_buf + 14.0 {
+                let mut net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
+                    as i16)
+                    .max(0) as f32;
+                if net_subframes + fifo_subframes > target_buf + 16.0 {
                     // Preserve `target_buf` cushion on fast-forward so 2.4GHz doesn't immediately underrun!
-                    let keep = (target_buf.ceil() as u16).max(2);
-                    next_play_seq = latest_rx_seq.wrapping_sub(keep);
+                    let keep = (target_buf.ceil() as u16).max(4);
+                    next_play_seq = latest_rx_seq.wrapping_add(1).wrapping_sub(keep);
                     net_subframes = keep as f32;
                 }
                 // Regulate COMBINED (Sequencer + FIFO) buffer so they never stack in series!
@@ -1025,8 +1047,8 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-                // Pre-clamp hardware DMA ring capacity to 384 frames (8.0ms) to force ULL MMAP allocation!
-                AAudioStreamBuilder_setBufferCapacityInFrames(builder, 384);
+                // Provide 1920-frame capacity so SoCs with 192/240-frame bursts can allocate 3x bursts cleanly
+                AAudioStreamBuilder_setBufferCapacityInFrames(builder, 1920);
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,
@@ -1047,10 +1069,10 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                // Enforce hardware double-buffering (2 * hardware burst = ~4.0ms internal DAC buffer)
+                // Use 3 * hardware burst (minimum 256 frames = ~5.3ms) to prevent HAL DMA XRuns
                 let burst = AAudioStream_getFramesPerBurst(stream);
                 if burst > 0 {
-                    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
+                    AAudioStream_setBufferSizeInFrames(stream, (burst * 3).max(256));
                 }
 
                 AAudioStream_requestStart(stream);
@@ -1156,10 +1178,10 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                // Enforce hardware double-buffering (2 * hardware burst = ~4.0ms internal DAC buffer)
+                // Use 3 * hardware burst (minimum 256 frames = ~5.3ms) to prevent HAL DMA XRuns
                 let burst = AAudioStream_getFramesPerBurst(stream);
                 if burst > 0 {
-                    AAudioStream_setBufferSizeInFrames(stream, burst * 2);
+                    AAudioStream_setBufferSizeInFrames(stream, (burst * 3).max(256));
                 }
 
                 AAudioStream_requestStart(stream);

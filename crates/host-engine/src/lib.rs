@@ -204,6 +204,13 @@ pub fn promote_thread_realtime() {
             AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority,
             THREAD_PRIORITY_TIME_CRITICAL,
         };
+        #[link(name = "winmm")]
+        extern "system" {
+            fn timeBeginPeriod(u_period: u32) -> u32;
+        }
+        // Force 1.0ms kernel timer resolution on Windows (default is 15.625ms!)
+        timeBeginPeriod(1);
+
         let mut task_idx = 0u32;
         let name: [u16; 10] = [
             b'P' as u16,
@@ -766,31 +773,33 @@ impl HostEngine {
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         heartbeat
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        let in_frames = data.len() / channels.max(1);
-                        let safe_frames = in_frames.min(1024);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
                         let mut f32_tmp = [0.0f32; 2048];
-                        let total_samples = (safe_frames * channels).min(2048);
-                        for (dst, &s) in f32_tmp[..total_samples]
-                            .iter_mut()
-                            .zip(data[..total_samples].iter())
-                        {
-                            *dst = (s as f32) * (1.0 / 32768.0);
-                        }
-
-                        downmix_to_stereo(
-                            &f32_tmp[..safe_frames * channels],
-                            channels,
-                            &mut stereo_buf[..safe_frames * 2],
-                        );
-
-                        if src_rate == SAMPLE_RATE {
-                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
-                        } else {
-                            let mut resampled = [0.0f32; 4096];
-                            let out_frames = host_resampler
-                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
-                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                                *dst = (s as f32) * (1.0 / 32768.0);
+                            }
+                            downmix_to_stereo(
+                                &f32_tmp[..chunk_frames * ch],
+                                ch,
+                                &mut stereo_buf[..chunk_frames * 2],
+                            );
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let mut resampled = [0.0f32; 4096];
+                                let out_frames = host_resampler
+                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
+                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
                         }
                     },
                     |_| {},
@@ -805,31 +814,33 @@ impl HostEngine {
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
                         heartbeat
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        let in_frames = data.len() / channels.max(1);
-                        let safe_frames = in_frames.min(1024);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
                         let mut f32_tmp = [0.0f32; 2048];
-                        let total_samples = (safe_frames * channels).min(2048);
-                        for (dst, &s) in f32_tmp[..total_samples]
-                            .iter_mut()
-                            .zip(data[..total_samples].iter())
-                        {
-                            *dst = ((s as f32) - 32768.0) * (1.0 / 32768.0);
-                        }
-
-                        downmix_to_stereo(
-                            &f32_tmp[..safe_frames * channels],
-                            channels,
-                            &mut stereo_buf[..safe_frames * 2],
-                        );
-
-                        if src_rate == SAMPLE_RATE {
-                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
-                        } else {
-                            let mut resampled = [0.0f32; 4096];
-                            let out_frames = host_resampler
-                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
-                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                                *dst = ((s as f32) - 32768.0) * (1.0 / 32768.0);
+                            }
+                            downmix_to_stereo(
+                                &f32_tmp[..chunk_frames * ch],
+                                ch,
+                                &mut stereo_buf[..chunk_frames * 2],
+                            );
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let mut resampled = [0.0f32; 4096];
+                                let out_frames = host_resampler
+                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
+                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
                         }
                     },
                     |_| {},
@@ -844,23 +855,25 @@ impl HostEngine {
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         heartbeat
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        let in_frames = data.len() / channels.max(1);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
-                        let safe_frames = in_frames.min(1024);
-
-                        downmix_to_stereo(
-                            &data[..safe_frames * channels],
-                            channels,
-                            &mut stereo_buf[..safe_frames * 2],
-                        );
-
-                        if src_rate == SAMPLE_RATE {
-                            ring_buf.push_samples(&stereo_buf[..safe_frames * 2]);
-                        } else {
-                            let mut resampled = [0.0f32; 4096];
-                            let out_frames = host_resampler
-                                .process(&stereo_buf[..safe_frames * 2], &mut resampled);
-                            ring_buf.push_samples(&resampled[..out_frames * 2]);
+                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            downmix_to_stereo(src_slice, ch, &mut stereo_buf[..chunk_frames * 2]);
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let mut resampled = [0.0f32; 4096];
+                                let out_frames = host_resampler
+                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
+                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
                         }
                     },
                     |_| {},
@@ -921,7 +934,6 @@ impl HostEngine {
         let mut subframes_per_pkt = config.subframes_per_packet.clamp(1, 4) as usize;
         let mut packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
         let mut next_tick = start_instant + packet_interval;
-        let mut last_tx_instant = start_instant;
 
         let mut seq: u16 = 0;
         let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
@@ -1103,10 +1115,10 @@ impl HostEngine {
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::MaxStability24Ghz => {
-                    // 10.0 ms framing (4 x 2.5 ms = 100 packets/sec) with the
-                    // 160 kbps rung: long-range 2.4 GHz through walls.
+                    // Keep 2 subframes/pkt (5.0 ms) so [N-1] and [N-2] FEC cover 100%
+                    // of every packet on 2.4 GHz without unrecoverable 2-subframe holes!
                     dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = 4;
+                    subframes_per_pkt = 2;
                     tx_bitrate_kbps = 160;
                 }
                 QualityProfile::StudioLossless24Bit => {
@@ -1120,7 +1132,7 @@ impl HostEngine {
                 QualityProfile::SmartAuto => {
                     if worst_loss_permille > 120 {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = 4;
+                        subframes_per_pkt = 2;
                         tx_bitrate_kbps = 160;
                     } else if worst_loss_permille > 45 {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
@@ -1139,32 +1151,26 @@ impl HostEngine {
                 .store(dynamic_codec_mode as u8, Ordering::Relaxed);
 
             // Wait until soundcard pushes a full packet of samples into `ring`,
-            // or fall back to silence synthesis if capture endpoint is idle >15ms
+            // or fall back to silence synthesis only if capture endpoint is truly idle >80ms.
             let needed_samples = subframes_per_pkt * SUBFRAME_STEREO_SAMPLES;
             if !config.use_test_tone {
                 let avail = ring.available_samples();
-                // Anti-Latency-Creep Guard: If an OS stall piled up >8 subframes (20ms) in `ring`,
-                // drain stale excess samples so Host capture latency never creeps up!
-                if avail > SUBFRAME_STEREO_SAMPLES * 8 {
+                // Allow up to 24 subframes (60ms = 5760 samples) so normal 10-22ms OS callbacks
+                // on Windows WASAPI and Linux PipeWire are NEVER discarded mid-callback!
+                if avail > SUBFRAME_STEREO_SAMPLES * 24 {
                     let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                     let mut dummy_rng = 1u32;
-                    while ring.available_samples() > needed_samples + SUBFRAME_STEREO_SAMPLES {
+                    while ring.available_samples() > needed_samples + SUBFRAME_STEREO_SAMPLES * 4 {
                         ring.pop_exact_or_dither(&mut discard, &mut dummy_rng);
                     }
                 } else if avail < needed_samples {
                     let now_ms = start_instant.elapsed().as_millis() as u64;
                     let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last_cb) <= 15 {
-                        std::thread::sleep(Duration::from_micros(400));
+                    if now_ms.saturating_sub(last_cb) <= 80 {
+                        std::thread::sleep(Duration::from_micros(500));
                         continue;
                     }
                 }
-            }
-
-            // Anti-Microburst Pacer: Never blast back-to-back Wi-Fi packets closer than 1.2ms apart
-            let since_last_tx = last_tx_instant.elapsed();
-            if since_last_tx < Duration::from_micros(1200) && subframes_per_pkt >= 2 {
-                std::thread::sleep(Duration::from_micros(1200) - since_last_tx);
             }
 
             // 3. Encode Subframes
@@ -1351,7 +1357,6 @@ impl HostEngine {
             if let Some(pkt_len) = maybe_pkt_len {
                 for &target_addr in &cached_targets {
                     if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
-                        last_tx_instant = Instant::now();
                         telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
                         telemetry
                             .bytes_sent
@@ -1360,12 +1365,24 @@ impl HostEngine {
                 }
             }
 
-            if config.use_test_tone || ring.available_samples() < needed_samples {
-                let now = Instant::now();
-                if next_tick > now {
-                    std::thread::sleep(next_tick - now);
-                }
-                next_tick = Instant::now() + packet_interval;
+            // Steady Isochronous Packet Pacer: Always pace packets at real-time cadence
+            // even when an OS capture callback delivered a 10-20ms chunk into `ring`.
+            // If `ring` has >3 packets queued, gently nudge `next_tick` 8% faster so the queue
+            // drains smoothly without ever microbursting or starving between OS callbacks!
+            let step_interval =
+                if !config.use_test_tone && ring.available_samples() > needed_samples * 3 {
+                    Duration::from_micros(((2300 * subframes_per_pkt) as u64).max(1000))
+                } else {
+                    packet_interval
+                };
+            let now = Instant::now();
+            if next_tick > now {
+                std::thread::sleep(next_tick - now);
+                next_tick += step_interval;
+            } else if now.duration_since(next_tick) > packet_interval * 4 {
+                next_tick = now + step_interval;
+            } else {
+                next_tick += step_interval;
             }
         }
     }
