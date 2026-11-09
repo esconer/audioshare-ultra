@@ -18,6 +18,7 @@ use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PHONE_MIC_PORT};
 use audioshare_host_engine::{
     list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo, DEFAULT_PORT,
 };
+use audioshare_protocol::lpc_lossless::QualityProfile;
 use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
 use qrcode::{Color as QrColor, QrCode};
@@ -57,6 +58,8 @@ struct AudioShareApp {
     beacon: Option<DiscoveryBeacon>,
     adb_watcher: Option<AdbUsbWatcher>,
     os_guard: Option<VirtualSpeakerAndRadioGuard>,
+    quality_profile: QualityProfile,
+    target_bitrate_kbps: u16,
     usb_low_latency_pacing: bool,
     enable_smart_dtx: bool,
     enable_virtual_speaker: bool,
@@ -108,6 +111,8 @@ impl AudioShareApp {
             beacon: None,
             adb_watcher: None,
             os_guard: None,
+            quality_profile: QualityProfile::SmartAuto,
+            target_bitrate_kbps: 256,
             usb_low_latency_pacing: false,
             enable_smart_dtx: true,
             enable_virtual_speaker: false,
@@ -168,6 +173,14 @@ impl AudioShareApp {
                     if self.enable_pin_encryption {
                         engine.set_encryption_pin(Some(&self.pairing_pin));
                     }
+                    engine
+                        .telemetry
+                        .quality_profile
+                        .store(self.quality_profile as u8, Ordering::Relaxed);
+                    engine
+                        .telemetry
+                        .target_bitrate_kbps
+                        .store(self.target_bitrate_kbps, Ordering::Relaxed);
                     self.os_guard = Some(guard);
                     self.beacon = Some(DiscoveryBeacon::start(
                         DEFAULT_PORT,
@@ -409,6 +422,78 @@ impl AudioShareApp {
         ui.add_space(8.0);
 
         ui.group(|ui| {
+            ui.heading("Quality Mode & Compressed Bitrate");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("🎚️ Mode:");
+                for (profile, label) in [
+                    (QualityProfile::SmartAuto, "🤖 Smart Auto"),
+                    (QualityProfile::StudioLossless, "💎 Studio Lossless (0ms)"),
+                    (
+                        QualityProfile::LowLatencyCompressed,
+                        "⚡ Low-Latency Compressed",
+                    ),
+                    (
+                        QualityProfile::MaxStability24Ghz,
+                        "🛡️ Max Stability (10ms 2.4GHz)",
+                    ),
+                ] {
+                    if ui
+                        .selectable_value(&mut self.quality_profile, profile, label)
+                        .changed()
+                    {
+                        if let Some(ref host) = self.host_engine {
+                            host.telemetry
+                                .quality_profile
+                                .store(self.quality_profile as u8, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
+            if self.quality_profile == QualityProfile::LowLatencyCompressed
+                || self.quality_profile == QualityProfile::SmartAuto
+            {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("📶 Compressed bitrate:");
+                    for kbps in [96u16, 160, 256, 320] {
+                        if ui
+                            .selectable_value(
+                                &mut self.target_bitrate_kbps,
+                                kbps,
+                                format!("{} kbps", kbps),
+                            )
+                            .changed()
+                        {
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .target_bitrate_kbps
+                                    .store(self.target_bitrate_kbps, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+
+            let note = match self.quality_profile {
+                QualityProfile::SmartAuto => {
+                    "Adapts: lossless at <4.5% loss, compressed at >4.5%, 10ms/160k at >12%."
+                }
+                QualityProfile::StudioLossless => {
+                    "100% bit-perfect LPC-Delta, 2.5/5.0ms framing, zero codec lookahead."
+                }
+                QualityProfile::LowLatencyCompressed => {
+                    "VBR DPCM primary payload at the selected target; ADPCM FEC stays active."
+                }
+                QualityProfile::MaxStability24Ghz => {
+                    "Fixed 10ms (4-subframe) framing at 160 kbps for long-range 2.4GHz."
+                }
+            };
+            ui.label(egui::RichText::new(note).color(egui::Color32::GRAY));
+        });
+
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
             ui.heading("Active Network, USB & 1-Hop Direct Wireless Endpoints");
             if let Some(ref adb) = self.adb_watcher {
                 let usb_ok = adb.usb_device_connected.load(Ordering::Relaxed);
@@ -483,11 +568,14 @@ impl AudioShareApp {
                 }
 
                 let mode_str = if dtx {
-                    "SMART-DTX SILENCE (0.6 kbps)"
+                    "SMART-DTX SILENCE (0.6 kbps)".to_string()
                 } else if mode_id == 2 {
-                    "GOVERNOR: COMPRESSED LOW-DELAY (Weak Wi-Fi Protection)"
+                    format!(
+                        "GOVERNOR: COMPRESSED VBR {} kbps (Weak Wi-Fi Protection)",
+                        self.target_bitrate_kbps
+                    )
                 } else {
-                    "GOVERNOR: STUDIO LOSSLESS LPC + [N-1]/[N-2] FEC"
+                    "GOVERNOR: STUDIO LOSSLESS LPC + [N-1]/[N-2] FEC".to_string()
                 };
 
                 ui.monospace(format!(

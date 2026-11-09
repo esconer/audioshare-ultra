@@ -48,6 +48,8 @@ fun MainScreen() {
     var nightMode by remember { mutableStateOf(false) }
     var crossfeed by remember { mutableStateOf(false) }
     var channelRole by remember { mutableIntStateOf(0) }
+    // 0=Smart Auto, 1=Studio Lossless, 2=Low-Latency VBR, 3=Max Stability (10ms 2.4GHz)
+    var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
     var sharePhoneMic by remember { mutableStateOf(false) }
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
@@ -242,6 +244,32 @@ fun MainScreen() {
                         },
                         valueRange = -12.0f..24.0f
                     )
+
+                    // Host quality profile selector (sent as feedback mode 1..4)
+                    Text("Host Quality Mode", style = MaterialTheme.typography.titleSmall)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            0 to "🤖 Auto",
+                            1 to "💎 Lossless",
+                            2 to "⚡ VBR",
+                            3 to "🛡️ 10ms 2.4G"
+                        ).forEach { (idx, label) ->
+                            FilterChip(
+                                selected = qualityMode == idx,
+                                onClick = {
+                                    qualityMode = idx
+                                    prefs.edit().putInt("quality_mode", idx).apply()
+                                    // Host feedback mapping: 1=Auto, 2=Lossless,
+                                    // 3=Compressed, 4=Max Stability.
+                                    AudioEngineService.nativeSendMediaCommand(idx + 1)
+                                },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),

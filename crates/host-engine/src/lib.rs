@@ -9,7 +9,8 @@ use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::downmix_to_stereo;
 use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
-    encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
+    encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, QualityProfile,
+    ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
@@ -220,6 +221,8 @@ pub struct HostTelemetry {
     pub bytes_sent: AtomicU64,
     pub dtx_silent_mode: AtomicBool,
     pub active_codec_mode: AtomicU8,
+    pub quality_profile: AtomicU8,
+    pub target_bitrate_kbps: AtomicU16,
     pub host_volume: AtomicU8,
     pub host_vu_peak_pct: AtomicU8,
     pub active_clients_count: AtomicU8,
@@ -275,6 +278,8 @@ impl HostEngine {
             bytes_sent: AtomicU64::new(0),
             dtx_silent_mode: AtomicBool::new(false),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
+            quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
+            target_bitrate_kbps: AtomicU16::new(256),
             host_volume: AtomicU8::new(100),
             host_vu_peak_pct: AtomicU8::new(0),
             active_clients_count: AtomicU8::new(initial_targets.len() as u8),
@@ -717,8 +722,8 @@ impl HostEngine {
             None
         };
 
-        let subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
-        let packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
+        let mut subframes_per_pkt = config.subframes_per_packet.clamp(1, 4) as usize;
+        let mut packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
         let mut next_tick = start_instant + packet_interval;
 
         let mut seq: u16 = 0;
@@ -730,7 +735,9 @@ impl HostEngine {
         let mut silent_subframes: u32 = 0;
         let mut tone_phase: f32 = 0.0;
         let mut ctrl_buf = [0u8; 64];
-        let mut dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+        let mut dynamic_codec_mode;
+        let mut tx_bitrate_kbps;
+        let mut worst_loss_permille: u16 = 0;
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
         if let Ok(map) = clients.lock() {
@@ -806,6 +813,16 @@ impl HostEngine {
                             bt_optimization::execute_remote_media_command(cmd);
                         }
 
+                        // Remote quality-mode selection from the phone UI:
+                        // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
+                        // 4=Max Stability (10 ms 2.4 GHz).  Values >= 10 are
+                        // Bluetooth media transport commands handled above.
+                        if (1..=4).contains(&fb.requested_mode) {
+                            telemetry
+                                .quality_profile
+                                .store(fb.requested_mode - 1, Ordering::Relaxed);
+                        }
+
                         let mut map = clients.lock().unwrap();
                         let entry = map.entry(src_addr).or_insert(ConnectedClient {
                             addr: src_addr,
@@ -824,8 +841,8 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
 
-                        // Dynamic Link Governor: Switch to CompressedLowDelay if any client experiences >15% catastrophic loss
-                        let max_loss = map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
+                        worst_loss_permille =
+                            map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
                         let max_bt = map
                             .values()
                             .map(|c| c.bluetooth_delay_ms)
@@ -834,15 +851,6 @@ impl HostEngine {
                         telemetry
                             .max_client_bt_delay_ms
                             .store(max_bt, Ordering::Relaxed);
-
-                        dynamic_codec_mode = if max_loss > 150 {
-                            CodecMode::CompressedLowDelay
-                        } else {
-                            CodecMode::StudioLosslessLpc
-                        };
-                        telemetry
-                            .active_codec_mode
-                            .store(dynamic_codec_mode as u8, Ordering::Relaxed);
 
                         cached_targets.clear();
                         for c in map.values() {
@@ -865,6 +873,8 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
                     }
+                    worst_loss_permille =
+                        map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
                     cached_targets.clear();
                     for c in map.values() {
                         if !c.muted {
@@ -873,6 +883,54 @@ impl HostEngine {
                     }
                 }
             }
+
+            // 2c. Evaluate the user-selected quality profile (re-evaluated every
+            // packet so a UI change takes effect immediately, and so the
+            // Smart Auto governor can adapt framing without restarting TX).
+            let profile =
+                QualityProfile::from_u8(telemetry.quality_profile.load(Ordering::Relaxed));
+            let selected_kbps = telemetry
+                .target_bitrate_kbps
+                .load(Ordering::Relaxed)
+                .clamp(96, 320);
+            match profile {
+                QualityProfile::StudioLossless => {
+                    dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                    tx_bitrate_kbps = selected_kbps;
+                }
+                QualityProfile::LowLatencyCompressed => {
+                    dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                    tx_bitrate_kbps = selected_kbps;
+                }
+                QualityProfile::MaxStability24Ghz => {
+                    // 10.0 ms framing (4 x 2.5 ms = 100 packets/sec) with the
+                    // 160 kbps rung: long-range 2.4 GHz through walls.
+                    dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                    subframes_per_pkt = 4;
+                    tx_bitrate_kbps = 160;
+                }
+                QualityProfile::SmartAuto => {
+                    if worst_loss_permille > 120 {
+                        dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                        subframes_per_pkt = 4;
+                        tx_bitrate_kbps = 160;
+                    } else if worst_loss_permille > 45 {
+                        dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                        subframes_per_pkt = 2;
+                        tx_bitrate_kbps = selected_kbps;
+                    } else {
+                        dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+                        subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                        tx_bitrate_kbps = selected_kbps;
+                    }
+                }
+            }
+            packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
+            telemetry
+                .active_codec_mode
+                .store(dynamic_codec_mode as u8, Ordering::Relaxed);
 
             // Wait until soundcard pushes a full packet of samples into `ring`,
             // or fall back to silence synthesis if capture endpoint is idle >15ms
@@ -887,7 +945,7 @@ impl HostEngine {
             }
 
             // 3. Encode Subframes
-            let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
+            let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 4 + 12];
             let mut primary_cursor = 0usize;
             let base_seq = seq;
             let prev_n1_copy = fec_n1;
@@ -946,14 +1004,18 @@ impl HostEngine {
                 has_fec_n1 = true;
 
                 if dynamic_codec_mode == CodecMode::CompressedLowDelay {
-                    // Weak Wi-Fi fallback: Use compact 124-byte ADPCM frame as primary payload (75% smaller!)
-                    let len_be = (ADPCM_FEC_BYTES as u16).to_be_bytes();
+                    // VBR primary payload targeted by the selected quality mode.
+                    // A 2.5 ms frame is only 32-94 bytes (vs 124-byte ADPCM FEC),
+                    // and the same payload is also valid as its own FEC backup.
+                    let mut enc_vbr = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                    let enc_len = encode_vbr_subframe(&i16_subframe, tx_bitrate_kbps, &mut enc_vbr);
+                    let len_be = (enc_len as u16).to_be_bytes();
                     primary_bundle[primary_cursor] = len_be[0];
                     primary_bundle[primary_cursor + 1] = len_be[1];
                     primary_cursor += 2;
-                    primary_bundle[primary_cursor..primary_cursor + ADPCM_FEC_BYTES]
-                        .copy_from_slice(&fec_n1);
-                    primary_cursor += ADPCM_FEC_BYTES;
+                    primary_bundle[primary_cursor..primary_cursor + enc_len]
+                        .copy_from_slice(&enc_vbr[..enc_len]);
+                    primary_cursor += enc_len;
                 } else {
                     let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
                     let enc_len = encode_lossless_subframe(&i16_subframe, &mut enc_sub);

@@ -43,7 +43,9 @@ pub struct ClientFeedbackPacket {
     pub bluetooth_delay_ms: u16,
     /// Client volume (0..=100) for bidirectional volume sync
     pub client_volume: u8,
-    /// Client requested quality mode (0 = Auto, 1 = Force Lossless, 2 = Force Compressed)
+    /// Client requested quality profile (0 = no change, 1 = Smart Auto,
+    /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms)
+    /// or a media transport command (10 = play/pause, 11 = next, 12 = previous).
     pub requested_mode: u8,
     /// 32-bit authentication token derived from SessionKey (or 0 if unencrypted)
     pub auth_mac32: u32,

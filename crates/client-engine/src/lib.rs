@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
-use audioshare_protocol::lpc_lossless::{decode_fec_subframe_to_f32, decode_lossless_subframe};
+use audioshare_protocol::lpc_lossless::{
+    decode_fec_subframe_to_f32, decode_lossless_subframe, decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+};
 use audioshare_protocol::sequencer::{
     ZeroJitterSequencer, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
 };
@@ -359,10 +361,14 @@ impl ClientEngine {
                             let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             let decoded_ok = if parsed.header.mode == CodecMode::CompressedLowDelay
                             {
-                                decode_fec_subframe_to_f32(
-                                    &prim[cursor..cursor + sub_len],
-                                    &mut pcm_f32,
-                                )
+                                let payload = &prim[cursor..cursor + sub_len];
+                                if payload.first() == Some(&TAG_VBR_BFP) {
+                                    decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
+                                } else {
+                                    // Backward compatible with hosts that still
+                                    // send a raw IMA-ADPCM primary frame.
+                                    decode_fec_subframe_to_f32(payload, &mut pcm_f32)
+                                }
                             } else {
                                 let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
                                 if decode_lossless_subframe(
