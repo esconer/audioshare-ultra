@@ -3,12 +3,19 @@ use crate::{SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 /// Maximum encoded size for a 2.5ms lossless subframe (1 byte tag + 480 bytes raw fallback)
 pub const MAX_LOSSLESS_SUBFRAME_BYTES: usize = 481;
 
+/// Maximum encoded size for a true 24-bit 2.5ms lossless subframe:
+/// 1 byte tag + up to 481 bytes compressed/raw upper-16-bit payload +
+/// 240 bytes of exact per-sample LSB extension = 722 bytes.
+pub const MAX_LOSSLESS_PCM24_BYTES: usize = 722;
+
 /// Exact byte size of a 2.5ms (120 stereo frames) IMA-ADPCM FEC backup frame:
 /// 4 bytes state header (L_val, R_val) + 120 bytes (4-bit L + 4-bit R nibbles) = 124 bytes!
 pub const ADPCM_FEC_BYTES: usize = 124;
 
 const TAG_RAW_PCM16: u8 = 0x00;
 const TAG_LPC_PACKED: u8 = 0x01;
+/// True 24-bit lossless: compressed upper 16 bits + exact 8-bit LSB plane.
+const TAG_LPC_PCM24: u8 = 0x03;
 
 /// Tag for a variable-bitrate compressed subframe (quality-profile byte follows).
 ///
@@ -32,6 +39,9 @@ pub enum QualityProfile {
     LowLatencyCompressed = 2,
     /// 10.0 ms (4 x 2.5 ms) framing for long-range 2.4 GHz links through walls.
     MaxStability24Ghz = 3,
+    /// True 24-bit / 48 kHz studio-master lossless (upper 16-bit LPC + exact
+    /// 8-bit LSB plane, zero codec lookahead).
+    StudioLossless24Bit = 4,
 }
 
 impl QualityProfile {
@@ -41,6 +51,7 @@ impl QualityProfile {
             1 => Self::StudioLossless,
             2 => Self::LowLatencyCompressed,
             3 => Self::MaxStability24Ghz,
+            4 => Self::StudioLossless24Bit,
             _ => Self::SmartAuto,
         }
     }
@@ -374,6 +385,62 @@ pub fn decode_vbr_subframe_to_f32(
         }
     }
 
+    true
+}
+
+/// Encode true 24-bit stereo audio (f32 -> signed 24-bit PCM) with 0.0 ms
+/// lookahead and bit-exact reconstruction of the quantized 24-bit samples.
+///
+/// Layout: `[TAG_LPC_PCM24][upper-16-bit lossless subframe][240 x exact LSB]`.
+/// The upper plane reuses the zero-lookahead LPC packer (including its raw
+/// fallback for incompressible blocks); the lower byte plane is stored
+/// verbatim, so the codec remains exactly reversible at 24-bit resolution.
+pub fn encode_lossless_pcm24_subframe(
+    pcm_f32: &[f32; SUBFRAME_STEREO_SAMPLES],
+    out: &mut [u8; MAX_LOSSLESS_PCM24_BYTES],
+) -> usize {
+    let mut upper16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+    let mut lower8 = [0u8; SUBFRAME_STEREO_SAMPLES];
+
+    for i in 0..SUBFRAME_STEREO_SAMPLES {
+        // Full-scale +1.0 maps to 8388607 and -1.0 to -8388608, matching the
+        // 24-bit two's-complement range. 24-bit integers are exactly
+        // representable in f32, so the f32 -> i32 -> f32 round trip is stable.
+        let s24 = (pcm_f32[i].clamp(-1.0, 1.0) * 8_388_608.0)
+            .round()
+            .clamp(-8_388_608.0, 8_388_607.0) as i32;
+        upper16[i] = (s24 >> 8) as i16;
+        lower8[i] = (s24 & 0xFF) as u8;
+    }
+
+    let mut enc16 = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+    let len16 = encode_lossless_subframe(&upper16, &mut enc16);
+
+    out[0] = TAG_LPC_PCM24;
+    out[1..1 + len16].copy_from_slice(&enc16[..len16]);
+    out[1 + len16..1 + len16 + SUBFRAME_STEREO_SAMPLES].copy_from_slice(&lower8);
+    1 + len16 + SUBFRAME_STEREO_SAMPLES
+}
+
+/// Decode a true 24-bit lossless subframe directly into normalized f32 stereo
+/// samples. Returns `false` for a foreign tag or a truncated/malformed payload.
+pub fn decode_lossless_pcm24_to_f32(
+    encoded: &[u8],
+    out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
+) -> bool {
+    if encoded.len() <= 1 + SUBFRAME_STEREO_SAMPLES || encoded[0] != TAG_LPC_PCM24 {
+        return false;
+    }
+    let len16 = encoded.len() - 1 - SUBFRAME_STEREO_SAMPLES;
+    let mut upper16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+    if decode_lossless_subframe(&encoded[1..1 + len16], &mut upper16).is_err() {
+        return false;
+    }
+    let lower8 = &encoded[1 + len16..];
+    for i in 0..SUBFRAME_STEREO_SAMPLES {
+        let s24 = ((upper16[i] as i32) << 8) | (lower8[i] as i32);
+        out_f32[i] = (s24 as f32) * (1.0 / 8_388_608.0);
+    }
     true
 }
 
@@ -875,8 +942,70 @@ mod tests {
     }
 
     #[test]
+    fn test_pcm24_bit_exact_roundtrip_and_size() {
+        let mut original = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut original_s24 = [0i32; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            // Exercise full-scale edges plus tiny LSB-only values that the
+            // upper-16-bit core alone would completely erase.
+            let s24 = match i % 5 {
+                0 => 8_388_607,
+                1 => -8_388_608,
+                2 => 1,
+                3 => -1,
+                _ => ((i as i32 * 104_729) % 8_388_608) - 4_194_304,
+            };
+            original_s24[i] = s24;
+            original[i] = s24 as f32 * (1.0 / 8_388_608.0);
+        }
+
+        let mut encoded = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let enc_len = encode_lossless_pcm24_subframe(&original, &mut encoded);
+        assert!(enc_len <= MAX_LOSSLESS_PCM24_BYTES);
+
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_lossless_pcm24_to_f32(
+            &encoded[..enc_len],
+            &mut decoded
+        ));
+
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            let decoded_s24 = (decoded[i] * 8_388_608.0).round() as i32;
+            assert_eq!(decoded_s24, original_s24[i], "LSB mismatch at index {}", i);
+        }
+
+        // Foreign/truncated payloads must be rejected.
+        assert!(!decode_lossless_pcm24_to_f32(
+            &encoded[..enc_len - 1],
+            &mut decoded
+        ));
+        let mut wrong_tag = encoded;
+        wrong_tag[0] = TAG_LPC_PACKED;
+        assert!(!decode_lossless_pcm24_to_f32(
+            &wrong_tag[..enc_len],
+            &mut decoded
+        ));
+    }
+
+    #[test]
+    fn test_pcm24_worst_case_fits_advertised_max() {
+        // Full-scale alternating noise forces the upper plane into its raw
+        // PCM16 fallback (481 bytes), which is the true worst case.
+        let mut noisy = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for (i, s) in noisy.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut encoded = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let len = encode_lossless_pcm24_subframe(&noisy, &mut encoded);
+        assert_eq!(len, MAX_LOSSLESS_PCM24_BYTES);
+
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_lossless_pcm24_to_f32(&encoded[..len], &mut decoded));
+    }
+
+    #[test]
     fn test_quality_profile_roundtrip() {
-        for v in 0..=3u8 {
+        for v in 0..=4u8 {
             assert_eq!(QualityProfile::from_u8(v) as u8, v);
         }
         assert_eq!(QualityProfile::from_u8(200), QualityProfile::SmartAuto);

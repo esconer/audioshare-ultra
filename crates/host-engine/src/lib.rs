@@ -9,8 +9,9 @@ use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::downmix_to_stereo;
 use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
-    encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, QualityProfile,
-    ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
+    encode_fec_subframe, encode_lossless_pcm24_subframe, encode_lossless_subframe,
+    encode_vbr_subframe, QualityProfile, ADPCM_FEC_BYTES, MAX_LOSSLESS_PCM24_BYTES,
+    MAX_LOSSLESS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
@@ -25,6 +26,8 @@ pub mod app_routing;
 pub mod bt_optimization;
 pub mod discovery_and_os;
 pub mod virtual_mic;
+
+use discovery_and_os::HostVolumeMonitor;
 
 pub const DEFAULT_PORT: u16 = 65530;
 const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
@@ -160,6 +163,37 @@ pub fn promote_thread_realtime() {
         // CAP_SYS_NICE/root; failure is non-fatal and falls back to nice -19.
         let param = libc::sched_param { sched_priority: 50 };
         let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+
+        // Pin the audio/network loop to the upper half of the CPU set on ARM
+        // big.LITTLE SoCs (Android and ARM64 Linux), where high-numbered cores
+        // are the performance cores. This prevents the real-time thread from
+        // being scheduled onto a slow LITTLE core. We deliberately skip x86
+        // desktops: on Intel hybrid CPUs the upper-numbered cores can be the
+        // E-cores. Any failure (restricted cpuset, SELinux, etc.) is non-fatal.
+        #[cfg(any(
+            target_os = "android",
+            all(target_os = "linux", target_arch = "aarch64")
+        ))]
+        {
+            let num_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            if num_cpus >= 4 {
+                let first_upper = num_cpus / 2;
+                let last = num_cpus.min(libc::CPU_SETSIZE as usize);
+                if first_upper < last {
+                    let mut cpuset: libc::cpu_set_t = core::mem::zeroed();
+                    for cpu in first_upper..last {
+                        libc::CPU_SET(cpu, &mut cpuset);
+                    }
+                    let _ = libc::sched_setaffinity(
+                        0,
+                        core::mem::size_of::<libc::cpu_set_t>(),
+                        &cpuset,
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -268,6 +302,7 @@ pub struct HostEngine {
     clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
     session_key: Arc<Mutex<Option<SessionKey>>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
+    volume_monitor: Option<HostVolumeMonitor>,
 }
 
 impl HostEngine {
@@ -309,6 +344,11 @@ impl HostEngine {
         let clients = Arc::new(Mutex::new(client_map));
         let session_key = Arc::new(Mutex::new(None));
 
+        // Poll the OS master sink volume/mute state on a dedicated, non-RT
+        // thread so physical PC keyboard Vol+/Vol-/Mute keys propagate to the
+        // phone without ever blocking the real-time TX loop on `pactl`.
+        let volume_monitor = Some(HostVolumeMonitor::start(Arc::clone(&telemetry)));
+
         let bind_addr = SocketAddr::from(([0, 0, 0, 0], config.bind_port));
         let socket = UdpSocket::bind(bind_addr)
             .map_err(|e| format!("Failed to bind UDP port {}: {}", config.bind_port, e))?;
@@ -348,6 +388,7 @@ impl HostEngine {
             clients,
             session_key,
             worker_handle: Some(worker_handle),
+            volume_monitor,
         })
     }
 
@@ -379,6 +420,8 @@ impl HostEngine {
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
         }
+        // Dropping the monitor stops and joins its polling thread.
+        self.volume_monitor = None;
     }
 
     #[cfg(target_os = "linux")]
@@ -815,9 +858,10 @@ impl HostEngine {
 
                         // Remote quality-mode selection from the phone UI:
                         // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
-                        // 4=Max Stability (10 ms 2.4 GHz).  Values >= 10 are
-                        // Bluetooth media transport commands handled above.
-                        if (1..=4).contains(&fb.requested_mode) {
+                        // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
+                        // Values >= 10 are Bluetooth media transport commands
+                        // handled above.
+                        if (1..=5).contains(&fb.requested_mode) {
                             telemetry
                                 .quality_profile
                                 .store(fb.requested_mode - 1, Ordering::Relaxed);
@@ -911,6 +955,14 @@ impl HostEngine {
                     subframes_per_pkt = 4;
                     tx_bitrate_kbps = 160;
                 }
+                QualityProfile::StudioLossless24Bit => {
+                    // A worst-case 24-bit subframe is 722 bytes. Keeping one
+                    // subframe per packet leaves ample room for both 124-byte
+                    // ADPCM FEC backups inside the 1380-byte safe UDP MTU.
+                    dynamic_codec_mode = CodecMode::StudioLosslessLpc;
+                    subframes_per_pkt = 1;
+                    tx_bitrate_kbps = selected_kbps;
+                }
                 QualityProfile::SmartAuto => {
                     if worst_loss_permille > 120 {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
@@ -945,7 +997,7 @@ impl HostEngine {
             }
 
             // 3. Encode Subframes
-            let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 4 + 12];
+            let mut primary_bundle = [0u8; MAX_LOSSLESS_PCM24_BYTES * 4 + 12];
             let mut primary_cursor = 0usize;
             let base_seq = seq;
             let prev_n1_copy = fec_n1;
@@ -1015,6 +1067,19 @@ impl HostEngine {
                     primary_cursor += 2;
                     primary_bundle[primary_cursor..primary_cursor + enc_len]
                         .copy_from_slice(&enc_vbr[..enc_len]);
+                    primary_cursor += enc_len;
+                } else if profile == QualityProfile::StudioLossless24Bit {
+                    // Encode from the original f32 samples (not the i16
+                    // noise-shaper output) so the lower 8 bits carry genuine
+                    // 24-bit resolution when the transport provides it.
+                    let mut enc_24 = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+                    let enc_len = encode_lossless_pcm24_subframe(&f32_subframe, &mut enc_24);
+                    let len_be = (enc_len as u16).to_be_bytes();
+                    primary_bundle[primary_cursor] = len_be[0];
+                    primary_bundle[primary_cursor + 1] = len_be[1];
+                    primary_cursor += 2;
+                    primary_bundle[primary_cursor..primary_cursor + enc_len]
+                        .copy_from_slice(&enc_24[..enc_len]);
                     primary_cursor += enc_len;
                 } else {
                     let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];

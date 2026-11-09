@@ -414,15 +414,16 @@ pub mod android_native {
         env: JNIEnv,
         _class: JClass,
     ) -> jlongArray {
-        let mut stats = [0i64; 5];
+        let mut stats = [0i64; 6];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
             stats[2] = c.telemetry.fec_healed_frames.load(Ordering::Relaxed) as i64;
             stats[3] = c.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed) as i64;
             stats[4] = c.telemetry.clock_drift_ppm.load(Ordering::Relaxed) as i64;
+            stats[5] = c.telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed) as i64;
         }
-        let arr = env.new_long_array(5).unwrap();
+        let arr = env.new_long_array(6).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
     }

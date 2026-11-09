@@ -11,6 +11,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -48,12 +49,13 @@ fun MainScreen() {
     var nightMode by remember { mutableStateOf(false) }
     var crossfeed by remember { mutableStateOf(false) }
     var channelRole by remember { mutableIntStateOf(0) }
-    // 0=Smart Auto, 1=Studio Lossless, 2=Low-Latency VBR, 3=Max Stability (10ms 2.4GHz)
+    // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
+    // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
     var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
     var sharePhoneMic by remember { mutableStateOf(false) }
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
-    var telemetry by remember { mutableStateOf(LongArray(5)) }
+    var telemetry by remember { mutableStateOf(LongArray(6)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -245,25 +247,28 @@ fun MainScreen() {
                         valueRange = -12.0f..24.0f
                     )
 
-                    // Host quality profile selector (sent as feedback mode 1..4)
+                    // Host quality profile selector (sent as feedback mode 1..5)
                     Text("Host Quality Mode", style = MaterialTheme.typography.titleSmall)
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         listOf(
                             0 to "🤖 Auto",
-                            1 to "💎 Lossless",
+                            1 to "💎 16-Bit",
                             2 to "⚡ VBR",
-                            3 to "🛡️ 10ms 2.4G"
+                            3 to "🛡️ 10ms 2.4G",
+                            4 to "👑 24-Bit"
                         ).forEach { (idx, label) ->
                             FilterChip(
                                 selected = qualityMode == idx,
                                 onClick = {
                                     qualityMode = idx
                                     prefs.edit().putInt("quality_mode", idx).apply()
-                                    // Host feedback mapping: 1=Auto, 2=Lossless,
-                                    // 3=Compressed, 4=Max Stability.
+                                    // Host feedback mapping: 1=Auto, 2=Lossless 16-bit,
+                                    // 3=Compressed, 4=Max Stability, 5=Lossless 24-bit.
                                     AudioEngineService.nativeSendMediaCommand(idx + 1)
                                 },
                                 label = { Text(label) }
@@ -450,6 +455,7 @@ fun MainScreen() {
                     Text("FEC Healed Drops  : ${telemetry[2]}", fontFamily = FontFamily.Monospace)
                     Text("WSOLA PLC Frames  : ${telemetry[3]}", fontFamily = FontFamily.Monospace)
                     Text("Clock Drift Lock  : ${telemetry[4]} ppm", fontFamily = FontFamily.Monospace)
+                    Text("AAudio HW Latency : ${telemetry[5]} ms", fontFamily = FontFamily.Monospace)
                     if (btEarbudsDetected) {
                         Text(
                             "🎧 Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",

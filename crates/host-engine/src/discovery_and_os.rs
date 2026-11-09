@@ -1,11 +1,16 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::HostTelemetry;
+
 pub const DISCOVERY_PORT: u16 = 65531;
+/// Link-local multicast group used alongside subnet broadcast. Some mesh
+/// Wi-Fi nodes drop directed/limited broadcasts but still forward multicast.
+pub const DISCOVERY_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 const BEACON_PREFIX: &str = "ASULTRA_BEACON|";
 
 #[derive(Debug, Clone)]
@@ -33,12 +38,18 @@ impl DiscoveryBeacon {
                     return;
                 };
                 let _ = sock.set_broadcast(true);
+                // Link-local scope: never leak discovery beacons past the LAN.
+                let _ = sock.set_multicast_ttl_v4(1);
                 let payload = format!("{}{}|{}", BEACON_PREFIX, host_label, stream_port);
 
                 while run_clone.load(Ordering::Relaxed) {
                     let _ = sock.send_to(
                         payload.as_bytes(),
                         SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
+                    );
+                    let _ = sock.send_to(
+                        payload.as_bytes(),
+                        SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT)),
                     );
 
                     for iface in crate::list_valid_host_interfaces() {
@@ -100,6 +111,15 @@ impl DiscoveryScanner {
                     return;
                 }
                 let sock: UdpSocket = raw_sock.into();
+                // Join the link-local multicast group on the default route and
+                // on every valid LAN interface (mesh nodes/APs may only forward
+                // multicast on a specific interface).
+                let _ = sock.join_multicast_v4(&DISCOVERY_MULTICAST_GROUP, &Ipv4Addr::UNSPECIFIED);
+                for iface in crate::list_valid_host_interfaces() {
+                    if let IpAddr::V4(ip) = iface.ip {
+                        let _ = sock.join_multicast_v4(&DISCOVERY_MULTICAST_GROUP, &ip);
+                    }
+                }
                 let _ = sock.set_read_timeout(Some(Duration::from_millis(250)));
                 let mut buf = [0u8; 256];
 
@@ -309,14 +329,116 @@ pub fn open_os_firewall_ports() -> String {
     }
 }
 
-/// Virtual Speaker & OS Wi-Fi Scan Suppressor Guard
+/// Polls the OS master output volume/mute on a dedicated thread and mirrors it
+/// into `HostTelemetry::host_volume`. This lets physical PC keyboard media
+/// keys propagate to connected phones without ever invoking `pactl` from the
+/// real-time audio TX loop.
+pub struct HostVolumeMonitor {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HostVolumeMonitor {
+    pub fn start(telemetry: Arc<HostTelemetry>) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let run_clone = Arc::clone(&running);
+
+        let handle = std::thread::Builder::new()
+            .name("as-ultra-volume-monitor".into())
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                {
+                    let mut last_os_volume: Option<u8> = None;
+                    while run_clone.load(Ordering::Relaxed) {
+                        if let Some(volume) = read_linux_master_volume() {
+                            // Only overwrite the telemetry when the OS value
+                            // itself changed. A GUI slider adjustment therefore
+                            // persists until the user actually presses a system
+                            // volume/mute key.
+                            if last_os_volume != Some(volume) {
+                                telemetry.host_volume.store(volume, Ordering::Relaxed);
+                                last_os_volume = Some(volume);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = telemetry;
+                    while run_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            })
+            .ok();
+
+        Self { running, handle }
+    }
+}
+
+impl Drop for HostVolumeMonitor {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Parse the first channel percentage from `pactl get-sink-volume` output.
+#[cfg(target_os = "linux")]
+fn parse_pactl_volume_percent(output: &str) -> Option<u8> {
+    let pct_end = output.find('%')?;
+    let number = output[..pct_end].split_whitespace().last()?;
+    number.parse::<u32>().ok().map(|v| v.min(100) as u8)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_master_volume() -> Option<u8> {
+    let mute = Command::new("pactl")
+        .args(["get-sink-mute", "@DEFAULT_SINK@"])
+        .output()
+        .ok()?;
+    if !mute.status.success() {
+        return None;
+    }
+    let muted = String::from_utf8_lossy(&mute.stdout)
+        .to_ascii_lowercase()
+        .contains("yes");
+    if muted {
+        return Some(0);
+    }
+
+    let volume = Command::new("pactl")
+        .args(["get-sink-volume", "@DEFAULT_SINK@"])
+        .output()
+        .ok()?;
+    if !volume.status.success() {
+        return None;
+    }
+    parse_pactl_volume_percent(&String::from_utf8_lossy(&volume.stdout))
+}
+
+/// Virtual Speaker & OS Wi-Fi Scan Suppressor Guard.
+///
+/// `acquire()` loads/registers the virtual endpoint but leaves the user's
+/// current routing untouched. The desktop GUI calls `activate()` once at
+/// least one phone is connected and `deactivate()` when the last phone leaves,
+/// so the physical speakers are only replaced while audio is being streamed.
 pub struct VirtualSpeakerAndRadioGuard {
+    /// The virtual endpoint is available and may be activated.
+    enabled: bool,
+    /// The virtual endpoint is currently the default routing target.
+    active: bool,
     #[cfg(target_os = "linux")]
     pactl_module_id: Option<String>,
     #[cfg(target_os = "linux")]
     prev_default_sink: Option<String>,
     #[cfg(target_os = "linux")]
     prev_default_source: Option<String>,
+    #[cfg(target_os = "windows")]
+    prev_default_sink: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -340,7 +462,39 @@ fn pactl_set_default(kind: &str, value: &str) {
     let _ = Command::new("pactl").args([arg.as_str(), value]).output();
 }
 
+#[cfg(target_os = "windows")]
+fn windows_default_playback_name() -> Option<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$d = Get-AudioDevice -List | Where-Object {$_.Default -eq $true} | Select-Object -First 1; if ($d) { $d.Name }",
+        ])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_set_playback_name(name: &str) {
+    let escaped = name.replace('\'', "''");
+    let script = format!(
+        "Get-AudioDevice -List | Where-Object {{$_.Name -eq '{}'}} | Set-AudioDevice",
+        escaped
+    );
+    let _ = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output();
+}
+
 impl VirtualSpeakerAndRadioGuard {
+    /// Register the virtual endpoint (if enabled) without changing the user's
+    /// current default sink/source. Call `activate()` when a client connects.
     pub fn acquire(enable_virtual_speaker: bool) -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -360,10 +514,6 @@ impl VirtualSpeakerAndRadioGuard {
                     if output.status.success() {
                         let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
                         if !id.is_empty() {
-                            // Route the default output into the streamed null sink,
-                            // and capture that sink's monitor as the default input.
-                            pactl_set_default("sink", "AudioShare_Ultra");
-                            pactl_set_default("source", "AudioShare_Ultra.monitor");
                             pactl_module_id = Some(id);
                         }
                     }
@@ -374,6 +524,8 @@ impl VirtualSpeakerAndRadioGuard {
                 .output();
 
             Self {
+                enabled: pactl_module_id.is_some(),
+                active: false,
                 pactl_module_id,
                 prev_default_sink,
                 prev_default_source,
@@ -382,51 +534,96 @@ impl VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "windows")]
         {
-            if enable_virtual_speaker {
-                // Switch playback to a Virtual Audio Cable / Virtual Speaker and
-                // capture from its recording endpoint.
-                let _ = Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Input*' -or $_.Name -like '*Virtual*'} | Set-AudioDevice",
-                    ])
-                    .output();
-                let _ = Command::new("powershell")
-                    .args([
-                        "-NoProfile",
-                        "-Command",
-                        "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Output*'} | Set-AudioDevice",
-                    ])
-                    .output();
-            }
             // Suppress Windows 60-second background Wi-Fi roaming/location channel scans
             set_windows_wlan_media_streaming_mode(true);
-            Self {}
+            Self {
+                enabled: enable_virtual_speaker,
+                active: false,
+                prev_default_sink: if enable_virtual_speaker {
+                    windows_default_playback_name()
+                } else {
+                    None
+                },
+            }
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
             let _ = enable_virtual_speaker;
-            Self {}
+            Self {
+                enabled: false,
+                active: false,
+            }
         }
+    }
+
+    /// Route the default output into the virtual speaker and capture its
+    /// monitor. Idempotent; safe to call from the GUI update loop.
+    pub fn activate(&mut self) {
+        if !self.enabled || self.active {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            pactl_set_default("sink", "AudioShare_Ultra");
+            pactl_set_default("source", "AudioShare_Ultra.monitor");
+            self.active = true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Input*' -or $_.Name -like '*Virtual*'} | Set-AudioDevice",
+                ])
+                .output();
+            let _ = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Output*'} | Set-AudioDevice",
+                ])
+                .output();
+            self.active = true;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            self.active = true;
+        }
+    }
+
+    /// Restore the physical default sink/source. Idempotent.
+    pub fn deactivate(&mut self) {
+        if !self.active {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref sink) = self.prev_default_sink {
+                pactl_set_default("sink", sink);
+            }
+            if let Some(ref source) = self.prev_default_source {
+                pactl_set_default("source", source);
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref sink) = self.prev_default_sink {
+                windows_set_playback_name(sink);
+            }
+        }
+        self.active = false;
     }
 }
 
 impl Drop for VirtualSpeakerAndRadioGuard {
     fn drop(&mut self) {
+        self.deactivate();
+
         #[cfg(target_os = "linux")]
-        {
-            // Restore the user's previous routing before removing the null sink.
-            if let Some(sink) = self.prev_default_sink.take() {
-                pactl_set_default("sink", &sink);
-            }
-            if let Some(source) = self.prev_default_source.take() {
-                pactl_set_default("source", &source);
-            }
-            if let Some(ref id) = self.pactl_module_id {
-                let _ = Command::new("pactl").args(["unload-module", id]).output();
-            }
+        if let Some(ref id) = self.pactl_module_id {
+            let _ = Command::new("pactl").args(["unload-module", id]).output();
         }
 
         #[cfg(target_os = "windows")]
@@ -563,6 +760,26 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pactl_volume_parser_handles_typical_output() {
+        let typical = "Volume: front-left: 65536 / 100% / 0.00 dB,   \
+                       front-right: 65536 / 100% / 0.00 dB\n        balance 0.00\n";
+        assert_eq!(parse_pactl_volume_percent(typical), Some(100));
+
+        let quiet = "Volume: front-left: 26214 /  40% / -23.88 dB,   \
+                     front-right: 26214 /  40% / -23.88 dB\n";
+        assert_eq!(parse_pactl_volume_percent(quiet), Some(40));
+        assert_eq!(parse_pactl_volume_percent("garbage"), None);
+    }
+
+    #[test]
+    fn test_multicast_discovery_group_is_link_local() {
+        assert!(DISCOVERY_MULTICAST_GROUP.is_multicast());
+        assert!(DISCOVERY_MULTICAST_GROUP.octets()[0] >= 224);
+        assert!(DISCOVERY_MULTICAST_GROUP.octets()[0] <= 239);
+    }
 
     #[test]
     fn test_discovery_scanner_reuse_address() {

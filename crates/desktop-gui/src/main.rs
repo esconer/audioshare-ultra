@@ -289,7 +289,29 @@ impl AudioShareApp {
 
 impl eframe::App for AudioShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Drop GUI CPU usage to ~0% while minimized: audio/network threads keep
+        // running, and winit asks for a repaint as soon as the window returns.
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !is_minimized {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // Auto-switch to the virtual speaker only while phones are connected,
+        // then restore the physical speakers when the last client leaves.
+        if let Some(ref host) = self.host_engine {
+            let client_count = host.telemetry.active_clients_count.load(Ordering::Relaxed);
+            self.host_master_volume = host.telemetry.host_volume.load(Ordering::Relaxed);
+            // Reflect profile changes requested from a connected phone.
+            self.quality_profile =
+                QualityProfile::from_u8(host.telemetry.quality_profile.load(Ordering::Relaxed));
+            if let Some(ref mut guard) = self.os_guard {
+                if client_count > 0 {
+                    guard.activate();
+                } else {
+                    guard.deactivate();
+                }
+            }
+        }
 
         egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -427,7 +449,11 @@ impl AudioShareApp {
                 ui.label("🎚️ Mode:");
                 for (profile, label) in [
                     (QualityProfile::SmartAuto, "🤖 Smart Auto"),
-                    (QualityProfile::StudioLossless, "💎 Studio Lossless (0ms)"),
+                    (QualityProfile::StudioLossless, "💎 Studio Lossless 16-Bit (0ms)"),
+                    (
+                        QualityProfile::StudioLossless24Bit,
+                        "👑 Studio Master 24-Bit (0ms)",
+                    ),
                     (
                         QualityProfile::LowLatencyCompressed,
                         "⚡ Low-Latency Compressed",
@@ -479,7 +505,10 @@ impl AudioShareApp {
                     "Adapts: lossless at <4.5% loss, compressed at >4.5%, 10ms/160k at >12%."
                 }
                 QualityProfile::StudioLossless => {
-                    "100% bit-perfect LPC-Delta, 2.5/5.0ms framing, zero codec lookahead."
+                    "100% bit-perfect 16-bit LPC-Delta, 2.5/5.0ms framing, zero codec lookahead."
+                }
+                QualityProfile::StudioLossless24Bit => {
+                    "True 24-bit: upper-16-bit LPC + exact LSB plane, 2.5ms single-subframe packets."
                 }
                 QualityProfile::LowLatencyCompressed => {
                     "VBR DPCM primary payload at the selected target; ADPCM FEC stays active."
@@ -574,6 +603,8 @@ impl AudioShareApp {
                         "GOVERNOR: COMPRESSED VBR {} kbps (Weak Wi-Fi Protection)",
                         self.target_bitrate_kbps
                     )
+                } else if self.quality_profile == QualityProfile::StudioLossless24Bit {
+                    "GOVERNOR: STUDIO MASTER 24-BIT LOSSLESS + FEC".to_string()
                 } else {
                     "GOVERNOR: STUDIO LOSSLESS LPC + [N-1]/[N-2] FEC".to_string()
                 };

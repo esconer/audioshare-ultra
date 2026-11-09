@@ -7,7 +7,8 @@ use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realt
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
 use audioshare_protocol::lpc_lossless::{
-    decode_fec_subframe_to_f32, decode_lossless_subframe, decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+    decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
+    decode_vbr_subframe_to_f32, TAG_VBR_BFP,
 };
 use audioshare_protocol::sequencer::{
     ZeroJitterSequencer, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
@@ -45,6 +46,10 @@ pub struct ClientTelemetry {
     pub enable_night_mode: AtomicBool,
     pub gaming_mode_hard_lock: AtomicBool,
     pub downstream_bt_delay_ms: AtomicU16,
+    /// Hardware/DAC latency measured with `AAudioStream_getTimestamp` on
+    /// Android. Kept separate from the A2DP codec estimate reported by Kotlin;
+    /// consumers use the larger of the two.
+    pub downstream_hw_delay_ms: AtomicU16,
     pub pending_media_command: AtomicU8,
     pub host_volume: AtomicU8,
     pub max_group_delay_ms: AtomicU16,
@@ -81,6 +86,7 @@ impl ClientEngine {
             enable_night_mode: AtomicBool::new(false),
             gaming_mode_hard_lock: AtomicBool::new(false),
             downstream_bt_delay_ms: AtomicU16::new(0),
+            downstream_hw_delay_ms: AtomicU16::new(0),
             pending_media_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
             max_group_delay_ms: AtomicU16::new(0),
@@ -222,6 +228,8 @@ impl ClientEngine {
         let mut latest_rx_seq: u16 = 0;
 
         let mut last_feedback = Instant::now();
+        #[cfg(target_os = "android")]
+        let mut last_hw_latency_poll = Instant::now();
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 12.0 (30.0ms) on 2.4GHz!
@@ -243,6 +251,24 @@ impl ClientEngine {
             {
                 *aaudio_guard =
                     android_aaudio::AAudioOutputGuard::open_low_latency(Arc::clone(&burst_fifo));
+                // The previous route's measurement is no longer valid.
+                telemetry.downstream_hw_delay_ms.store(0, Ordering::Relaxed);
+            }
+
+            // Sample the AAudio hardware timestamp twice a second. This is
+            // intentionally done from the RX loop (not the audio callback) so
+            // a slow HAL timestamp query can never cause an output glitch.
+            #[cfg(target_os = "android")]
+            if last_hw_latency_poll.elapsed() >= Duration::from_millis(500) {
+                last_hw_latency_poll = Instant::now();
+                if let Some(delay_ms) = aaudio_guard
+                    .as_ref()
+                    .and_then(|guard| guard.measure_hardware_latency_ms())
+                {
+                    telemetry
+                        .downstream_hw_delay_ms
+                        .store(delay_ms, Ordering::Relaxed);
+                }
             }
 
             if last_feedback.elapsed() >= Duration::from_millis(500)
@@ -269,9 +295,17 @@ impl ClientEngine {
                     (10.0f32.powf(gain_db / 20.0) * 100.0).clamp(0.0, 100.0) as u8
                 };
 
+                // Use the larger of the Kotlin A2DP estimate and the measured
+                // AAudio hardware/DAC delay, so wired output also reports real
+                // hardware latency while Bluetooth keeps its full codec delay.
+                let downstream_delay_ms = telemetry
+                    .downstream_bt_delay_ms
+                    .load(Ordering::Relaxed)
+                    .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
+
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
-                    bluetooth_delay_ms: telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
+                    bluetooth_delay_ms: downstream_delay_ms,
                     client_volume: client_vol,
                     requested_mode: media_cmd,
                     auth_mac32: 0,
@@ -370,19 +404,22 @@ impl ClientEngine {
                                     decode_fec_subframe_to_f32(payload, &mut pcm_f32)
                                 }
                             } else {
-                                let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
-                                if decode_lossless_subframe(
-                                    &prim[cursor..cursor + sub_len],
-                                    &mut pcm_i16,
-                                )
-                                .is_ok()
-                                {
-                                    for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
-                                        *dst = (s as f32) * (1.0 / 32768.0);
-                                    }
+                                let payload = &prim[cursor..cursor + sub_len];
+                                // True 24-bit profile: upper-16-bit LPC plus
+                                // the exact 8-bit LSB plane. Falls through to
+                                // the legacy 16-bit packer for all other tags.
+                                if decode_lossless_pcm24_to_f32(payload, &mut pcm_f32) {
                                     true
                                 } else {
-                                    false
+                                    let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+                                    if decode_lossless_subframe(payload, &mut pcm_i16).is_ok() {
+                                        for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
+                                            *dst = (s as f32) * (1.0 / 32768.0);
+                                        }
+                                        true
+                                    } else {
+                                        false
+                                    }
                                 }
                             };
 
@@ -417,10 +454,14 @@ impl ClientEngine {
             } else {
                 adaptive_wifi_subframes
             };
+            let downstream_delay_ms = telemetry
+                .downstream_bt_delay_ms
+                .load(Ordering::Relaxed)
+                .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
             let target_buf = group_sync.aligned_target_subframes(
                 base_target,
                 telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
+                downstream_delay_ms,
             );
 
             // Demand-driven by the Hardware Audio DAC:
@@ -717,6 +758,13 @@ pub mod android_aaudio {
         fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> i32;
         fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
+        fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
+        fn AAudioStream_getTimestamp(
+            stream: *mut AAudioStream,
+            clockid: i32,
+            frame_position: *mut i64,
+            time_nanoseconds: *mut i64,
+        ) -> i32;
         fn AAudioStream_requestStart(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_requestStop(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_close(stream: *mut AAudioStream) -> i32;
@@ -773,6 +821,32 @@ pub mod android_aaudio {
                 return true;
             }
             unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
+        }
+
+        /// Measure the downstream hardware/DAC pipeline latency from the
+        /// difference between frames written and the frame position that
+        /// AAudio reports as already presented to the hardware.
+        pub fn measure_hardware_latency_ms(&self) -> Option<u16> {
+            if self.stream.is_null() {
+                return None;
+            }
+            unsafe {
+                let mut frame_position: i64 = 0;
+                let mut time_nanoseconds: i64 = 0;
+                let result = AAudioStream_getTimestamp(
+                    self.stream,
+                    libc::CLOCK_MONOTONIC,
+                    &mut frame_position,
+                    &mut time_nanoseconds,
+                );
+                if result != 0 || frame_position < 0 || time_nanoseconds <= 0 {
+                    return None;
+                }
+                let written = AAudioStream_getFramesWritten(self.stream);
+                let pending_frames = written.saturating_sub(frame_position);
+                let delay_ms = ((pending_frames * 1000) / SAMPLE_RATE as i64).clamp(0, 400) as u16;
+                Some(delay_ms)
+            }
         }
 
         pub fn open_low_latency(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
