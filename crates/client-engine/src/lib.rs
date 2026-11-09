@@ -495,11 +495,12 @@ impl ClientEngine {
             );
 
             // Demand-driven by the Hardware Audio DAC:
-            // Keep burst_fifo topped up to 4 subframes (960 floats = 480 stereo frames) so no AAudio burst size ever starves!
+            // Keep burst_fifo at a tight adapter cushion (1.5 subframes in gaming mode, 2 subframes = 5.0ms normally)
+            // to eliminate dead buffering while preventing AAudio hardware DAC starvation.
             let fifo_watermark = if target_buf <= 2.5 {
                 SUBFRAME_STEREO_SAMPLES + SUBFRAME_STEREO_SAMPLES / 2 // 360 samples = 1.5 subframes
             } else {
-                SUBFRAME_STEREO_SAMPLES * 4 // 960 samples = 4 subframes
+                SUBFRAME_STEREO_SAMPLES * 2 // 480 samples = 2 subframes = 5.0ms
             };
 
             while stream_initialized
@@ -509,22 +510,32 @@ impl ClientEngine {
             {
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
-                next_play_seq = next_play_seq.wrapping_add(1);
 
                 match status {
                     STATUS_PRIMARY_LOSSLESS => {
+                        next_play_seq = next_play_seq.wrapping_add(1);
                         window_primary += 1;
                         telemetry
                             .primary_frames_played
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_HEALED_BY_FEC => {
+                        next_play_seq = next_play_seq.wrapping_add(1);
                         window_fec += 1;
                         // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 12.0 = 30.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(12.0);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
+                        // WebRTC NetEQ Rule:
+                        // Only advance `next_play_seq` past an empty slot if a NEWER packet already arrived
+                        // (proving `next_play_seq` was dropped) or if hold duration exceeds 8 subframes (20ms).
+                        // If no newer packet has arrived yet, `next_play_seq` is just delayed in the 2.4GHz air -> Hold playhead so it plays on arrival!
+                        if (latest_rx_seq.wrapping_sub(next_play_seq) as i16) >= 0
+                            || sequencer.consecutive_plc_count() > 8
+                        {
+                            next_play_seq = next_play_seq.wrapping_add(1);
+                        }
                         window_fec += 1;
                         // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 12.0 = 30.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
@@ -532,7 +543,9 @@ impl ClientEngine {
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    _ => {}
+                    _ => {
+                        next_play_seq = next_play_seq.wrapping_add(1);
+                    }
                 }
 
                 // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay)
@@ -701,6 +714,53 @@ mod tests {
         assert_eq!(i16_samples[1], -32767);
         assert_eq!(i16_samples[2], 0);
         assert_eq!(i16_samples[3], 16383);
+    }
+
+    #[test]
+    fn test_hold_playhead_on_delayed_packet_vs_dropped() {
+        let latest_rx = 99u16;
+        let mut next_play = 100u16;
+
+        // Case A: No newer packet arrived yet (latest_rx < next_play) -> Hold playhead!
+        let seq_delta = latest_rx.wrapping_sub(next_play) as i16;
+        let consecutive_plc = 1u32;
+        let should_advance = seq_delta >= 0 || consecutive_plc > 8;
+        assert!(
+            !should_advance,
+            "Playhead must hold when packet is delayed in 2.4GHz air"
+        );
+        if should_advance {
+            next_play = next_play.wrapping_add(1);
+        }
+        assert_eq!(next_play, 100);
+
+        // Case B: A newer packet already arrived (latest_rx >= next_play) -> Advance past dropped packet!
+        let latest_rx_newer = 101u16;
+        let seq_delta_newer = latest_rx_newer.wrapping_sub(next_play) as i16;
+        let should_advance_newer = seq_delta_newer >= 0 || consecutive_plc > 8;
+        assert!(
+            should_advance_newer,
+            "Playhead must advance when newer packet arrived"
+        );
+        if should_advance_newer {
+            next_play = next_play.wrapping_add(1);
+        }
+        assert_eq!(next_play, 101);
+
+        // Case C: Prolonged outage (>8 subframes) -> Force advance to prevent stale lag
+        let latest_rx_stale = 100u16;
+        let mut next_play_stale = 101u16;
+        let seq_delta_stale = latest_rx_stale.wrapping_sub(next_play_stale) as i16;
+        let prolonged_plc = 9u32;
+        let should_advance_stale = seq_delta_stale >= 0 || prolonged_plc > 8;
+        assert!(
+            should_advance_stale,
+            "Playhead must advance after prolonged outage"
+        );
+        if should_advance_stale {
+            next_play_stale = next_play_stale.wrapping_add(1);
+        }
+        assert_eq!(next_play_stale, 102);
     }
 }
 

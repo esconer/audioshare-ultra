@@ -207,6 +207,11 @@ impl ZeroJitterSequencer {
         self.append_to_history(out);
         STATUS_EMPTY
     }
+
+    #[inline]
+    pub fn consecutive_plc_count(&self) -> u32 {
+        self.consecutive_plc_count
+    }
 }
 
 #[cfg(test)]

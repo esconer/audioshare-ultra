@@ -467,6 +467,25 @@ impl HostEngine {
                 {
                     let current_monitor = get_default_monitor();
 
+                    // 1. Try direct in-process libpulse-simple.so.0 (2.5ms hardware fragsize, zero pipe buffering!)
+                    if Self::try_inprocess_pulse_simple_capture(
+                        &current_monitor,
+                        &ring,
+                        &heartbeat_ms,
+                        &running,
+                        &stream_active_clone,
+                        start_epoch,
+                        &get_default_monitor,
+                    ) {
+                        if stream_active_clone.load(Ordering::Relaxed)
+                            && running.load(Ordering::Relaxed)
+                        {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        continue;
+                    }
+
+                    // 2. Fallback to parec CLI if libpulse-simple.so.0 is unavailable
                     if let Ok(mut child) = Command::new("parec")
                         .env("PIPEWIRE_LATENCY", "64/48000")
                         .args([
@@ -546,6 +565,134 @@ impl HostEngine {
             stream_active,
             child_pid,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_inprocess_pulse_simple_capture<F>(
+        monitor_name: &str,
+        ring: &Arc<BurstDecouplerRing>,
+        heartbeat_ms: &Arc<AtomicU64>,
+        running: &Arc<AtomicBool>,
+        stream_active: &Arc<AtomicBool>,
+        start_epoch: Instant,
+        get_default_monitor: &F,
+    ) -> bool
+    where
+        F: Fn() -> String,
+    {
+        #[repr(C)]
+        struct PaSampleSpec {
+            format: i32,
+            rate: u32,
+            channels: u8,
+        }
+        #[repr(C)]
+        struct PaBufferAttr {
+            maxlength: u32,
+            tlength: u32,
+            prebuf: u32,
+            minreq: u32,
+            fragsize: u32,
+        }
+        type FnPaSimpleNew = unsafe extern "C" fn(
+            *const i8,
+            *const i8,
+            i32,
+            *const i8,
+            *const i8,
+            *const PaSampleSpec,
+            *const core::ffi::c_void,
+            *const PaBufferAttr,
+            *mut i32,
+        ) -> *mut core::ffi::c_void;
+        type FnPaSimpleRead =
+            unsafe extern "C" fn(*mut core::ffi::c_void, *mut u8, usize, *mut i32) -> i32;
+        type FnPaSimpleFree = unsafe extern "C" fn(*mut core::ffi::c_void);
+
+        unsafe {
+            let lib = libc::dlopen(
+                b"libpulse-simple.so.0\0".as_ptr() as *const i8,
+                libc::RTLD_LAZY,
+            );
+            if lib.is_null() {
+                return false;
+            }
+            let p_new = libc::dlsym(lib, b"pa_simple_new\0".as_ptr() as *const i8);
+            let p_read = libc::dlsym(lib, b"pa_simple_read\0".as_ptr() as *const i8);
+            let p_free = libc::dlsym(lib, b"pa_simple_free\0".as_ptr() as *const i8);
+            if p_new.is_null() || p_read.is_null() || p_free.is_null() {
+                libc::dlclose(lib);
+                return false;
+            }
+            let pa_new: FnPaSimpleNew = core::mem::transmute(p_new);
+            let pa_read: FnPaSimpleRead = core::mem::transmute(p_read);
+            let pa_free: FnPaSimpleFree = core::mem::transmute(p_free);
+
+            let dev_cstr = if monitor_name.is_empty() || monitor_name == "@DEFAULT_MONITOR@" {
+                None
+            } else {
+                std::ffi::CString::new(monitor_name).ok()
+            };
+            let dev_ptr = dev_cstr
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(core::ptr::null());
+
+            let ss = PaSampleSpec {
+                format: 5, // PA_SAMPLE_FLOAT32LE = 5
+                rate: 48_000,
+                channels: 2,
+            };
+            let attr = PaBufferAttr {
+                maxlength: (SUBFRAME_STEREO_SAMPLES * 4 * 2) as u32, // 5.0ms max buffer
+                tlength: u32::MAX,
+                prebuf: u32::MAX,
+                minreq: u32::MAX,
+                fragsize: (SUBFRAME_STEREO_SAMPLES * 4) as u32, // Exact 2.5ms (960B) DMA fragment!
+            };
+            let mut err = 0i32;
+            let handle = pa_new(
+                core::ptr::null(),
+                b"AudioShare Ultra\0".as_ptr() as *const i8,
+                2, // PA_STREAM_RECORD = 2
+                dev_ptr,
+                b"2.5ms Lossless Monitor\0".as_ptr() as *const i8,
+                &ss,
+                core::ptr::null(),
+                &attr,
+                &mut err,
+            );
+            if handle.is_null() {
+                libc::dlclose(lib);
+                return false;
+            }
+
+            let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            let mut frames_read = 0u32;
+            while stream_active.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+                if pa_read(
+                    handle,
+                    f32_buf.as_mut_ptr() as *mut u8,
+                    SUBFRAME_STEREO_SAMPLES * 4,
+                    &mut err,
+                ) < 0
+                {
+                    break;
+                }
+                heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                ring.push_samples(&f32_buf);
+                frames_read += 1;
+                if frames_read >= 800 {
+                    frames_read = 0;
+                    if get_default_monitor() != monitor_name {
+                        break;
+                    }
+                }
+            }
+            pa_free(handle);
+            libc::dlclose(lib);
+            true
+        }
     }
 
     #[cfg(not(target_os = "android"))]
