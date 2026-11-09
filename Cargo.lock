@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-android-jni"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-client-engine"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-desktop-gui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-host-engine"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "audioshare-protocol",
  "cpal",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-protocol"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "autocfg"
