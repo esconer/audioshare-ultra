@@ -45,6 +45,16 @@ impl ZeroJitterSequencer {
         }
     }
 
+    /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing
+    #[inline]
+    pub fn is_slot_missing(&self, target_seq: u16) -> bool {
+        let slot = &self.slots[(target_seq as usize) & RING_MASK];
+        let cur = slot.state.load(Ordering::Acquire);
+        let cur_seq = (cur >> 16) as u16;
+        let cur_status = cur & 0xFFFF;
+        cur_seq != target_seq || cur_status == STATUS_EMPTY
+    }
+
     #[inline]
     pub fn push_primary(&self, seq: u16, pcm_f32: &[f32; SUBFRAME_STEREO_SAMPLES]) -> bool {
         let slot = &self.slots[(seq as usize) & RING_MASK];

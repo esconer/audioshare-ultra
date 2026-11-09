@@ -135,8 +135,10 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     let sock_ref = socket2::SockRef::from(socket);
     // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
     let _ = sock_ref.set_tos(0xA0);
-    let _ = sock_ref.set_send_buffer_size(262_144);
-    let _ = sock_ref.set_recv_buffer_size(262_144);
+    // Asymmetric buffers: Tight 16KB SO_SNDBUF prevents kernel TX bufferbloat on 2.4GHz stalls;
+    // 128KB SO_RCVBUF ensures receiver never drops incoming Wi-Fi aggregation bursts.
+    let _ = sock_ref.set_send_buffer_size(16_384);
+    let _ = sock_ref.set_recv_buffer_size(131_072);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -915,6 +917,7 @@ impl HostEngine {
         let mut subframes_per_pkt = config.subframes_per_packet.clamp(1, 4) as usize;
         let mut packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
         let mut next_tick = start_instant + packet_interval;
+        let mut last_tx_instant = start_instant;
 
         let mut seq: u16 = 0;
         let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
@@ -1134,13 +1137,30 @@ impl HostEngine {
             // Wait until soundcard pushes a full packet of samples into `ring`,
             // or fall back to silence synthesis if capture endpoint is idle >15ms
             let needed_samples = subframes_per_pkt * SUBFRAME_STEREO_SAMPLES;
-            if !config.use_test_tone && ring.available_samples() < needed_samples {
-                let now_ms = start_instant.elapsed().as_millis() as u64;
-                let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(last_cb) <= 15 {
-                    std::thread::sleep(Duration::from_micros(400));
-                    continue;
+            if !config.use_test_tone {
+                let avail = ring.available_samples();
+                // Anti-Latency-Creep Guard: If an OS stall piled up >8 subframes (20ms) in `ring`,
+                // drain stale excess samples so Host capture latency never creeps up!
+                if avail > SUBFRAME_STEREO_SAMPLES * 8 {
+                    let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                    let mut dummy_rng = 1u32;
+                    while ring.available_samples() > needed_samples + SUBFRAME_STEREO_SAMPLES {
+                        ring.pop_exact_or_dither(&mut discard, &mut dummy_rng);
+                    }
+                } else if avail < needed_samples {
+                    let now_ms = start_instant.elapsed().as_millis() as u64;
+                    let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last_cb) <= 15 {
+                        std::thread::sleep(Duration::from_micros(400));
+                        continue;
+                    }
                 }
+            }
+
+            // Anti-Microburst Pacer: Never blast back-to-back Wi-Fi packets closer than 1.2ms apart
+            let since_last_tx = last_tx_instant.elapsed();
+            if since_last_tx < Duration::from_micros(1200) && subframes_per_pkt >= 2 {
+                std::thread::sleep(Duration::from_micros(1200) - since_last_tx);
             }
 
             // 3. Encode Subframes
@@ -1307,6 +1327,7 @@ impl HostEngine {
             if let Some(pkt_len) = maybe_pkt_len {
                 for &target_addr in &cached_targets {
                     if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
+                        last_tx_instant = Instant::now();
                         telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
                         telemetry
                             .bytes_sent
