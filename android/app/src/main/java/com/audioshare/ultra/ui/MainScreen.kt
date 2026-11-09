@@ -42,14 +42,16 @@ fun MainScreen() {
     var pinCode by remember {
         mutableStateOf(prefs.getString("pin_code", "") ?: "")
     }
+    var selectedTab by remember { mutableIntStateOf(0) } // 0=Connect, 1=Studio DSP, 2=Cast & Party
     var isConnected by remember { mutableStateOf(AudioEngineService.isStreaming) }
-    var preampGainDb by remember { mutableFloatStateOf(0.0f) }
-    var bassDb by remember { mutableFloatStateOf(0.0f) }
-    var vocalDb by remember { mutableFloatStateOf(0.0f) }
-    var trebleDb by remember { mutableFloatStateOf(0.0f) }
-    var nightMode by remember { mutableStateOf(false) }
-    var crossfeed by remember { mutableStateOf(false) }
-    var channelRole by remember { mutableIntStateOf(0) }
+    var preampGainDb by remember { mutableFloatStateOf(prefs.getFloat("gain_db", 0.0f)) }
+    var bassDb by remember { mutableFloatStateOf(prefs.getFloat("bass_db", 0.0f)) }
+    var vocalDb by remember { mutableFloatStateOf(prefs.getFloat("vocal_db", 0.0f)) }
+    var trebleDb by remember { mutableFloatStateOf(prefs.getFloat("treble_db", 0.0f)) }
+    var nightMode by remember { mutableStateOf(prefs.getBoolean("night_mode", false)) }
+    var crossfeed by remember { mutableStateOf(prefs.getBoolean("crossfeed", false)) }
+    var gamingLock by remember { mutableStateOf(prefs.getBoolean("gaming_lock", false)) }
+    var channelRole by remember { mutableIntStateOf(prefs.getInt("channel_role", 0)) }
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
     // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
     var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
@@ -57,8 +59,23 @@ fun MainScreen() {
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
-    var telemetry by remember { mutableStateOf(LongArray(7)) }
+    var telemetry by remember { mutableStateOf(LongArray(11)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
+
+    fun syncAndSaveDsp() {
+        prefs.edit()
+            .putFloat("gain_db", preampGainDb)
+            .putFloat("bass_db", bassDb)
+            .putFloat("vocal_db", vocalDb)
+            .putFloat("treble_db", trebleDb)
+            .putBoolean("night_mode", nightMode)
+            .putBoolean("crossfeed", crossfeed)
+            .putBoolean("gaming_lock", gamingLock)
+            .putInt("channel_role", channelRole)
+            .apply()
+        AudioEngineService.nativeSetGainDb(preampGainDb)
+        AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode, gamingLock)
+    }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -155,279 +172,405 @@ fun MainScreen() {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // 1. Host Connection Card
+            // Persistent Top Live Status & Warning Banner
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text("PC Host Endpoint (USB RNDIS or 5GHz Wi-Fi)", style = MaterialTheme.typography.titleMedium)
-                    OutlinedTextField(
-                        value = hostAddress,
-                        onValueChange = { hostAddress = it },
-                        label = { Text("Host IP:Port") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    val authErr = telemetry.getOrElse(5) { 0L }
+                    val idleSecs = telemetry.getOrElse(6) { 0L }
+                    val dtxSilent = telemetry.getOrElse(7) { 0L } == 1L
+                    val hostVol = telemetry.getOrElse(8) { 100L }
+                    val groupDelay = telemetry.getOrElse(9) { 0L }
 
-                    if (discoveredHosts.isNotEmpty()) {
+                    val statusTitle = when {
+                        !isConnected -> "⚪ Disconnected — Tap a PC below or scan QR"
+                        authErr > 5 -> "🔴 Wrong Encryption PIN! ($authErr packets rejected)"
+                        idleSecs >= 3 -> "⚠️ Host Signal Lost (${idleSecs}s) — Auto-Reconnecting..."
+                        dtxSilent -> "🔋 Smart DTX Sleep (-90dBFS BT Keep-Alive Active)"
+                        else -> "🟢 Streaming 48kHz Lossless • Host Vol: ${hostVol}%"
+                    }
+                    Text(statusTitle, style = MaterialTheme.typography.titleSmall)
+                    if (isConnected) {
                         Text(
-                            "Auto-Discovered PC Hosts (tap to select)",
+                            "Pkts: ${telemetry[0]} | FEC: ${telemetry[2]} | Drift: ${telemetry[4]} ppm | Sync: +${groupDelay}ms",
+                            fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodySmall
                         )
-                        discoveredHosts.forEach { entry ->
-                            val parts = entry.split("|")
-                            val name = parts.getOrNull(0) ?: entry
-                            val addr = parts.getOrNull(1) ?: entry
-                            val mode = parts.getOrNull(2) ?: "WiFi"
+                    }
+                }
+            }
+
+            // 3-Tab Material 3 Navigation Bar
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("📡 Connect") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("🎛️ Studio DSP") })
+                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("🎙️ Cast & Party") })
+            }
+
+            if (selectedTab == 0) {
+                // 1. Host Connection Card
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("PC Host Endpoint (USB RNDIS or 5GHz Wi-Fi)", style = MaterialTheme.typography.titleMedium)
+                        OutlinedTextField(
+                            value = hostAddress,
+                            onValueChange = { hostAddress = it },
+                            label = { Text("Host IP:Port") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (discoveredHosts.isNotEmpty()) {
+                            Text(
+                                "Auto-Discovered PC Hosts (tap to select)",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            discoveredHosts.forEach { entry ->
+                                val parts = entry.split("|")
+                                val name = parts.getOrNull(0) ?: entry
+                                val addr = parts.getOrNull(1) ?: entry
+                                val mode = parts.getOrNull(2) ?: "WiFi"
+                                OutlinedButton(
+                                    onClick = {
+                                        hostAddress = addr
+                                        prefs.edit().putString("last_host_addr", hostAddress).putString("pin_code", pinCode).apply()
+                                        val intent = Intent(context, AudioEngineService::class.java).apply {
+                                            putExtra("HOST_ADDR", hostAddress)
+                                            putExtra("GAIN_DB", preampGainDb)
+                                            putExtra("PIN", pinCode)
+                                        }
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            context.startForegroundService(intent)
+                                        } else {
+                                            context.startService(intent)
+                                        }
+                                        isConnected = true
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("⚡ 1-Tap Connect: [$mode] $name ($addr)")
+                                }
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = pinCode,
+                            onValueChange = {
+                                pinCode = it
+                                prefs.edit().putString("pin_code", it).apply()
+                            },
+                            label = { Text("PIN (optional, ChaCha20 + MAC32)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Button(
+                                onClick = {
+                                    prefs.edit().putString("last_host_addr", hostAddress).apply()
+                                    prefs.edit().putString("pin_code", pinCode).apply()
+                                    val intent = Intent(context, AudioEngineService::class.java)
+                                    if (isConnected) {
+                                        intent.action = "ACTION_STOP"
+                                        context.startService(intent)
+                                        isConnected = false
+                                    } else {
+                                        intent.putExtra("HOST_ADDR", hostAddress)
+                                        intent.putExtra("GAIN_DB", preampGainDb)
+                                        intent.putExtra("PIN", pinCode)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            context.startForegroundService(intent)
+                                        } else {
+                                            context.startService(intent)
+                                        }
+                                        isConnected = true
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(if (isConnected) "Disconnect" else "Connect Lossless Stream")
+                            }
+
+                            OutlinedButton(
+                                onClick = { hostAddress = "127.0.0.1:65530" }
+                            ) {
+                                Text("USB ADB")
+                            }
+
+                            // In-App 1-Tap QR Camera Launcher
                             OutlinedButton(
                                 onClick = {
-                                    hostAddress = addr
-                                    prefs.edit().putString("last_host_addr", hostAddress).putString("pin_code", pinCode).apply()
-                                    val intent = Intent(context, AudioEngineService::class.java).apply {
-                                        putExtra("HOST_ADDR", hostAddress)
-                                        putExtra("GAIN_DB", preampGainDb)
-                                        putExtra("PIN", pinCode)
+                                    try {
+                                        val qrIntent = Intent("com.google.zxing.client.android.SCAN")
+                                        context.startActivity(qrIntent)
+                                    } catch (_: Exception) {
+                                        val camIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
+                                        context.startActivity(camIntent)
                                     }
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                        context.startForegroundService(intent)
-                                    } else {
-                                        context.startService(intent)
-                                    }
-                                    isConnected = true
-                                },
-                                modifier = Modifier.fillMaxWidth()
+                                }
                             ) {
-                                Text("⚡ 1-Tap Connect: [$mode] $name ($addr)")
+                                Text("📷 QR")
                             }
                         }
                     }
+                }
 
-                    OutlinedTextField(
-                        value = pinCode,
-                        onValueChange = {
-                            pinCode = it
-                            prefs.edit().putString("pin_code", it).apply()
-                        },
-                        label = { Text("PIN (optional, ChaCha20 + MAC32)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                // 2. Live Real-Time Sequencer & Clock Drift HUD
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text("Real-Time Hardware Telemetry", style = MaterialTheme.typography.titleMedium)
+                        Text("RX Packets        : ${telemetry[0]}", fontFamily = FontFamily.Monospace)
+                        Text("Lossless Subframes: ${telemetry[1]}", fontFamily = FontFamily.Monospace)
+                        Text("FEC Healed Drops  : ${telemetry[2]}", fontFamily = FontFamily.Monospace)
+                        Text("WSOLA PLC Frames  : ${telemetry[3]}", fontFamily = FontFamily.Monospace)
+                        Text("Clock Drift Lock  : ${telemetry[4]} ppm", fontFamily = FontFamily.Monospace)
+                        Text("AAudio HW Latency : ${telemetry.getOrElse(10) { 0L }} ms", fontFamily = FontFamily.Monospace)
+                        Text("Host Silence      : ${telemetry.getOrElse(6) { 0L }} s", fontFamily = FontFamily.Monospace)
+                        if (telemetry.getOrElse(5) { 0L } > 0) {
+                            Text("Auth Failures     : ${telemetry[5]}", color = MaterialTheme.colorScheme.error, fontFamily = FontFamily.Monospace)
+                        }
+                        if (btEarbudsDetected) {
+                            Text(
+                                "🎧 Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",
+                                color = MaterialTheme.colorScheme.tertiary,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            } // End Tab 0
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Button(
-                            onClick = {
-                                prefs.edit().putString("last_host_addr", hostAddress).apply()
-                                prefs.edit().putString("pin_code", pinCode).apply()
-                                val intent = Intent(context, AudioEngineService::class.java)
-                                if (isConnected) {
-                                    intent.action = "ACTION_STOP"
-                                    context.startService(intent)
-                                    isConnected = false
-                                } else {
-                                    intent.putExtra("HOST_ADDR", hostAddress)
-                                    intent.putExtra("GAIN_DB", preampGainDb)
-                                    intent.putExtra("PIN", pinCode)
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                        context.startForegroundService(intent)
-                                    } else {
-                                        context.startService(intent)
+            if (selectedTab == 1) {
+                // Studio Pre-Amp & True-Peak Limiter Card (#64 & #34)
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // 1-Tap Studio EQ Presets
+                        Text("✨ 1-Tap Studio EQ Presets:", style = MaterialTheme.typography.labelMedium)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            listOf(
+                                Triple("Flat", 0f, 0f) to 0f,
+                                Triple("🔥 Bass", 6.5f, 0f) to 1.5f,
+                                Triple("🎙️ Vocal", -2f, 5.5f) to 2f,
+                                Triple("🎮 FPS", -3f, 6f) to 4.5f
+                            ).forEach { (b_v, t) ->
+                                OutlinedButton(
+                                    onClick = {
+                                        bassDb = b_v.second
+                                        vocalDb = b_v.third
+                                        trebleDb = t
+                                        syncAndSaveDsp()
                                     }
-                                    isConnected = true
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(if (isConnected) "Disconnect" else "Connect Lossless Stream")
-                        }
-
-                        OutlinedButton(
-                            onClick = { hostAddress = "127.0.0.1:65530" }
-                        ) {
-                            Text("USB ADB")
-                        }
-
-                        // In-App 1-Tap QR Camera Launcher
-                        OutlinedButton(
-                            onClick = {
-                                try {
-                                    val qrIntent = Intent("com.google.zxing.client.android.SCAN")
-                                    context.startActivity(qrIntent)
-                                } catch (_: Exception) {
-                                    val camIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
-                                    context.startActivity(camIntent)
-                                }
+                                ) { Text(b_v.first) }
                             }
-                        ) {
-                            Text("📷 QR")
                         }
-                    }
-                }
-            }
 
-            // 2. Studio Pre-Amp & True-Peak Limiter Card (#64 & #34)
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Studio Pre-Amp (True-Peak Limited)", style = MaterialTheme.typography.titleMedium)
-                        Text("${"%.1f".format(preampGainDb)} dB", fontFamily = FontFamily.Monospace)
-                    }
-                    Slider(
-                        value = preampGainDb,
-                        onValueChange = {
-                            preampGainDb = it
-                            if (isConnected) AudioEngineService.nativeSetGainDb(it)
-                        },
-                        valueRange = -12.0f..24.0f
-                    )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Studio Pre-Amp (True-Peak Limited)", style = MaterialTheme.typography.titleMedium)
+                            Text("${"%.1f".format(preampGainDb)} dB", fontFamily = FontFamily.Monospace)
+                        }
+                        Slider(
+                            value = preampGainDb,
+                            onValueChange = {
+                                preampGainDb = it
+                                syncAndSaveDsp()
+                            },
+                            valueRange = -12.0f..24.0f
+                        )
 
-                    // Host quality profile selector (sent as feedback mode 1..5)
-                    Text("Host Quality Mode", style = MaterialTheme.typography.titleSmall)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf(
-                            0 to "🤖 Auto",
-                            1 to "💎 16-Bit",
-                            2 to "⚡ VBR",
-                            3 to "🛡️ 10ms 2.4G",
-                            4 to "👑 24-Bit"
-                        ).forEach { (idx, label) ->
+                        // Host quality profile selector (sent as feedback mode 1..5)
+                        Text("Host Quality Mode", style = MaterialTheme.typography.titleSmall)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            listOf(
+                                0 to "🤖 Auto",
+                                1 to "💎 16-Bit",
+                                2 to "⚡ VBR",
+                                3 to "🛡️ 10ms 2.4G",
+                                4 to "👑 24-Bit"
+                            ).forEach { (idx, label) ->
+                                FilterChip(
+                                    selected = qualityMode == idx,
+                                    onClick = {
+                                        qualityMode = idx
+                                        prefs.edit().putInt("quality_mode", idx).apply()
+                                        AudioEngineService.nativeSendMediaCommand(idx + 1)
+                                    },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
                             FilterChip(
-                                selected = qualityMode == idx,
+                                selected = nightMode,
                                 onClick = {
-                                    qualityMode = idx
-                                    prefs.edit().putInt("quality_mode", idx).apply()
-                                    // Host feedback mapping: 1=Auto, 2=Lossless 16-bit,
-                                    // 3=Compressed, 4=Max Stability, 5=Lossless 24-bit.
-                                    AudioEngineService.nativeSendMediaCommand(idx + 1)
+                                    nightMode = !nightMode
+                                    syncAndSaveDsp()
                                 },
-                                label = { Text(label) }
+                                label = { Text("🌙 Night") }
                             )
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        FilterChip(
-                            selected = nightMode,
-                            onClick = {
-                                nightMode = !nightMode
-                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                            },
-                            label = { Text("🌙 Night Mode") }
-                        )
-                        FilterChip(
-                            selected = crossfeed,
-                            onClick = {
-                                crossfeed = !crossfeed
-                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                            },
-                            label = { Text("🎧 Binaural 3D") }
-                        )
-                        FilterChip(
-                            selected = channelRole != 0,
-                            onClick = {
-                                channelRole = (channelRole + 1) % 5
-                                AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                            },
-                            label = {
-                                val roleName = listOf("Stereo", "Left", "Right", "Vocal", "Surround")[channelRole]
-                                Text("🔊 $roleName")
-                            }
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly
-                    ) {
-                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(12) }) { Text("⏮ Prev") }
-                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(10) }) { Text("⏯ Play/Pause PC") }
-                        OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(11) }) { Text("⏭ Next") }
-                    }
-
-                    // Sleep Timer Selector (Off / 15m / 30m / 60m)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("⏲️ Sleep Timer:", style = MaterialTheme.typography.labelMedium)
-                        listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
                             FilterChip(
-                                selected = sleepTimerMinutes == mins,
-                                onClick = { sleepTimerMinutes = mins },
-                                label = { Text(lbl) }
+                                selected = crossfeed,
+                                onClick = {
+                                    crossfeed = !crossfeed
+                                    syncAndSaveDsp()
+                                },
+                                label = { Text("🎧 3D") }
+                            )
+                            FilterChip(
+                                selected = gamingLock,
+                                onClick = {
+                                    gamingLock = !gamingLock
+                                    syncAndSaveDsp()
+                                },
+                                label = { Text("🎮 5ms Lock") }
+                            )
+                            FilterChip(
+                                selected = channelRole != 0,
+                                onClick = {
+                                    channelRole = (channelRole + 1) % 5
+                                    syncAndSaveDsp()
+                                },
+                                label = {
+                                    val roleName = listOf("Stereo", "Left", "Right", "Vocal", "Surround")[channelRole]
+                                    Text("🔊 $roleName")
+                                }
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(12) }) { Text("⏮ Prev") }
+                            OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(10) }) { Text("⏯ Play/Pause PC") }
+                            OutlinedButton(onClick = { AudioEngineService.nativeSendMediaCommand(11) }) { Text("⏭ Next") }
+                        }
+
+                        // Sleep Timer Selector (Off / 15m / 30m / 60m)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("⏲️ Sleep Timer:", style = MaterialTheme.typography.labelMedium)
+                            listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
+                                FilterChip(
+                                    selected = sleepTimerMinutes == mins,
+                                    onClick = { sleepTimerMinutes = mins },
+                                    label = { Text(lbl) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Studio 3-Band Parametric Equalizer Card
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Studio 3-Band Parametric EQ", style = MaterialTheme.typography.titleMedium)
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Sub-Bass (80 Hz)", style = MaterialTheme.typography.bodySmall)
+                            Text("${"%.1f".format(bassDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Slider(
+                            value = bassDb,
+                            onValueChange = {
+                                bassDb = it
+                                syncAndSaveDsp()
+                            },
+                            valueRange = -12.0f..12.0f
+                        )
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Vocal Presence (2.5 kHz)", style = MaterialTheme.typography.bodySmall)
+                            Text("${"%.1f".format(vocalDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Slider(
+                            value = vocalDb,
+                            onValueChange = {
+                                vocalDb = it
+                                syncAndSaveDsp()
+                            },
+                            valueRange = -12.0f..12.0f
+                        )
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Treble Air (10 kHz)", style = MaterialTheme.typography.bodySmall)
+                            Text("${"%.1f".format(trebleDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                        }
+                        Slider(
+                            value = trebleDb,
+                            onValueChange = {
+                                trebleDb = it
+                                syncAndSaveDsp()
+                            },
+                            valueRange = -12.0f..12.0f
+                        )
+                    }
+                }
+            } // End Tab 1
+
+            if (selectedTab == 2) {
+                // Cast Phone Internal Media & Games (PhoneAudioCaster - Party Mode)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Cast Phone Internal Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    "Broadcasts media & games directly from this phone to PC headphones or multiple phones",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Switch(
+                                checked = castPhoneInternalAudio,
+                                onCheckedChange = { enabled ->
+                                    if (enabled) {
+                                        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                        projectionLauncher.launch(mgr.createScreenCaptureIntent())
+                                    } else {
+                                        activeCaster?.stopCasting()
+                                        activeCaster = null
+                                        castPhoneInternalAudio = false
+                                        AudioEngineService.nativeStopPhoneMic()
+                                    }
+                                }
                             )
                         }
                     }
                 }
-            }
 
-            // 3. Studio 3-Band Parametric Equalizer Card
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text("Studio 3-Band Parametric EQ", style = MaterialTheme.typography.titleMedium)
-
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("Sub-Bass (80 Hz)", style = MaterialTheme.typography.bodySmall)
-                        Text("${"%.1f".format(bassDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Slider(
-                        value = bassDb,
-                        onValueChange = {
-                            bassDb = it
-                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                        },
-                        valueRange = -12.0f..12.0f
-                    )
-
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("Vocal Presence (2.5 kHz)", style = MaterialTheme.typography.bodySmall)
-                        Text("${"%.1f".format(vocalDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Slider(
-                        value = vocalDb,
-                        onValueChange = {
-                            vocalDb = it
-                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                        },
-                        valueRange = -12.0f..12.0f
-                    )
-
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text("Treble Air (10 kHz)", style = MaterialTheme.typography.bodySmall)
-                        Text("${"%.1f".format(trebleDb)} dB", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Slider(
-                        value = trebleDb,
-                        onValueChange = {
-                            trebleDb = it
-                            AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode)
-                        },
-                        valueRange = -12.0f..12.0f
-                    )
-                }
-            }
-
-            // 4. Cast Phone Internal Media & Games (PhoneAudioCaster - Party Mode)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // Bidirectional Phone-as-PC-Microphone Card (#27)
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                     Row(
                         modifier = Modifier
@@ -437,92 +580,35 @@ fun MainScreen() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Cast Phone Internal Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
+                            Text("Share Phone Microphone / Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
                             Text(
-                                "Broadcasts media & games directly from this phone to PC headphones or multiple phones",
+                                "Streams 48kHz low-latency AAudio Mic or Internal Cast to PC or multiple phones (Port 65532)",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
                         Switch(
-                            checked = castPhoneInternalAudio,
+                            checked = sharePhoneMic,
                             onCheckedChange = { enabled ->
-                                if (enabled) {
-                                    val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                                    projectionLauncher.launch(mgr.createScreenCaptureIntent())
-                                } else {
-                                    activeCaster?.stopCasting()
-                                    activeCaster = null
-                                    castPhoneInternalAudio = false
+                                if (!enabled) {
+                                    sharePhoneMic = false
                                     AudioEngineService.nativeStopPhoneMic()
+                                } else if (isConnected) {
+                                    val hasPerm = ContextCompat.checkSelfPermission(
+                                        context,
+                                        Manifest.permission.RECORD_AUDIO
+                                    ) == PackageManager.PERMISSION_GRANTED
+                                    if (hasPerm) {
+                                        sharePhoneMic = true
+                                        AudioEngineService.nativeStartPhoneMic(hostAddress, true)
+                                    } else {
+                                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
                                 }
                             }
                         )
                     }
                 }
-            }
-
-            // 3. Bidirectional Phone-as-PC-Microphone Card (#27)
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Share Phone Microphone / Audio (Party Mode)", style = MaterialTheme.typography.titleMedium)
-                        Text(
-                            "Streams 48kHz low-latency AAudio Mic or Internal Cast to PC or multiple phones (Port 65532)",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                    Switch(
-                        checked = sharePhoneMic,
-                        onCheckedChange = { enabled ->
-                            if (!enabled) {
-                                sharePhoneMic = false
-                                AudioEngineService.nativeStopPhoneMic()
-                            } else if (isConnected) {
-                                val hasPerm = ContextCompat.checkSelfPermission(
-                                    context,
-                                    Manifest.permission.RECORD_AUDIO
-                                ) == PackageManager.PERMISSION_GRANTED
-                                if (hasPerm) {
-                                    sharePhoneMic = true
-                                    AudioEngineService.nativeStartPhoneMic(hostAddress, true)
-                                } else {
-                                    micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                }
-                            }
-                        }
-                    )
-                }
-            }
-
-            // 4. Live Real-Time Sequencer & Clock Drift HUD
-            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Text("Real-Time Hardware Telemetry", style = MaterialTheme.typography.titleMedium)
-                    Text("RX Packets        : ${telemetry[0]}", fontFamily = FontFamily.Monospace)
-                    Text("Lossless Subframes: ${telemetry[1]}", fontFamily = FontFamily.Monospace)
-                    Text("FEC Healed Drops  : ${telemetry[2]}", fontFamily = FontFamily.Monospace)
-                    Text("WSOLA PLC Frames  : ${telemetry[3]}", fontFamily = FontFamily.Monospace)
-                    Text("Clock Drift Lock  : ${telemetry[4]} ppm", fontFamily = FontFamily.Monospace)
-                    Text("AAudio HW Latency : ${telemetry[5]} ms", fontFamily = FontFamily.Monospace)
-                    Text("Host Silence      : ${telemetry.getOrElse(6) { 0L }} s", fontFamily = FontFamily.Monospace)
-                    if (btEarbudsDetected) {
-                        Text(
-                            "🎧 Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",
-                            color = MaterialTheme.colorScheme.tertiary,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-            }
+            } // End Tab 2
         }
     }
 }

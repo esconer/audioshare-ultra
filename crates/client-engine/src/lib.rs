@@ -97,8 +97,29 @@ impl ClientEngine {
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| format!("Failed to bind client UDP socket: {}", e))?;
+        // Bind port 65530 with SO_REUSEADDR first (enables receiving 1-Phone-to-Multi-Phone broadcasts!),
+        // falling back to an ephemeral port (0.0.0.0:0) if HostEngine is running on the same device.
+        let socket = {
+            let mut bound = None;
+            if let Ok(raw) = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            ) {
+                let _ = raw.set_reuse_address(true);
+                #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+                let _ = raw.set_reuse_port(true);
+                let addr = SocketAddr::from(([0, 0, 0, 0], 65530));
+                if raw.bind(&addr.into()).is_ok() {
+                    bound = Some(UdpSocket::from(raw));
+                }
+            }
+            match bound {
+                Some(s) => s,
+                None => UdpSocket::bind("0.0.0.0:0")
+                    .map_err(|e| format!("Failed to bind client UDP socket: {}", e))?,
+            }
+        };
         configure_realtime_udp_socket(&socket)
             .map_err(|e| format!("Failed to configure real-time client socket: {}", e))?;
         let _ = socket.set_read_timeout(Some(Duration::from_millis(5)));

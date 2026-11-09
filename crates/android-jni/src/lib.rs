@@ -76,8 +76,11 @@ impl PhoneMicTransmitter {
             return Err("No valid target endpoints found for transmitter".into());
         }
 
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+        let socket = UdpSocket::bind(("0.0.0.0", 65530))
+            .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
+            .map_err(|e| e.to_string())?;
         let _ = socket.set_broadcast(true);
+        let _ = socket.set_nonblocking(true);
         configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
 
         let running = Arc::new(AtomicBool::new(true));
@@ -103,8 +106,19 @@ impl PhoneMicTransmitter {
                 let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
                 let mut has_fec = false;
                 let mut dither_rng = 1u32;
+                let mut ctrl_buf = [0u8; 64];
 
                 while run_clone.load(Ordering::Relaxed) {
+                    while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
+                        if len >= 8
+                            && (&ctrl_buf[..8] == b"ASULTRA1" || &ctrl_buf[..8] == b"ASULCTRL")
+                        {
+                            if !targets.contains(&src_addr) {
+                                targets.push(src_addr);
+                            }
+                        }
+                    }
+
                     if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES {
                         let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                         ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
@@ -251,6 +265,7 @@ pub fn android_configure_dsp(
     role: u8,
     crossfeed: bool,
     night_mode: bool,
+    gaming_lock: bool,
 ) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
         client
@@ -274,6 +289,10 @@ pub fn android_configure_dsp(
             .telemetry
             .enable_night_mode
             .store(night_mode, Ordering::Relaxed);
+        client
+            .telemetry
+            .gaming_mode_hard_lock
+            .store(gaming_lock, Ordering::Relaxed);
     }
 }
 
@@ -377,6 +396,7 @@ pub mod android_native {
         role: jint,
         crossfeed: jboolean,
         night_mode: jboolean,
+        gaming_lock: jboolean,
     ) {
         android_configure_dsp(
             bass_db,
@@ -385,6 +405,7 @@ pub mod android_native {
             role as u8,
             crossfeed != 0,
             night_mode != 0,
+            gaming_lock != 0,
         );
     }
 
@@ -435,20 +456,24 @@ pub mod android_native {
         env: JNIEnv,
         _class: JClass,
     ) -> jlongArray {
-        let mut stats = [0i64; 7];
+        let mut stats = [0i64; 11];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
             stats[2] = c.telemetry.fec_healed_frames.load(Ordering::Relaxed) as i64;
             stats[3] = c.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed) as i64;
             stats[4] = c.telemetry.clock_drift_ppm.load(Ordering::Relaxed) as i64;
-            stats[5] = c.telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed) as i64;
+            stats[5] = c.telemetry.auth_failures.load(Ordering::Relaxed) as i64;
             stats[6] = c
                 .telemetry
                 .seconds_since_last_packet
                 .load(Ordering::Relaxed) as i64;
+            stats[7] = i64::from(c.telemetry.server_dtx_silent.load(Ordering::Relaxed));
+            stats[8] = c.telemetry.host_volume.load(Ordering::Relaxed) as i64;
+            stats[9] = c.telemetry.max_group_delay_ms.load(Ordering::Relaxed) as i64;
+            stats[10] = c.telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed) as i64;
         }
-        let arr = env.new_long_array(7).unwrap();
+        let arr = env.new_long_array(11).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
     }

@@ -1,8 +1,10 @@
 package com.audioshare.ultra.service
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
@@ -51,7 +53,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             trebDb: Float,
             role: Int,
             crossfeed: Boolean,
-            nightMode: Boolean
+            nightMode: Boolean,
+            gamingLock: Boolean
         )
 
         @JvmStatic
@@ -73,25 +76,66 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var focusRequest: AudioFocusRequest? = null
     private var mediaSession: MediaSession? = null
     private var currentGainDb = 0.0f
+    private var isLocallyMuted: Boolean = false
+    private var currentHostAddr: String = ""
+    private var currentIsUsb: Boolean = false
+
+    // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
+    private val becomingNoisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                isLocallyMuted = true
+                nativeSetGainDb(-96.0f)
+                startForegroundNotification(currentHostAddr, currentIsUsb)
+            }
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "ACTION_STOP") {
             stopStreamAndService()
             return START_NOT_STICKY
         }
+        if (intent?.action == "ACTION_TOGGLE_MUTE") {
+            val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+            val savedGain = prefs.getFloat("gain_db", 0.0f)
+            isLocallyMuted = !isLocallyMuted
+            nativeSetGainDb(if (isLocallyMuted) -96.0f else savedGain)
+            startForegroundNotification(currentHostAddr, currentIsUsb)
+            return START_STICKY
+        }
 
-        val hostAddr = intent?.getStringExtra("HOST_ADDR") ?: "192.168.42.129:65530"
+        val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+        val hostAddr = intent?.getStringExtra("HOST_ADDR")
+            ?: prefs.getString("last_host_addr", "192.168.42.129:65530")
+            ?: "192.168.42.129:65530"
         val isUsb = hostAddr.startsWith("192.168.42.") || hostAddr.startsWith("127.0.0.1")
-        val gainDb = intent?.getFloatExtra("GAIN_DB", 0.0f) ?: 0.0f
-        val pin = intent?.getStringExtra("PIN") ?: ""
+        val gainDb = intent?.getFloatExtra("GAIN_DB", prefs.getFloat("gain_db", 0.0f)) ?: 0.0f
+        val pin = intent?.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: ""
         currentGainDb = gainDb
+        currentHostAddr = hostAddr
+        currentIsUsb = isUsb
+        isLocallyMuted = false
 
         startForegroundNotification(hostAddr, isUsb)
         acquireRealtimeHardwareLocks()
         setupHardwareBluetoothMediaSession()
         requestAudioFocus()
+        try {
+            registerReceiver(becomingNoisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
+        } catch (_: Exception) {}
 
         isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin)
+        // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode & Gaming Lock automatically!
+        nativeConfigureDsp(
+            prefs.getFloat("bass_db", 0.0f),
+            prefs.getFloat("vocal_db", 0.0f),
+            prefs.getFloat("treble_db", 0.0f),
+            prefs.getInt("channel_role", 0),
+            prefs.getBoolean("crossfeed", false),
+            prefs.getBoolean("night_mode", false),
+            prefs.getBoolean("gaming_lock", false)
+        )
         return START_STICKY
     }
 
@@ -177,13 +221,22 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             this, 0, stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val muteIntent = Intent(this, AudioEngineService::class.java).apply {
+            action = "ACTION_TOGGLE_MUTE"
+        }
+        val mutePending = PendingIntent.getService(
+            this, 1, muteIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
 
         val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
+        val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("AudioShare Ultra • $badge")
-            .setContentText("Connected to $hostAddr")
+            .setContentText(statusText)
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setOngoing(true)
+            .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
             .addAction(android.R.drawable.ic_media_pause, "Disconnect", stopPending)
             .build()
 
@@ -223,6 +276,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopPhoneMic()
         nativeStopClient()
         isStreaming = false
+        try {
+            unregisterReceiver(becomingNoisyReceiver)
+        } catch (_: Exception) {}
         mediaSession?.isActive = false
         mediaSession?.release()
         mediaSession = null
