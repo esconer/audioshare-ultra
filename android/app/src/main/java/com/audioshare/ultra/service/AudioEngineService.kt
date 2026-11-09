@@ -98,6 +98,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             stopStreamAndService()
             return START_NOT_STICKY
         }
+        if (intent?.action == "ACTION_START_CAST_GUARD") {
+            // Standalone Mic / Party Host Mode: Hold ForegroundService + Low-Latency WifiLock + WakeLock
+            // so Android never kills the microphone or Party Cast when the screen turns off!
+            val label = intent.getStringExtra("CAST_LABEL") ?: "Mic / Party Broadcast"
+            currentHostAddr = label
+            currentIsUsb = false
+            startForegroundNotification(label, false)
+            acquireRealtimeHardwareLocks()
+            return START_STICKY
+        }
         if (intent?.action == "ACTION_TOGGLE_MUTE") {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val savedGain = prefs.getFloat("gain_db", 0.0f)

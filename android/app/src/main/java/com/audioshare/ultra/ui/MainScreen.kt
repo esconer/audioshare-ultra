@@ -95,8 +95,19 @@ fun MainScreen() {
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted && isConnected) {
+        if (granted) {
             sharePhoneMic = true
+            if (!isConnected) {
+                val guardIntent = Intent(context, AudioEngineService::class.java).apply {
+                    action = "ACTION_START_CAST_GUARD"
+                    putExtra("CAST_LABEL", "PC Video-Call Mic Active")
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(guardIntent)
+                } else {
+                    context.startService(guardIntent)
+                }
+            }
             AudioEngineService.nativeStartPhoneMic(hostAddress, true)
         } else {
             sharePhoneMic = false
@@ -107,6 +118,17 @@ fun MainScreen() {
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            if (!isConnected) {
+                val guardIntent = Intent(context, AudioEngineService::class.java).apply {
+                    action = "ACTION_START_CAST_GUARD"
+                    putExtra("CAST_LABEL", "Party Audio Broadcast Active")
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(guardIntent)
+                } else {
+                    context.startService(guardIntent)
+                }
+            }
             val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val proj = mgr.getMediaProjection(result.resultCode, result.data!!)
             if (proj != null) {
@@ -273,6 +295,7 @@ fun MainScreen() {
                                 val name = parts.getOrNull(0) ?: entry
                                 val addr = parts.getOrNull(1) ?: entry
                                 val mode = parts.getOrNull(2) ?: "WiFi"
+                                val icon = if (name.contains("Party")) "📱 Party Phone" else "💻 PC"
                                 OutlinedButton(
                                     onClick = {
                                         hostAddress = addr
@@ -291,7 +314,7 @@ fun MainScreen() {
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Text("⚡ 1-Tap Connect: [$mode] $name ($addr)")
+                                    Text("⚡ $icon [$mode]: $name ($addr)")
                                 }
                             }
                         }
@@ -576,6 +599,16 @@ fun MainScreen() {
             } // End Tab 1
 
             if (selectedTab == 2) {
+                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("🎙️ Cast & Party Broadcast", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "Stream your microphone to Zoom/Discord/Meet on PC, or broadcast internal music & gaming audio across multiple phones. Other phones discover this device automatically as 'Android-Party-Host'.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
                 // Cast Phone Internal Media & Games (PhoneAudioCaster - Party Mode)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
@@ -633,13 +666,24 @@ fun MainScreen() {
                                 if (!enabled) {
                                     sharePhoneMic = false
                                     AudioEngineService.nativeStopPhoneMic()
-                                } else if (isConnected) {
+                                } else {
                                     val hasPerm = ContextCompat.checkSelfPermission(
                                         context,
                                         Manifest.permission.RECORD_AUDIO
                                     ) == PackageManager.PERMISSION_GRANTED
                                     if (hasPerm) {
                                         sharePhoneMic = true
+                                        if (!isConnected) {
+                                            val guardIntent = Intent(context, AudioEngineService::class.java).apply {
+                                                action = "ACTION_START_CAST_GUARD"
+                                                putExtra("CAST_LABEL", "PC Video-Call Mic Active")
+                                            }
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                                context.startForegroundService(guardIntent)
+                                            } else {
+                                                context.startService(guardIntent)
+                                            }
+                                        }
                                         AudioEngineService.nativeStartPhoneMic(hostAddress, true)
                                     } else {
                                         micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)

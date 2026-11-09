@@ -75,6 +75,8 @@ struct AudioShareApp {
     enable_smart_dtx: bool,
     enable_virtual_speaker: bool,
     auto_bt_video_lipsync: bool,
+    enable_group_sync: bool,
+    group_sync_trim_ms: u16,
     last_applied_bt_delay: u16,
     host_master_volume: u8,
     use_test_tone: bool,
@@ -139,6 +141,8 @@ impl AudioShareApp {
             enable_smart_dtx: true,
             enable_virtual_speaker: false,
             auto_bt_video_lipsync: true,
+            enable_group_sync: true,
+            group_sync_trim_ms: 0,
             last_applied_bt_delay: 0,
             host_master_volume: 100,
             use_test_tone: false,
@@ -217,6 +221,8 @@ impl AudioShareApp {
              enable_smart_dtx={}\n\
              enable_virtual_speaker={}\n\
              auto_bt_video_lipsync={}\n\
+             enable_group_sync={}\n\
+             group_sync_trim_ms={}\n\
              host_master_volume={}\n\
              enable_pin_encryption={}\n\
              pairing_pin={}\n\
@@ -242,6 +248,8 @@ impl AudioShareApp {
             self.enable_smart_dtx,
             self.enable_virtual_speaker,
             self.auto_bt_video_lipsync,
+            self.enable_group_sync,
+            self.group_sync_trim_ms,
             self.host_master_volume,
             self.enable_pin_encryption,
             self.pairing_pin,
@@ -291,6 +299,12 @@ impl AudioShareApp {
                     "enable_smart_dtx" => self.enable_smart_dtx = v.trim() == "true",
                     "enable_virtual_speaker" => self.enable_virtual_speaker = v.trim() == "true",
                     "auto_bt_video_lipsync" => self.auto_bt_video_lipsync = v.trim() == "true",
+                    "enable_group_sync" => self.enable_group_sync = v.trim() != "false",
+                    "group_sync_trim_ms" => {
+                        if let Ok(n) = v.trim().parse::<u16>() {
+                            self.group_sync_trim_ms = n.min(120);
+                        }
+                    }
                     "host_master_volume" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             self.host_master_volume = n.min(100);
@@ -372,6 +386,14 @@ impl AudioShareApp {
                         .telemetry
                         .target_bitrate_kbps
                         .store(self.target_bitrate_kbps, Ordering::Relaxed);
+                    engine
+                        .telemetry
+                        .enable_group_sync
+                        .store(self.enable_group_sync, Ordering::Relaxed);
+                    engine
+                        .telemetry
+                        .manual_group_sync_trim_ms
+                        .store(self.group_sync_trim_ms, Ordering::Relaxed);
                     self.os_guard = Some(guard);
                     self.beacon = Some(DiscoveryBeacon::start(
                         DEFAULT_PORT,
@@ -907,6 +929,35 @@ impl AudioShareApp {
                     }
                 });
 
+                // Multi-Device Acoustic Group Sync Controls
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .checkbox(
+                            &mut self.enable_group_sync,
+                            "🔗 Multi-Device Acoustic Sync (Lock All Phones/Speakers in Phase)",
+                        )
+                        .changed()
+                    {
+                        host.telemetry
+                            .enable_group_sync
+                            .store(self.enable_group_sync, Ordering::Relaxed);
+                    }
+                    if self.enable_group_sync {
+                        ui.label("Room Trim:");
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut self.group_sync_trim_ms, 0..=120)
+                                    .suffix(" ms"),
+                            )
+                            .changed()
+                        {
+                            host.telemetry
+                                .manual_group_sync_trim_ms
+                                .store(self.group_sync_trim_ms, Ordering::Relaxed);
+                        }
+                    }
+                });
+
                 if bt_delay > 40 {
                     ui.colored_label(
                         egui::Color32::YELLOW,
@@ -1018,16 +1069,30 @@ impl AudioShareApp {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label("📲 Phone -> PC Mode:");
-                ui.selectable_value(
-                    &mut self.phone_rx_mode,
-                    PhoneRxRoutingMode::VirtualMicForCalls,
-                    "🎙️ Virtual Mic (Zoom / Discord / Meet)",
-                );
-                ui.selectable_value(
-                    &mut self.phone_rx_mode,
-                    PhoneRxRoutingMode::PlayOnPcSpeakers,
-                    "🔊 Play Phone Audio on PC Speakers",
-                );
+                let mut mode_changed = false;
+                mode_changed |= ui
+                    .selectable_value(
+                        &mut self.phone_rx_mode,
+                        PhoneRxRoutingMode::VirtualMicForCalls,
+                        "🎙️ Virtual Mic (Zoom / Discord / Meet)",
+                    )
+                    .changed();
+                mode_changed |= ui
+                    .selectable_value(
+                        &mut self.phone_rx_mode,
+                        PhoneRxRoutingMode::PlayOnPcSpeakers,
+                        "🔊 Play Phone Audio on PC Speakers",
+                    )
+                    .changed();
+
+                // Hot-swap routing mode immediately if receiver is already active!
+                if mode_changed && self.phone_mic_receiver.is_some() {
+                    if let Some(mut m) = self.phone_mic_receiver.take() {
+                        m.stop();
+                    }
+                    self.phone_mic_receiver =
+                        PhoneMicReceiver::start_with_mode(PHONE_MIC_PORT, self.phone_rx_mode).ok();
+                }
 
                 let mic_active = self.phone_mic_receiver.is_some();
                 let btn_label = if mic_active {
@@ -1353,6 +1418,8 @@ channel_role=1
 binaural_crossfeed=true
 night_mode_drc=true
 gaming_hard_lock=true
+enable_group_sync=false
+group_sync_trim_ms=45
 phone_rx_mode=1
 ";
         app.parse_config_string(config_sample);
@@ -1367,6 +1434,8 @@ phone_rx_mode=1
         assert!(app.usb_low_latency_pacing);
         assert!(!app.enable_smart_dtx);
         assert!(app.enable_virtual_speaker);
+        assert!(!app.enable_group_sync);
+        assert_eq!(app.group_sync_trim_ms, 45);
         assert_eq!(app.host_master_volume, 75);
         assert!(app.enable_pin_encryption);
         assert_eq!(app.pairing_pin, "9999");

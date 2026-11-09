@@ -258,6 +258,8 @@ pub struct HostTelemetry {
     pub dtx_silent_mode: AtomicBool,
     pub active_codec_mode: AtomicU8,
     pub quality_profile: AtomicU8,
+    pub enable_group_sync: AtomicBool,
+    pub manual_group_sync_trim_ms: AtomicU16,
     pub target_bitrate_kbps: AtomicU16,
     pub host_volume: AtomicU8,
     pub host_vu_peak_pct: AtomicU8,
@@ -316,6 +318,8 @@ impl HostEngine {
             dtx_silent_mode: AtomicBool::new(false),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
+            enable_group_sync: AtomicBool::new(true),
+            manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
             host_volume: AtomicU8::new(100),
             host_vu_peak_pct: AtomicU8::new(0),
@@ -1285,9 +1289,19 @@ impl HostEngine {
                         fec_n1_len: 0,
                         fec_n2_len: 0,
                         host_volume: telemetry.host_volume.load(Ordering::Relaxed),
-                        // Broadcast max group delay (in 2ms units) so fast phones align with slower phones!
-                        stream_id: (telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) / 2)
-                            .min(255) as u8,
+                        // Broadcast max group delay (in 2ms units) when Multi-Device Acoustic Sync is enabled,
+                        // or 0 when Independent Lowest-Latency Mode is selected!
+                        stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed) {
+                            let total_sync_ms = telemetry
+                                .max_client_bt_delay_ms
+                                .load(Ordering::Relaxed)
+                                .saturating_add(
+                                    telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed),
+                                );
+                            (total_sync_ms / 2).min(255) as u8
+                        } else {
+                            0
+                        },
                         header_crc16: 0,
                     };
                     pack_datagram_with_key(hdr, &[], &[], &[], active_key.as_ref(), &mut datagram)
@@ -1306,9 +1320,19 @@ impl HostEngine {
                     fec_n1_len: 0,
                     fec_n2_len: 0,
                     host_volume: telemetry.host_volume.load(Ordering::Relaxed),
-                    // Broadcast max group delay (in 2ms units) so fast phones align with slower phones!
-                    stream_id: (telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) / 2)
-                        .min(255) as u8,
+                    // Broadcast max group delay (in 2ms units) when Multi-Device Acoustic Sync is enabled,
+                    // or 0 when Independent Lowest-Latency Mode is selected!
+                    stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed) {
+                        let total_sync_ms = telemetry
+                            .max_client_bt_delay_ms
+                            .load(Ordering::Relaxed)
+                            .saturating_add(
+                                telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed),
+                            );
+                        (total_sync_ms / 2).min(255) as u8
+                    } else {
+                        0
+                    },
                     header_crc16: 0,
                 };
                 let f1_slice = if send_n1 { &prev_n1_copy[..] } else { &[] };
