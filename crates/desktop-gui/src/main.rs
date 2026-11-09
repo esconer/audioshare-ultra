@@ -3,16 +3,17 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
 use audioshare_host_engine::app_routing::{
-    list_active_audio_apps, route_single_app_to_audioshare, AudioAppEntry,
+    list_active_audio_apps, restore_all_apps_to_default_sink, route_single_app_to_audioshare,
+    AudioAppEntry,
 };
 use audioshare_host_engine::bt_optimization::apply_automatic_video_lipsync_offset_ms;
 use audioshare_host_engine::discovery_and_os::{
-    open_os_firewall_ports, AdbUsbWatcher, DirectHotspotController, DiscoveryBeacon,
-    DiscoveryScanner, VirtualSpeakerAndRadioGuard,
+    open_os_firewall_ports, set_os_boot_autostart, AdbUsbWatcher, DirectHotspotController,
+    DiscoveryBeacon, DiscoveryScanner, VirtualSpeakerAndRadioGuard,
 };
 use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PHONE_MIC_PORT};
 use audioshare_host_engine::{
@@ -36,8 +37,13 @@ fn main() -> eframe::Result<()> {
         "AudioShare Ultra",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            Ok(Box::new(AudioShareApp::new()))
+            let app = AudioShareApp::new();
+            cc.egui_ctx.set_visuals(if app.dark_mode {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            });
+            Ok(Box::new(app))
         }),
     )
 }
@@ -52,6 +58,11 @@ struct AudioShareApp {
     tab: AppTab,
     interfaces: Vec<NetworkInterfaceInfo>,
     show_qr_modal: bool,
+    dark_mode: bool,
+    minimize_on_close: bool,
+    autostart_stream_on_launch: bool,
+    os_boot_autostart: bool,
+    force_quit: bool,
 
     // Host State
     host_engine: Option<HostEngine>,
@@ -68,6 +79,11 @@ struct AudioShareApp {
     host_master_volume: u8,
     use_test_tone: bool,
     host_status_msg: String,
+    last_rate_calc: Instant,
+    prev_bytes_sent: u64,
+    prev_pkts_sent: u64,
+    live_kbps: u32,
+    live_pps: u32,
 
     // 1-Hop Wi-Fi Direct SoftAP State
     direct_hotspot_active: bool,
@@ -107,6 +123,11 @@ impl AudioShareApp {
             tab: AppTab::HostSender,
             interfaces: list_valid_host_interfaces(),
             show_qr_modal: false,
+            dark_mode: true,
+            minimize_on_close: true,
+            autostart_stream_on_launch: false,
+            os_boot_autostart: false,
+            force_quit: false,
             host_engine: None,
             beacon: None,
             adb_watcher: None,
@@ -121,6 +142,11 @@ impl AudioShareApp {
             host_master_volume: 100,
             use_test_tone: false,
             host_status_msg: "Stopped. Click 'Start Host Server' to broadcast.".into(),
+            last_rate_calc: Instant::now(),
+            prev_bytes_sent: 0,
+            prev_pkts_sent: 0,
+            live_kbps: 0,
+            live_pps: 0,
             direct_hotspot_active: false,
             hotspot_ssid: "AudioShare_5G".into(),
             hotspot_pass: "audioshare88".into(),
@@ -148,6 +174,10 @@ impl AudioShareApp {
             client_status_msg: "Idle. Select a discovered host or enter IP.".into(),
         };
         app.load_persistent_config();
+        let launched_via_autostart = std::env::args().any(|a| a == "--autostart");
+        if app.autostart_stream_on_launch || launched_via_autostart {
+            app.toggle_host();
+        }
         app
     }
 
@@ -173,7 +203,13 @@ impl AudioShareApp {
 
     fn save_persistent_config(&self) {
         let content = format!(
-            "quality_profile={}\n\
+            "dark_mode={}\n\
+             minimize_on_close={}\n\
+             autostart_stream_on_launch={}\n\
+             os_boot_autostart={}\n\
+             hotspot_ssid={}\n\
+             hotspot_pass={}\n\
+             quality_profile={}\n\
              target_bitrate_kbps={}\n\
              usb_low_latency_pacing={}\n\
              enable_smart_dtx={}\n\
@@ -191,6 +227,12 @@ impl AudioShareApp {
              binaural_crossfeed={}\n\
              night_mode_drc={}\n\
              gaming_hard_lock={}\n",
+            self.dark_mode,
+            self.minimize_on_close,
+            self.autostart_stream_on_launch,
+            self.os_boot_autostart,
+            self.hotspot_ssid,
+            self.hotspot_pass,
             self.quality_profile as u8,
             self.target_bitrate_kbps,
             self.usb_low_latency_pacing,
@@ -223,6 +265,14 @@ impl AudioShareApp {
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 match k.trim() {
+                    "dark_mode" => self.dark_mode = v.trim() != "false",
+                    "minimize_on_close" => self.minimize_on_close = v.trim() != "false",
+                    "autostart_stream_on_launch" => {
+                        self.autostart_stream_on_launch = v.trim() == "true"
+                    }
+                    "os_boot_autostart" => self.os_boot_autostart = v.trim() == "true",
+                    "hotspot_ssid" => self.hotspot_ssid = v.trim().to_string(),
+                    "hotspot_pass" => self.hotspot_pass = v.trim().to_string(),
                     "quality_profile" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             self.quality_profile = QualityProfile::from_u8(n);
@@ -419,6 +469,17 @@ impl AudioShareApp {
 
 impl eframe::App for AudioShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Close-to-Background Protection: If streaming is active and user clicks window 'X',
+        // minimize to taskbar (0.0% CPU) instead of killing the live audio stream!
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.force_quit
+            && self.minimize_on_close
+            && (self.host_engine.is_some() || self.client_engine.is_some())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+
         // Drop GUI CPU usage to ~0% while minimized: audio/network threads keep
         // running, and winit asks for a repaint as soon as the window returns.
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
@@ -459,6 +520,23 @@ impl eframe::App for AudioShareApp {
                     "🔊 Client Receiver & Studio DSP",
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🚪 Quit").clicked() {
+                        self.force_quit = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    let theme_lbl = if self.dark_mode {
+                        "☀️ Light"
+                    } else {
+                        "🌙 Dark"
+                    };
+                    if ui.button(theme_lbl).clicked() {
+                        self.dark_mode = !self.dark_mode;
+                        ctx.set_visuals(if self.dark_mode {
+                            egui::Visuals::dark()
+                        } else {
+                            egui::Visuals::light()
+                        });
+                    }
                     if ui.button("📱 Scan QR to Connect Phone").clicked() {
                         self.interfaces = list_valid_host_interfaces();
                         self.show_qr_modal = !self.show_qr_modal;
@@ -493,6 +571,10 @@ impl eframe::App for AudioShareApp {
                         Self::draw_qr_code(ui, &uri);
                         ui.add_space(6.0);
                         ui.monospace(&uri);
+                        ui.add_space(6.0);
+                        if ui.button("📋 Copy Connection URI").clicked() {
+                            ui.ctx().copy_text(uri.clone());
+                        }
                         ui.add_space(6.0);
                         if ui.button("Close QR Window").clicked() {
                             self.show_qr_modal = false;
@@ -569,6 +651,22 @@ impl AudioShareApp {
                     "🎬 Auto Video Lip-Sync for Phone Bluetooth Earbuds",
                 );
                 ui.checkbox(&mut self.use_test_tone, "🎵 440Hz/554Hz Test Chord");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(
+                    &mut self.autostart_stream_on_launch,
+                    "🚀 Auto-Start Broadcast on App Launch",
+                );
+                if ui
+                    .checkbox(&mut self.os_boot_autostart, "🖥️ Start App on OS Login")
+                    .changed()
+                {
+                    self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
+                }
+                ui.checkbox(
+                    &mut self.minimize_on_close,
+                    "📌 Minimize on Window Close (Keep Stream Alive)",
+                );
             });
         });
 
@@ -669,17 +767,30 @@ impl AudioShareApp {
                 } else {
                     "📶 [Wi-Fi / Ethernet]"
                 };
-                ui.monospace(format!(
-                    "{} {}:{} ({})",
-                    tag, iface.ip, DEFAULT_PORT, iface.name
-                ));
+                ui.horizontal(|ui| {
+                    let ep = format!("{}:{}", iface.ip, DEFAULT_PORT);
+                    ui.monospace(format!("{} {} ({})", tag, ep, iface.name));
+                    if ui.small_button("📋 Copy IP").clicked() {
+                        ui.ctx().copy_text(ep);
+                    }
+                });
             }
             ui.separator();
             ui.horizontal(|ui| {
+                ui.label("SSID:");
+                ui.add_sized(
+                    [110.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.hotspot_ssid),
+                );
+                ui.label("Pass:");
+                ui.add_sized(
+                    [100.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.hotspot_pass),
+                );
                 let hs_btn = if self.direct_hotspot_active {
                     "Stop 1-Hop Direct Hotspot"
                 } else {
-                    "📡 Start 1-Hop 5GHz Direct Link (Bypass Router)"
+                    "📡 Start 1-Hop 5GHz Link"
                 };
                 if ui.button(hs_btn).clicked() {
                     if self.direct_hotspot_active {
@@ -720,6 +831,18 @@ impl AudioShareApp {
                 let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
                 let bt_delay = host.telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed);
                 let rebinds = host.telemetry.hotplug_rebinds.load(Ordering::Relaxed);
+                let bytes_now = host.telemetry.bytes_sent.load(Ordering::Relaxed);
+
+                if self.last_rate_calc.elapsed() >= Duration::from_secs(1) {
+                    let dt = self.last_rate_calc.elapsed().as_secs_f32().max(0.1);
+                    self.live_kbps = (((bytes_now.saturating_sub(self.prev_bytes_sent)) as f32 * 8.0)
+                        / (dt * 1000.0)) as u32;
+                    self.live_pps =
+                        ((pkts.saturating_sub(self.prev_pkts_sent)) as f32 / dt) as u32;
+                    self.prev_bytes_sent = bytes_now;
+                    self.prev_pkts_sent = pkts;
+                    self.last_rate_calc = Instant::now();
+                }
 
                 // Automatically adjust PipeWire sink latency offset when phone Bluetooth delay changes!
                 if self.auto_bt_video_lipsync && bt_delay != self.last_applied_bt_delay {
@@ -741,8 +864,8 @@ impl AudioShareApp {
                 };
 
                 ui.monospace(format!(
-                    "TX Pkts: {} | KB: {} | Hot-Plug Recoveries: {} | Mode: {}",
-                    pkts, kb, rebinds, mode_str
+                    "Live Speed: {} kbps ({} pkt/s) | Total: {} KB | Rebinds: {} | {}",
+                    self.live_kbps, self.live_pps, kb, rebinds, mode_str
                 ));
 
                 // Live 60 FPS Audio Capture VU Peak Bar
@@ -855,6 +978,13 @@ impl AudioShareApp {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label("🎯 Per-App Capture:");
+                if ui
+                    .selectable_label(self.selected_app_idx.is_none(), "🌐 All System Audio")
+                    .clicked()
+                {
+                    self.selected_app_idx = None;
+                    self.app_route_status = restore_all_apps_to_default_sink();
+                }
                 if ui.button("🔄 Refresh Apps").clicked() {
                     self.audio_apps = list_active_audio_apps();
                 }
@@ -975,6 +1105,26 @@ impl AudioShareApp {
             ui.heading("🎛️ Zero-Latency Studio DSP (3-Band EQ, Spatial Role & Binaural Crossfeed)");
 
             let mut dsp_changed = false;
+            // 1-Click Studio EQ Presets
+            ui.horizontal_wrapped(|ui| {
+                ui.label("✨ 1-Click EQ Presets:");
+                for (name, b, p, t) in [
+                    ("Flat (Studio)", 0.0, 0.0, 0.0),
+                    ("🔥 Bass Boost", 6.5, 0.0, 1.5),
+                    ("🎙️ Vocal / Podcast", -2.0, 5.5, 2.0),
+                    ("🎮 FPS Footsteps", -3.0, 6.0, 4.5),
+                    ("🎧 Harman Target", 4.5, 1.5, 3.0),
+                ] {
+                    if ui.button(name).clicked() {
+                        self.eq_bass_db = b;
+                        self.eq_presence_db = p;
+                        self.eq_treble_db = t;
+                        dsp_changed = true;
+                    }
+                }
+            });
+            ui.separator();
+
             ui.horizontal(|ui| {
                 ui.label("Pre-Amp Gain   :");
                 dsp_changed |= ui
@@ -1067,6 +1217,27 @@ impl AudioShareApp {
                 self.drift_history.pop_front();
                 self.drift_history.push_back(drift as f32);
 
+                let host_vol = client.telemetry.host_volume.load(Ordering::Relaxed);
+                let group_ms = client.telemetry.max_group_delay_ms.load(Ordering::Relaxed);
+                let idle_secs = client
+                    .telemetry
+                    .seconds_since_last_packet
+                    .load(Ordering::Relaxed);
+
+                if idle_secs >= 3 {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "⚠️ No packets from Host for {}s — Waiting for automatic reconnect...",
+                            idle_secs
+                        ),
+                    );
+                }
+                ui.monospace(format!(
+                    "Host Master Vol: {:<9}% | Multi-Phone Group Sync Delay: +{} ms",
+                    host_vol, group_ms
+                ));
+
                 ui.monospace(format!(
                     "RX Packets     : {:<10} | Lossless Subframes : {}",
                     pkts, prim
@@ -1133,6 +1304,12 @@ mod tests {
     fn test_desktop_config_string_parser() {
         let mut app = AudioShareApp::new();
         let config_sample = "\
+dark_mode=false
+minimize_on_close=true
+autostart_stream_on_launch=true
+os_boot_autostart=false
+hotspot_ssid=AudioShare_Direct
+hotspot_pass=pass1234
 quality_profile=4
 target_bitrate_kbps=320
 usb_low_latency_pacing=true
@@ -1153,6 +1330,12 @@ night_mode_drc=true
 gaming_hard_lock=true
 ";
         app.parse_config_string(config_sample);
+        assert!(!app.dark_mode);
+        assert!(app.minimize_on_close);
+        assert!(app.autostart_stream_on_launch);
+        assert!(!app.os_boot_autostart);
+        assert_eq!(app.hotspot_ssid, "AudioShare_Direct");
+        assert_eq!(app.hotspot_pass, "pass1234");
         assert_eq!(app.quality_profile, QualityProfile::StudioLossless24Bit);
         assert_eq!(app.target_bitrate_kbps, 320);
         assert!(app.usb_low_latency_pacing);

@@ -329,6 +329,72 @@ pub fn open_os_firewall_ports() -> String {
     }
 }
 
+/// Configures or removes OS Boot Auto-Start (Solves Issue #170 on Linux XDG & Windows Registry)
+pub fn set_os_boot_autostart(enable: bool) -> String {
+    let Ok(exe_path) = std::env::current_exe() else {
+        return "Failed to resolve executable path".into();
+    };
+    let exe_str = exe_path.to_string_lossy();
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let autostart_dir = std::path::Path::new(&home).join(".config/autostart");
+        let desktop_file = autostart_dir.join("audioshare-ultra.desktop");
+        if enable {
+            let _ = std::fs::create_dir_all(&autostart_dir);
+            let content = format!(
+                "[Desktop Entry]\nType=Application\nName=AudioShare Ultra\nExec={} --autostart\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+                exe_str
+            );
+            match std::fs::write(&desktop_file, content) {
+                Ok(_) => "Enabled Linux Boot Auto-Start (~/.config/autostart)".into(),
+                Err(e) => format!("Auto-start error: {}", e),
+            }
+        } else {
+            let _ = std::fs::remove_file(&desktop_file);
+            "Disabled Linux Boot Auto-Start".into()
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if enable {
+            let _ = Command::new("reg")
+                .args([
+                    "add",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    "/v",
+                    "AudioShareUltra",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &format!("\"{}\" --autostart", exe_str),
+                    "/f",
+                ])
+                .output();
+            "Enabled Windows Boot Auto-Start (HKCU Run)".into()
+        } else {
+            let _ = Command::new("reg")
+                .args([
+                    "delete",
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+                    "/v",
+                    "AudioShareUltra",
+                    "/f",
+                ])
+                .output();
+            "Disabled Windows Boot Auto-Start".into()
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (enable, &exe_str);
+        "Unsupported OS for boot auto-start".into()
+    }
+}
+
 /// Polls the OS master output volume/mute on a dedicated thread and mirrors it
 /// into `HostTelemetry::host_volume`. This lets physical PC keyboard media
 /// keys propagate to connected phones without ever invoking `pactl` from the

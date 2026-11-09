@@ -161,3 +161,20 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
         ))
     }
 }
+
+/// Restores all isolated applications back to the default system speaker/sink
+pub fn restore_all_apps_to_default_sink() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        for app in list_active_audio_apps() {
+            let _ = Command::new("pactl")
+                .args(["move-sink-input", &app.id.to_string(), "@DEFAULT_SINK@"])
+                .output();
+        }
+        "Restored: Capturing Full System Audio (All Applications)".into()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "Restored: Capturing Full System Audio (All Applications)".into()
+    }
+}
