@@ -2,6 +2,10 @@
 
 #[cfg(target_os = "linux")]
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU16, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,16 +32,39 @@ impl RemoteMediaCommand {
 pub fn apply_automatic_video_lipsync_offset_ms(bt_delay_ms: u16) {
     #[cfg(target_os = "linux")]
     {
-        // PipeWire/PulseAudio latency offset is specified in microseconds
+        // The GUI calls this from its update loop whenever the reported BT
+        // delay changes. `pactl` can take tens of milliseconds to talk to
+        // PipeWire/PulseAudio, so never run it on the render thread.
+        static LAST_REQUESTED: AtomicU16 = AtomicU16::new(u16::MAX);
+        static APPLY_LOCK: Mutex<()> = Mutex::new(());
+
+        // Coalesce repeated requests for the same delay (the GUI already
+        // filters, but this function is public).
+        if LAST_REQUESTED.swap(bt_delay_ms, Ordering::Relaxed) == bt_delay_ms {
+            return;
+        }
+
+        // PipeWire/PulseAudio latency offset is specified in microseconds.
         let offset_us = (bt_delay_ms as u64) * 1_000;
-        let _ = Command::new("pactl")
-            .args([
-                "set-port-latency-offset",
-                "AudioShare_Ultra",
-                "analog-output",
-                &offset_us.to_string(),
-            ])
-            .output();
+        let _ = std::thread::Builder::new()
+            .name("as-ultra-bt-lipsync".into())
+            .spawn(move || {
+                // Serialize `pactl` invocations and drop a request that was
+                // superseded while waiting, so an older slow invocation can
+                // never overwrite the newest delay.
+                let _guard = APPLY_LOCK.lock().unwrap();
+                if LAST_REQUESTED.load(Ordering::Relaxed) != bt_delay_ms {
+                    return;
+                }
+                let _ = Command::new("pactl")
+                    .args([
+                        "set-port-latency-offset",
+                        "AudioShare_Ultra",
+                        "analog-output",
+                        &offset_us.to_string(),
+                    ])
+                    .output();
+            });
     }
     #[cfg(not(target_os = "linux"))]
     {

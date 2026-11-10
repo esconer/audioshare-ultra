@@ -132,8 +132,7 @@ impl DiscoveryScanner {
                                     let hostname = parts[0].to_string();
                                     let port: u16 = parts[1].parse().unwrap_or(crate::DEFAULT_PORT);
                                     let host_addr = SocketAddr::new(src.ip(), port);
-                                    let is_usb = src.ip().to_string().starts_with("192.168.42.")
-                                        || src.ip().to_string().starts_with("192.168.137.");
+                                    let is_usb = crate::is_usb_subnet_ip(src.ip());
 
                                     hosts_clone.lock().unwrap().insert(
                                         host_addr,
@@ -528,6 +527,41 @@ fn pactl_set_default(kind: &str, value: &str) {
     let _ = Command::new("pactl").args([arg.as_str(), value]).output();
 }
 
+/// Linux names wireless NICs `wl*` (e.g. `wlan0`, `wlp2s0`, `wlo1`).
+#[cfg(target_os = "linux")]
+fn is_wireless_interface_name(name: &str) -> bool {
+    name.starts_with("wl")
+}
+
+/// Enumerate every wireless interface from sysfs, including interfaces that
+/// are currently down and therefore absent from `list_valid_host_interfaces`.
+#[cfg(target_os = "linux")]
+fn wireless_interface_names() -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_wireless_interface_name(&name) && !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if names.is_empty() {
+        // Fallback for containers/chroots without sysfs.
+        names.push("wlan0".into());
+    }
+    names
+}
+
+#[cfg(target_os = "linux")]
+fn disable_wifi_power_save() {
+    for iface in wireless_interface_names() {
+        let _ = Command::new("iw")
+            .args(["dev", &iface, "set", "power_save", "off"])
+            .output();
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_default_playback_name() -> Option<String> {
     let output = Command::new("powershell")
@@ -585,9 +619,7 @@ impl VirtualSpeakerAndRadioGuard {
                     }
                 }
             }
-            let _ = Command::new("iw")
-                .args(["dev", "wlan0", "set", "power_save", "off"])
-                .output();
+            disable_wifi_power_save();
 
             Self {
                 enabled: pactl_module_id.is_some(),
@@ -838,6 +870,17 @@ mod tests {
                      front-right: 26214 /  40% / -23.88 dB\n";
         assert_eq!(parse_pactl_volume_percent(quiet), Some(40));
         assert_eq!(parse_pactl_volume_percent("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_wireless_interface_name_detection() {
+        assert!(is_wireless_interface_name("wlan0"));
+        assert!(is_wireless_interface_name("wlp2s0"));
+        assert!(is_wireless_interface_name("wlo1"));
+        assert!(!is_wireless_interface_name("eth0"));
+        assert!(!is_wireless_interface_name("enx001122334455"));
+        assert!(!is_wireless_interface_name("lo"));
     }
 
     #[test]

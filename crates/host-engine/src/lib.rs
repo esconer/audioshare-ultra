@@ -89,6 +89,18 @@ pub struct NetworkInterfaceInfo {
     pub is_usb_tethering: bool,
 }
 
+/// True for kernel gadget names (`usb0`, `rndis0`, `ncm0`), Windows-style
+/// descriptions, and systemd predictable names for USB tethering NICs:
+/// `enx<mac>` (CDC-ECM) and `enp<bus>s<slot>f<func>u<port>` (RNDIS/NCM).
+fn is_usb_interface_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("rndis")
+        || lower.contains("usb")
+        || lower.contains("ncm")
+        || lower.starts_with("enx")
+        || (lower.starts_with("enp") && lower.contains('u'))
+}
+
 pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
     let mut valid = Vec::new();
     if let Ok(addrs) = if_addrs::get_if_addrs() {
@@ -114,9 +126,7 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
             }
 
             let ip_str = ip.to_string();
-            let is_usb = lower.contains("rndis")
-                || lower.contains("usb")
-                || lower.contains("ncm")
+            let is_usb = is_usb_interface_name(&iface.name)
                 || ip_str.starts_with("192.168.42.")
                 || ip_str.starts_with("192.168.137.");
 
@@ -129,6 +139,39 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
     }
     valid.sort_by_key(|i| !i.is_usb_tethering);
     valid
+}
+
+/// Returns `true` for loopback, the legacy Android RNDIS subnets, or any IPv4
+/// address in the same `/24` as a local USB-tethering interface.
+///
+/// Android 11+ randomizes the RNDIS subnet for each tethering session, so a
+/// fixed `192.168.42.x` / `192.168.137.x` prefix check is not sufficient. The
+/// local interface list is queried on demand because USB tethering can be
+/// enabled after the host engine starts.
+pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
+    if addr_ip.is_loopback() {
+        return true;
+    }
+    let IpAddr::V4(target) = addr_ip else {
+        return false;
+    };
+    let t = target.octets();
+    if t[0] == 192 && t[1] == 168 && (t[2] == 42 || t[2] == 137) {
+        return true;
+    }
+
+    list_valid_host_interfaces().into_iter().any(|iface| {
+        if !iface.is_usb_tethering {
+            return false;
+        }
+        match iface.ip {
+            IpAddr::V4(local) => {
+                let l = local.octets();
+                t[0] == l[0] && t[1] == l[1] && t[2] == l[2]
+            }
+            IpAddr::V6(_) => false,
+        }
+    })
 }
 
 pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
@@ -158,8 +201,13 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
 pub fn promote_thread_realtime() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
-        #[cfg(target_os = "linux")]
-        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+        // Deliberately no process-wide `mlockall(MCL_CURRENT | MCL_FUTURE)`.
+        // This function runs in the same process as the desktop GUI and GPU
+        // driver, so MCL_FUTURE pins every later wgpu/egui allocation and can
+        // fail with ENOMEM against the default RLIMIT_MEMLOCK. It also makes
+        // every helper `fork()` (pactl/adb/playerctl) duplicate a much larger
+        // set of locked VMAs. SCHED_FIFO + nice -19 + CPU affinity provide the
+        // scheduling guarantees without those process-wide side effects.
         libc::setpriority(libc::PRIO_PROCESS, 0, -19);
         // Hard real-time SCHED_FIFO for the audio TX/RX loops. Requires
         // CAP_SYS_NICE/root; failure is non-fatal and falls back to nice -19.
@@ -346,8 +394,7 @@ impl HostEngine {
 
         let mut client_map = HashMap::new();
         for addr in initial_targets {
-            let is_usb = addr.ip().to_string().starts_with("192.168.42.")
-                || addr.ip().to_string().starts_with("127.0.0.1");
+            let is_usb = is_usb_subnet_ip(addr.ip());
             client_map.insert(
                 addr,
                 ConnectedClient {
@@ -1063,8 +1110,7 @@ impl HostEngine {
 
             // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
             while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
-                let is_usb = src_addr.ip().to_string().starts_with("192.168.42.")
-                    || src_addr.ip().to_string().starts_with("127.0.0.1");
+                let is_usb = is_usb_subnet_ip(src_addr.ip());
 
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
                     let mut map = clients.lock().unwrap();
@@ -1612,5 +1658,32 @@ mod tests {
             1
         );
         engine.stop();
+    }
+
+    #[test]
+    fn test_usb_interface_name_detection() {
+        for name in [
+            "usb0",
+            "rndis0",
+            "ncm0",
+            "enx001122334455",
+            "enp0s20f0u1",
+            "ENX001122334455",
+        ] {
+            assert!(is_usb_interface_name(name), "{} should be USB", name);
+        }
+        for name in ["eth0", "wlp2s0", "wlo1", "enp3s0", "lo", "docker0"] {
+            assert!(!is_usb_interface_name(name), "{} should not be USB", name);
+        }
+    }
+
+    #[test]
+    fn test_is_usb_subnet_ip_recognizes_loopback_and_legacy_rndis() {
+        assert!(is_usb_subnet_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_usb_subnet_ip("192.168.42.7".parse().unwrap()));
+        assert!(is_usb_subnet_ip("192.168.137.7".parse().unwrap()));
+        // TEST-NET-3 is never a local tethering subnet.
+        assert!(!is_usb_subnet_ip("203.0.113.7".parse().unwrap()));
+        assert!(!is_usb_subnet_ip("2001:db8::1".parse().unwrap()));
     }
 }
