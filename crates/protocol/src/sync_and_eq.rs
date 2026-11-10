@@ -376,8 +376,12 @@ impl LatencySonar {
             }
             prev = cur;
         }
-        // A 3.5kHz-7kHz chirp in 2.5ms has >= 20 zero crossings and distinct peak energy
-        max_peak > 0.18 && zero_crossings >= 20
+        // A full 2.5ms chirp has ~34 zero crossings, but a real acoustic
+        // return almost always straddles two capture subframes. The larger
+        // half then has 12-22 crossings, so the old >=20 threshold missed
+        // most split returns. Keep a peak floor so low-level noise cannot
+        // trigger the measurement.
+        max_peak > 0.12 && zero_crossings >= 12
     }
 }
 
@@ -575,6 +579,37 @@ mod tests {
         // Random noise or silence shouldn't trigger false positive
         let silence = [0.0f32; 240];
         assert!(!LatencySonar::detect_chirp_return(&silence));
+    }
+
+    #[test]
+    fn test_latency_sonar_detects_chirp_split_across_subframes() {
+        let mut chirp = [0.0f32; 240];
+        LatencySonar::inject_chirp(&mut chirp);
+
+        // An acoustic return arrives at an arbitrary phase, so the 2.5ms
+        // chirp is split between two capture subframes. At least one half
+        // must still exceed the detection threshold.
+        for split in [40usize, 50, 60, 70, 80, 90] {
+            let mut first = [0.0f32; 240];
+            let mut second = [0.0f32; 240];
+            first[..split * 2].copy_from_slice(&chirp[..split * 2]);
+            second[..(120 - split) * 2].copy_from_slice(&chirp[split * 2..]);
+            assert!(
+                LatencySonar::detect_chirp_return(&first)
+                    || LatencySonar::detect_chirp_return(&second),
+                "split at {} frames was missed",
+                split
+            );
+        }
+
+        // A 1kHz tone has too few zero crossings to be mistaken for a chirp.
+        let mut tone = [0.0f32; 240];
+        for i in 0..120 {
+            let v = ((i as f32) * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin() * 0.8;
+            tone[i * 2] = v;
+            tone[i * 2 + 1] = v;
+        }
+        assert!(!LatencySonar::detect_chirp_return(&tone));
     }
 
     #[test]

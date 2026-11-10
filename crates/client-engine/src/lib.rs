@@ -472,6 +472,11 @@ impl ClientEngine {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
                             prebuffer_ready = false;
                             next_play_seq = base_seq;
+                            // DTX means the host stopped sending audio. Drop
+                            // any buffered slots and PLC history from before
+                            // the silence so a later stream restart cannot
+                            // replay stale payloads.
+                            sequencer.reset();
                             continue;
                         }
 
@@ -481,6 +486,11 @@ impl ClientEngine {
                             || seq_delta > 48
                             || seq_delta < -200
                         {
+                            // The playhead is jumping to a new base sequence.
+                            // Clear old slots so a wrapped/reused sequence
+                            // number cannot surface a stale payload, and
+                            // clear PLC history from the previous stream.
+                            sequencer.reset();
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             prebuffer_ready = false;
@@ -533,8 +543,12 @@ impl ClientEngine {
                                 if payload.first() == Some(&TAG_VBR_BFP) {
                                     decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
                                 } else {
-                                    // Backward compatible with hosts that still
-                                    // send a raw IMA-ADPCM primary frame.
+                                    // Legacy fallback: older hosts used a raw
+                                    // 124-byte IMA-ADPCM frame as the compressed
+                                    // primary payload. Current hosts always send
+                                    // TAG_VBR_BFP. The FEC decoder recovers
+                                    // sample 0 from the 4-byte header, so it
+                                    // also reads those legacy frames correctly.
                                     decode_fec_subframe_to_f32(payload, &mut pcm_f32)
                                 }
                             } else {

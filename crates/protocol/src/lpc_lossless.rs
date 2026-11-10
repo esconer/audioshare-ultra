@@ -731,7 +731,13 @@ pub fn encode_fec_subframe(
     out[2..4].copy_from_slice(&pcm_stereo[1].to_le_bytes());
     pred_l = l_tagged as i32;
 
-    for i in 0..SUBFRAME_FRAMES {
+    // Sample 0 is represented by the 4-byte header (L is quantized to the
+    // 7-bit index tag, R is exact). Re-encoding it with `init_idx` would apply
+    // an ADPCM step of up to step/8 to a near-zero residual, biasing the
+    // predictor before sample 1. Keep the first nibble for wire compatibility
+    // but start the ADPCM stream at sample 1.
+    out[4] = 0;
+    for i in 1..SUBFRAME_FRAMES {
         let nib_l = encode_adpcm_sample(pcm_stereo[i * 2], &mut pred_l, &mut idx_l);
         let nib_r = encode_adpcm_sample(pcm_stereo[i * 2 + 1], &mut pred_r, &mut idx_r);
         out[4 + i] = (nib_l & 0x0F) | ((nib_r & 0x0F) << 4);
@@ -753,7 +759,13 @@ pub fn decode_fec_subframe_to_f32(
     let mut idx_l = init_idx;
     let mut idx_r = init_idx;
 
-    for i in 0..SUBFRAME_FRAMES {
+    // The 4-byte header already carries the first stereo frame (L is
+    // quantized to the 7-bit index tag, R is exact). The first nibble is
+    // reserved/unused; decoding it would apply a step/8 bias to sample 0.
+    out_f32[0] = (pred_l as f32) * (1.0 / 32768.0);
+    out_f32[1] = (pred_r as f32) * (1.0 / 32768.0);
+
+    for i in 1..SUBFRAME_FRAMES {
         let packed = fec_bytes[4 + i];
         let s_l = decode_adpcm_sample(packed & 0x0F, &mut pred_l, &mut idx_l);
         let s_r = decode_adpcm_sample(packed >> 4, &mut pred_r, &mut idx_r);
@@ -825,6 +837,43 @@ mod tests {
         let orig_r = (pcm[1] as f32) / 32768.0;
         assert!((decoded_f32[0] - orig_l).abs() < 0.05);
         assert!((decoded_f32[1] - orig_r).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_fec_first_sample_does_not_inherit_step_bias() {
+        // A steep transient at sample 1 forces a large initial ADPCM step.
+        // The old encoder re-encoded sample 0 with that step, so sample 0
+        // jumped by step/8 (up to ~4096 LSB) before the first real transient.
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        pcm[0] = 10_000;
+        pcm[1] = -10_000;
+        pcm[2] = 30_000;
+        pcm[3] = -30_000;
+        for i in 2..SUBFRAME_FRAMES {
+            pcm[i * 2] = if i % 2 == 0 { 30_000 } else { -30_000 };
+            pcm[i * 2 + 1] = -pcm[i * 2];
+        }
+
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+        assert_eq!(fec[4], 0, "first nibble must be reserved/unused");
+
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut decoded));
+
+        // L is quantized to the 7-bit index tag in the header, so a small
+        // error is expected; the old step/8 bias was ~2500 LSB.
+        assert!(
+            (decoded[0] - (pcm[0] as f32) / 32768.0).abs() < 0.01,
+            "sample 0 L bias: {}",
+            decoded[0] - (pcm[0] as f32) / 32768.0
+        );
+        // R is stored exactly in the header.
+        assert!(
+            (decoded[1] - (pcm[1] as f32) / 32768.0).abs() < 1e-6,
+            "sample 0 R bias: {}",
+            decoded[1] - (pcm[1] as f32) / 32768.0
+        );
     }
 
     fn make_sine(samples: &mut [i16; SUBFRAME_STEREO_SAMPLES]) {

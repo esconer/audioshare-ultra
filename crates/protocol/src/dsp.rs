@@ -1,6 +1,11 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Queue errors below this are sub-frame phase beat between packet arrival
+/// and DAC callbacks, not clock drift. Feeding them into the integral term
+/// slowly winds it up and releases the accumulated correction as a ratio step.
+const CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES: f64 = 0.15;
+
 /// 1. Jitter-Immune Windowed-Min DLL + 4-Point Hermite Cubic Fractional Resampler
 pub struct ClockDriftResampler {
     phase: f64,
@@ -43,7 +48,15 @@ impl ClockDriftResampler {
 
         if self.window_ticks >= 200 {
             let err = (self.min_queue_frames_window - target_min_subframes) as f64;
-            self.integral_err = (self.integral_err + err * 0.5).clamp(-10.0, 10.0);
+
+            // Ignore sub-frame phase-beat noise in the integral accumulator.
+            // Without this deadband, a tiny persistent quantization offset
+            // slowly winds the integral and then releases it as a ratio step.
+            if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
+                self.integral_err = (self.integral_err + err * 0.5).clamp(-10.0, 10.0);
+            } else {
+                self.integral_err *= 0.9;
+            }
 
             // Dual-slope catch-up: +/- 500 ppm for normal drift, up to +2500 ppm after a Wi-Fi burst spike
             let (kp, max_clamp) = if err > 2.0 {
@@ -52,7 +65,16 @@ impl ClockDriftResampler {
                 (0.00005, 0.0005)
             };
             let corr = (kp * err + 0.000005 * self.integral_err).clamp(-0.0005, max_clamp);
-            self.ratio = 1.0 + corr;
+            let target_ratio = 1.0 + corr;
+
+            // A ratio step every 500 ms modulates pitch. Large burst errors
+            // still snap immediately, but normal corrections slew over a few
+            // windows so the resampler phase stays continuous.
+            if err > 2.0 {
+                self.ratio = target_ratio;
+            } else {
+                self.ratio = 0.3 * self.ratio + 0.7 * target_ratio;
+            }
             self.min_queue_frames_window = 999.0;
             self.window_ticks = 0;
         }
@@ -141,7 +163,9 @@ impl BurstDecouplerRing {
         let w = self.write_idx.load(Ordering::Relaxed);
         let r = self.read_idx.load(Ordering::Acquire);
         let free = FIFO_CAPACITY - w.wrapping_sub(r);
-        let to_write = samples.len().min(free);
+        // The ring is stereo-interleaved. An odd write count would shift every
+        // subsequent Left/Right pair by one sample, so always write whole frames.
+        let to_write = samples.len().min(free) & !1;
 
         let buf_ptr = self.buf.get() as *mut f32;
         for (i, &s) in samples[..to_write].iter().enumerate() {
@@ -448,5 +472,59 @@ mod tests {
             "EMA must cushion against single-tick packet arrival dips: {}",
             resampler.min_queue_frames_window
         );
+    }
+
+    #[test]
+    fn test_clock_loop_smooths_normal_ratio_changes() {
+        let mut resampler = ClockDriftResampler::new();
+        for _ in 0..200 {
+            resampler.update_clock_loop(3.0, 2.0);
+        }
+        let first_ratio = resampler.ratio;
+        assert!(first_ratio > 1.0);
+        // Target correction for err=1.0 is ~52.5 ppm. The first window must
+        // apply only part of it instead of jumping to the full target.
+        assert!(
+            first_ratio < 1.000_05,
+            "normal ratio correction must slew, got {}",
+            first_ratio
+        );
+
+        for _ in 0..200 {
+            resampler.update_clock_loop(3.0, 2.0);
+        }
+        assert!(
+            resampler.ratio > first_ratio,
+            "ratio must converge toward the target over successive windows"
+        );
+    }
+
+    #[test]
+    fn test_clock_loop_integral_deadband_ignores_phase_beat() {
+        let mut resampler = ClockDriftResampler::new();
+        // A 0.05-subframe error is normal packet/DAC phase beat, not drift.
+        for _ in 0..400 {
+            resampler.update_clock_loop(2.05, 2.0);
+        }
+        assert_eq!(
+            resampler.integral_err, 0.0,
+            "sub-deadband error must not wind up the integral term"
+        );
+    }
+
+    #[test]
+    fn test_burst_decoupler_odd_push_preserves_stereo_alignment() {
+        let ring = BurstDecouplerRing::new();
+        // An odd caller slice must not write a half frame.
+        assert_eq!(ring.push_samples(&[1.0, 2.0, 3.0]), 2);
+        assert_eq!(ring.available_samples(), 2);
+
+        assert_eq!(ring.push_samples(&[4.0, 5.0]), 2);
+        assert_eq!(ring.available_samples(), 4);
+
+        let mut out = [0.0f32; 4];
+        let mut rng = 1u32;
+        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
     }
 }

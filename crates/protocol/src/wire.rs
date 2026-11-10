@@ -105,6 +105,7 @@ pub enum WireError {
     PacketExceedsMtu,
     InvalidMagic,
     InvalidCodecMode,
+    InvalidSubframeCount,
     HeaderCrcMismatch,
     PayloadLengthMismatch,
     AuthenticationFailed,
@@ -181,6 +182,12 @@ impl WireHeader {
         let flags = buf[1];
         let mode = CodecMode::from_u8(flags & 0x07).ok_or(WireError::InvalidCodecMode)?;
         let subframe_count = (flags >> 3) & 0x07;
+        // The host bundles at most four 2.5ms subframes per datagram, and a
+        // non-heartbeat packet must carry at least one. Reject impossible
+        // counts before callers iterate over `subframe_count` payloads.
+        if subframe_count > 4 || (mode != CodecMode::SilenceHeartbeat && subframe_count == 0) {
+            return Err(WireError::InvalidSubframeCount);
+        }
         let encrypted = (flags & 0x40) != 0;
 
         let sequence = u16::from_be_bytes([buf[2], buf[3]]);
@@ -377,6 +384,49 @@ mod tests {
         let parsed = ParsedPacket::parse_and_decrypt(&mut buf[..len], Some(&key)).unwrap();
         assert_eq!(parsed.primary_payload, &primary);
         assert_eq!(parsed.fec_n1_payload, &fec1);
+    }
+
+    #[test]
+    fn test_wire_header_rejects_invalid_subframe_count() {
+        let mut buf = [0u8; HEADER_LEN];
+        let mut hdr = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 0,
+            encrypted: false,
+            sequence: 1,
+            tx_timestamp_us: 0,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+
+        hdr.encode(&mut buf);
+        assert_eq!(
+            WireHeader::decode(&buf).err(),
+            Some(WireError::InvalidSubframeCount)
+        );
+
+        hdr.subframe_count = 5;
+        hdr.encode(&mut buf);
+        assert_eq!(
+            WireHeader::decode(&buf).err(),
+            Some(WireError::InvalidSubframeCount)
+        );
+
+        // Heartbeats carry no audio payload, so zero is valid for them.
+        hdr.mode = CodecMode::SilenceHeartbeat;
+        hdr.subframe_count = 0;
+        hdr.encode(&mut buf);
+        assert!(WireHeader::decode(&buf).is_ok());
+
+        // Four bundled subframes are the maximum valid non-heartbeat packet.
+        hdr.mode = CodecMode::StudioLosslessLpc;
+        hdr.subframe_count = 4;
+        hdr.encode(&mut buf);
+        assert!(WireHeader::decode(&buf).is_ok());
     }
 
     #[test]

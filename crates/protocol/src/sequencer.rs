@@ -45,6 +45,22 @@ impl ZeroJitterSequencer {
         }
     }
 
+    /// Reset all sequencer slots and PLC state on stream re-initialization or DTX wake.
+    ///
+    /// Slots are indexed by `seq & (RING_SLOTS - 1)`, so a new stream that
+    /// restarts at a previously used sequence number would otherwise find a
+    /// stale `STATUS_PRIMARY_LOSSLESS` payload and play it. Clearing the
+    /// history/tail also prevents PLC from extrapolating audio from the old
+    /// stream after a reset.
+    pub fn reset(&mut self) {
+        for slot in &self.slots {
+            slot.state.store(STATUS_EMPTY, Ordering::Release);
+        }
+        self.history.fill(0.0);
+        self.plc_recovery_tail.fill(0.0);
+        self.consecutive_plc_count = 0;
+    }
+
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing
     #[inline]
     pub fn is_slot_missing(&self, target_seq: u16) -> bool {
@@ -202,22 +218,47 @@ impl ZeroJitterSequencer {
         }
 
         // WSOLA Pitch-Period Waveform Extrapolation
+        //
+        // At PLC onset the first sample must continue from the last played
+        // sample, not jump to `history[HISTORY_FRAMES - pitch_lag] * 0.90`.
+        // A 10% step at the frame boundary is a broadband click. Crossfade
+        // the first CROSSFADE_FRAMES from the exact last output sample and
+        // ramp the attenuation from the previous frame's value to this
+        // frame's target instead of applying a constant per-frame step.
+        let prev_attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
         self.consecutive_plc_count += 1;
+        let target_attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
         let pitch_lag = self.find_best_pitch_period();
-        let attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
+        let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
+        let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
 
         let copy_start = HISTORY_FRAMES - pitch_lag;
         for i in 0..SUBFRAME_FRAMES {
+            let frac = (i as f32) / ((SUBFRAME_FRAMES - 1) as f32);
+            let attenuation = prev_attenuation + (target_attenuation - prev_attenuation) * frac;
             let src_frame = copy_start + (i % pitch_lag);
-            out[i * 2] = self.history[src_frame * 2] * attenuation;
-            out[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
+            let mut l = self.history[src_frame * 2] * attenuation;
+            let mut r = self.history[src_frame * 2 + 1] * attenuation;
+
+            if self.consecutive_plc_count == 1 && i < CROSSFADE_FRAMES {
+                // Raised-cosine onset fade from the last real sample. At i=0
+                // the weight is exactly 0, so there is no step discontinuity.
+                let alpha = (i as f32) / ((CROSSFADE_FRAMES - 1) as f32);
+                let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                l = last_l * (1.0 - w_in) + l * w_in;
+                r = last_r * (1.0 - w_in) + r * w_in;
+            }
+
+            out[i * 2] = l;
+            out[i * 2 + 1] = r;
         }
 
         // Prepare continuation tail for seamless crossfade when next good packet arrives
         for i in 0..CROSSFADE_FRAMES {
             let src_frame = copy_start + ((SUBFRAME_FRAMES + i) % pitch_lag);
-            self.plc_recovery_tail[i * 2] = self.history[src_frame * 2] * attenuation;
-            self.plc_recovery_tail[i * 2 + 1] = self.history[src_frame * 2 + 1] * attenuation;
+            self.plc_recovery_tail[i * 2] = self.history[src_frame * 2] * target_attenuation;
+            self.plc_recovery_tail[i * 2 + 1] =
+                self.history[src_frame * 2 + 1] * target_attenuation;
         }
 
         self.append_to_history(out);
@@ -264,5 +305,77 @@ mod tests {
         seq.push_primary(4, &sine_frame);
         let mut rec_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(seq.pop_next(4, &mut rec_out), STATUS_PRIMARY_LOSSLESS);
+    }
+
+    #[test]
+    fn test_plc_onset_continues_from_last_sample() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut last_sample = 0.0f32;
+
+        // Use a continuous 300Hz sine across subframes so the pitch period
+        // (160 frames) is well inside the WSOLA search range. Repeating one
+        // 120-frame buffer would create artificial discontinuities.
+        for s in 0..3u16 {
+            let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let n = s as usize * SUBFRAME_FRAMES + i;
+                let v = ((n as f32) * 2.0 * std::f32::consts::PI * 300.0 / 48_000.0).sin() * 0.5;
+                frame[i * 2] = v;
+                frame[i * 2 + 1] = v;
+                last_sample = v;
+            }
+            assert!(seq.push_primary(s, &frame));
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+
+        let mut plc_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(3, &mut plc_out), STATUS_EMPTY);
+
+        // The old code multiplied the first extrapolated sample by 0.90,
+        // producing a -1 dB step from the last real sample.
+        assert!(
+            (plc_out[0] - last_sample).abs() < 1e-4,
+            "PLC onset stepped from {} to {}",
+            last_sample,
+            plc_out[0]
+        );
+
+        // The per-sample attenuation ramp must still reduce the frame energy.
+        let start_energy: f32 = plc_out[..32].iter().map(|x| x * x).sum();
+        let end_energy: f32 = plc_out[SUBFRAME_STEREO_SAMPLES - 32..]
+            .iter()
+            .map(|x| x * x)
+            .sum();
+        assert!(
+            end_energy < start_energy,
+            "PLC attenuation must ramp down across the subframe"
+        );
+    }
+
+    #[test]
+    fn test_reset_discards_stale_slots_and_plc_history() {
+        let mut seq = ZeroJitterSequencer::new();
+        let stale = [0.5f32; SUBFRAME_STEREO_SAMPLES];
+        let fresh = [0.25f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Leave a decoded payload in slot 0 without consuming it.
+        assert!(seq.push_primary(0, &stale));
+        seq.reset();
+        assert_eq!(seq.consecutive_plc_count(), 0);
+
+        // History must be empty as well: a missing slot after reset produces
+        // silence, not extrapolation from the previous stream.
+        let mut plc = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(0, &mut plc), STATUS_EMPTY);
+        assert!(plc.iter().all(|&s| s == 0.0));
+        seq.reset();
+
+        // A new stream reusing sequence 0 must be accepted, not rejected as
+        // a duplicate of the stale payload.
+        assert!(seq.push_primary(0, &fresh));
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert_eq!(out[0], 0.25);
     }
 }
