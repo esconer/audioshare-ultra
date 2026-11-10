@@ -81,6 +81,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var isLocallyMuted: Boolean = false
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
+    private var noisyReceiverRegistered: Boolean = false
 
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
@@ -121,8 +122,17 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val hostAddr = intent?.getStringExtra("HOST_ADDR")
             ?: prefs.getString("last_host_addr", "192.168.42.129:65530")
             ?: "192.168.42.129:65530"
-        val isUsb = intent?.getBooleanExtra("IS_USB", false)
-            ?: isUsbHost(hostAddr)
+        // `getBooleanExtra(..., false)` returns false, not null, when the
+        // extra is absent, so an Elvis fallback would never run. Check for the
+        // extra explicitly so manual entry, QR scans and the quick-settings
+        // tile still get USB auto-detection.
+        val isUsb = intent?.let {
+            if (it.hasExtra("IS_USB")) {
+                it.getBooleanExtra("IS_USB", false)
+            } else {
+                isUsbHost(hostAddr)
+            }
+        } ?: isUsbHost(hostAddr)
         val gainDb = intent?.getFloatExtra("GAIN_DB", prefs.getFloat("gain_db", 0.0f)) ?: 0.0f
         val pin = intent?.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: ""
         currentGainDb = gainDb
@@ -134,9 +144,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         acquireRealtimeHardwareLocks()
         setupHardwareBluetoothMediaSession()
         requestAudioFocus()
-        try {
-            registerReceiver(becomingNoisyReceiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY))
-        } catch (_: Exception) {}
+        if (!noisyReceiverRegistered) {
+            try {
+                registerReceiver(
+                    becomingNoisyReceiver,
+                    IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+                )
+                noisyReceiverRegistered = true
+            } catch (_: Exception) {}
+        }
 
         isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin)
         // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode & Gaming Lock automatically!
@@ -179,6 +195,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun requestAudioFocus() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        // Reconnects call onStartCommand again; abandon the previous request
+        // instead of overwriting it and leaking focus ownership.
+        focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         audioManager = am
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(
@@ -194,30 +213,42 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun acquireRealtimeHardwareLocks() {
-        val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-        } else {
-            @Suppress("DEPRECATION")
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        // onStartCommand can run again for a host switch or a cast-guard
+        // restart. Reuse the existing locks instead of overwriting the only
+        // reference to an acquired lock.
+        if (wifiLock == null) {
+            val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                @Suppress("DEPRECATION")
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifiMgr.createWifiLock(mode, "AudioShareUltra::LowLatencyWifi").apply {
+                setReferenceCounted(false)
+            }
         }
-        wifiLock = wifiMgr.createWifiLock(mode, "AudioShareUltra::LowLatencyWifi").apply {
-            setReferenceCounted(false)
-            if (!isHeld) acquire()
-        }
+        wifiLock?.let { if (!it.isHeld) it.acquire() }
 
-        val powerMgr = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerMgr.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "AudioShareUltra::RealtimeWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-            if (!isHeld) acquire()
+        if (wakeLock == null) {
+            val powerMgr = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = powerMgr.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "AudioShareUltra::RealtimeWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+            }
         }
+        wakeLock?.let { if (!it.isHeld) it.acquire() }
 
         // Android 12+ ADPF (Dynamic Performance Framework): Request 2.5ms real-time scheduler boost
         // to prevent ARM CPU cores from entering deep C3 sleep between Wi-Fi packets!
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                perfHintSession?.close()
+            } catch (_: Exception) {
+            }
+            perfHintSession = null
             try {
                 val hintMgr = getSystemService(PerformanceHintManager::class.java)
                 val tids = intArrayOf(android.os.Process.myTid())
@@ -228,7 +259,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun isUsbHost(hostAddr: String): Boolean {
-        if (hostAddr.startsWith("127.0.0.1") || hostAddr.startsWith("192.168.42.")) {
+        if (hostAddr.startsWith("127.0.0.1") ||
+            hostAddr.startsWith("192.168.42.") ||
+            hostAddr.startsWith("192.168.137.")
+        ) {
             return true
         }
         val hostIp = hostAddr.substringBefore(':')
@@ -236,7 +270,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
             for (iface in ifaces) {
                 val name = iface.name.lowercase()
-                if ((name.contains("rndis") || name.contains("usb") || name.contains("ncm")) && iface.isUp) {
+                val isUsbName = name.contains("rndis") ||
+                    name.contains("usb") ||
+                    name.contains("ncm") ||
+                    name.startsWith("enx") ||
+                    (name.startsWith("enp") && name.contains('u'))
+                if (isUsbName && iface.isUp) {
                     for (addr in iface.interfaceAddresses) {
                         val ip = addr.address?.hostAddress ?: continue
                         val prefix = ip.substringBeforeLast('.')
@@ -325,9 +364,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopPhoneMic()
         nativeStopClient()
         isStreaming = false
-        try {
-            unregisterReceiver(becomingNoisyReceiver)
-        } catch (_: Exception) {}
+        if (noisyReceiverRegistered) {
+            try {
+                unregisterReceiver(becomingNoisyReceiver)
+            } catch (_: Exception) {}
+            noisyReceiverRegistered = false
+        }
         mediaSession?.isActive = false
         mediaSession?.release()
         mediaSession = null
