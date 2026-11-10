@@ -17,7 +17,8 @@ use audioshare_host_engine::discovery_and_os::{
 };
 use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PhoneRxRoutingMode, PHONE_MIC_PORT};
 use audioshare_host_engine::{
-    list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo, DEFAULT_PORT,
+    is_usb_subnet_ip, list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo,
+    DEFAULT_PORT,
 };
 use audioshare_protocol::lpc_lossless::QualityProfile;
 use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
@@ -118,6 +119,20 @@ struct AudioShareApp {
     usb_buffer_mode: bool,
     drift_history: VecDeque<f32>,
     client_status_msg: String,
+}
+
+/// Bluetooth A2DP delay reports arrive in 1 ms steps. Re-running the PipeWire
+/// offset helper for every step spawns a `pactl` process and can make the
+/// video offset audibly hunt. Apply the first non-zero report, reset when the
+/// delay returns to zero, and otherwise ignore changes smaller than 10 ms.
+fn should_apply_lipsync(new_delay_ms: u16, last_delay_ms: u16) -> bool {
+    if new_delay_ms == last_delay_ms {
+        return false;
+    }
+    if new_delay_ms == 0 || last_delay_ms == 0 {
+        return true;
+    }
+    new_delay_ms.abs_diff(last_delay_ms) >= 10
 }
 
 impl AudioShareApp {
@@ -878,7 +893,9 @@ impl AudioShareApp {
                 }
 
                 // Automatically adjust PipeWire sink latency offset when phone Bluetooth delay changes!
-                if self.auto_bt_video_lipsync && bt_delay != self.last_applied_bt_delay {
+                if self.auto_bt_video_lipsync
+                    && should_apply_lipsync(bt_delay, self.last_applied_bt_delay)
+                {
                     apply_automatic_video_lipsync_offset_ms(bt_delay);
                     self.last_applied_bt_delay = bt_delay;
                 }
@@ -1171,10 +1188,15 @@ impl AudioShareApp {
                 }
                 if ui.button("Connect").clicked() {
                     if let Ok(addr) = self.manual_server_ip.parse::<SocketAddr>() {
+                        // The scanner sets this for discovered hosts. Manual
+                        // entry, QR URIs and saved addresses bypass that path,
+                        // so detect USB tethering from the destination address.
+                        self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
                         self.connect_client(addr);
                     } else if let Ok(addr) =
                         format!("{}:{}", self.manual_server_ip, DEFAULT_PORT).parse::<SocketAddr>()
                     {
+                        self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
                         self.connect_client(addr);
                     }
                 }
@@ -1389,6 +1411,31 @@ impl AudioShareApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lipsync_hysteresis() {
+        assert!(!should_apply_lipsync(0, 0));
+        assert!(!should_apply_lipsync(50, 50));
+        assert!(
+            should_apply_lipsync(5, 0),
+            "the first non-zero report must apply"
+        );
+        assert!(
+            should_apply_lipsync(50, 0),
+            "the first report after startup must apply"
+        );
+        assert!(!should_apply_lipsync(55, 50));
+        assert!(!should_apply_lipsync(59, 50));
+        assert!(should_apply_lipsync(60, 50));
+        assert!(
+            should_apply_lipsync(0, 50),
+            "returning to zero must always apply"
+        );
+        assert!(
+            should_apply_lipsync(5, 60),
+            "a large downward change must apply"
+        );
+    }
 
     #[test]
     fn test_desktop_config_string_parser() {
