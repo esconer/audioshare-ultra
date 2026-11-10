@@ -326,6 +326,11 @@ fun MainScreen() {
                                         prefs.edit().putString("last_host_addr", hostAddress).putString("pin_code", pinCode).apply()
                                         val intent = Intent(context, AudioEngineService::class.java).apply {
                                             putExtra("HOST_ADDR", hostAddress)
+                                            // The scanner already knows whether this
+                                            // host was discovered over USB. Forward
+                                            // it so Android 11+ randomized RNDIS
+                                            // subnets still get the USB jitter buffer.
+                                            putExtra("IS_USB", mode.equals("USB", ignoreCase = true))
                                             putExtra("GAIN_DB", preampGainDb)
                                             putExtra("PIN", pinCode)
                                         }
