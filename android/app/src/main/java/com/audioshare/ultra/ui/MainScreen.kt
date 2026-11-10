@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.projection.MediaProjectionManager
@@ -182,14 +183,37 @@ fun MainScreen() {
                 break
             }
 
-            val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-            val hasBt = devices.any {
-                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            // Only treat Bluetooth as active when media audio is actually
+            // routed there. `getDevices(GET_DEVICES_OUTPUTS)` lists every
+            // connected device, so a paired-but-idle headset used to report
+            // +145ms even while the phone played through its own speaker.
+            val hasBt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+                val routedType = audioManager.getAudioDevicesForAttributes(attrs)
+                    .firstOrNull()?.type
+                routedType == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    routedType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    routedType == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    routedType == AudioDeviceInfo.TYPE_BLE_SPEAKER
+            } else {
+                // API < 31 has no per-attributes routing query, and BLE audio
+                // does not exist before API 31. The deprecated routing flags
+                // are the only way to distinguish a routed A2DP/SCO headset
+                // from one that is merely paired and idle.
+                @Suppress("DEPRECATION")
+                val a2dpRouted = audioManager.isBluetoothA2dpOn
+                @Suppress("DEPRECATION")
+                val scoRouted = audioManager.isBluetoothScoOn()
+                a2dpRouted || scoRouted
             }
             btEarbudsDetected = hasBt
-            // Report downstream Bluetooth A2DP latency back to PC Host for Video Sync helper
-            AudioEngineService.nativeReportBluetoothDelayMs(if (hasBt) 145 else 8)
+            // Report genuine downstream Bluetooth latency back to the PC
+            // host for the video-sync helper. 0 means "no BT route"; never
+            // fake 8ms of Bluetooth latency.
+            AudioEngineService.nativeReportBluetoothDelayMs(if (hasBt) 145 else 0)
             delay(250)
         }
     }
