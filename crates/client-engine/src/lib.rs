@@ -1,4 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(target_os = "android")]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -60,6 +62,45 @@ fn decide_empty_playhead(
     } else {
         PlayheadDecision::Hold
     }
+}
+
+/// A packet this far ahead of the playhead means the sequence tracker was
+/// lost or the sender restarted. 48 subframes = 120 ms.
+const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 48;
+
+/// A packet this far behind the playhead is outside the 35 ms maximum jitter
+/// buffer. Treat it as a new stream instead of discarding hundreds of
+/// milliseconds of audio after a host restart. 32 subframes = 80 ms.
+const STREAM_RESYNC_BEHIND_SUBFRAMES: i16 = -32;
+
+#[inline]
+fn needs_stream_resync(seq_delta: i16) -> bool {
+    seq_delta > STREAM_RESYNC_AHEAD_SUBFRAMES || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
+}
+
+/// Decode a `CodecMode::RawPcm16` payload.
+///
+/// The lossless encoder's raw fallback is a tagged 481-byte frame
+/// (`TAG_RAW_PCM16` + 480 bytes). A raw-mode sender may also omit the tag and
+/// send exactly 480 bytes. Accept both so the mode is not tied to one
+/// historical framing choice.
+fn decode_raw_pcm16_payload(payload: &[u8], out: &mut [f32; SUBFRAME_STEREO_SAMPLES]) -> bool {
+    if payload.len() == SUBFRAME_STEREO_SAMPLES * 2 {
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            let s = i16::from_le_bytes([payload[i * 2], payload[i * 2 + 1]]);
+            out[i] = (s as f32) * (1.0 / 32768.0);
+        }
+        return true;
+    }
+
+    let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+    if decode_lossless_subframe(payload, &mut pcm_i16).is_ok() {
+        for (dst, &s) in out.iter_mut().zip(pcm_i16.iter()) {
+            *dst = (s as f32) * (1.0 / 32768.0);
+        }
+        return true;
+    }
+    false
 }
 
 /// Convert an AAudio timestamp snapshot into the milliseconds still queued
@@ -232,6 +273,26 @@ impl ClientEngine {
     }
 
     #[cfg(not(target_os = "android"))]
+    fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
+        // CPAL callbacks can be larger than 4096 samples on PulseAudio/ALSA.
+        // Fill every sample in chunks; the old code only filled the first
+        // 4096 and left the rest of the buffer uninitialized.
+        let mut tmp = [0.0f32; 4096];
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let chunk = (out.len() - offset).min(tmp.len());
+            fifo.pop_exact_or_dither(&mut tmp[..chunk], dither_rng);
+            for (dst, &s) in out[offset..offset + chunk]
+                .iter_mut()
+                .zip(tmp[..chunk].iter())
+            {
+                *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            }
+            offset += chunk;
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
     fn spawn_desktop_output_sink(
         burst_fifo: Arc<BurstDecouplerRing>,
     ) -> Result<cpal::Stream, String> {
@@ -244,37 +305,46 @@ impl ClientEngine {
             .map_err(|e| format!("Output config error: {}", e))?;
         let sample_format = default_cfg.sample_format();
 
-        let cfg = cpal::StreamConfig {
+        // Prefer a 5 ms fixed callback buffer to cut desktop output latency.
+        // Many ALSA/PulseAudio backends reject an unsupported period size, so
+        // fall back to the device default instead of failing to start audio.
+        let low_lat_cfg = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Fixed(240),
+        };
+        let default_stream_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
 
-        let mut dither_rng = 0x9E37_79B9u32;
-        let stream = match sample_format {
-            cpal::SampleFormat::I16 => device.build_output_stream(
-                &cfg,
-                move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    let mut tmp = [0.0f32; 4096];
-                    let count = out.len().min(4096);
-                    burst_fifo.pop_exact_or_dither(&mut tmp[..count], &mut dither_rng);
-                    for (dst, &s) in out[..count].iter_mut().zip(tmp[..count].iter()) {
-                        *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    }
-                },
-                |_| {},
-                None,
-            ),
-            _ => device.build_output_stream(
-                &cfg,
-                move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    burst_fifo.pop_exact_or_dither(out, &mut dither_rng);
-                },
-                |_| {},
-                None,
-            ),
-        }
-        .map_err(|e| format!("Failed to open audio output: {}", e))?;
+        let build_for_cfg = |cfg: &cpal::StreamConfig| {
+            let fifo = Arc::clone(&burst_fifo);
+            let mut dither_rng = 0x9E37_79B9u32;
+            match sample_format {
+                cpal::SampleFormat::I16 => device.build_output_stream(
+                    cfg,
+                    move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        Self::fill_i16_output(&fifo, out, &mut dither_rng);
+                    },
+                    |_| {},
+                    None,
+                ),
+                _ => device.build_output_stream(
+                    cfg,
+                    move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        fifo.pop_exact_or_dither(out, &mut dither_rng);
+                    },
+                    |_| {},
+                    None,
+                ),
+            }
+        };
+
+        let stream = build_for_cfg(&low_lat_cfg)
+            .or_else(|_| build_for_cfg(&default_stream_cfg))
+            .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
         stream
             .play()
@@ -430,6 +500,36 @@ impl ClientEngine {
                 match ParsedPacket::parse_and_decrypt(&mut recv_buf[..len], active_key.as_ref()) {
                     Ok(parsed) => {
                         last_packet_instant = Instant::now();
+                        let base_seq = parsed.header.sequence;
+
+                        telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
+                        telemetry
+                            .host_volume
+                            .store(parsed.header.host_volume, Ordering::Relaxed);
+                        telemetry
+                            .max_group_delay_ms
+                            .store((parsed.header.stream_id as u16) * 2, Ordering::Relaxed);
+
+                        // DTX heartbeats are not audio: they arrive every
+                        // 200 ms and must not feed the RFC 3550 jitter
+                        // estimator, which assumes back-to-back 2.5 ms
+                        // packets. They still advance both sequence trackers
+                        // so a long silence cannot leave `latest_rx_seq`
+                        // behind the 16-bit wrap point.
+                        if parsed.header.mode == CodecMode::SilenceHeartbeat {
+                            telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
+                            prebuffer_ready = false;
+                            next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
+                            prev_rx_us = None;
+                            // DTX means the host stopped sending audio. Drop
+                            // any buffered slots and PLC history from before
+                            // the silence so a later stream restart cannot
+                            // replay stale payloads.
+                            sequencer.reset();
+                            continue;
+                        }
+
                         // RFC 3550 Inter-Arrival Jitter calculation using sender `tx_timestamp_us`
                         let rx_now_us = start_instant.elapsed().as_micros() as u32;
                         let tx_now_us = parsed.header.tx_timestamp_us;
@@ -453,38 +553,16 @@ impl ClientEngine {
                             ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
                         adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
 
-                        telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
-                        telemetry
-                            .host_volume
-                            .store(parsed.header.host_volume, Ordering::Relaxed);
-                        telemetry
-                            .max_group_delay_ms
-                            .store((parsed.header.stream_id as u16) * 2, Ordering::Relaxed);
-
-                        let base_seq = parsed.header.sequence;
                         if !stream_initialized {
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             stream_initialized = true;
                         }
 
-                        if parsed.header.mode == CodecMode::SilenceHeartbeat {
-                            telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
-                            prebuffer_ready = false;
-                            next_play_seq = base_seq;
-                            // DTX means the host stopped sending audio. Drop
-                            // any buffered slots and PLC history from before
-                            // the silence so a later stream restart cannot
-                            // replay stale payloads.
-                            sequencer.reset();
-                            continue;
-                        }
-
                         // Signed 16-bit sequence delta (RFC 1982): >0 means future, <0 means past/late duplicate
                         let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
                         if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
-                            || seq_delta > 48
-                            || seq_delta < -200
+                            || needs_stream_resync(seq_delta)
                         {
                             // The playhead is jumping to a new base sequence.
                             // Clear old slots so a wrapped/reused sequence
@@ -494,6 +572,7 @@ impl ClientEngine {
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             prebuffer_ready = false;
+                            prev_rx_us = None;
                         }
 
                         // Lazy FEC Decoding: Only decode FEC [N-1] / [N-2] if that slot is ACTUALLY missing
@@ -551,6 +630,11 @@ impl ClientEngine {
                                     // also reads those legacy frames correctly.
                                     decode_fec_subframe_to_f32(payload, &mut pcm_f32)
                                 }
+                            } else if parsed.header.mode == CodecMode::RawPcm16 {
+                                decode_raw_pcm16_payload(
+                                    &prim[cursor..cursor + sub_len],
+                                    &mut pcm_f32,
+                                )
                             } else {
                                 let payload = &prim[cursor..cursor + sub_len];
                                 // True 24-bit profile: upper-16-bit LPC plus
@@ -968,6 +1052,80 @@ mod tests {
             pending_hardware_delay_ms(0, timestamp_ns, timestamp_ns + 5_000_000_000, 48_000);
         assert_eq!(stale, Some(120));
     }
+
+    #[test]
+    fn test_stream_resync_thresholds_detect_host_restart() {
+        assert!(!needs_stream_resync(0));
+        assert!(!needs_stream_resync(48));
+        assert!(needs_stream_resync(49));
+        assert!(!needs_stream_resync(-32));
+        assert!(needs_stream_resync(-33));
+
+        // Host restarted while the playhead was at 150: the new stream starts
+        // at sequence 0 and must be accepted immediately, not after 375 ms.
+        let next_play = 150u16;
+        let new_host_base = 0u16;
+        let delta = new_host_base.wrapping_sub(next_play) as i16;
+        assert!(needs_stream_resync(delta));
+
+        // A packet still inside the 80 ms window is a late duplicate, not a
+        // new stream.
+        let late = 140u16;
+        let delta = late.wrapping_sub(next_play) as i16;
+        assert!(!needs_stream_resync(delta));
+    }
+
+    #[test]
+    fn test_raw_pcm16_accepts_tagged_and_untagged_frames() {
+        let mut raw = [0u8; SUBFRAME_STEREO_SAMPLES * 2];
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            let s = ((i as i16) - 120) * 200;
+            raw[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
+        }
+
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_raw_pcm16_payload(&raw, &mut decoded));
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            let expected = (((i as i16) - 120) * 200) as f32 / 32768.0;
+            assert!((decoded[i] - expected).abs() < 1e-7);
+        }
+
+        // The lossless encoder's raw fallback carries a 0x00 tag byte.
+        let mut tagged = [0u8; 481];
+        tagged[1..].copy_from_slice(&raw);
+        decoded.fill(0.0);
+        assert!(decode_raw_pcm16_payload(&tagged, &mut decoded));
+        for i in 0..SUBFRAME_STEREO_SAMPLES {
+            let expected = (((i as i16) - 120) * 200) as f32 / 32768.0;
+            assert!((decoded[i] - expected).abs() < 1e-7);
+        }
+
+        // Truncated payloads are rejected rather than producing partial audio.
+        assert!(!decode_raw_pcm16_payload(
+            &raw[..raw.len() - 2],
+            &mut decoded
+        ));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_i16_output_fills_buffers_larger_than_one_chunk() {
+        let ring = BurstDecouplerRing::new();
+        let mut input = [0.0f32; 5000];
+        for (i, s) in input.iter_mut().enumerate() {
+            *s = ((i % 100) as f32 - 50.0) / 100.0;
+        }
+        assert_eq!(ring.push_samples(&input), input.len());
+
+        let mut out = [i16::MIN; 5000];
+        let mut rng = 1u32;
+        ClientEngine::fill_i16_output(&ring, &mut out, &mut rng);
+
+        for (i, &sample) in input.iter().enumerate() {
+            let expected = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            assert_eq!(out[i], expected, "unfilled sample at {}", i);
+        }
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -1072,7 +1230,11 @@ pub mod android_aaudio {
 
     struct CallbackContext {
         fifo: Arc<BurstDecouplerRing>,
-        dither_rng: u32,
+        // The AAudio data callback and the RX/error threads share this
+        // context. A `&mut CallbackContext` in the callback would alias the
+        // `&CallbackContext` used by `needs_reopen()`/the error callback, so
+        // the RNG state is atomic and every access uses a shared reference.
+        dither_rng: AtomicU32,
         disconnected: AtomicBool,
     }
 
@@ -1086,10 +1248,12 @@ pub mod android_aaudio {
             return AAUDIO_CALLBACK_RESULT_CONTINUE;
         }
         unsafe {
-            let ctx = &mut *(user_data as *mut CallbackContext);
+            let ctx = &*(user_data as *const CallbackContext);
             let total_samples = (num_frames as usize) * 2;
             let out_slice = core::slice::from_raw_parts_mut(audio_data as *mut f32, total_samples);
-            ctx.fifo.pop_exact_or_dither(out_slice, &mut ctx.dither_rng);
+            let mut rng = ctx.dither_rng.load(Ordering::Relaxed);
+            ctx.fifo.pop_exact_or_dither(out_slice, &mut rng);
+            ctx.dither_rng.store(rng, Ordering::Relaxed);
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
@@ -1169,7 +1333,7 @@ pub mod android_aaudio {
 
                 let ctx = Box::new(CallbackContext {
                     fifo,
-                    dither_rng: 0x1357_9BDF,
+                    dither_rng: AtomicU32::new(0x1357_9BDF),
                     disconnected: AtomicBool::new(false),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
