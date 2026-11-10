@@ -53,6 +53,24 @@ pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
     targets
 }
 
+/// Bind the transmitter socket.
+///
+/// Hardware-mic mode streams to the PC on `PHONE_MIC_PORT` (65532), so it has
+/// no reason to own port 65530. That port belongs to `ClientEngine`, which
+/// receives PC speaker audio there. Sharing it (especially with
+/// `SO_REUSEPORT`) lets this transmitter drain or steal speaker packets and
+/// forces the client onto a fallback port.
+///
+/// Party Broadcast mode is a host: peers send HELLO/feedback to the
+/// well-known port 65530, so keep that binding when it is available.
+fn bind_phone_mic_socket(use_hardware_mic: bool) -> std::io::Result<UdpSocket> {
+    if use_hardware_mic {
+        UdpSocket::bind("0.0.0.0:0")
+    } else {
+        UdpSocket::bind(("0.0.0.0", 65530)).or_else(|_| UdpSocket::bind("0.0.0.0:0"))
+    }
+}
+
 impl PhoneMicTransmitter {
     pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
         let mut targets = parse_target_endpoints(target_hosts);
@@ -80,9 +98,7 @@ impl PhoneMicTransmitter {
             return Err("No valid target endpoints found for transmitter".into());
         }
 
-        let socket = UdpSocket::bind(("0.0.0.0", 65530))
-            .or_else(|_| UdpSocket::bind("0.0.0.0:0"))
-            .map_err(|e| e.to_string())?;
+        let socket = bind_phone_mic_socket(use_hardware_mic).map_err(|e| e.to_string())?;
         let _ = socket.set_broadcast(true);
         let _ = socket.set_nonblocking(true);
         configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
@@ -123,24 +139,30 @@ impl PhoneMicTransmitter {
                 let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
 
                 while run_clone.load(Ordering::Relaxed) {
-                    // Accept incoming HELLO & ClientFeedbackPacket from peer phones for Multi-Phone Group Sync!
-                    while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
-                        if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
-                            if !targets.contains(&src_addr) {
-                                targets.push(src_addr);
-                            }
-                        } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
-                            if !targets.contains(&src_addr) {
-                                targets.push(src_addr);
-                            }
-                            if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
-                                // Align the fixed downstream delay (A2DP or
-                                // measured DAC), never the adaptive network
-                                // jitter buffer.
-                                peer_delays.insert(
-                                    src_addr,
-                                    fb.bluetooth_delay_ms.max(fb.hardware_delay_ms),
-                                );
+                    if !use_hardware_mic {
+                        // Party Mode only: accept incoming HELLO and
+                        // ClientFeedbackPacket from peer phones for
+                        // Multi-Phone Group Sync. In hardware-mic mode this
+                        // socket is ephemeral and port 65530 belongs to
+                        // ClientEngine, so there is nothing to listen for.
+                        while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
+                            if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
+                                if !targets.contains(&src_addr) {
+                                    targets.push(src_addr);
+                                }
+                            } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
+                                if !targets.contains(&src_addr) {
+                                    targets.push(src_addr);
+                                }
+                                if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                                    // Align the fixed downstream delay (A2DP or
+                                    // measured DAC), never the adaptive network
+                                    // jitter buffer.
+                                    peer_delays.insert(
+                                        src_addr,
+                                        fb.bluetooth_delay_ms.max(fb.hardware_delay_ms),
+                                    );
+                                }
                             }
                         }
                     }
@@ -251,9 +273,13 @@ pub fn android_start_stream(
         existing.stop();
     }
 
+    // Kotlin can only report USB when the discovery row or caller knows it.
+    // Android 11+ randomizes the RNDIS subnet, so also ask the host-engine
+    // helper, which compares the address against local USB interfaces.
+    let detected_usb = is_usb || audioshare_host_engine::is_usb_subnet_ip(addr.ip());
     let cfg = ClientConfig {
         server_addr: addr,
-        target_buffer_subframes: if is_usb { 2.0 } else { 3.5 },
+        target_buffer_subframes: if detected_usb { 2.0 } else { 3.5 },
         preamp_gain_db: gain_db,
     };
 
@@ -555,6 +581,16 @@ mod tests {
         assert_eq!(decoded.fec_rate_permille, 45);
         assert_eq!(decoded.bluetooth_delay_ms, 120);
         assert_eq!(decoded.hardware_delay_ms, 17);
+    }
+
+    #[test]
+    fn test_hardware_mic_transmitter_uses_ephemeral_port() {
+        let socket = bind_phone_mic_socket(true).expect("hardware-mic socket bind");
+        assert_ne!(
+            socket.local_addr().unwrap().port(),
+            65530,
+            "hardware-mic mode must not occupy ClientEngine's speaker port"
+        );
     }
 
     #[test]
