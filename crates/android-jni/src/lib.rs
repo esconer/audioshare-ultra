@@ -526,8 +526,11 @@ pub mod android_native {
         env: JNIEnv,
         _class: JClass,
     ) -> jlongArray {
-        let mut stats = [0i64; 11];
+        // Keep this array length and index order in sync with
+        // MainScreen.kt's `LongArray(24)` telemetry buffer.
+        let mut stats = [0i64; 24];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+            let latency = c.telemetry.latency_snapshot(0.0);
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
             stats[2] = c.telemetry.fec_healed_frames.load(Ordering::Relaxed) as i64;
@@ -542,8 +545,18 @@ pub mod android_native {
             stats[8] = c.telemetry.host_volume.load(Ordering::Relaxed) as i64;
             stats[9] = c.telemetry.max_group_delay_ms.load(Ordering::Relaxed) as i64;
             stats[10] = c.telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed) as i64;
+            stats[11] = c.telemetry.packet_interval_us.load(Ordering::Relaxed) as i64;
+            stats[12] = c.telemetry.network_jitter_us.load(Ordering::Relaxed) as i64;
+            stats[13] = c.telemetry.adaptive_buffer_us.load(Ordering::Relaxed) as i64;
+            stats[14] = c.telemetry.target_buffer_us.load(Ordering::Relaxed) as i64;
+            stats[15] = c.telemetry.buffered_audio_us.load(Ordering::Relaxed) as i64;
+            stats[16] = c.telemetry.group_sync_extra_us.load(Ordering::Relaxed) as i64;
+            stats[17] = c.telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) as i64;
+            stats[18] = i64::from(c.telemetry.prebuffer_ready.load(Ordering::Relaxed));
+            stats[19] = c.telemetry.codec_mode.load(Ordering::Relaxed) as i64;
+            stats[20] = (latency.estimated_one_way_ms() * 10.0).round() as i64;
         }
-        let arr = env.new_long_array(11).unwrap();
+        let arr = env.new_long_array(24).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
     }

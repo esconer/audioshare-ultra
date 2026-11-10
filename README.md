@@ -76,13 +76,23 @@ as-ultra host --usb
 # Play a test tone instead of capturing the system output
 as-ultra host --test-tone
 
+# Opt-in live latency breakdown (host and client HUDs)
+as-ultra host --latency-debug
+as-ultra client <host-ip> --latency-debug
+
 # Run the built-in packet-loss/latency benchmark
 as-ultra benchmark
 ```
 
+`--latency-debug` (or `--debug`) shows the live packetization, jitter, FIFO,
+DAC/Bluetooth, and estimated one-way latency components without changing audio
+behavior. It can also be enabled with `AUDIOSHARE_LATENCY_DEBUG=1`.
+
 The desktop application (`audioshare-gui`) provides the same host/client controls,
 device discovery, per-application audio capture, encryption PIN setup, connected
-client management, and live latency/jitter/FEC telemetry.
+client management, and live latency/jitter/FEC telemetry. Use the top-bar
+`Latency Debug` toggle for the live component breakdown; the Android app exposes
+the same view as a persisted `Debug` toggle on the Connect tab.
 
 ## Android
 

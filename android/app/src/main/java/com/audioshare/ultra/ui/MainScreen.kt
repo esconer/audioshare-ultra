@@ -32,6 +32,16 @@ import com.audioshare.ultra.service.AudioEngineService
 import com.audioshare.ultra.service.PhoneAudioCaster
 import kotlinx.coroutines.delay
 
+private fun usToMs(us: Long): String = "%.1f".format(us / 1000.0)
+
+private fun codecModeName(mode: Long): String = when (mode.toInt()) {
+    0 -> "Lossless LPC"
+    1 -> "Raw PCM16"
+    2 -> "VBR Compressed"
+    3 -> "DTX Silence"
+    else -> "Unknown"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
@@ -67,6 +77,7 @@ fun MainScreen() {
     var nightMode by remember { mutableStateOf(prefs.getBoolean("night_mode", false)) }
     var crossfeed by remember { mutableStateOf(prefs.getBoolean("crossfeed", false)) }
     var gamingLock by remember { mutableStateOf(prefs.getBoolean("gaming_lock", false)) }
+    var latencyDebug by remember { mutableStateOf(prefs.getBoolean("latency_debug", false)) }
     var channelRole by remember { mutableIntStateOf(prefs.getInt("channel_role", 0)) }
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
     // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
@@ -75,7 +86,9 @@ fun MainScreen() {
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
-    var telemetry by remember { mutableStateOf(LongArray(11)) }
+    // Index contract matches crates/android-jni/src/lib.rs:
+    // 0..10 legacy counters, 11..20 live latency breakdown.
+    var telemetry by remember { mutableStateOf(LongArray(24)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
 
     fun syncAndSaveDsp() {
@@ -256,6 +269,17 @@ fun MainScreen() {
                             fontFamily = FontFamily.Monospace,
                             style = MaterialTheme.typography.bodySmall
                         )
+                        if (latencyDebug) {
+                            val estMs = telemetry.getOrElse(20) { 0L } / 10.0
+                            val targetMs = telemetry.getOrElse(14) { 0L } / 1000.0
+                            val bufferedMs = telemetry.getOrElse(15) { 0L } / 1000.0
+                            Text(
+                                "📊 Est: ${"%.1f".format(estMs)} ms | FIFO: ${"%.1f".format(bufferedMs)}/${"%.1f".format(targetMs)} ms | DAC: ${telemetry.getOrElse(10) { 0L }} ms | BT: ${telemetry.getOrElse(17) { 0L }} ms",
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.tertiary
+                            )
+                        }
                     }
                 }
             }
@@ -416,7 +440,22 @@ fun MainScreen() {
                         modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text("Real-Time Hardware Telemetry", style = MaterialTheme.typography.titleMedium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Real-Time Hardware Telemetry", style = MaterialTheme.typography.titleMedium)
+                            FilterChip(
+                                selected = latencyDebug,
+                                onClick = {
+                                    val next = !latencyDebug
+                                    latencyDebug = next
+                                    prefs.edit().putBoolean("latency_debug", next).apply()
+                                },
+                                label = { Text("📊 Debug") }
+                            )
+                        }
                         Text("RX Packets        : ${telemetry[0]}", fontFamily = FontFamily.Monospace)
                         Text("Lossless Subframes: ${telemetry[1]}", fontFamily = FontFamily.Monospace)
                         Text("FEC Healed Drops  : ${telemetry[2]}", fontFamily = FontFamily.Monospace)
@@ -431,6 +470,51 @@ fun MainScreen() {
                             Text(
                                 "🎧 Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",
                                 color = MaterialTheme.colorScheme.tertiary,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+
+                        if (latencyDebug) {
+                            val packetUs = telemetry.getOrElse(11) { 0L }
+                            val jitterUs = telemetry.getOrElse(12) { 0L }
+                            val adaptiveUs = telemetry.getOrElse(13) { 0L }
+                            val targetUs = telemetry.getOrElse(14) { 0L }
+                            val bufferedUs = telemetry.getOrElse(15) { 0L }
+                            val groupUs = telemetry.getOrElse(16) { 0L }
+                            val btMs = telemetry.getOrElse(17) { 0L }
+                            val prebufferReady = telemetry.getOrElse(18) { 0L } == 1L
+                            val codecMode = telemetry.getOrElse(19) { 0L }
+                            val estMs = telemetry.getOrElse(20) { 0L } / 10.0
+                            val fillPct = if (targetUs > 0) {
+                                ((bufferedUs.toDouble() / targetUs) * 100.0).coerceIn(0.0, 100.0)
+                            } else {
+                                0.0
+                            }
+                            val btLabel = if (btMs > 0) "$btMs ms (fixed A2DP)" else "not routed"
+                            val prebufferLabel = if (prebufferReady) "READY" else "FILLING"
+
+                            Spacer(Modifier.height(4.dp))
+                            Text("📊 Live Latency Breakdown", style = MaterialTheme.typography.titleSmall)
+                            Text(
+                                "Estimated one-way  : ${"%.1f".format(estMs)} ms",
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.tertiary
+                            )
+                            Text("Sender packetization: ${usToMs(packetUs)} ms", fontFamily = FontFamily.Monospace)
+                            Text("Network jitter     : ${usToMs(jitterUs)} ms", fontFamily = FontFamily.Monospace)
+                            Text("Adaptive cushion   : ${usToMs(adaptiveUs)} ms", fontFamily = FontFamily.Monospace)
+                            Text("Target FIFO        : ${usToMs(targetUs)} ms", fontFamily = FontFamily.Monospace)
+                            Text(
+                                "Buffered right now : ${usToMs(bufferedUs)} ms (${"%.0f".format(fillPct)}%)",
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text("Group sync addition: +${usToMs(groupUs)} ms", fontFamily = FontFamily.Monospace)
+                            Text("DAC queue          : ${telemetry.getOrElse(10) { 0L }} ms", fontFamily = FontFamily.Monospace)
+                            Text("Bluetooth estimate : $btLabel", fontFamily = FontFamily.Monospace)
+                            Text("Prebuffer          : $prebufferLabel", fontFamily = FontFamily.Monospace)
+                            Text("Codec              : ${codecModeName(codecMode)}", fontFamily = FontFamily.Monospace)
+                            Text(
+                                "Estimate = packetization + target FIFO + max(DAC, BT, output). Group sync is already inside the FIFO. Excludes one-way network transit and the acoustic air path; use the sonar for end-to-end.",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }

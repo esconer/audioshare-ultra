@@ -1,13 +1,14 @@
 use std::net::{SocketAddr, UdpSocket};
-#[cfg(target_os = "android")]
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
+use audioshare_protocol::latency::ClientLatencySnapshot;
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, TAG_VBR_BFP,
@@ -151,6 +152,45 @@ pub struct ClientTelemetry {
     pub max_group_delay_ms: AtomicU16,
     pub seconds_since_last_packet: AtomicU16,
     pub server_dtx_silent: AtomicBool,
+    /// RFC 3550 inter-arrival jitter estimate in microseconds.
+    pub network_jitter_us: AtomicU32,
+    /// Adaptive network cushion before group-sync alignment, in microseconds.
+    pub adaptive_buffer_us: AtomicU32,
+    /// Final clamped FIFO target (including effective group sync), in
+    /// microseconds.
+    pub target_buffer_us: AtomicU32,
+    /// Live combined sequencer + output FIFO depth, in microseconds.
+    pub buffered_audio_us: AtomicU32,
+    /// Effective group-sync addition after the FIFO clamp, in microseconds.
+    pub group_sync_extra_us: AtomicU32,
+    /// Sender bundling interval (`subframe_count * 2.5 ms`), in microseconds.
+    pub packet_interval_us: AtomicU32,
+    /// Wire codec mode of the most recent audio packet.
+    pub codec_mode: AtomicU8,
+    /// True once the prebuffer has filled enough to start playback.
+    pub prebuffer_ready: AtomicBool,
+}
+
+impl ClientTelemetry {
+    /// Build a point-in-time breakdown for the live debug views.
+    ///
+    /// `output_buffer_ms` is the platform's configured output stage: 5 ms on
+    /// desktop CPAL, 0 on Android where the AAudio DAC queue is measured.
+    pub fn latency_snapshot(&self, output_buffer_ms: f32) -> ClientLatencySnapshot {
+        ClientLatencySnapshot {
+            packet_interval_ms: self.packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            network_jitter_ms: self.network_jitter_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            adaptive_buffer_ms: self.adaptive_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            target_buffer_ms: self.target_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            buffered_audio_ms: self.buffered_audio_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            group_sync_extra_ms: self.group_sync_extra_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            hardware_delay_ms: self.downstream_hw_delay_ms.load(Ordering::Relaxed),
+            bluetooth_delay_ms: self.downstream_bt_delay_ms.load(Ordering::Relaxed),
+            output_buffer_ms,
+            prebuffer_ready: self.prebuffer_ready.load(Ordering::Relaxed),
+            codec_mode: self.codec_mode.load(Ordering::Relaxed),
+        }
+    }
 }
 
 pub struct ClientEngine {
@@ -167,6 +207,14 @@ impl ClientEngine {
 
     pub fn connect_with_pin(config: ClientConfig, pin: Option<&str>) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
+        // Mirror the RX loop's initial cushion so the debug view has sensible
+        // values before the first packet arrives.
+        let initial_floor_subframes = if config.target_buffer_subframes <= 2.5 {
+            4.0
+        } else {
+            config.target_buffer_subframes.max(6.0)
+        };
+        let initial_target_subframes = (initial_floor_subframes.ceil() as u32).clamp(4, 12);
         let telemetry = Arc::new(ClientTelemetry {
             packets_received: AtomicU64::new(0),
             primary_frames_played: AtomicU64::new(0),
@@ -189,6 +237,14 @@ impl ClientEngine {
             max_group_delay_ms: AtomicU16::new(0),
             seconds_since_last_packet: AtomicU16::new(0),
             server_dtx_silent: AtomicBool::new(false),
+            network_jitter_us: AtomicU32::new(2500),
+            adaptive_buffer_us: AtomicU32::new((initial_floor_subframes * 2500.0) as u32),
+            target_buffer_us: AtomicU32::new(initial_target_subframes * 2500),
+            buffered_audio_us: AtomicU32::new(0),
+            group_sync_extra_us: AtomicU32::new(0),
+            packet_interval_us: AtomicU32::new(2500),
+            codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
+            prebuffer_ready: AtomicBool::new(false),
         });
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
@@ -509,6 +565,13 @@ impl ClientEngine {
                         telemetry
                             .max_group_delay_ms
                             .store((parsed.header.stream_id as u16) * 2, Ordering::Relaxed);
+                        telemetry.packet_interval_us.store(
+                            (parsed.header.subframe_count.max(1) as u32) * 2500,
+                            Ordering::Relaxed,
+                        );
+                        telemetry
+                            .codec_mode
+                            .store(parsed.header.mode as u8, Ordering::Relaxed);
 
                         // DTX heartbeats are not audio: they arrive every
                         // 200 ms and must not feed the RFC 3550 jitter
@@ -519,6 +582,7 @@ impl ClientEngine {
                         if parsed.header.mode == CodecMode::SilenceHeartbeat {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
                             prebuffer_ready = false;
+                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             prev_rx_us = None;
@@ -540,6 +604,9 @@ impl ClientEngine {
                             jitter_estimate_us +=
                                 (transit_delta - jitter_estimate_us) * (1.0 / 16.0);
                         }
+                        telemetry
+                            .network_jitter_us
+                            .store(jitter_estimate_us.max(0.0) as u32, Ordering::Relaxed);
                         prev_rx_us = Some(rx_now_us);
                         prev_tx_us = tx_now_us;
                         // Ensure floor is always at least 2.5 packets for the sender's bundling mode
@@ -572,6 +639,7 @@ impl ClientEngine {
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             prebuffer_ready = false;
+                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             prev_rx_us = None;
                         }
 
@@ -673,6 +741,7 @@ impl ClientEngine {
                             .max(0) as f32;
                         if buffered >= initial_wifi_floor {
                             prebuffer_ready = true;
+                            telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
                         }
                     }
                     Err(WireError::AuthenticationFailed) => {
@@ -714,7 +783,15 @@ impl ClientEngine {
             // 2. `plc_emergency_watermark` (2 subframes = 5.0ms): If `next_play_seq` is missing in
             //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 2 subframes!
             //    We wait for the delayed packet or Packet [K+1]'s FEC to arrive first!
+            let base_fifo_subframes = (base_target.ceil() as usize).clamp(4, 12);
             let target_fifo_subframes = (target_buf.ceil() as usize).clamp(4, 12);
+            telemetry
+                .target_buffer_us
+                .store((target_fifo_subframes as u32) * 2500, Ordering::Relaxed);
+            telemetry.group_sync_extra_us.store(
+                (target_fifo_subframes.saturating_sub(base_fifo_subframes) as u32) * 2500,
+                Ordering::Relaxed,
+            );
             let fifo_watermark = target_fifo_subframes * SUBFRAME_STEREO_SAMPLES;
             let plc_emergency_watermark = SUBFRAME_STEREO_SAMPLES * 2;
 
@@ -847,7 +924,12 @@ impl ClientEngine {
                     net_subframes = keep as f32;
                 }
                 // Regulate COMBINED (Sequencer + FIFO) buffer so they never stack in series!
-                resampler.update_clock_loop(net_subframes + fifo_subframes, target_buf);
+                let buffered_subframes = net_subframes + fifo_subframes;
+                telemetry.buffered_audio_us.store(
+                    (buffered_subframes.max(0.0) * 2500.0) as u32,
+                    Ordering::Relaxed,
+                );
+                resampler.update_clock_loop(buffered_subframes, target_buf);
 
                 let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
                 telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
@@ -864,6 +946,16 @@ impl ClientEngine {
                     break;
                 }
             }
+
+            // Publish the adaptive cushion and prebuffer state for the live
+            // debug views. The audio path itself never reads these atomics.
+            telemetry.adaptive_buffer_us.store(
+                (adaptive_wifi_subframes.max(0.0) * 2500.0) as u32,
+                Ordering::Relaxed,
+            );
+            telemetry
+                .prebuffer_ready
+                .store(prebuffer_ready, Ordering::Relaxed);
         }
     }
 }

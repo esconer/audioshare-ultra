@@ -7,6 +7,7 @@ use audioshare_host_engine::discovery_and_os::{
     AdbUsbWatcher, DiscoveryBeacon, VirtualSpeakerAndRadioGuard,
 };
 use audioshare_host_engine::{list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT};
+use audioshare_protocol::latency::{codec_mode_name, DESKTOP_OUTPUT_BUFFER_MS, SUBFRAME_MS};
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_subframe, encode_fec_subframe,
     encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
@@ -33,14 +34,37 @@ fn print_usage() {
     println!("  AudioShare Ultra — Hard Real-Time Lossless Audio Engine");
     println!("================================================================");
     println!("Usage:");
-    println!("  as-ultra host [--test-tone] [--usb]   Start PC Host Server");
-    println!("  as-ultra client <host-ip[:port]>      Connect Client to Host");
+    println!("  as-ultra host [--test-tone] [--usb] [--latency-debug]");
+    println!("  as-ultra client <host-ip[:port]> [--latency-debug]");
     println!("  as-ultra benchmark                    Run Wi-Fi Loss & Latency Benchmark");
+    println!();
+    println!("  --latency-debug  Show the live component latency breakdown.");
+    println!("                   Also enabled by AUDIOSHARE_LATENCY_DEBUG=1.");
+}
+
+fn has_latency_debug_flag(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--latency-debug" || a == "--debug")
+}
+
+fn latency_debug_enabled(args: &[String]) -> bool {
+    has_latency_debug_flag(args)
+        || std::env::var("AUDIOSHARE_LATENCY_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn client_target(args: &[String]) -> &str {
+    args.iter()
+        .find(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .unwrap_or("127.0.0.1:65530")
 }
 
 fn run_host(args: &[String]) {
     let use_test_tone = args.iter().any(|a| a == "--test-tone");
     let usb_mode = args.iter().any(|a| a == "--usb");
+    let latency_debug = latency_debug_enabled(args);
 
     println!("================================================================");
     println!("  AudioShare Ultra Host — Starting Real-Time Engine");
@@ -94,27 +118,63 @@ fn run_host(args: &[String]) {
         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
         let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
 
-        print!(
-            "\r[HOST HUD] Clients: {} | TX Packets: {:<8} | Total KB: {:<8} | Mode: {:<18}",
-            clients,
-            pkts,
-            bytes / 1024,
-            if dtx {
-                "SMART-DTX (0.6kbps)"
-            } else {
-                "LOSSLESS-ACTIVE"
-            }
-        );
+        if latency_debug {
+            let pacing_ms =
+                host.telemetry.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0;
+            let capture_ms =
+                host.telemetry.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0;
+            let subframes = host
+                .telemetry
+                .tx_subframes_per_packet
+                .load(Ordering::Relaxed);
+            let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
+            let bt_max = host
+                .telemetry
+                .max_client_bt_delay_ms
+                .load(Ordering::Relaxed);
+            let downstream_max = host
+                .telemetry
+                .max_client_downstream_delay_ms
+                .load(Ordering::Relaxed);
+            let room_trim = host
+                .telemetry
+                .manual_group_sync_trim_ms
+                .load(Ordering::Relaxed);
+            print!(
+                "\r[HOST LATENCY] Pacing: {:.1} ms ({} × {:.1} ms) | Capture: {:.1} ms | Pipeline: {:.1} ms | Downstream max: {} ms (BT {}) | Trim: +{} ms | Clients: {} | Mode: {}   ",
+                pacing_ms,
+                subframes,
+                SUBFRAME_MS,
+                capture_ms,
+                capture_ms + pacing_ms,
+                downstream_max,
+                bt_max,
+                room_trim,
+                clients,
+                if dtx { "SMART-DTX" } else { codec }
+            );
+        } else {
+            print!(
+                "\r[HOST HUD] Clients: {} | TX Packets: {:<8} | Total KB: {:<8} | Mode: {:<18}",
+                clients,
+                pkts,
+                bytes / 1024,
+                if dtx {
+                    "SMART-DTX (0.6kbps)"
+                } else {
+                    "LOSSLESS-ACTIVE"
+                }
+            );
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
 }
 
 fn run_client(args: &[String]) {
-    let raw_target = args
-        .first()
-        .map(|s| s.as_str())
-        .unwrap_or("127.0.0.1:65530");
+    let latency_debug = latency_debug_enabled(args);
+    // Allow `client --latency-debug 192.168.1.5` as well as the address first.
+    let raw_target = client_target(args);
     let target_str = if raw_target.contains(':') {
         raw_target.to_string()
     } else {
@@ -155,10 +215,32 @@ fn run_client(args: &[String]) {
         let drift = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
         let dtx = client.telemetry.server_dtx_silent.load(Ordering::Relaxed);
 
-        print!(
-            "\r[CLIENT HUD] RX Pkts: {:<7} | Lossless Frames: {:<7} | FEC Healed: {:<4} | PLC: {:<4} | Clock Drift: {:+4} ppm | DTX: {}",
-            pkts, prim, fec, plc, drift, if dtx { "SLEEP" } else { "LIVE " }
-        );
+        if latency_debug {
+            let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
+            print!(
+                "\r[CLIENT LATENCY] Est: {:.1} ms = pkt {:.1} + FIFO {:.1} (fill {:.1}, group +{:.1}) + out {:.1} [DAC {} ms, BT {} ms] | Jitter {:.1} ms | {} | {} | RX {} | FEC {} | PLC {} | Drift {:+} ppm   ",
+                snap.estimated_one_way_ms(),
+                snap.packet_interval_ms,
+                snap.target_buffer_ms,
+                snap.buffered_audio_ms,
+                snap.group_sync_extra_ms,
+                snap.downstream_stage_ms(),
+                snap.hardware_delay_ms,
+                snap.bluetooth_delay_ms,
+                snap.network_jitter_ms,
+                snap.codec_name(),
+                if snap.prebuffer_ready { "READY" } else { "FILLING" },
+                pkts,
+                fec,
+                plc,
+                drift
+            );
+        } else {
+            print!(
+                "\r[CLIENT HUD] RX Pkts: {:<7} | Lossless Frames: {:<7} | FEC Healed: {:<4} | PLC: {:<4} | Clock Drift: {:+4} ppm | DTX: {}",
+                pkts, prim, fec, plc, drift, if dtx { "SLEEP" } else { "LIVE " }
+            );
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
@@ -292,4 +374,33 @@ fn run_wifi_torture_benchmark() {
     println!("================================================================");
     assert_eq!(unrecovered_drops, 0, "Zero audible dropouts SLA violated!");
     println!("  [PASS] All Hard Real-Time & Zero-Jitter SLAs Verified!");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn test_latency_debug_flag_aliases() {
+        assert!(has_latency_debug_flag(&args(&["--latency-debug"])));
+        assert!(has_latency_debug_flag(&args(&["--debug"])));
+        assert!(!has_latency_debug_flag(&args(&["192.168.1.5"])));
+    }
+
+    #[test]
+    fn test_client_target_skips_flags() {
+        assert_eq!(
+            client_target(&args(&["--latency-debug", "192.168.1.5"])),
+            "192.168.1.5"
+        );
+        assert_eq!(
+            client_target(&args(&["192.168.1.5", "--debug"])),
+            "192.168.1.5"
+        );
+        assert_eq!(client_target(&[]), "127.0.0.1:65530");
+    }
 }

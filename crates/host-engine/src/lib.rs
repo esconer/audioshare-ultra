@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -329,6 +329,13 @@ pub struct HostTelemetry {
     pub hotplug_rebinds: AtomicU16,
     pub trigger_sonar_ping: AtomicBool,
     pub sonar_tx_timestamp_us: AtomicU64,
+    /// Actual subframes bundled into each outgoing packet after the quality
+    /// governor runs.
+    pub tx_subframes_per_packet: AtomicU8,
+    /// Actual sender pacing/bundling interval in microseconds.
+    pub tx_packet_interval_us: AtomicU32,
+    /// Captured audio waiting in the host ring at send time, in microseconds.
+    pub capture_buffer_us: AtomicU32,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -390,6 +397,11 @@ impl HostEngine {
             hotplug_rebinds: AtomicU16::new(0),
             trigger_sonar_ping: AtomicBool::new(false),
             sonar_tx_timestamp_us: AtomicU64::new(0),
+            tx_subframes_per_packet: AtomicU8::new(config.subframes_per_packet.clamp(1, 4)),
+            tx_packet_interval_us: AtomicU32::new(
+                (config.subframes_per_packet.clamp(1, 4) as u32) * 2500,
+            ),
+            capture_buffer_us: AtomicU32::new(0),
         });
 
         let mut client_map = HashMap::new();
@@ -1272,6 +1284,12 @@ impl HostEngine {
             telemetry
                 .active_codec_mode
                 .store(dynamic_codec_mode as u8, Ordering::Relaxed);
+            telemetry
+                .tx_subframes_per_packet
+                .store(subframes_per_pkt as u8, Ordering::Relaxed);
+            telemetry
+                .tx_packet_interval_us
+                .store((2500 * subframes_per_pkt) as u32, Ordering::Relaxed);
 
             // Wait until soundcard pushes a full packet of samples into `ring`,
             // or fall back to silence synthesis only if capture endpoint is truly idle >80ms.
@@ -1295,6 +1313,13 @@ impl HostEngine {
                     }
                 }
             }
+
+            // Capture backlog at send time (0 in synthetic test-tone mode).
+            let captured_subframes = ring.available_samples() / SUBFRAME_STEREO_SAMPLES;
+            telemetry.capture_buffer_us.store(
+                (captured_subframes as u32).saturating_mul(2500),
+                Ordering::Relaxed,
+            );
 
             // 3. Encode Subframes
             let mut primary_bundle = [0u8; MAX_LOSSLESS_PCM24_BYTES * 4 + 12];

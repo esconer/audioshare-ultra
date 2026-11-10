@@ -20,6 +20,7 @@ use audioshare_host_engine::{
     is_usb_subnet_ip, list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo,
     DEFAULT_PORT,
 };
+use audioshare_protocol::latency::{codec_mode_name, DESKTOP_OUTPUT_BUFFER_MS, SUBFRAME_MS};
 use audioshare_protocol::lpc_lossless::QualityProfile;
 use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
@@ -115,6 +116,8 @@ struct AudioShareApp {
     binaural_crossfeed: bool,
     night_mode_drc: bool,
     measured_sonar_ms: Option<f32>,
+    measured_sonar_at: Option<Instant>,
+    latency_debug: bool,
     gaming_hard_lock: bool,
     usb_buffer_mode: bool,
     drift_history: VecDeque<f32>,
@@ -189,6 +192,8 @@ impl AudioShareApp {
             binaural_crossfeed: false,
             night_mode_drc: false,
             measured_sonar_ms: None,
+            measured_sonar_at: None,
+            latency_debug: false,
             gaming_hard_lock: false,
             usb_buffer_mode: false,
             drift_history: VecDeque::from(vec![0.0; 120]),
@@ -249,6 +254,7 @@ impl AudioShareApp {
              channel_role={}\n\
              binaural_crossfeed={}\n\
              night_mode_drc={}\n\
+             latency_debug={}\n\
              gaming_hard_lock={}\n\
              phone_rx_mode={}\n",
             self.dark_mode,
@@ -276,6 +282,7 @@ impl AudioShareApp {
             self.channel_role as u8,
             self.binaural_crossfeed,
             self.night_mode_drc,
+            self.latency_debug,
             self.gaming_hard_lock,
             self.phone_rx_mode as u8,
         );
@@ -355,6 +362,7 @@ impl AudioShareApp {
                     }
                     "binaural_crossfeed" => self.binaural_crossfeed = v.trim() == "true",
                     "night_mode_drc" => self.night_mode_drc = v.trim() == "true",
+                    "latency_debug" => self.latency_debug = v.trim() == "true",
                     "gaming_hard_lock" => self.gaming_hard_lock = v.trim() == "true",
                     "phone_rx_mode" => {
                         if v.trim() == "1" || v.trim().eq_ignore_ascii_case("speakers") {
@@ -572,6 +580,14 @@ impl eframe::App for AudioShareApp {
                         self.force_quit = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    let debug_lbl = if self.latency_debug {
+                        "📊 Latency Debug: ON"
+                    } else {
+                        "📊 Latency Debug"
+                    };
+                    if ui.button(debug_lbl).clicked() {
+                        self.latency_debug = !self.latency_debug;
+                    }
                     let theme_lbl = if self.dark_mode {
                         "☀️ Light"
                     } else {
@@ -629,6 +645,14 @@ impl eframe::App for AudioShareApp {
                         }
                     });
                 });
+        }
+
+        if self.latency_debug {
+            egui::Window::new("📊 Live Latency Debug")
+                .default_width(560.0)
+                .default_height(460.0)
+                .resizable(true)
+                .show(ctx, |ui| self.render_latency_debug(ui));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1142,17 +1166,240 @@ impl AudioShareApp {
                         let rx_us = mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
                         if rx_us > tx_us && (rx_us - tx_us) < 500_000 {
                             self.measured_sonar_ms = Some(((rx_us - tx_us) as f32) / 2000.0);
+                            self.measured_sonar_at = Some(Instant::now());
                         }
                     }
                 }
                 if let Some(ms) = self.measured_sonar_ms {
+                    let age_s = self
+                        .measured_sonar_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
                     ui.colored_label(
                         egui::Color32::LIGHT_GREEN,
-                        format!("⚡ Measured One-Way Latency: {:.1} ms", ms),
+                        format!("⚡ Measured One-Way Latency: {:.1} ms ({}s ago)", ms, age_s),
                     );
                 }
             });
         });
+    }
+
+    fn render_latency_debug(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Live values are published by the audio threads. The estimate is not an acoustic measurement.",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
+        ui.separator();
+
+        let sonar_ms = self.measured_sonar_ms;
+        let sonar_age_s = self.measured_sonar_at.map(|t| t.elapsed().as_secs_f32());
+        let mut any_engine = false;
+
+        if let Some(ref host) = self.host_engine {
+            any_engine = true;
+            ui.heading("Host: capture → wire");
+            let pacing_ms =
+                host.telemetry.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0;
+            let capture_ms =
+                host.telemetry.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0;
+            let subframes = host
+                .telemetry
+                .tx_subframes_per_packet
+                .load(Ordering::Relaxed);
+            let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
+            let clients = host.connected_clients();
+            let bt_max = host
+                .telemetry
+                .max_client_bt_delay_ms
+                .load(Ordering::Relaxed);
+            let downstream_max = host
+                .telemetry
+                .max_client_downstream_delay_ms
+                .load(Ordering::Relaxed);
+            let room_trim = host
+                .telemetry
+                .manual_group_sync_trim_ms
+                .load(Ordering::Relaxed);
+
+            egui::Grid::new("host_latency_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Packetization");
+                    ui.monospace(format!(
+                        "{:.1} ms ({} × {:.1} ms, {})",
+                        pacing_ms, subframes, SUBFRAME_MS, codec
+                    ));
+                    ui.end_row();
+
+                    ui.label("Capture backlog");
+                    ui.monospace(format!("{:.1} ms", capture_ms));
+                    ui.end_row();
+
+                    ui.label("Host pipeline");
+                    ui.monospace(format!("{:.1} ms", capture_ms + pacing_ms));
+                    ui.end_row();
+
+                    ui.label("Connected clients");
+                    ui.monospace(format!("{}", clients.len()));
+                    ui.end_row();
+
+                    ui.label("Downstream max");
+                    ui.monospace(format!("{} ms (BT max {} ms)", downstream_max, bt_max));
+                    ui.end_row();
+
+                    ui.label("Room trim");
+                    ui.monospace(format!("+{} ms", room_trim));
+                    ui.end_row();
+
+                    ui.label("Acoustic sonar");
+                    match (sonar_ms, sonar_age_s) {
+                        (Some(ms), Some(age)) => {
+                            ui.monospace(format!("{:.1} ms ({:.0}s ago)", ms, age));
+                        }
+                        (Some(ms), None) => {
+                            ui.monospace(format!("{:.1} ms", ms));
+                        }
+                        _ => {
+                            ui.label("not measured");
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            if clients.is_empty() {
+                ui.label("No clients connected.");
+            } else {
+                for c in &clients {
+                    let badge = if c.is_usb { "⚡ USB" } else { "📶 Wi-Fi" };
+                    ui.monospace(format!(
+                        "{} {} | Loss {:.1}% | BT {} ms | DAC {} ms | Vol {}%{}",
+                        badge,
+                        c.addr,
+                        (c.fec_rate_permille as f32) / 10.0,
+                        c.bluetooth_delay_ms,
+                        c.hardware_delay_ms,
+                        c.client_volume,
+                        if c.muted { " | MUTED" } else { "" }
+                    ));
+                }
+            }
+        }
+
+        if any_engine {
+            ui.separator();
+        }
+
+        if let Some(ref client) = self.client_engine {
+            any_engine = true;
+            let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
+
+            ui.heading("Client: ingress → speaker");
+            ui.monospace(
+                egui::RichText::new(format!(
+                    "Estimated one-way: {:.1} ms",
+                    snap.estimated_one_way_ms()
+                ))
+                .strong()
+                .color(egui::Color32::LIGHT_GREEN),
+            );
+
+            egui::Grid::new("client_latency_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Sender packetization");
+                    ui.monospace(format!("{:.1} ms", snap.packet_interval_ms));
+                    ui.end_row();
+
+                    ui.label("Network jitter");
+                    ui.monospace(format!("{:.1} ms (sizes the FIFO)", snap.network_jitter_ms));
+                    ui.end_row();
+
+                    ui.label("Adaptive cushion");
+                    ui.monospace(format!("{:.1} ms", snap.adaptive_buffer_ms));
+                    ui.end_row();
+
+                    ui.label("Target FIFO");
+                    ui.monospace(format!("{:.1} ms", snap.target_buffer_ms));
+                    ui.end_row();
+
+                    ui.label("Group sync addition");
+                    ui.monospace(format!("+{:.1} ms", snap.group_sync_extra_ms));
+                    ui.end_row();
+
+                    ui.label("Buffered right now");
+                    ui.monospace(format!("{:.1} ms", snap.buffered_audio_ms));
+                    ui.end_row();
+
+                    ui.label("Downstream stage");
+                    ui.monospace(format!("{:.1} ms", snap.downstream_stage_ms()));
+                    ui.end_row();
+
+                    ui.label("DAC queue");
+                    if snap.hardware_delay_ms > 0 {
+                        ui.monospace(format!("{} ms (measured)", snap.hardware_delay_ms));
+                    } else {
+                        ui.label("not measured on this platform");
+                    }
+                    ui.end_row();
+
+                    ui.label("Bluetooth estimate");
+                    if snap.bluetooth_delay_ms > 0 {
+                        ui.monospace(format!(
+                            "{} ms (fixed A2DP estimate)",
+                            snap.bluetooth_delay_ms
+                        ));
+                    } else {
+                        ui.label("not routed");
+                    }
+                    ui.end_row();
+
+                    ui.label("Desktop output buffer");
+                    ui.monospace(format!("{:.1} ms (configured)", snap.output_buffer_ms));
+                    ui.end_row();
+
+                    ui.label("Prebuffer");
+                    ui.monospace(if snap.prebuffer_ready {
+                        "READY"
+                    } else {
+                        "FILLING"
+                    });
+                    ui.end_row();
+
+                    ui.label("Codec");
+                    ui.monospace(snap.codec_name());
+                    ui.end_row();
+                });
+
+            let fill = if snap.target_buffer_ms > 0.0 {
+                (snap.buffered_audio_ms / snap.target_buffer_ms).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(fill).text(format!(
+                "FIFO fill: {:.1} / {:.1} ms",
+                snap.buffered_audio_ms, snap.target_buffer_ms
+            )));
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Estimate = packetization + target FIFO + max(DAC, BT, desktop output). \
+                     Group sync is already inside the target FIFO. Excludes one-way network \
+                     transit and the acoustic air path; use the sonar for end-to-end.",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        }
+
+        if !any_engine {
+            ui.label("Start the Host Server or connect to a Client to see live latency.");
+        }
     }
 
     fn render_client_tab(&mut self, ui: &mut egui::Ui) {
@@ -1464,6 +1711,7 @@ eq_treble_db=4.5
 channel_role=1
 binaural_crossfeed=true
 night_mode_drc=true
+latency_debug=true
 gaming_hard_lock=true
 enable_group_sync=false
 group_sync_trim_ms=45
@@ -1494,6 +1742,7 @@ phone_rx_mode=1
         assert_eq!(app.channel_role, ChannelRole::LeftMono);
         assert!(app.binaural_crossfeed);
         assert!(app.night_mode_drc);
+        assert!(app.latency_debug);
         assert!(app.gaming_hard_lock);
         assert_eq!(app.phone_rx_mode, PhoneRxRoutingMode::PlayOnPcSpeakers);
     }
