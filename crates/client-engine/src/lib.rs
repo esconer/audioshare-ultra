@@ -31,6 +31,60 @@ pub struct ClientConfig {
     pub preamp_gain_db: f32,
 }
 
+/// Decision for a missing sequencer slot at the current playhead.
+///
+/// RFC 1982 signed deltas make `latest_rx_seq - next_play_seq < 0` mean the
+/// packet is still in flight. Advancing in that state would make the playhead
+/// reject that packet when it finally arrives, so the playhead must hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayheadDecision {
+    Hold,
+    Advance,
+}
+
+#[inline]
+fn decide_empty_playhead(
+    latest_rx_seq: u16,
+    next_play_seq: u16,
+    consecutive_holds: u8,
+) -> PlayheadDecision {
+    let delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
+    if delta < 0 {
+        // The missing packet has not arrived yet. Never skip it, even after
+        // a long hold: the next real packet/FEC will move `latest_rx_seq`.
+        PlayheadDecision::Hold
+    } else if delta >= 2 || consecutive_holds >= 2 {
+        // A newer packet is already buffered (or the missing slot had its
+        // bounded 5ms grace period), so it is safe to skip the hole.
+        PlayheadDecision::Advance
+    } else {
+        PlayheadDecision::Hold
+    }
+}
+
+/// Convert an AAudio timestamp snapshot into the milliseconds still queued
+/// ahead of the DAC. `AAudioStream_getTimestamp` reports the frame position at
+/// the last HAL interrupt, not at "now"; the position must be extrapolated by
+/// the elapsed monotonic time before subtracting it from frames written.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn pending_hardware_delay_ms(
+    frame_position: i64,
+    timestamp_ns: i64,
+    now_ns: i64,
+    frames_written: i64,
+) -> Option<u16> {
+    if frame_position < 0 || timestamp_ns <= 0 {
+        return None;
+    }
+    let elapsed_ns = (now_ns - timestamp_ns).clamp(0, 500_000_000);
+    let presented_now = frame_position
+        .saturating_add(elapsed_ns.saturating_mul(SAMPLE_RATE as i64) / 1_000_000_000);
+    let pending_frames = frames_written.saturating_sub(presented_now).max(0);
+    let delay_ms = ((pending_frames * 1000) / SAMPLE_RATE as i64).clamp(0, 120) as u16;
+    Some(delay_ms)
+}
+
 pub struct ClientTelemetry {
     pub packets_received: AtomicU64,
     pub primary_frames_played: AtomicU64,
@@ -333,18 +387,18 @@ impl ClientEngine {
                     (10.0f32.powf(gain_db / 20.0) * 100.0).clamp(0.0, 100.0) as u8
                 };
 
-                // Report Total Pipeline Delay (Hardware/BT Delay + Client Network Buffer)
-                // so the Host aligns devices across USB, 5GHz, 2.4GHz, and Bluetooth.
-                let downstream_delay_ms = telemetry
-                    .downstream_bt_delay_ms
-                    .load(Ordering::Relaxed)
-                    .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
-                let net_buf_ms = (adaptive_wifi_subframes * 2.5) as u16;
-                let my_total_delay_ms = downstream_delay_ms.saturating_add(net_buf_ms);
+                // Report the two downstream delays separately. The network
+                // jitter buffer is a local, adaptive quantity and must never
+                // be fed back into the group-sync loop: doing so makes the
+                // host echo a stale buffer depth back to the only client and
+                // causes `target_buf` to inflate/collapse every 500ms.
+                let bt_delay_ms = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed);
+                let hw_delay_ms = telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed);
 
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
-                    bluetooth_delay_ms: my_total_delay_ms,
+                    bluetooth_delay_ms: bt_delay_ms,
+                    hardware_delay_ms: hw_delay_ms,
                     client_volume: client_vol,
                     requested_mode: media_cmd,
                     auth_mac32: 0,
@@ -542,15 +596,18 @@ impl ClientEngine {
             } else {
                 adaptive_wifi_subframes
             };
-            let downstream_delay_ms = telemetry
+            let my_downstream_delay_ms = telemetry
                 .downstream_bt_delay_ms
                 .load(Ordering::Relaxed)
                 .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
-            let my_total_ms = downstream_delay_ms.saturating_add((base_target * 2.5) as u16);
+            // `base_target` already contains this client's adaptive network
+            // jitter cushion. Group sync only aligns the fixed downstream
+            // hardware/A2DP delay, so the network buffer is deliberately not
+            // added here (that was the source of the 500ms oscillation).
             let target_buf = group_sync.aligned_target_subframes(
                 base_target,
                 telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                my_total_ms,
+                my_downstream_delay_ms,
             );
 
             // Two-Level DAC Watermark:
@@ -568,8 +625,15 @@ impl ClientEngine {
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
                 && burst_fifo.available_samples() < fifo_watermark
             {
+                // If the missing slot is still within the in-flight/FEC
+                // recovery window, wait while the FIFO has at least 5ms of
+                // real audio. Once a newer packet is already buffered
+                // (`missing_delta >= 3`), waiting can no longer heal the hole:
+                // skip it immediately instead of draining the FIFO first.
+                let missing_delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
                 if sequencer.is_slot_missing(next_play_seq)
                     && burst_fifo.available_samples() >= plc_emergency_watermark
+                    && missing_delta < 3
                 {
                     // Wait for in-flight packet or [N-1]/[N-2] FEC before triggering WSOLA PLC!
                     break;
@@ -598,16 +662,20 @@ impl ClientEngine {
                     }
                     STATUS_EMPTY => {
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
-                        // Bounded WebRTC NetEQ Hold-Playhead Rule:
-                        // Hold playhead for at most 2 subframes (5.0ms) if packet is delayed in 2.4GHz air.
-                        if (latest_rx_seq.wrapping_sub(next_play_seq) as i16) >= 0
-                            || consecutive_holds >= 2
-                            || sequencer.consecutive_plc_count() > 8
+                        // Bounded WebRTC NetEQ hold-playhead rule. The hard
+                        // invariant is that `next_play_seq` must never advance
+                        // past `latest_rx_seq + 1`: if it does, the delayed
+                        // packet is rejected as "past" when it arrives, which
+                        // creates the runaway packet-rejection domino.
+                        match decide_empty_playhead(latest_rx_seq, next_play_seq, consecutive_holds)
                         {
-                            next_play_seq = next_play_seq.wrapping_add(1);
-                            consecutive_holds = 0;
-                        } else {
-                            consecutive_holds += 1;
+                            PlayheadDecision::Advance => {
+                                next_play_seq = next_play_seq.wrapping_add(1);
+                                consecutive_holds = 0;
+                            }
+                            PlayheadDecision::Hold => {
+                                consecutive_holds = consecutive_holds.saturating_add(1);
+                            }
                         }
                         window_fec += 1;
                         // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
@@ -616,8 +684,10 @@ impl ClientEngine {
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
 
-                        // If Host disconnected or Wi-Fi dropped for >60ms (24 ticks), suspend into clean standby
-                        if consecutive_empty_ticks >= 24 {
+                        // If Host disconnected or Wi-Fi dropped for >200ms (80 PLC
+                        // subframes), suspend into clean standby. 60ms was too
+                        // aggressive for 2.4GHz bursts and caused false standby.
+                        if consecutive_empty_ticks >= 80 {
                             prebuffer_ready = false;
                             consecutive_empty_ticks = 0;
                         }
@@ -687,6 +757,14 @@ impl ClientEngine {
                 let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
                 let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
                 burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
+
+                // Never synthesize more than one PLC subframe per loop pass
+                // without first polling the socket again. The previous code
+                // could fill the whole FIFO with PLC in one CPU-speed pass,
+                // advancing the playhead multiple slots ahead of the network.
+                if status == STATUS_EMPTY {
+                    break;
+                }
             }
         }
     }
@@ -700,6 +778,8 @@ impl Drop for ClientEngine {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_signed_sequence_delta_rfc1982() {
         // Late duplicate packet arrived after playback moved ahead
@@ -799,47 +879,80 @@ mod tests {
     }
 
     #[test]
-    fn test_hold_playhead_on_delayed_packet_vs_dropped() {
-        let latest_rx = 99u16;
-        let mut next_play = 100u16;
-
-        // Case A: No newer packet arrived yet (latest_rx < next_play) and consecutive_holds < 2 -> Hold playhead!
-        let seq_delta = latest_rx.wrapping_sub(next_play) as i16;
-        let mut consecutive_holds = 0u8;
-        let consecutive_plc = 1u32;
-        let should_advance = seq_delta >= 0 || consecutive_holds >= 2 || consecutive_plc > 8;
-        assert!(
-            !should_advance,
-            "Playhead must hold when packet is delayed in 2.4GHz air"
-        );
-        consecutive_holds += 1;
-        assert_eq!(next_play, 100);
-
-        // Case B: Second hold tick (consecutive_holds = 1) -> Still hold
-        let should_advance_2 = seq_delta >= 0 || consecutive_holds >= 2 || consecutive_plc > 8;
-        assert!(!should_advance_2);
-        consecutive_holds += 1;
-
-        // Case C: Third tick (consecutive_holds = 2) -> Bounded hold cap reached, advance!
-        let should_advance_3 = seq_delta >= 0 || consecutive_holds >= 2 || consecutive_plc > 8;
-        assert!(should_advance_3);
-        if should_advance_3 {
-            next_play = next_play.wrapping_add(1);
+    fn test_playhead_never_runs_ahead_of_latest_rx() {
+        // Packet 101 is still in flight (`latest_rx = 100`). Even after an
+        // arbitrarily long hold, the playhead must stay at 101 so the packet
+        // is not rejected as "past" when it arrives.
+        let latest_rx = 100u16;
+        let next_play = 101u16;
+        for holds in 0..=u8::MAX {
+            assert_eq!(
+                decide_empty_playhead(latest_rx, next_play, holds),
+                PlayheadDecision::Hold,
+                "playhead advanced past an in-flight packet after {} holds",
+                holds
+            );
         }
-        assert_eq!(next_play, 101);
 
-        // Case D: A newer packet already arrived (latest_rx >= next_play) -> Advance past dropped packet!
-        let latest_rx_newer = 102u16;
-        let seq_delta_newer = latest_rx_newer.wrapping_sub(next_play) as i16;
-        let should_advance_newer = seq_delta_newer >= 0;
-        assert!(
-            should_advance_newer,
-            "Playhead must advance when newer packet arrived"
+        // A newer packet is already buffered: skipping the missing hole is safe.
+        assert_eq!(
+            decide_empty_playhead(104, 101, 0),
+            PlayheadDecision::Advance
         );
-        if should_advance_newer {
-            next_play = next_play.wrapping_add(1);
-        }
-        assert_eq!(next_play, 102);
+        // One newer packet arrived, but give FEC/PLC two ticks to heal it first.
+        assert_eq!(decide_empty_playhead(102, 101, 0), PlayheadDecision::Hold);
+        assert_eq!(decide_empty_playhead(102, 101, 1), PlayheadDecision::Hold);
+        assert_eq!(
+            decide_empty_playhead(102, 101, 2),
+            PlayheadDecision::Advance
+        );
+        // The latest received packet is the missing one (e.g. its payload
+        // failed to decode): after the 5ms grace period, skip it.
+        assert_eq!(decide_empty_playhead(101, 101, 1), PlayheadDecision::Hold);
+        assert_eq!(
+            decide_empty_playhead(101, 101, 2),
+            PlayheadDecision::Advance
+        );
+        // Sequence wrap-around must preserve the same invariant.
+        assert_eq!(decide_empty_playhead(0, 1, 0), PlayheadDecision::Hold);
+        assert_eq!(
+            decide_empty_playhead(3, 65535, 0),
+            PlayheadDecision::Advance
+        );
+    }
+
+    #[test]
+    fn test_aaudio_timestamp_extrapolation_prevents_fake_latency() {
+        let rate = SAMPLE_RATE as i64;
+        let timestamp_ns = 1_000_000_000i64;
+        // Timestamp snapshot says frame 48_000 was presented 10ms ago.
+        // The DAC has therefore presented ~48_480 frames by "now".
+        let now_ns = timestamp_ns + 10_000_000;
+        let frames_written = 48_000 + 480 + 240; // 240 frames = 5ms still queued
+        let delay = pending_hardware_delay_ms(48_000, timestamp_ns, now_ns, frames_written);
+        assert_eq!(delay, Some(5));
+
+        // Without extrapolation the same snapshot would report 15ms.
+        let unextrapolated = ((frames_written - 48_000) * 1000) / rate;
+        assert_eq!(unextrapolated, 15);
+
+        // A future timestamp (clock anomaly) must not underflow the subtraction.
+        let delay =
+            pending_hardware_delay_ms(48_000, timestamp_ns + 5_000_000, timestamp_ns, 48_100);
+        assert_eq!(delay, Some(2));
+
+        // Invalid snapshots are rejected instead of producing fake latency.
+        assert_eq!(
+            pending_hardware_delay_ms(-1, timestamp_ns, now_ns, 48_000),
+            None
+        );
+        assert_eq!(pending_hardware_delay_ms(0, 0, now_ns, 48_000), None);
+
+        // Very stale timestamps are bounded so a broken HAL cannot report
+        // hundreds of milliseconds of fake hardware latency.
+        let stale =
+            pending_hardware_delay_ms(0, timestamp_ns, timestamp_ns + 5_000_000_000, 48_000);
+        assert_eq!(stale, Some(120));
     }
 }
 
@@ -1012,13 +1125,19 @@ pub mod android_aaudio {
                     &mut frame_position,
                     &mut time_nanoseconds,
                 );
-                if result != 0 || frame_position < 0 || time_nanoseconds <= 0 {
+                if result != 0 {
                     return None;
                 }
+                let mut now_ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now_ts) != 0 {
+                    return None;
+                }
+                let now_ns = (now_ts.tv_sec as i64) * 1_000_000_000 + (now_ts.tv_nsec as i64);
                 let written = AAudioStream_getFramesWritten(self.stream);
-                let pending_frames = written.saturating_sub(frame_position);
-                let delay_ms = ((pending_frames * 1000) / SAMPLE_RATE as i64).clamp(0, 400) as u16;
-                Some(delay_ms)
+                pending_hardware_delay_ms(frame_position, time_nanoseconds, now_ns, written)
             }
         }
 

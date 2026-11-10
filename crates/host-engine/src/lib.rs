@@ -236,7 +236,10 @@ pub struct ConnectedClient {
     pub is_usb: bool,
     pub muted: bool,
     pub fec_rate_permille: u16,
+    /// Genuine Bluetooth A2DP delay reported by the client (0 when not on BT).
     pub bluetooth_delay_ms: u16,
+    /// Measured DAC/hardware presentation delay reported by the client.
+    pub hardware_delay_ms: u16,
     pub client_volume: u8,
 }
 
@@ -271,7 +274,10 @@ pub struct HostTelemetry {
     pub host_volume: AtomicU8,
     pub host_vu_peak_pct: AtomicU8,
     pub active_clients_count: AtomicU8,
+    /// Max genuine Bluetooth A2DP delay (for the BT banner and video lip-sync).
     pub max_client_bt_delay_ms: AtomicU16,
+    /// Max fixed downstream delay (BT or measured DAC) for multi-device sync.
+    pub max_client_downstream_delay_ms: AtomicU16,
     pub hotplug_rebinds: AtomicU16,
     pub trigger_sonar_ping: AtomicBool,
     pub sonar_tx_timestamp_us: AtomicU64,
@@ -332,6 +338,7 @@ impl HostEngine {
             host_vu_peak_pct: AtomicU8::new(0),
             active_clients_count: AtomicU8::new(initial_targets.len() as u8),
             max_client_bt_delay_ms: AtomicU16::new(0),
+            max_client_downstream_delay_ms: AtomicU16::new(0),
             hotplug_rebinds: AtomicU16::new(0),
             trigger_sonar_ping: AtomicBool::new(false),
             sonar_tx_timestamp_us: AtomicU64::new(0),
@@ -350,6 +357,7 @@ impl HostEngine {
                     muted: false,
                     fec_rate_permille: 0,
                     bluetooth_delay_ms: 0,
+                    hardware_delay_ms: 0,
                     client_volume: 100,
                 },
             );
@@ -414,10 +422,53 @@ impl HostEngine {
         self.clients.lock().unwrap().values().cloned().collect()
     }
 
+    /// Recompute both delay maxima from the live client map.
+    ///
+    /// `max_client_bt_delay_ms` drives the Bluetooth banner / video lip-sync,
+    /// while `max_client_downstream_delay_ms` drives multi-device acoustic
+    /// alignment. Keeping them separate prevents a measured DAC latency (or a
+    /// stale disconnected client) from being mistaken for Bluetooth. Muted
+    /// clients are excluded because they receive no audio and therefore
+    /// cannot contribute to either delay.
+    fn refresh_client_delay_telemetry(
+        map: &HashMap<SocketAddr, ConnectedClient>,
+        telemetry: &HostTelemetry,
+    ) {
+        let (max_bt, max_downstream) = Self::client_delay_maxima(map);
+        telemetry
+            .max_client_bt_delay_ms
+            .store(max_bt, Ordering::Relaxed);
+        telemetry
+            .max_client_downstream_delay_ms
+            .store(max_downstream, Ordering::Relaxed);
+    }
+
+    /// Pure computation behind [`Self::refresh_client_delay_telemetry`].
+    ///
+    /// Returns `(max_bt, max_downstream)`. Muted clients are excluded from
+    /// both because the host no longer sends them audio.
+    fn client_delay_maxima(map: &HashMap<SocketAddr, ConnectedClient>) -> (u16, u16) {
+        let max_bt = map
+            .values()
+            .filter(|c| !c.muted)
+            .map(|c| c.bluetooth_delay_ms)
+            .max()
+            .unwrap_or(0);
+        let max_downstream = map
+            .values()
+            .filter(|c| !c.muted)
+            .map(|c| c.bluetooth_delay_ms.max(c.hardware_delay_ms))
+            .max()
+            .unwrap_or(0);
+        (max_bt, max_downstream)
+    }
+
     pub fn set_client_muted(&self, addr: SocketAddr, muted: bool) {
-        if let Some(client) = self.clients.lock().unwrap().get_mut(&addr) {
+        let mut map = self.clients.lock().unwrap();
+        if let Some(client) = map.get_mut(&addr) {
             client.muted = muted;
         }
+        Self::refresh_client_delay_telemetry(&map, &self.telemetry);
     }
 
     pub fn kick_client(&self, addr: SocketAddr) {
@@ -426,6 +477,7 @@ impl HostEngine {
         self.telemetry
             .active_clients_count
             .store(map.len() as u8, Ordering::Relaxed);
+        Self::refresh_client_delay_telemetry(&map, &self.telemetry);
     }
 
     pub fn stop(&mut self) {
@@ -460,7 +512,7 @@ impl HostEngine {
                 let mut byte_buf = [0u8; SUBFRAME_STEREO_SAMPLES * 4]; // 960 bytes = 2.5ms stereo f32
                 let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
 
-                let get_default_monitor = || -> String {
+                fn query_default_monitor() -> Option<String> {
                     Command::new("pactl")
                         .arg("get-default-sink")
                         .output()
@@ -473,12 +525,43 @@ impl HostEngine {
                                 Some(format!("{}.monitor", s))
                             }
                         })
-                        .unwrap_or_else(|| "@DEFAULT_MONITOR@".to_string())
-                };
+                }
+
+                // The default sink is polled by a dedicated, non-real-time
+                // watcher thread. Never spawn `pactl` from this capture
+                // thread: a 10-100ms subprocess stall would drop audio.
+                let latest_monitor = Arc::new(Mutex::new(
+                    query_default_monitor().unwrap_or_else(|| "@DEFAULT_MONITOR@".to_string()),
+                ));
+                let sink_generation = Arc::new(AtomicU64::new(0));
+                {
+                    let watcher_running = Arc::clone(&running);
+                    let watcher_active = Arc::clone(&stream_active_clone);
+                    let watcher_latest = Arc::clone(&latest_monitor);
+                    let watcher_generation = Arc::clone(&sink_generation);
+                    let _ = std::thread::Builder::new()
+                        .name("as-ultra-sink-watch".into())
+                        .spawn(move || {
+                            let mut last = watcher_latest.lock().unwrap().clone();
+                            while watcher_running.load(Ordering::Relaxed)
+                                && watcher_active.load(Ordering::Relaxed)
+                            {
+                                std::thread::sleep(Duration::from_secs(2));
+                                if let Some(current) = query_default_monitor() {
+                                    if current != last {
+                                        last = current.clone();
+                                        *watcher_latest.lock().unwrap() = current;
+                                        watcher_generation.fetch_add(1, Ordering::Release);
+                                    }
+                                }
+                            }
+                        });
+                }
 
                 while stream_active_clone.load(Ordering::Relaxed) && running.load(Ordering::Relaxed)
                 {
-                    let current_monitor = get_default_monitor();
+                    let generation = sink_generation.load(Ordering::Acquire);
+                    let current_monitor = latest_monitor.lock().unwrap().clone();
 
                     // 1. Try direct in-process libpulse-simple.so.0 (2.5ms hardware fragsize, zero pipe buffering!)
                     if Self::try_inprocess_pulse_simple_capture(
@@ -488,7 +571,8 @@ impl HostEngine {
                         &running,
                         &stream_active_clone,
                         start_epoch,
-                        &get_default_monitor,
+                        &sink_generation,
+                        generation,
                     ) {
                         if stream_active_clone.load(Ordering::Relaxed)
                             && running.load(Ordering::Relaxed)
@@ -529,7 +613,6 @@ impl HostEngine {
                             }
                         });
                         if let Some(mut stdout) = child.stdout.take() {
-                            let mut frames_read = 0u32;
                             while stream_active_clone.load(Ordering::Relaxed)
                                 && running.load(Ordering::Relaxed)
                             {
@@ -545,13 +628,11 @@ impl HostEngine {
                                     }
                                     ring.push_samples(&f32_buf);
 
-                                    // Every 2 seconds (800 x 2.5ms subframes), check if default sink changed
-                                    frames_read += 1;
-                                    if frames_read >= 800 {
-                                        frames_read = 0;
-                                        if get_default_monitor() != current_monitor {
-                                            break; // Re-open parec on the newly selected sink monitor!
-                                        }
+                                    // The watcher thread already resolved the
+                                    // new sink; just reopen without blocking
+                                    // this real-time loop on `pactl`.
+                                    if sink_generation.load(Ordering::Acquire) != generation {
+                                        break;
                                     }
                                 } else {
                                     break;
@@ -581,18 +662,16 @@ impl HostEngine {
     }
 
     #[cfg(target_os = "linux")]
-    fn try_inprocess_pulse_simple_capture<F>(
+    fn try_inprocess_pulse_simple_capture(
         monitor_name: &str,
         ring: &Arc<BurstDecouplerRing>,
         heartbeat_ms: &Arc<AtomicU64>,
         running: &Arc<AtomicBool>,
         stream_active: &Arc<AtomicBool>,
         start_epoch: Instant,
-        get_default_monitor: &F,
-    ) -> bool
-    where
-        F: Fn() -> String,
-    {
+        sink_generation: &Arc<AtomicU64>,
+        generation: u64,
+    ) -> bool {
         #[repr(C)]
         struct PaSampleSpec {
             format: i32,
@@ -683,7 +762,6 @@ impl HostEngine {
             }
 
             let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-            let mut frames_read = 0u32;
             while stream_active.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
                 if pa_read(
                     handle,
@@ -696,12 +774,10 @@ impl HostEngine {
                 }
                 heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                 ring.push_samples(&f32_buf);
-                frames_read += 1;
-                if frames_read >= 800 {
-                    frames_read = 0;
-                    if get_default_monitor() != monitor_name {
-                        break;
-                    }
+                // The watcher thread resolves sink changes off this
+                // real-time path; reopening is cheap once it signals.
+                if sink_generation.load(Ordering::Acquire) != generation {
+                    break;
                 }
             }
             pa_free(handle);
@@ -936,6 +1012,7 @@ impl HostEngine {
         let mut subframes_per_pkt = config.subframes_per_packet.clamp(1, 4) as usize;
         let mut packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
         let mut next_tick = start_instant + packet_interval;
+        let mut last_tx_instant = start_instant;
 
         let mut seq: u16 = 0;
         let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
@@ -999,12 +1076,14 @@ impl HostEngine {
                             muted: false,
                             fec_rate_permille: 0,
                             bluetooth_delay_ms: 0,
+                            hardware_delay_ms: 0,
                             client_volume: 100,
                         })
                         .last_seen = Instant::now();
                     telemetry
                         .active_clients_count
                         .store(map.len() as u8, Ordering::Relaxed);
+                    Self::refresh_client_delay_telemetry(&map, &telemetry);
                     cached_targets.clear();
                     for c in map.values() {
                         if !c.muted {
@@ -1043,11 +1122,13 @@ impl HostEngine {
                             muted: false,
                             fec_rate_permille: fb.fec_rate_permille,
                             bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                            hardware_delay_ms: fb.hardware_delay_ms,
                             client_volume: fb.client_volume,
                         });
                         entry.last_seen = Instant::now();
                         entry.fec_rate_permille = fb.fec_rate_permille;
                         entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                        entry.hardware_delay_ms = fb.hardware_delay_ms;
                         entry.client_volume = fb.client_volume;
                         telemetry
                             .active_clients_count
@@ -1055,14 +1136,7 @@ impl HostEngine {
 
                         worst_loss_permille =
                             map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
-                        let max_bt = map
-                            .values()
-                            .map(|c| c.bluetooth_delay_ms)
-                            .max()
-                            .unwrap_or(0);
-                        telemetry
-                            .max_client_bt_delay_ms
-                            .store(max_bt, Ordering::Relaxed);
+                        Self::refresh_client_delay_telemetry(&map, &telemetry);
 
                         cached_targets.clear();
                         for c in map.values() {
@@ -1087,6 +1161,7 @@ impl HostEngine {
                     }
                     worst_loss_permille =
                         map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
+                    Self::refresh_client_delay_telemetry(&map, &telemetry);
                     cached_targets.clear();
                     for c in map.values() {
                         if !c.muted {
@@ -1299,9 +1374,12 @@ impl HostEngine {
                         host_volume: telemetry.host_volume.load(Ordering::Relaxed),
                         // Broadcast max group delay (in 2ms units) when Multi-Device Acoustic Sync is enabled,
                         // or 0 when Independent Lowest-Latency Mode is selected!
-                        stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed) {
+                        stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed)
+                            && (cached_targets.len() >= 2
+                                || telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed) > 0)
+                        {
                             let total_sync_ms = telemetry
-                                .max_client_bt_delay_ms
+                                .max_client_downstream_delay_ms
                                 .load(Ordering::Relaxed)
                                 .saturating_add(
                                     telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed),
@@ -1330,9 +1408,12 @@ impl HostEngine {
                     host_volume: telemetry.host_volume.load(Ordering::Relaxed),
                     // Broadcast max group delay (in 2ms units) when Multi-Device Acoustic Sync is enabled,
                     // or 0 when Independent Lowest-Latency Mode is selected!
-                    stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed) {
+                    stream_id: if telemetry.enable_group_sync.load(Ordering::Relaxed)
+                        && (cached_targets.len() >= 2
+                            || telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed) > 0)
+                    {
                         let total_sync_ms = telemetry
-                            .max_client_bt_delay_ms
+                            .max_client_downstream_delay_ms
                             .load(Ordering::Relaxed)
                             .saturating_add(
                                 telemetry.manual_group_sync_trim_ms.load(Ordering::Relaxed),
@@ -1367,24 +1448,58 @@ impl HostEngine {
                 }
             }
 
-            // Steady Isochronous Packet Pacer: Always pace packets at real-time cadence
-            // even when an OS capture callback delivered a 10-20ms chunk into `ring`.
-            // If `ring` has >3 packets queued, gently nudge `next_tick` 8% faster so the queue
-            // drains smoothly without ever microbursting or starving between OS callbacks!
-            let step_interval =
-                if !config.use_test_tone && ring.available_samples() > needed_samples * 3 {
-                    Duration::from_micros(((2300 * subframes_per_pkt) as u64).max(1000))
-                } else {
-                    packet_interval
-                };
+            // Capture-Clock-Master Packet Pacer:
+            //
+            // The capture endpoint (PipeWire/WASAPI/AAudio) is already a
+            // real-time clock: it delivers samples at exactly the playback
+            // rate. Waiting for a full packet at the top of the loop and then
+            // also sleeping until an independent `next_tick` deadline double-
+            // paces the loop and starves the socket between callbacks.
+            //
+            // When capture is live, send as soon as a full packet is ready.
+            // Only enforce a small anti-burst gap while a backlog remains,
+            // because OS callbacks may hand us 10-20ms of audio at once.
+            // The original isochronous pacer is retained for the synthetic
+            // test tone (no capture clock) and for a stalled capture endpoint,
+            // where silence must still be synthesized at real-time cadence.
             let now = Instant::now();
-            if next_tick > now {
-                std::thread::sleep(next_tick - now);
-                next_tick += step_interval;
-            } else if now.duration_since(next_tick) > packet_interval * 4 {
-                next_tick = now + step_interval;
+            let capture_active = !config.use_test_tone
+                && (start_instant.elapsed().as_millis() as u64)
+                    .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
+                    <= 80;
+            if capture_active && subframes_per_pkt >= 2 {
+                if ring.available_samples() >= needed_samples {
+                    let min_gap = Duration::from_micros(1500);
+                    let since_tx = now.saturating_duration_since(last_tx_instant);
+                    if since_tx < min_gap {
+                        std::thread::sleep(min_gap - since_tx);
+                    }
+                }
+                if maybe_pkt_len.is_some() {
+                    last_tx_instant = Instant::now();
+                }
+                // Keep the isochronous deadline anchored so a later capture
+                // stall does not trigger a catch-up burst.
+                next_tick = last_tx_instant + packet_interval;
             } else {
-                next_tick += step_interval;
+                let step_interval =
+                    if !config.use_test_tone && ring.available_samples() > needed_samples * 3 {
+                        Duration::from_micros(((2300 * subframes_per_pkt) as u64).max(1000))
+                    } else {
+                        packet_interval
+                    };
+                let now = Instant::now();
+                if next_tick > now {
+                    std::thread::sleep(next_tick - now);
+                    next_tick += step_interval;
+                } else if now.duration_since(next_tick) > packet_interval * 4 {
+                    next_tick = now + step_interval;
+                } else {
+                    next_tick += step_interval;
+                }
+                if maybe_pkt_len.is_some() {
+                    last_tx_instant = Instant::now();
+                }
             }
         }
     }
@@ -1416,6 +1531,62 @@ mod tests {
         downmix_to_stereo(&f32_tmp, 2, &mut stereo_buf);
         assert_eq!(stereo_buf[0], f32_tmp[0]);
         assert_eq!(stereo_buf[1], f32_tmp[1]);
+    }
+
+    #[test]
+    fn test_client_delay_maxima_separates_bt_and_hardware() {
+        let mut map = HashMap::new();
+        let wired: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let bluetooth: SocketAddr = "127.0.0.1:1002".parse().unwrap();
+        let muted_bluetooth: SocketAddr = "127.0.0.1:1003".parse().unwrap();
+        map.insert(
+            wired,
+            ConnectedClient {
+                addr: wired,
+                last_seen: Instant::now(),
+                is_usb: true,
+                muted: false,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 17,
+                client_volume: 100,
+            },
+        );
+        map.insert(
+            bluetooth,
+            ConnectedClient {
+                addr: bluetooth,
+                last_seen: Instant::now(),
+                is_usb: false,
+                muted: false,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 145,
+                hardware_delay_ms: 30,
+                client_volume: 100,
+            },
+        );
+        map.insert(
+            muted_bluetooth,
+            ConnectedClient {
+                addr: muted_bluetooth,
+                last_seen: Instant::now(),
+                is_usb: false,
+                muted: true,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 200,
+                hardware_delay_ms: 200,
+                client_volume: 100,
+            },
+        );
+
+        // BT remains a genuine A2DP-only metric; downstream alignment takes
+        // the larger of A2DP and measured DAC latency. The muted client must
+        // not influence either value.
+        assert_eq!(HostEngine::client_delay_maxima(&map), (145, 145));
+
+        // Without any BT client, a wired DAC delay must not be reported as BT.
+        map.remove(&bluetooth);
+        assert_eq!(HostEngine::client_delay_maxima(&map), (0, 17));
     }
 
     #[test]

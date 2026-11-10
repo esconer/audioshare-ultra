@@ -134,7 +134,13 @@ impl PhoneMicTransmitter {
                                 targets.push(src_addr);
                             }
                             if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
-                                peer_delays.insert(src_addr, fb.bluetooth_delay_ms);
+                                // Align the fixed downstream delay (A2DP or
+                                // measured DAC), never the adaptive network
+                                // jitter buffer.
+                                peer_delays.insert(
+                                    src_addr,
+                                    fb.bluetooth_delay_ms.max(fb.hardware_delay_ms),
+                                );
                             }
                         }
                     }
@@ -539,6 +545,7 @@ mod tests {
             bluetooth_delay_ms: 120,
             client_volume: 85,
             requested_mode: 0,
+            hardware_delay_ms: 17,
             auth_mac32: 0,
         };
         let mut bytes = [0u8; CONTROL_FEEDBACK_LEN];
@@ -547,6 +554,7 @@ mod tests {
         assert_eq!(decoded.client_volume, 85);
         assert_eq!(decoded.fec_rate_permille, 45);
         assert_eq!(decoded.bluetooth_delay_ms, 120);
+        assert_eq!(decoded.hardware_delay_ms, 17);
     }
 
     #[test]

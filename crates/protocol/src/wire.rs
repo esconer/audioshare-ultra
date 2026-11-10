@@ -39,7 +39,8 @@ impl CodecMode {
 pub struct ClientFeedbackPacket {
     /// Rolling FEC recovery rate in permille (0..=1000, where 50 = 5.0% packet loss)
     pub fec_rate_permille: u16,
-    /// Downstream hardware + Bluetooth earbud presentation delay on Android in milliseconds
+    /// Genuine downstream Bluetooth A2DP presentation delay in milliseconds
+    /// (0 when the phone is not routing audio to Bluetooth).
     pub bluetooth_delay_ms: u16,
     /// Client volume (0..=100) for bidirectional volume sync
     pub client_volume: u8,
@@ -47,6 +48,11 @@ pub struct ClientFeedbackPacket {
     /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms)
     /// or a media transport command (10 = play/pause, 11 = next, 12 = previous).
     pub requested_mode: u8,
+    /// Measured downstream hardware/DAC presentation latency in milliseconds.
+    /// This is intentionally separate from `bluetooth_delay_ms`: the host uses
+    /// it for multi-device acoustic alignment, while the Bluetooth UI/lip-sync
+    /// path must only react to a genuine A2DP route.
+    pub hardware_delay_ms: u16,
     /// 32-bit authentication token derived from SessionKey (or 0 if unencrypted)
     pub auth_mac32: u32,
 }
@@ -58,7 +64,7 @@ impl ClientFeedbackPacket {
         out[10..12].copy_from_slice(&self.bluetooth_delay_ms.to_be_bytes());
         out[12] = self.client_volume;
         out[13] = self.requested_mode;
-        out[14..16].fill(0);
+        out[14..16].copy_from_slice(&self.hardware_delay_ms.to_be_bytes());
         out[16..20].copy_from_slice(&self.auth_mac32.to_be_bytes());
     }
 
@@ -71,6 +77,7 @@ impl ClientFeedbackPacket {
             bluetooth_delay_ms: u16::from_be_bytes([buf[10], buf[11]]),
             client_volume: buf[12],
             requested_mode: buf[13],
+            hardware_delay_ms: u16::from_be_bytes([buf[14], buf[15]]),
             auth_mac32: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
         })
     }
