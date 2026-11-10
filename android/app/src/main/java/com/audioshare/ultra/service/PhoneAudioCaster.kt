@@ -21,6 +21,8 @@ class PhoneAudioCaster(
 ) {
     @Volatile
     private var running = false
+
+    @Volatile
     private var audioRecord: AudioRecord? = null
 
     @SuppressLint("MissingPermission")
@@ -63,8 +65,20 @@ class PhoneAudioCaster(
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
             val subframe = FloatArray(240) // 120 stereo frames = 2.5ms
             while (running) {
-                val read = audioRecord?.read(subframe, 0, subframe.size, AudioRecord.READ_BLOCKING) ?: 0
-                if (read <= 0) break
+                var offset = 0
+                while (offset < subframe.size && running) {
+                    val read = audioRecord?.read(
+                        subframe,
+                        offset,
+                        subframe.size - offset,
+                        AudioRecord.READ_BLOCKING
+                    ) ?: -1
+                    if (read <= 0) break
+                    offset += read
+                }
+                // Never push a partially filled subframe: its tail would
+                // repeat samples from the previous 2.5 ms quantum.
+                if (offset < subframe.size) break
                 AudioEngineService.nativePushCapturedAudio(subframe)
             }
         }
