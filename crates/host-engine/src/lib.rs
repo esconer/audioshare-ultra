@@ -16,6 +16,7 @@ use audioshare_protocol::lpc_lossless::{
 use audioshare_protocol::opus_codec::OpusStreamEncoder;
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
+    HEADER_LEN, MAC_TAG_LEN,
 };
 use audioshare_protocol::{
     MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES,
@@ -276,6 +277,146 @@ pub fn promote_thread_realtime() {
         AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut task_idx);
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     }
+}
+
+/// Anti-burst gap for a capture-fed 2-subframe packet. OS callbacks often
+/// deliver 10-20 ms of audio at once; this spreads the catch-up packets
+/// without double-pacing the normal one-packet-per-callback case.
+const CAPTURE_MIN_GAP_MULTI_SUBFRAME_US: u64 = 1_500;
+
+/// Anti-burst gap for a 1-subframe packet (2.5 ms cadence). It must stay well
+/// below 2500 us so the capture clock remains the master.
+const CAPTURE_MIN_GAP_SINGLE_SUBFRAME_US: u64 = 800;
+
+#[inline]
+fn capture_min_gap_us(subframes_per_pkt: usize) -> u64 {
+    if subframes_per_pkt >= 2 {
+        CAPTURE_MIN_GAP_MULTI_SUBFRAME_US
+    } else {
+        CAPTURE_MIN_GAP_SINGLE_SUBFRAME_US
+    }
+}
+
+/// Datagram layout decision for one encoded packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatagramPlan {
+    /// The primary payload fits; the flags say which FEC frames fit with it.
+    Single { n1: bool, n2: bool },
+    /// Even the primary alone exceeds the safe MTU: send one subframe per
+    /// datagram instead of dropping audio.
+    SplitPerSubframe,
+}
+
+/// True when `primary_len` plus `fec_frames` ADPCM backups and the wire
+/// overhead fit inside the safe UDP payload budget.
+#[inline]
+fn datagram_fits(primary_len: usize, encrypted: bool, fec_frames: usize) -> bool {
+    let overhead =
+        HEADER_LEN + if encrypted { MAC_TAG_LEN } else { 0 } + fec_frames * ADPCM_FEC_BYTES;
+    overhead + primary_len <= MAX_SAFE_UDP_PAYLOAD
+}
+
+/// Choose how to fit a packet into one datagram.
+///
+/// FEC N-2 is dropped first because it is older and less useful than N-1.
+/// If N-1 cannot fit either, both are dropped; if even the primary alone
+/// cannot fit (only possible for two incompressible 24-bit subframes), the
+/// caller must split the bundle rather than lose audio.
+#[inline]
+fn plan_datagram(
+    primary_len: usize,
+    encrypted: bool,
+    want_n1: bool,
+    want_n2: bool,
+) -> DatagramPlan {
+    if !datagram_fits(primary_len, encrypted, 0) {
+        return DatagramPlan::SplitPerSubframe;
+    }
+    if want_n1 && want_n2 && datagram_fits(primary_len, encrypted, 2) {
+        DatagramPlan::Single { n1: true, n2: true }
+    } else if want_n1 && datagram_fits(primary_len, encrypted, 1) {
+        DatagramPlan::Single {
+            n1: true,
+            n2: false,
+        }
+    } else {
+        DatagramPlan::Single {
+            n1: false,
+            n2: false,
+        }
+    }
+}
+
+/// FEC candidates for one datagram of a split primary bundle.
+#[derive(Debug, Clone, Copy)]
+struct SplitFec<'a> {
+    want_n1: bool,
+    n1: &'a [u8],
+    want_n2: bool,
+    n2: &'a [u8],
+}
+
+/// Re-base the packet-level FEC history for a one-subframe split datagram.
+///
+/// For packet `i` (sequence `base + i`), N-1 is the subframe encoded at
+/// `i - 1` and N-2 is the subframe at `i - 2`. Index 0 therefore uses the
+/// history carried into the bundle, index 1 uses subframe 0 plus the old N-1,
+/// and later indexes use the in-packet copies.
+#[inline]
+fn split_packet_fec<'a>(
+    split_idx: usize,
+    send_n1: bool,
+    send_n2: bool,
+    prev_n1: &'a [u8],
+    prev_n2: &'a [u8],
+    packet_fec: &'a [[u8; ADPCM_FEC_BYTES]; 4],
+) -> SplitFec<'a> {
+    let (want_n1, n1) = if split_idx == 0 {
+        (send_n1, prev_n1)
+    } else {
+        (true, &packet_fec[split_idx - 1][..])
+    };
+    let (want_n2, n2) = if split_idx == 0 {
+        (send_n2, prev_n2)
+    } else if split_idx == 1 {
+        (send_n1, prev_n1)
+    } else {
+        (true, &packet_fec[split_idx - 2][..])
+    };
+    SplitFec {
+        want_n1,
+        n1,
+        want_n2,
+        n2,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_and_send(
+    socket: &UdpSocket,
+    datagram: &mut [u8; MAX_SAFE_UDP_PAYLOAD],
+    header: WireHeader,
+    primary: &[u8],
+    fec_n1: &[u8],
+    fec_n2: &[u8],
+    session_key: Option<&SessionKey>,
+    targets: &[SocketAddr],
+    telemetry: &HostTelemetry,
+) -> bool {
+    let Ok(pkt_len) =
+        pack_datagram_with_key(header, primary, fec_n1, fec_n2, session_key, datagram)
+    else {
+        return false;
+    };
+    for &target_addr in targets {
+        if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
+            telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
+            telemetry
+                .bytes_sent
+                .fetch_add(pkt_len as u64, Ordering::Relaxed);
+        }
+    }
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -1280,11 +1421,12 @@ impl HostEngine {
                     tx_bitrate_kbps = 160;
                 }
                 QualityProfile::StudioLossless24Bit => {
-                    // A worst-case 24-bit subframe is 722 bytes. Keeping one
-                    // subframe per packet leaves ample room for both 124-byte
-                    // ADPCM FEC backups inside the 1380-byte safe UDP MTU.
+                    // Two subframes halve MAC contention (200 packets/s).
+                    // A worst-case 24-bit subframe is huge, so the sender
+                    // drops FEC first and splits into per-subframe datagrams
+                    // only when the primary itself cannot fit the safe MTU.
                     dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                    subframes_per_pkt = 1;
+                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::SmartAuto => {
@@ -1371,6 +1513,12 @@ impl HostEngine {
             // 3. Encode Subframes
             let mut primary_bundle = [0u8; MAX_LOSSLESS_PCM24_BYTES * 4 + 12];
             let mut primary_cursor = 0usize;
+            // Byte range of each length-prefixed subframe inside
+            // `primary_bundle`, used by the MTU split fallback.
+            let mut subframe_ranges = [(0usize, 0usize); 4];
+            // FEC ADPCM copy of each subframe encoded in this packet. The
+            // per-subframe split path uses [i-1] and [i-2] as its N-1/N-2.
+            let mut packet_fec = [[0u8; ADPCM_FEC_BYTES]; 4];
             let base_seq = seq;
             let prev_n1_copy = fec_n1;
             let prev_n2_copy = fec_n2;
@@ -1378,7 +1526,7 @@ impl HostEngine {
             let send_n2 = has_fec_n2;
             let mut packet_is_silent = true;
 
-            for _ in 0..subframes_per_pkt {
+            for sub_idx in 0..subframes_per_pkt {
                 let mut f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 let mut dummy_rng = 1u32;
 
@@ -1426,7 +1574,9 @@ impl HostEngine {
                 has_fec_n2 = has_fec_n1;
                 encode_fec_subframe(&i16_subframe, &mut fec_n1);
                 has_fec_n1 = true;
+                packet_fec[sub_idx] = fec_n1;
 
+                let entry_start = primary_cursor;
                 if matches!(
                     dynamic_codec_mode,
                     CodecMode::CompressedLowDelay | CodecMode::OpusRld
@@ -1495,6 +1645,7 @@ impl HostEngine {
                         .copy_from_slice(&enc_sub[..enc_len]);
                     primary_cursor += enc_len;
                 }
+                subframe_ranges[sub_idx] = (entry_start, primary_cursor);
 
                 seq = seq.wrapping_add(1);
             }
@@ -1515,7 +1666,8 @@ impl HostEngine {
                 .dtx_silent_mode
                 .store(is_dtx_active, Ordering::Relaxed);
 
-            let maybe_pkt_len = if is_dtx_active {
+            let mut sent_any = false;
+            if is_dtx_active {
                 if (base_seq % 80) == 0 {
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
@@ -1545,10 +1697,17 @@ impl HostEngine {
                         },
                         header_crc16: 0,
                     };
-                    pack_datagram_with_key(hdr, &[], &[], &[], active_key.as_ref(), &mut datagram)
-                        .ok()
-                } else {
-                    None
+                    sent_any = pack_and_send(
+                        &socket,
+                        &mut datagram,
+                        hdr,
+                        &[],
+                        &[],
+                        &[],
+                        active_key.as_ref(),
+                        &cached_targets,
+                        &telemetry,
+                    );
                 }
             } else {
                 let hdr = WireHeader {
@@ -1579,26 +1738,69 @@ impl HostEngine {
                     },
                     header_crc16: 0,
                 };
-                let f1_slice = if send_n1 { &prev_n1_copy[..] } else { &[] };
-                let f2_slice = if send_n2 { &prev_n2_copy[..] } else { &[] };
-                pack_datagram_with_key(
-                    hdr,
-                    &primary_bundle[..primary_cursor],
-                    f1_slice,
-                    f2_slice,
-                    active_key.as_ref(),
-                    &mut datagram,
-                )
-                .ok()
-            };
+                match plan_datagram(primary_cursor, active_key.is_some(), send_n1, send_n2) {
+                    DatagramPlan::Single { n1, n2 } => {
+                        let f1_slice = if n1 { &prev_n1_copy[..] } else { &[] };
+                        let f2_slice = if n2 { &prev_n2_copy[..] } else { &[] };
+                        sent_any = pack_and_send(
+                            &socket,
+                            &mut datagram,
+                            hdr,
+                            &primary_bundle[..primary_cursor],
+                            f1_slice,
+                            f2_slice,
+                            active_key.as_ref(),
+                            &cached_targets,
+                            &telemetry,
+                        );
+                    }
+                    DatagramPlan::SplitPerSubframe => {
+                        // Two incompressible 24-bit subframes can exceed the
+                        // MTU even with both FEC frames removed. Keep the
+                        // audio by sending one subframe per datagram, with the
+                        // FEC history re-based to each new packet sequence.
+                        for split_idx in 0..subframes_per_pkt {
+                            let (start, end) = subframe_ranges[split_idx];
+                            let mut split_hdr = hdr;
+                            split_hdr.subframe_count = 1;
+                            split_hdr.sequence = base_seq.wrapping_add(split_idx as u16);
 
-            if let Some(pkt_len) = maybe_pkt_len {
-                for &target_addr in &cached_targets {
-                    if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
-                        telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        telemetry
-                            .bytes_sent
-                            .fetch_add(pkt_len as u64, Ordering::Relaxed);
+                            let fec = split_packet_fec(
+                                split_idx,
+                                send_n1,
+                                send_n2,
+                                &prev_n1_copy,
+                                &prev_n2_copy,
+                                &packet_fec,
+                            );
+                            let (n1, n2) = match plan_datagram(
+                                end - start,
+                                active_key.is_some(),
+                                fec.want_n1,
+                                fec.want_n2,
+                            ) {
+                                DatagramPlan::Single { n1, n2 } => (n1, n2),
+                                DatagramPlan::SplitPerSubframe => {
+                                    // A single 24-bit subframe is at most
+                                    // 722 bytes and always fits.
+                                    debug_assert!(false, "single subframe exceeds safe MTU");
+                                    (false, false)
+                                }
+                            };
+                            let f1_slice = if n1 { fec.n1 } else { &[] };
+                            let f2_slice = if n2 { fec.n2 } else { &[] };
+                            sent_any |= pack_and_send(
+                                &socket,
+                                &mut datagram,
+                                split_hdr,
+                                &primary_bundle[start..end],
+                                f1_slice,
+                                f2_slice,
+                                active_key.as_ref(),
+                                &cached_targets,
+                                &telemetry,
+                            );
+                        }
                     }
                 }
             }
@@ -1622,15 +1824,18 @@ impl HostEngine {
                 && (start_instant.elapsed().as_millis() as u64)
                     .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
                     <= 80;
-            if capture_active && subframes_per_pkt >= 2 {
+            if capture_active {
                 if ring.available_samples() >= needed_samples {
-                    let min_gap = Duration::from_micros(1500);
+                    // 1-subframe mode (2.5 ms cadence) still needs a small
+                    // anti-burst gap, but 800 us keeps the capture clock in
+                    // charge; 2-subframe mode keeps its 1.5 ms gap.
+                    let min_gap = Duration::from_micros(capture_min_gap_us(subframes_per_pkt));
                     let since_tx = now.saturating_duration_since(last_tx_instant);
                     if since_tx < min_gap {
                         std::thread::sleep(min_gap - since_tx);
                     }
                 }
-                if maybe_pkt_len.is_some() {
+                if sent_any {
                     last_tx_instant = Instant::now();
                 }
                 // Keep the isochronous deadline anchored so a later capture
@@ -1652,7 +1857,7 @@ impl HostEngine {
                 } else {
                     next_tick += step_interval;
                 }
-                if maybe_pkt_len.is_some() {
+                if sent_any {
                     last_tx_instant = Instant::now();
                 }
             }
@@ -1826,5 +2031,149 @@ mod tests {
         // TEST-NET-3 is never a local tethering subnet.
         assert!(!is_usb_subnet_ip("203.0.113.7".parse().unwrap()));
         assert!(!is_usb_subnet_ip("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_datagram_plan_drops_fec_before_splitting() {
+        // Worst-case two 24-bit subframes = 2 * (2-byte length + 722 bytes).
+        let worst_two = 2 * (2 + MAX_LOSSLESS_PCM24_BYTES);
+        assert_eq!(worst_two, 1448);
+        assert_eq!(
+            plan_datagram(worst_two, true, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+        assert_eq!(
+            plan_datagram(worst_two, false, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+
+        // One worst-case subframe always fits with both FEC frames.
+        let worst_one = 2 + MAX_LOSSLESS_PCM24_BYTES;
+        assert_eq!(
+            plan_datagram(worst_one, true, true, true),
+            DatagramPlan::Single { n1: true, n2: true }
+        );
+
+        let two_fec_budget = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - 2 * ADPCM_FEC_BYTES;
+        assert_eq!(
+            plan_datagram(two_fec_budget, true, true, true),
+            DatagramPlan::Single { n1: true, n2: true }
+        );
+        // One byte over the two-FEC budget: drop the older N-2 first.
+        assert_eq!(
+            plan_datagram(two_fec_budget + 1, true, true, true),
+            DatagramPlan::Single {
+                n1: true,
+                n2: false
+            }
+        );
+        // One byte over the one-FEC budget: no FEC can fit.
+        let one_fec_budget = two_fec_budget + ADPCM_FEC_BYTES;
+        assert_eq!(
+            plan_datagram(one_fec_budget + 1, true, true, true),
+            DatagramPlan::Single {
+                n1: false,
+                n2: false
+            }
+        );
+        // Encrypted packets reserve a 4-byte MAC tag; unencrypted ones do not.
+        let primary_only = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN;
+        assert_eq!(
+            plan_datagram(primary_only, true, true, true),
+            DatagramPlan::Single {
+                n1: false,
+                n2: false
+            }
+        );
+        assert_eq!(
+            plan_datagram(primary_only + 1, true, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+        assert_eq!(
+            plan_datagram(primary_only + 1, false, true, true),
+            DatagramPlan::Single {
+                n1: false,
+                n2: false
+            }
+        );
+        assert_eq!(
+            plan_datagram(primary_only + 1 + MAC_TAG_LEN, false, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+    }
+
+    #[test]
+    fn test_split_fec_history_rebases_per_subframe() {
+        let prev_n1 = [0x11u8; ADPCM_FEC_BYTES];
+        let prev_n2 = [0x22u8; ADPCM_FEC_BYTES];
+        let mut packet_fec = [[0u8; ADPCM_FEC_BYTES]; 4];
+        packet_fec[0] = [0xAA; ADPCM_FEC_BYTES];
+        packet_fec[1] = [0xBB; ADPCM_FEC_BYTES];
+
+        // Packet 0 keeps the history that preceded the bundle.
+        let f0 = split_packet_fec(0, true, true, &prev_n1, &prev_n2, &packet_fec);
+        assert!(f0.want_n1 && f0.want_n2);
+        assert_eq!(f0.n1, &prev_n1[..]);
+        assert_eq!(f0.n2, &prev_n2[..]);
+
+        // Packet 1: N-1 is subframe 0; N-2 is the old N-1.
+        let f1 = split_packet_fec(1, true, true, &prev_n1, &prev_n2, &packet_fec);
+        assert!(f1.want_n1 && f1.want_n2);
+        assert_eq!(f1.n1, &packet_fec[0][..]);
+        assert_eq!(f1.n2, &prev_n1[..]);
+
+        // Packet 2: N-1 is subframe 1; N-2 is subframe 0.
+        let f2 = split_packet_fec(2, true, true, &prev_n1, &prev_n2, &packet_fec);
+        assert!(f2.want_n1 && f2.want_n2);
+        assert_eq!(f2.n1, &packet_fec[1][..]);
+        assert_eq!(f2.n2, &packet_fec[0][..]);
+
+        // At stream start there is no old N-1, so packet 1 has no N-2.
+        let f1_start = split_packet_fec(1, false, false, &prev_n1, &prev_n2, &packet_fec);
+        assert!(f1_start.want_n1);
+        assert!(!f1_start.want_n2);
+    }
+
+    #[test]
+    fn test_capture_pacer_covers_single_subframe_mode() {
+        assert_eq!(capture_min_gap_us(1), 800);
+        assert_eq!(capture_min_gap_us(2), 1_500);
+        assert_eq!(capture_min_gap_us(4), 1_500);
+        // The anti-burst gap must stay below the 2.5 ms packet cadence so the
+        // capture clock remains the master in 1-subframe mode.
+        assert!(capture_min_gap_us(1) < 2_500);
+    }
+
+    #[test]
+    fn test_24bit_profile_uses_up_to_two_subframes_per_packet() {
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 2,
+            enable_smart_dtx: false,
+        };
+        let mut engine = HostEngine::start(config, vec![]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::StudioLossless24Bit as u8, Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = 0u8;
+        while Instant::now() < deadline {
+            observed = engine
+                .telemetry
+                .tx_subframes_per_packet
+                .load(Ordering::Relaxed);
+            if observed == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            observed, 2,
+            "24-bit profile did not bundle two subframes per packet"
+        );
+        engine.stop();
     }
 }
