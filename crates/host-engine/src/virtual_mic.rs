@@ -31,6 +31,21 @@ fn buffered_subframes(latest_seq: u16, next_seq: u16) -> i16 {
     (latest_seq.wrapping_add(1).wrapping_sub(next_seq) as i16).max(0)
 }
 
+/// Phone-mic playhead rule: advance only when the slot contained audio or a
+/// newer packet is already buffered.
+///
+/// The receiver ticks from the PC `Instant` clock. If the PC clock runs faster
+/// than the phone (or a brief Wi-Fi pause leaves the timer running), blindly
+/// incrementing `next_seq` walks the playhead ahead of `latest_seq`; every
+/// later phone packet is then rejected as "past" even though it is the newest
+/// audio available. Holding the playhead while the slot is empty and no newer
+/// packet exists lets the phone sequence catch up.
+#[inline]
+fn should_advance_mic_playhead(status: u32, latest_seq: u16, next_seq: u16) -> bool {
+    status != audioshare_protocol::sequencer::STATUS_EMPTY
+        || (latest_seq.wrapping_sub(next_seq) as i16) >= 0
+}
+
 /// Decode every length-prefixed subframe in a primary bundle.
 ///
 /// The phone transmitter may bundle up to four 2.5 ms subframes per datagram.
@@ -399,7 +414,14 @@ impl PhoneMicReceiver {
                             // Wait for a 7.5 ms cushion before starting
                             // playback. This absorbs the first network jitter
                             // burst without adding noticeable call latency.
-                            if buffered_subframes(latest_seq, next_seq) >= 3 {
+                            // If a burst pushed the backlog beyond 40 ms, keep
+                            // only the newest 10 ms so call latency cannot
+                            // ratchet upwards.
+                            let buf_depth = buffered_subframes(latest_seq, next_seq);
+                            if buf_depth > 16 {
+                                next_seq = latest_seq.wrapping_add(1).wrapping_sub(4);
+                            }
+                            if buf_depth >= 3 {
                                 prebuffer_ready = true;
                             }
                         }
@@ -410,8 +432,10 @@ impl PhoneMicReceiver {
                         next_tick += Duration::from_micros(2500);
                         if initialized && prebuffer_ready {
                             let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                            sequencer.pop_next(next_seq, &mut frame);
-                            next_seq = next_seq.wrapping_add(1);
+                            let status = sequencer.pop_next(next_seq, &mut frame);
+                            if should_advance_mic_playhead(status, latest_seq, next_seq) {
+                                next_seq = next_seq.wrapping_add(1);
+                            }
                             // The rumble/noise gate is a voice-call processor.
                             // Music cast to PC speakers must keep its sub-bass
                             // and quiet passages.
@@ -521,6 +545,28 @@ mod tests {
         short[0..2].copy_from_slice(&100u16.to_be_bytes());
         let count = decode_primary_bundle(&short, 1, |_, _| panic!("must not decode"));
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_phone_mic_playhead_holds_when_pc_clock_runs_ahead() {
+        use audioshare_protocol::sequencer::{
+            STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
+        };
+
+        // The PC tick found an empty slot and no newer packet: hold so the
+        // phone can catch up instead of running the playhead ahead forever.
+        assert!(!should_advance_mic_playhead(STATUS_EMPTY, 99, 100));
+        // A newer packet is already buffered: skip the hole.
+        assert!(should_advance_mic_playhead(STATUS_EMPTY, 100, 100));
+        // Real and FEC audio always advance.
+        assert!(should_advance_mic_playhead(
+            STATUS_PRIMARY_LOSSLESS,
+            50,
+            100
+        ));
+        assert!(should_advance_mic_playhead(STATUS_HEALED_BY_FEC, 50, 100));
+        // 16-bit wrap: latest 65535 with next 0 means next is one ahead.
+        assert!(!should_advance_mic_playhead(STATUS_EMPTY, 65535, 0));
     }
 
     #[test]

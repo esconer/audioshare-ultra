@@ -86,16 +86,24 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
             RemoteMediaCommand::PrevTrack => "previous",
             RemoteMediaCommand::None => return,
         };
-        // Try playerctl (MPRIS standard used by Chrome, Firefox, Spotify, VLC on Linux)
-        if Command::new("playerctl").arg(action).output().is_err() {
-            let key = match cmd {
-                RemoteMediaCommand::PlayPause => "XF86AudioPlay",
-                RemoteMediaCommand::NextTrack => "XF86AudioNext",
-                RemoteMediaCommand::PrevTrack => "XF86AudioPrev",
-                RemoteMediaCommand::None => return,
-            };
-            let _ = Command::new("xdotool").args(["key", key]).output();
-        }
+        // This function is called from the host's hard real-time TX loop.
+        // `playerctl` talks to D-Bus/MPRIS and can block for tens of
+        // milliseconds, which would starve every connected client. Run the
+        // subprocess on a detached helper thread instead.
+        let _ = std::thread::Builder::new()
+            .name("as-ultra-media-key".into())
+            .spawn(move || {
+                // Try playerctl (MPRIS standard used by Chrome, Firefox, Spotify, VLC)
+                if Command::new("playerctl").arg(action).output().is_err() {
+                    let key = match cmd {
+                        RemoteMediaCommand::PlayPause => "XF86AudioPlay",
+                        RemoteMediaCommand::NextTrack => "XF86AudioNext",
+                        RemoteMediaCommand::PrevTrack => "XF86AudioPrev",
+                        RemoteMediaCommand::None => return,
+                    };
+                    let _ = Command::new("xdotool").args(["key", key]).output();
+                }
+            });
     }
 
     #[cfg(target_os = "windows")]

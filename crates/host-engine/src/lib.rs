@@ -34,6 +34,31 @@ use discovery_and_os::HostVolumeMonitor;
 pub const DEFAULT_PORT: u16 = 65530;
 const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
 
+/// Smart Auto selects compressed audio above this reported loss.
+const SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE: u16 = 45;
+/// Above this loss Smart Auto also drops to the fixed 160 kbps profile.
+const SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
+/// Keep compressed mode for this long after the last high-loss report. Without
+/// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
+/// encoder every 500 ms.
+const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(3);
+
+/// Fast-attack / slow-release governor for Smart Auto.
+///
+/// A new loss report above the compression threshold immediately wins and
+/// re-arms the hold window. While the window is open the highest reported
+/// value is kept, so a brief good window cannot step back up to lossless.
+fn governed_worst_loss(previous: u16, raw: u16, now: Instant, hold_until: &mut Instant) -> u16 {
+    if raw > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+        *hold_until = now + SMART_AUTO_LOSS_HOLD;
+    }
+    if now < *hold_until {
+        previous.max(raw)
+    } else {
+        raw
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub(crate) struct ClientPreviewSink;
 #[cfg(not(target_os = "android"))]
@@ -636,6 +661,22 @@ impl HostEngine {
     /// stale disconnected client) from being mistaken for Bluetooth. Muted
     /// clients are excluded because they receive no audio and therefore
     /// cannot contribute to either delay.
+    /// Drop older sockets from the same non-loopback IP when a client
+    /// reconnects with a new source port. Without this, the stale entry keeps
+    /// receiving audio for the 10-second sweep window and makes
+    /// `cached_targets.len() >= 2` enable group sync for a single phone.
+    ///
+    /// Loopback is exempt so local multi-client tests can share 127.0.0.1.
+    fn evict_same_ip_stale_ports(
+        map: &mut HashMap<SocketAddr, ConnectedClient>,
+        src_addr: SocketAddr,
+    ) {
+        if src_addr.ip().is_loopback() {
+            return;
+        }
+        map.retain(|addr, _| addr.ip() != src_addr.ip() || addr.port() == src_addr.port());
+    }
+
     fn refresh_client_delay_telemetry(
         map: &HashMap<SocketAddr, ConnectedClient>,
         telemetry: &HostTelemetry,
@@ -1232,6 +1273,7 @@ impl HostEngine {
         let mut dynamic_codec_mode;
         let mut tx_bitrate_kbps;
         let mut worst_loss_permille: u16 = 0;
+        let mut loss_hold_until = Instant::now();
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         // Lazily created on the first compressed packet after the user enables
         // the Opus backend. Dropped when the backend is disabled or the
@@ -1278,6 +1320,7 @@ impl HostEngine {
 
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
                     let mut map = clients.lock().unwrap();
+                    Self::evict_same_ip_stale_ports(&mut map, src_addr);
                     map.entry(src_addr)
                         .or_insert(ConnectedClient {
                             addr: src_addr,
@@ -1345,6 +1388,7 @@ impl HostEngine {
                         }
 
                         let mut map = clients.lock().unwrap();
+                        Self::evict_same_ip_stale_ports(&mut map, src_addr);
                         let entry = map.entry(src_addr).or_insert(ConnectedClient {
                             addr: src_addr,
                             last_seen: Instant::now(),
@@ -1364,8 +1408,23 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
 
-                        worst_loss_permille =
-                            map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
+                        // Fast attack / 3-second release. A borderline link
+                        // that alternates between 5% and 0% loss must not
+                        // recreate the Opus encoder every 500 ms. Muted
+                        // clients do not receive audio, so they cannot drive
+                        // the governor.
+                        let raw_worst = map
+                            .values()
+                            .filter(|c| !c.muted)
+                            .map(|c| c.fec_rate_permille)
+                            .max()
+                            .unwrap_or(0);
+                        worst_loss_permille = governed_worst_loss(
+                            worst_loss_permille,
+                            raw_worst,
+                            Instant::now(),
+                            &mut loss_hold_until,
+                        );
                         Self::refresh_client_delay_telemetry(&map, &telemetry);
 
                         cached_targets.clear();
@@ -1389,8 +1448,18 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
                     }
-                    worst_loss_permille =
-                        map.values().map(|c| c.fec_rate_permille).max().unwrap_or(0);
+                    let raw_worst = map
+                        .values()
+                        .filter(|c| !c.muted)
+                        .map(|c| c.fec_rate_permille)
+                        .max()
+                        .unwrap_or(0);
+                    worst_loss_permille = governed_worst_loss(
+                        worst_loss_permille,
+                        raw_worst,
+                        Instant::now(),
+                        &mut loss_hold_until,
+                    );
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     cached_targets.clear();
                     for c in map.values() {
@@ -1438,11 +1507,11 @@ impl HostEngine {
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::SmartAuto => {
-                    if worst_loss_permille > 120 {
+                    if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
                         subframes_per_pkt = 2;
                         tx_bitrate_kbps = 160;
-                    } else if worst_loss_permille > 45 {
+                    } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
                         subframes_per_pkt = 2;
                         tx_bitrate_kbps = selected_kbps;
@@ -2150,6 +2219,85 @@ mod tests {
         // The anti-burst gap must stay below the 2.5 ms packet cadence so the
         // capture clock remains the master in 1-subframe mode.
         assert!(capture_min_gap_us(1) < 2_500);
+    }
+
+    #[test]
+    fn test_same_ip_reconnect_evicts_stale_port() {
+        fn client(addr: SocketAddr) -> ConnectedClient {
+            ConnectedClient {
+                addr,
+                last_seen: Instant::now(),
+                is_usb: false,
+                muted: false,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 0,
+                client_volume: 100,
+            }
+        }
+
+        let mut map = HashMap::new();
+        let old: SocketAddr = "192.168.1.50:41000".parse().unwrap();
+        let new: SocketAddr = "192.168.1.50:41001".parse().unwrap();
+        let other: SocketAddr = "192.168.1.51:41000".parse().unwrap();
+        map.insert(old, client(old));
+        map.insert(other, client(other));
+
+        HostEngine::evict_same_ip_stale_ports(&mut map, new);
+        assert!(!map.contains_key(&old), "stale port must be evicted");
+        assert!(map.contains_key(&other), "other devices must survive");
+
+        // Loopback clients are independent test instances and must coexist.
+        let lo1: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let lo2: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        map.insert(lo1, client(lo1));
+        map.insert(lo2, client(lo2));
+        HostEngine::evict_same_ip_stale_ports(&mut map, lo2);
+        assert!(map.contains_key(&lo1));
+        assert!(map.contains_key(&lo2));
+    }
+
+    #[test]
+    fn test_smart_auto_loss_governor_holds_compressed_mode() {
+        let base = Instant::now();
+        let mut hold_until = base;
+
+        // 5% loss arms compressed mode.
+        assert_eq!(governed_worst_loss(0, 50, base, &mut hold_until), 50);
+        // The next 0% report cannot step back up while the hold is open.
+        assert_eq!(
+            governed_worst_loss(50, 0, base + Duration::from_millis(500), &mut hold_until),
+            50
+        );
+        assert_eq!(
+            governed_worst_loss(50, 0, base + Duration::from_millis(2_999), &mut hold_until),
+            50
+        );
+        // Three seconds after the last high report it releases.
+        assert_eq!(
+            governed_worst_loss(50, 0, base + Duration::from_millis(3_000), &mut hold_until),
+            0
+        );
+
+        // A high-loss burst re-arms the window and keeps the 160 kbps profile.
+        let t = base + Duration::from_millis(3_500);
+        assert_eq!(governed_worst_loss(0, 130, t, &mut hold_until), 130);
+        assert_eq!(
+            governed_worst_loss(130, 0, t + Duration::from_millis(2_900), &mut hold_until),
+            130
+        );
+        assert_eq!(
+            governed_worst_loss(130, 0, t + Duration::from_millis(3_001), &mut hold_until),
+            0
+        );
+
+        // Sub-threshold noise never arms the hold.
+        let mut hold_until = base;
+        assert_eq!(governed_worst_loss(0, 40, base, &mut hold_until), 40);
+        assert_eq!(
+            governed_worst_loss(40, 0, base + Duration::from_millis(1), &mut hold_until),
+            0
+        );
     }
 
     #[test]
