@@ -20,6 +20,8 @@ Rust core across desktop and Android.
   decouple the network quantum from the audio device burst size.
 - **Smart DTX** — silence is not transmitted; a −90 dBFS keep-alive keeps
   Bluetooth earbuds awake without draining the battery.
+- **Optional Opus backend** — live-switchable pure-Rust Opus for compressed
+  profiles, with automatic per-packet detection and VBR fallback.
 - **Hitless USB/Wi-Fi failover** — active-active feedback and deduplication.
 - **Encrypted streaming** — optional 1-tap PIN pairing with ChaCha20 and MAC32
   authentication.
@@ -80,6 +82,9 @@ as-ultra host --test-tone
 as-ultra host --latency-debug
 as-ultra client <host-ip> --latency-debug
 
+# Optional Opus backend for compressed quality profiles
+as-ultra host --libopus
+
 # Run the built-in packet-loss/latency benchmark
 as-ultra benchmark
 ```
@@ -87,6 +92,31 @@ as-ultra benchmark
 `--latency-debug` (or `--debug`) shows the live packetization, jitter, FIFO,
 DAC/Bluetooth, and estimated one-way latency components without changing audio
 behavior. It can also be enabled with `AUDIOSHARE_LATENCY_DEBUG=1`.
+
+### Compressed codec selection
+
+Lossless profiles always use the zero-lookahead LPC codec. For the compressed
+profiles (`Smart Auto` fallback, `Low-Latency Compressed`, and `Max Stability`)
+the host supports two interchangeable backends:
+
+| Backend | Wire tag | Lookahead | Notes |
+| --- | --- | --- | --- |
+| Pure-Rust VBR | `0x7E` | 0 ms | Default and automatic fallback |
+| Opus RLD (`opus-rs`) | `0x7F` | 2.5 ms | Opt-in, bundled pure Rust |
+
+The default is the pure-Rust VBR codec. Enable Opus with
+`as-ultra host --libopus`, the desktop GUI's **Compressed codec** selector, or
+the Android **Compressed Codec Module** switch (feedback codes `20`/`21`). The
+choice is persisted and can be changed while streaming: every packet is
+self-identifying, so the receiver switches decoders without a restart. If the
+Opus encoder cannot be created or rejects a frame, the host falls back to VBR
+for that packet rather than dropping audio.
+
+Opus uses `RestrictedLowDelay` at 48 kHz with 2.5 ms stereo frames. Its 2.5 ms
+lookahead is included in the client latency estimate and shown separately in the
+latency HUD. Lossless, raw PCM, 24-bit, and DTX paths are unchanged. The bundled
+codec is `opus-rs` 0.1.42; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for its BSD-3-Clause license.
 
 The desktop application (`audioshare-gui`) provides the same host/client controls,
 device discovery, per-application audio capture, encryption PIN setup, connected
@@ -116,7 +146,9 @@ be installed directly from GitHub Releases; no CI secrets are required. See
 ## License
 
 This project is licensed under the **GNU General Public License v3.0 only**
-(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full text.
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full text. Third-party
+components and their licenses are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 It was inspired by the original audio-share project, which was distributed
 under the Apache License 2.0. All code in this repository is an independent

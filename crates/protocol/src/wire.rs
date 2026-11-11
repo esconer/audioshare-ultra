@@ -15,10 +15,18 @@ pub enum CodecMode {
     StudioLosslessLpc = 0,
     /// Uncompressed Raw 16-bit PCM
     RawPcm16 = 1,
-    /// Low-Bitrate ADPCM / Opus Compressed Mode (Automatic fallback on weak 2.4GHz Wi-Fi)
+    /// Low-bitrate compressed mode. The primary payload is self-identifying:
+    /// `TAG_VBR_BFP` for the pure-Rust VBR codec or `TAG_OPUS_RLD` for Opus.
+    /// Used by hosts that do not distinguish the two backends at the header
+    /// level (and for backward compatibility).
     CompressedLowDelay = 2,
     /// Smart DTX Silence Heartbeat (Zero audio payload, keeps NAT & clock locked)
     SilenceHeartbeat = 3,
+    /// Compressed mode encoded by the bundled pure-Rust Opus (`opus-rs`)
+    /// backend. The payload still starts with `TAG_OPUS_RLD`, so per-packet
+    /// auto-detection remains authoritative. Older clients reject this mode
+    /// cleanly instead of misreading Opus bytes as legacy IMA-ADPCM.
+    OpusRld = 4,
 }
 
 impl CodecMode {
@@ -29,6 +37,7 @@ impl CodecMode {
             1 => Some(Self::RawPcm16),
             2 => Some(Self::CompressedLowDelay),
             3 => Some(Self::SilenceHeartbeat),
+            4 => Some(Self::OpusRld),
             _ => None,
         }
     }
@@ -45,8 +54,10 @@ pub struct ClientFeedbackPacket {
     /// Client volume (0..=100) for bidirectional volume sync
     pub client_volume: u8,
     /// Client requested quality profile (0 = no change, 1 = Smart Auto,
-    /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms)
-    /// or a media transport command (10 = play/pause, 11 = next, 12 = previous).
+    /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms,
+    /// 5 = Studio Master 24-bit), a media transport command (10 = play/pause,
+    /// 11 = next, 12 = previous), or a compressed-codec backend selection
+    /// (20 = pure-Rust VBR default, 21 = bundled Opus RLD).
     pub requested_mode: u8,
     /// Measured downstream hardware/DAC presentation latency in milliseconds.
     /// This is intentionally separate from `bluetooth_delay_ms`: the host uses
@@ -427,6 +438,28 @@ mod tests {
         hdr.subframe_count = 4;
         hdr.encode(&mut buf);
         assert!(WireHeader::decode(&buf).is_ok());
+    }
+
+    #[test]
+    fn test_opus_wire_mode_roundtrip() {
+        let mut buf = [0u8; HEADER_LEN];
+        let hdr = WireHeader {
+            mode: CodecMode::OpusRld,
+            subframe_count: 2,
+            encrypted: false,
+            sequence: 42,
+            tx_timestamp_us: 9_000,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+        hdr.encode(&mut buf);
+        let decoded = WireHeader::decode(&buf).expect("Opus mode header must decode");
+        assert_eq!(decoded.mode, CodecMode::OpusRld);
+        assert_eq!(decoded.subframe_count, 2);
     }
 
     #[test]

@@ -13,6 +13,7 @@ use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, TAG_VBR_BFP,
 };
+use audioshare_protocol::opus_codec::{OpusStreamDecoder, OPUS_LOOKAHEAD_MS, TAG_OPUS_RLD};
 use audioshare_protocol::sequencer::{
     ZeroJitterSequencer, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
 };
@@ -104,6 +105,40 @@ fn decode_raw_pcm16_payload(payload: &[u8], out: &mut [f32; SUBFRAME_STEREO_SAMP
     false
 }
 
+/// Decode a compressed-mode primary payload by its self-identifying tag.
+///
+/// The host can switch between the pure-Rust VBR codec and Opus live, so the
+/// tag is authoritative even when the wire header says
+/// `CompressedLowDelay` or `OpusRld`. Dropping the Opus decoder when a
+/// non-Opus payload arrives prevents stale codec history from leaking across
+/// a backend switch or a stream resync.
+fn decode_compressed_payload(
+    payload: &[u8],
+    opus_decoder: &mut Option<OpusStreamDecoder>,
+    out: &mut [f32; SUBFRAME_STEREO_SAMPLES],
+) -> bool {
+    if payload.first() == Some(&TAG_OPUS_RLD) {
+        if opus_decoder.is_none() {
+            *opus_decoder = OpusStreamDecoder::new();
+        }
+        return opus_decoder
+            .as_mut()
+            .map(|decoder| decoder.decode_subframe(payload, out))
+            .unwrap_or(false);
+    }
+
+    // A non-Opus frame means the host switched back to VBR (or sent a legacy
+    // ADPCM frame). Reset the Opus decoder so a later switch starts clean.
+    *opus_decoder = None;
+    if payload.first() == Some(&TAG_VBR_BFP) {
+        decode_vbr_subframe_to_f32(payload, out)
+    } else {
+        // Legacy fallback: older hosts used a raw 124-byte IMA-ADPCM frame as
+        // the compressed primary payload. The FEC decoder also reads those.
+        decode_fec_subframe_to_f32(payload, out)
+    }
+}
+
 /// Convert an AAudio timestamp snapshot into the milliseconds still queued
 /// ahead of the DAC. `AAudioStream_getTimestamp` reports the frame position at
 /// the last HAL interrupt, not at "now"; the position must be extrapolated by
@@ -187,6 +222,13 @@ impl ClientTelemetry {
             hardware_delay_ms: self.downstream_hw_delay_ms.load(Ordering::Relaxed),
             bluetooth_delay_ms: self.downstream_bt_delay_ms.load(Ordering::Relaxed),
             output_buffer_ms,
+            codec_lookahead_ms: if self.codec_mode.load(Ordering::Relaxed)
+                == CodecMode::OpusRld as u8
+            {
+                OPUS_LOOKAHEAD_MS
+            } else {
+                0.0
+            },
             prebuffer_ready: self.prebuffer_ready.load(Ordering::Relaxed),
             codec_mode: self.codec_mode.load(Ordering::Relaxed),
         }
@@ -424,6 +466,9 @@ impl ClientEngine {
         let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
         let mut night_compressor = audioshare_protocol::sync_and_eq::NightModeCompressor::new();
         let group_sync = audioshare_protocol::sync_and_eq::GroupSyncEstimator::new();
+        // Created lazily on the first Opus packet. Dropped on DTX/resync and
+        // whenever the host switches back to VBR.
+        let mut opus_decoder: Option<OpusStreamDecoder> = None;
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
@@ -591,6 +636,7 @@ impl ClientEngine {
                             // the silence so a later stream restart cannot
                             // replay stale payloads.
                             sequencer.reset();
+                            opus_decoder = None;
                             continue;
                         }
 
@@ -641,6 +687,7 @@ impl ClientEngine {
                             prebuffer_ready = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             prev_rx_us = None;
+                            opus_decoder = None;
                         }
 
                         // Lazy FEC Decoding: Only decode FEC [N-1] / [N-2] if that slot is ACTUALLY missing
@@ -684,20 +731,12 @@ impl ClientEngine {
                             }
 
                             let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                            let decoded_ok = if parsed.header.mode == CodecMode::CompressedLowDelay
-                            {
+                            let decoded_ok = if matches!(
+                                parsed.header.mode,
+                                CodecMode::CompressedLowDelay | CodecMode::OpusRld
+                            ) {
                                 let payload = &prim[cursor..cursor + sub_len];
-                                if payload.first() == Some(&TAG_VBR_BFP) {
-                                    decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
-                                } else {
-                                    // Legacy fallback: older hosts used a raw
-                                    // 124-byte IMA-ADPCM frame as the compressed
-                                    // primary payload. Current hosts always send
-                                    // TAG_VBR_BFP. The FEC decoder recovers
-                                    // sample 0 from the 4-byte header, so it
-                                    // also reads those legacy frames correctly.
-                                    decode_fec_subframe_to_f32(payload, &mut pcm_f32)
-                                }
+                                decode_compressed_payload(payload, &mut opus_decoder, &mut pcm_f32)
                             } else if parsed.header.mode == CodecMode::RawPcm16 {
                                 decode_raw_pcm16_payload(
                                     &prim[cursor..cursor + sub_len],
@@ -1143,6 +1182,58 @@ mod tests {
         let stale =
             pending_hardware_delay_ms(0, timestamp_ns, timestamp_ns + 5_000_000_000, 48_000);
         assert_eq!(stale, Some(120));
+    }
+
+    #[test]
+    fn test_compressed_payload_auto_detects_opus_and_vbr() {
+        use audioshare_protocol::lpc_lossless::{encode_vbr_subframe, MAX_LOSSLESS_SUBFRAME_BYTES};
+        use audioshare_protocol::opus_codec::OpusStreamEncoder;
+
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut opus_encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut opus_payload = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let opus_len = opus_encoder
+            .encode_subframe(&pcm, 128, &mut opus_payload)
+            .expect("encode Opus");
+        assert_eq!(opus_payload[0], TAG_OPUS_RLD);
+
+        let mut decoder = None;
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_compressed_payload(
+            &opus_payload[..opus_len],
+            &mut decoder,
+            &mut out
+        ));
+        assert!(decoder.is_some(), "Opus tag must create the decoder");
+
+        let mut vbr_payload = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let vbr_len = encode_vbr_subframe(&pcm, 160, &mut vbr_payload);
+        assert_eq!(vbr_payload[0], TAG_VBR_BFP);
+        let mut vbr_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_compressed_payload(
+            &vbr_payload[..vbr_len],
+            &mut decoder,
+            &mut vbr_out
+        ));
+        assert!(
+            decoder.is_none(),
+            "VBR payload must reset stale Opus decoder state"
+        );
+
+        // Switching back to Opus must lazily recreate the decoder.
+        let mut opus_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_compressed_payload(
+            &opus_payload[..opus_len],
+            &mut decoder,
+            &mut opus_out
+        ));
+        assert!(decoder.is_some());
     }
 
     #[test]

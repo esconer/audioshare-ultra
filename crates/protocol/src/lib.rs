@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod dsp;
 pub mod latency;
 pub mod lpc_lossless;
+pub mod opus_codec;
 pub mod sequencer;
 pub mod sync_and_eq;
 pub mod wire;

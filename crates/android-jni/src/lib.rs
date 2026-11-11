@@ -527,7 +527,8 @@ pub mod android_native {
         _class: JClass,
     ) -> jlongArray {
         // Keep this array length and index order in sync with
-        // MainScreen.kt's `LongArray(24)` telemetry buffer.
+        // MainScreen.kt's `LongArray(24)` telemetry buffer:
+        // 0..10 legacy counters, 11..21 live latency breakdown.
         let mut stats = [0i64; 24];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
             let latency = c.telemetry.latency_snapshot(0.0);
@@ -555,6 +556,7 @@ pub mod android_native {
             stats[18] = i64::from(c.telemetry.prebuffer_ready.load(Ordering::Relaxed));
             stats[19] = c.telemetry.codec_mode.load(Ordering::Relaxed) as i64;
             stats[20] = (latency.estimated_one_way_ms() * 10.0).round() as i64;
+            stats[21] = (latency.codec_lookahead_ms * 10.0).round() as i64;
         }
         let arr = env.new_long_array(24).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);

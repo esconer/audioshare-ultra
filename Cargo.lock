@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-android-jni"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-client-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-desktop-gui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-host-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "audioshare-protocol",
  "cpal",
@@ -491,7 +491,10 @@ dependencies = [
 
 [[package]]
 name = "audioshare-protocol"
-version = "0.1.5"
+version = "0.1.6"
+dependencies = [
+ "opus-rs",
+]
 
 [[package]]
 name = "autocfg"
@@ -2498,6 +2501,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bafbcaf2ed381cdf68ced4ed8d16517de90ffd7424e36f0b9e45d67fbe30b1f9"
 
 [[package]]
 name = "orbclient"

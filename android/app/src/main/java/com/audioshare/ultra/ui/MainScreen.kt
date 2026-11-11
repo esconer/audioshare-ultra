@@ -39,6 +39,7 @@ private fun codecModeName(mode: Long): String = when (mode.toInt()) {
     1 -> "Raw PCM16"
     2 -> "VBR Compressed"
     3 -> "DTX Silence"
+    4 -> "Opus RLD"
     else -> "Unknown"
 }
 
@@ -82,12 +83,15 @@ fun MainScreen() {
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
     // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
     var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
+    // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
+    // Sent to the host as feedback code 20/21; only affects compressed modes.
+    var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", false)) }
     var sharePhoneMic by remember { mutableStateOf(false) }
     var castPhoneInternalAudio by remember { mutableStateOf(false) }
     var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
-    // 0..10 legacy counters, 11..20 live latency breakdown.
+    // 0..10 legacy counters, 11..21 live latency breakdown.
     var telemetry by remember { mutableStateOf(LongArray(24)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
 
@@ -485,6 +489,7 @@ fun MainScreen() {
                             val prebufferReady = telemetry.getOrElse(18) { 0L } == 1L
                             val codecMode = telemetry.getOrElse(19) { 0L }
                             val estMs = telemetry.getOrElse(20) { 0L } / 10.0
+                            val codecLookaheadMs = telemetry.getOrElse(21) { 0L } / 10.0
                             val fillPct = if (targetUs > 0) {
                                 ((bufferedUs.toDouble() / targetUs) * 100.0).coerceIn(0.0, 100.0)
                             } else {
@@ -510,11 +515,12 @@ fun MainScreen() {
                             )
                             Text("Group sync addition: +${usToMs(groupUs)} ms", fontFamily = FontFamily.Monospace)
                             Text("DAC queue          : ${telemetry.getOrElse(10) { 0L }} ms", fontFamily = FontFamily.Monospace)
+                            Text("Codec lookahead    : ${"%.1f".format(codecLookaheadMs)} ms", fontFamily = FontFamily.Monospace)
                             Text("Bluetooth estimate : $btLabel", fontFamily = FontFamily.Monospace)
                             Text("Prebuffer          : $prebufferLabel", fontFamily = FontFamily.Monospace)
                             Text("Codec              : ${codecModeName(codecMode)}", fontFamily = FontFamily.Monospace)
                             Text(
-                                "Estimate = packetization + target FIFO + max(DAC, BT, output). Group sync is already inside the FIFO. Excludes one-way network transit and the acoustic air path; use the sonar for end-to-end.",
+                                "Estimate = packetization + target FIFO + max(DAC, BT, output) + codec lookahead. Group sync is already inside the FIFO. Excludes one-way network transit and the acoustic air path; use the sonar for end-to-end.",
                                 style = MaterialTheme.typography.bodySmall
                             )
                         }
@@ -591,6 +597,36 @@ fun MainScreen() {
                                     label = { Text(label) }
                                 )
                             }
+                        }
+
+                        // Separate compressed-codec backend switch. Lossless
+                        // profiles ignore it; the host can switch live without
+                        // restarting the client.
+                        Text("Compressed Codec Module", style = MaterialTheme.typography.titleSmall)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = !useOpus,
+                                onClick = {
+                                    useOpus = false
+                                    prefs.edit().putBoolean("use_opus", false).apply()
+                                    AudioEngineService.nativeSendMediaCommand(20)
+                                },
+                                label = { Text("🦀 Rust VBR (Default)") }
+                            )
+                            FilterChip(
+                                selected = useOpus,
+                                onClick = {
+                                    useOpus = true
+                                    prefs.edit().putBoolean("use_opus", true).apply()
+                                    AudioEngineService.nativeSendMediaCommand(21)
+                                },
+                                label = { Text("🎵 Opus RLD (Pure Rust)") }
+                            )
                         }
 
                         Row(

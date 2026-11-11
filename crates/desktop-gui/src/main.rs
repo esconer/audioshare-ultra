@@ -72,6 +72,7 @@ struct AudioShareApp {
     adb_watcher: Option<AdbUsbWatcher>,
     os_guard: Option<VirtualSpeakerAndRadioGuard>,
     quality_profile: QualityProfile,
+    prefer_opus: bool,
     target_bitrate_kbps: u16,
     usb_low_latency_pacing: bool,
     enable_smart_dtx: bool,
@@ -154,6 +155,7 @@ impl AudioShareApp {
             adb_watcher: None,
             os_guard: None,
             quality_profile: QualityProfile::SmartAuto,
+            prefer_opus: false,
             target_bitrate_kbps: 256,
             usb_low_latency_pacing: false,
             enable_smart_dtx: true,
@@ -236,6 +238,7 @@ impl AudioShareApp {
              hotspot_ssid={}\n\
              hotspot_pass={}\n\
              quality_profile={}\n\
+             prefer_opus={}\n\
              target_bitrate_kbps={}\n\
              usb_low_latency_pacing={}\n\
              enable_smart_dtx={}\n\
@@ -264,6 +267,7 @@ impl AudioShareApp {
             self.hotspot_ssid,
             self.hotspot_pass,
             self.quality_profile as u8,
+            self.prefer_opus,
             self.target_bitrate_kbps,
             self.usb_low_latency_pacing,
             self.enable_smart_dtx,
@@ -312,6 +316,7 @@ impl AudioShareApp {
                             self.quality_profile = QualityProfile::from_u8(n);
                         }
                     }
+                    "prefer_opus" => self.prefer_opus = v.trim() == "true",
                     "target_bitrate_kbps" => {
                         if let Ok(n) = v.trim().parse::<u16>() {
                             self.target_bitrate_kbps = n;
@@ -405,6 +410,10 @@ impl AudioShareApp {
                         .telemetry
                         .quality_profile
                         .store(self.quality_profile as u8, Ordering::Relaxed);
+                    engine
+                        .telemetry
+                        .prefer_opus
+                        .store(self.prefer_opus, Ordering::Relaxed);
                     engine
                         .telemetry
                         .target_bitrate_kbps
@@ -551,6 +560,7 @@ impl eframe::App for AudioShareApp {
             // Reflect profile changes requested from a connected phone.
             self.quality_profile =
                 QualityProfile::from_u8(host.telemetry.quality_profile.load(Ordering::Relaxed));
+            self.prefer_opus = host.telemetry.prefer_opus.load(Ordering::Relaxed);
             if let Some(ref mut guard) = self.os_guard {
                 if client_count > 0 {
                     guard.activate();
@@ -777,6 +787,42 @@ impl AudioShareApp {
                 }
             });
 
+            ui.horizontal_wrapped(|ui| {
+                ui.label("🧩 Compressed codec:");
+                if ui
+                    .selectable_value(&mut self.prefer_opus, false, "🦀 Pure-Rust VBR (Default)")
+                    .changed()
+                {
+                    if let Some(ref host) = self.host_engine {
+                        host.telemetry
+                            .prefer_opus
+                            .store(false, Ordering::Relaxed);
+                    }
+                }
+                if ui
+                    .selectable_value(
+                        &mut self.prefer_opus,
+                        true,
+                        "🎵 Opus RLD (Pure Rust, 2.5ms lookahead)",
+                    )
+                    .changed()
+                {
+                    if let Some(ref host) = self.host_engine {
+                        host.telemetry
+                            .prefer_opus
+                            .store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "Applies to compressed profiles only; lossless and 24-bit modes are unchanged. \
+                     Switching is live and auto-detected per packet.",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+
             if self.quality_profile == QualityProfile::LowLatencyCompressed
                 || self.quality_profile == QualityProfile::SmartAuto
             {
@@ -926,9 +972,14 @@ impl AudioShareApp {
 
                 let mode_str = if dtx {
                     "SMART-DTX SILENCE (0.6 kbps)".to_string()
+                } else if mode_id == 4 {
+                    format!(
+                        "GOVERNOR: COMPRESSED [OPUS RLD] {} kbps (Weak Wi-Fi Protection)",
+                        self.target_bitrate_kbps
+                    )
                 } else if mode_id == 2 {
                     format!(
-                        "GOVERNOR: COMPRESSED VBR {} kbps (Weak Wi-Fi Protection)",
+                        "GOVERNOR: COMPRESSED [RUST VBR] {} kbps (Weak Wi-Fi Protection)",
                         self.target_bitrate_kbps
                     )
                 } else if self.quality_profile == QualityProfile::StudioLossless24Bit {
@@ -1362,6 +1413,14 @@ impl AudioShareApp {
                     ui.monospace(format!("{:.1} ms (configured)", snap.output_buffer_ms));
                     ui.end_row();
 
+                    ui.label("Codec lookahead");
+                    if snap.codec_lookahead_ms > 0.0 {
+                        ui.monospace(format!("{:.1} ms (Opus RLD)", snap.codec_lookahead_ms));
+                    } else {
+                        ui.monospace("0.0 ms (lossless/VBR)");
+                    }
+                    ui.end_row();
+
                     ui.label("Prebuffer");
                     ui.monospace(if snap.prebuffer_ready {
                         "READY"
@@ -1388,9 +1447,9 @@ impl AudioShareApp {
             ui.add_space(4.0);
             ui.label(
                 egui::RichText::new(
-                    "Estimate = packetization + target FIFO + max(DAC, BT, desktop output). \
-                     Group sync is already inside the target FIFO. Excludes one-way network \
-                     transit and the acoustic air path; use the sonar for end-to-end.",
+                    "Estimate = packetization + target FIFO + max(DAC, BT, desktop output) + codec \
+                     lookahead. Group sync is already inside the target FIFO. Excludes one-way \
+                     network transit and the acoustic air path; use the sonar for end-to-end.",
                 )
                 .small()
                 .color(egui::Color32::GRAY),
@@ -1695,6 +1754,7 @@ os_boot_autostart=false
 hotspot_ssid=AudioShare_Direct
 hotspot_pass=pass1234
 quality_profile=4
+prefer_opus=true
 target_bitrate_kbps=320
 usb_low_latency_pacing=true
 enable_smart_dtx=false
@@ -1725,6 +1785,7 @@ phone_rx_mode=1
         assert_eq!(app.hotspot_ssid, "AudioShare_Direct");
         assert_eq!(app.hotspot_pass, "pass1234");
         assert_eq!(app.quality_profile, QualityProfile::StudioLossless24Bit);
+        assert!(app.prefer_opus);
         assert_eq!(app.target_bitrate_kbps, 320);
         assert!(app.usb_low_latency_pacing);
         assert!(!app.enable_smart_dtx);

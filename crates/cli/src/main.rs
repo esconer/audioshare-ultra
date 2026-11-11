@@ -34,12 +34,14 @@ fn print_usage() {
     println!("  AudioShare Ultra — Hard Real-Time Lossless Audio Engine");
     println!("================================================================");
     println!("Usage:");
-    println!("  as-ultra host [--test-tone] [--usb] [--latency-debug]");
+    println!("  as-ultra host [--test-tone] [--usb] [--latency-debug] [--libopus]");
     println!("  as-ultra client <host-ip[:port]> [--latency-debug]");
     println!("  as-ultra benchmark                    Run Wi-Fi Loss & Latency Benchmark");
     println!();
     println!("  --latency-debug  Show the live component latency breakdown.");
     println!("                   Also enabled by AUDIOSHARE_LATENCY_DEBUG=1.");
+    println!("  --libopus        Use the bundled pure-Rust Opus codec for compressed");
+    println!("                   modes. Default is the pure-Rust VBR codec.");
 }
 
 fn has_latency_debug_flag(args: &[String]) -> bool {
@@ -64,6 +66,7 @@ fn client_target(args: &[String]) -> &str {
 fn run_host(args: &[String]) {
     let use_test_tone = args.iter().any(|a| a == "--test-tone");
     let usb_mode = args.iter().any(|a| a == "--usb");
+    let use_opus = args.iter().any(|a| a == "--libopus");
     let latency_debug = latency_debug_enabled(args);
 
     println!("================================================================");
@@ -100,12 +103,23 @@ fn run_host(args: &[String]) {
 
     let _os_guard = VirtualSpeakerAndRadioGuard::acquire(false);
     let host = HostEngine::start(cfg, vec![]).expect("Failed to start HostEngine");
+    if use_opus {
+        host.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+    }
     let _beacon = DiscoveryBeacon::start(DEFAULT_PORT, "CLI-AudioShare-Ultra".into());
     let _adb = AdbUsbWatcher::start(DEFAULT_PORT);
     println!(
         "\n[+] Pacing: {:.1} ms ({} subframe/pkt) | QoS: 802.11e WMM AC_VI (0xA0) | Smart DTX: ON",
         (cfg.subframes_per_packet as f32) * 2.5,
         cfg.subframes_per_packet
+    );
+    println!(
+        "[+] Compressed codec: {}",
+        if use_opus {
+            "Opus RLD (pure Rust, 2.5 ms lookahead)"
+        } else {
+            "Pure-Rust VBR (default, zero lookahead)"
+        }
     );
     println!(
         "[+] Waiting for clients (or run `as-ultra client 127.0.0.1` in another terminal)...\n"
@@ -117,6 +131,7 @@ fn run_host(args: &[String]) {
         let bytes = host.telemetry.bytes_sent.load(Ordering::Relaxed);
         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
         let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
+        let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
 
         if latency_debug {
             let pacing_ms =
@@ -127,7 +142,6 @@ fn run_host(args: &[String]) {
                 .telemetry
                 .tx_subframes_per_packet
                 .load(Ordering::Relaxed);
-            let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
             let bt_max = host
                 .telemetry
                 .max_client_bt_delay_ms
@@ -159,11 +173,7 @@ fn run_host(args: &[String]) {
                 clients,
                 pkts,
                 bytes / 1024,
-                if dtx {
-                    "SMART-DTX (0.6kbps)"
-                } else {
-                    "LOSSLESS-ACTIVE"
-                }
+                if dtx { "SMART-DTX (0.6kbps)" } else { codec }
             );
         }
         use std::io::Write;
@@ -218,13 +228,14 @@ fn run_client(args: &[String]) {
         if latency_debug {
             let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
             print!(
-                "\r[CLIENT LATENCY] Est: {:.1} ms = pkt {:.1} + FIFO {:.1} (fill {:.1}, group +{:.1}) + out {:.1} [DAC {} ms, BT {} ms] | Jitter {:.1} ms | {} | {} | RX {} | FEC {} | PLC {} | Drift {:+} ppm   ",
+                "\r[CLIENT LATENCY] Est: {:.1} ms = pkt {:.1} + FIFO {:.1} (fill {:.1}, group +{:.1}) + out {:.1} + codec {:.1} [DAC {} ms, BT {} ms] | Jitter {:.1} ms | {} | {} | RX {} | FEC {} | PLC {} | Drift {:+} ppm   ",
                 snap.estimated_one_way_ms(),
                 snap.packet_interval_ms,
                 snap.target_buffer_ms,
                 snap.buffered_audio_ms,
                 snap.group_sync_extra_ms,
                 snap.downstream_stage_ms(),
+                snap.codec_lookahead_ms,
                 snap.hardware_delay_ms,
                 snap.bluetooth_delay_ms,
                 snap.network_jitter_ms,

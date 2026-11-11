@@ -13,6 +13,7 @@ use audioshare_protocol::lpc_lossless::{
     encode_vbr_subframe, QualityProfile, ADPCM_FEC_BYTES, MAX_LOSSLESS_PCM24_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
+use audioshare_protocol::opus_codec::OpusStreamEncoder;
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
 };
@@ -316,6 +317,10 @@ pub struct HostTelemetry {
     pub dtx_silent_mode: AtomicBool,
     pub active_codec_mode: AtomicU8,
     pub quality_profile: AtomicU8,
+    /// Opt-in compressed-codec backend switch. `false` (default) keeps the
+    /// pure-Rust VBR codec; `true` routes compressed profiles through the
+    /// bundled pure-Rust Opus encoder. Lossless profiles ignore this flag.
+    pub prefer_opus: AtomicBool,
     pub enable_group_sync: AtomicBool,
     pub manual_group_sync_trim_ms: AtomicU16,
     pub target_bitrate_kbps: AtomicU16,
@@ -386,6 +391,7 @@ impl HostEngine {
             dtx_silent_mode: AtomicBool::new(false),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
+            prefer_opus: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -1086,6 +1092,11 @@ impl HostEngine {
         let mut tx_bitrate_kbps;
         let mut worst_loss_permille: u16 = 0;
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
+        // Lazily created on the first compressed packet after the user enables
+        // the Opus backend. Dropped when the backend is disabled or the
+        // profile is lossless, so a later switch starts with clean state.
+        let mut opus_encoder: Option<OpusStreamEncoder> = None;
+        let mut opus_encoder_failed = false;
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
         if let Ok(map) = clients.lock() {
             for c in map.values() {
@@ -1150,8 +1161,20 @@ impl HostEngine {
                     }
                 } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
                     if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
-                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present
-                        if fb.requested_mode >= 10 {
+                        // Compressed-codec backend selection from the phone UI:
+                        // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
+                        // This is separate from the quality profile and only
+                        // affects compressed modes.
+                        match fb.requested_mode {
+                            20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
+                            21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
+                            _ => {}
+                        }
+
+                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
+                        // Keep this range below 20 so codec-backend commands are
+                        // not mistaken for transport commands.
+                        if (10..20).contains(&fb.requested_mode) {
                             let cmd = match fb.requested_mode {
                                 10 => bt_optimization::RemoteMediaCommand::PlayPause,
                                 11 => bt_optimization::RemoteMediaCommand::NextTrack,
@@ -1164,8 +1187,8 @@ impl HostEngine {
                         // Remote quality-mode selection from the phone UI:
                         // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
                         // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                        // Values >= 10 are Bluetooth media transport commands
-                        // handled above.
+                        // Values >= 10 are media transport or codec-backend
+                        // commands handled above.
                         if (1..=5).contains(&fb.requested_mode) {
                             telemetry
                                 .quality_profile
@@ -1280,6 +1303,30 @@ impl HostEngine {
                     }
                 }
             }
+            // Compressed-codec backend selection. Opus is opt-in and only
+            // replaces the payload of compressed profiles; lossless and
+            // 24-bit modes are untouched. If encoder creation fails we stay
+            // on the pure-Rust VBR path instead of dropping audio.
+            let prefer_opus = telemetry.prefer_opus.load(Ordering::Relaxed);
+            if !prefer_opus {
+                opus_encoder = None;
+                opus_encoder_failed = false;
+            } else if dynamic_codec_mode == CodecMode::CompressedLowDelay {
+                if opus_encoder.is_none() && !opus_encoder_failed {
+                    opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
+                    if opus_encoder.is_none() {
+                        opus_encoder_failed = true;
+                    }
+                }
+                if opus_encoder.is_some() {
+                    dynamic_codec_mode = CodecMode::OpusRld;
+                }
+            } else {
+                // Leaving compressed mode: drop the codec state so a later
+                // compressed period starts clean.
+                opus_encoder = None;
+            }
+
             packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
             telemetry
                 .active_codec_mode
@@ -1380,18 +1427,49 @@ impl HostEngine {
                 encode_fec_subframe(&i16_subframe, &mut fec_n1);
                 has_fec_n1 = true;
 
-                if dynamic_codec_mode == CodecMode::CompressedLowDelay {
-                    // VBR primary payload targeted by the selected quality mode.
-                    // A 2.5 ms frame is only 32-94 bytes (vs 124-byte ADPCM FEC),
-                    // and the same payload is also valid as its own FEC backup.
-                    let mut enc_vbr = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                    let enc_len = encode_vbr_subframe(&i16_subframe, tx_bitrate_kbps, &mut enc_vbr);
+                if matches!(
+                    dynamic_codec_mode,
+                    CodecMode::CompressedLowDelay | CodecMode::OpusRld
+                ) {
+                    // Compressed primary payload targeted by the selected
+                    // quality mode. The tag inside the payload tells the
+                    // receiver whether this is pure-Rust VBR or Opus, so a
+                    // live backend switch never requires a client restart.
+                    let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                    let enc_len = if dynamic_codec_mode == CodecMode::OpusRld {
+                        let opus_len = opus_encoder.as_mut().and_then(|encoder| {
+                            encoder.encode_subframe(
+                                &i16_subframe,
+                                tx_bitrate_kbps,
+                                &mut enc_primary,
+                            )
+                        });
+                        match opus_len {
+                            Some(len) => len,
+                            None => {
+                                // Never drop audio on a codec failure. Fall
+                                // back to VBR for this packet, mark the Opus
+                                // backend unavailable, and let the next
+                                // toggle retry it.
+                                opus_encoder = None;
+                                opus_encoder_failed = true;
+                                dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                                encode_vbr_subframe(
+                                    &i16_subframe,
+                                    tx_bitrate_kbps,
+                                    &mut enc_primary,
+                                )
+                            }
+                        }
+                    } else {
+                        encode_vbr_subframe(&i16_subframe, tx_bitrate_kbps, &mut enc_primary)
+                    };
                     let len_be = (enc_len as u16).to_be_bytes();
                     primary_bundle[primary_cursor] = len_be[0];
                     primary_bundle[primary_cursor + 1] = len_be[1];
                     primary_cursor += 2;
                     primary_bundle[primary_cursor..primary_cursor + enc_len]
-                        .copy_from_slice(&enc_vbr[..enc_len]);
+                        .copy_from_slice(&enc_primary[..enc_len]);
                     primary_cursor += enc_len;
                 } else if profile == QualityProfile::StudioLossless24Bit {
                     // Encode from the original f32 samples (not the i16
@@ -1420,6 +1498,12 @@ impl HostEngine {
 
                 seq = seq.wrapping_add(1);
             }
+
+            // If an Opus encode failed mid-packet we fell back to VBR above;
+            // publish the mode that matches the payload actually built.
+            telemetry
+                .active_codec_mode
+                .store(dynamic_codec_mode as u8, Ordering::Relaxed);
 
             let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
             let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
@@ -1681,6 +1765,38 @@ mod tests {
                 .active_clients_count
                 .load(Ordering::Relaxed),
             1
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_opus_backend_selected_for_compressed_profile() {
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 1,
+            enable_smart_dtx: false,
+        };
+        let mut engine = HostEngine::start(config, vec![]).expect("start host engine");
+        engine.telemetry.quality_profile.store(
+            QualityProfile::LowLatencyCompressed as u8,
+            Ordering::Relaxed,
+        );
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = 0u8;
+        while Instant::now() < deadline {
+            observed = engine.telemetry.active_codec_mode.load(Ordering::Relaxed);
+            if observed == CodecMode::OpusRld as u8 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            observed,
+            CodecMode::OpusRld as u8,
+            "host did not switch the compressed profile to Opus RLD"
         );
         engine.stop();
     }

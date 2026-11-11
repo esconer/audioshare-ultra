@@ -40,6 +40,9 @@ pub struct ClientLatencySnapshot {
     /// Desktop configured output buffer; 0 on Android where the DAC queue is
     /// measured instead.
     pub output_buffer_ms: f32,
+    /// Codec algorithmic lookahead. Opus Restricted Low Delay adds 2.5 ms;
+    /// the lossless LPC and pure-Rust VBR paths are zero-lookahead.
+    pub codec_lookahead_ms: f32,
     pub prebuffer_ready: bool,
     pub codec_mode: u8,
 }
@@ -59,12 +62,16 @@ impl ClientLatencySnapshot {
 
     /// Estimated time from a packet entering the client socket to the speaker.
     ///
-    /// `packet_interval + target FIFO + downstream stage`. The target FIFO
-    /// already contains the effective group-sync addition, so it is not added
-    /// again. Unknown one-way network transit and the acoustic air path are not
-    /// included; the sonar is the only measurement that covers those.
+    /// `packet_interval + target FIFO + downstream stage + codec lookahead`.
+    /// The target FIFO already contains the effective group-sync addition, so
+    /// it is not added again. Unknown one-way network transit and the acoustic
+    /// air path are not included; the sonar is the only measurement that
+    /// covers those.
     pub fn estimated_one_way_ms(&self) -> f32 {
-        self.packet_interval_ms + self.target_buffer_ms + self.downstream_stage_ms()
+        self.packet_interval_ms
+            + self.target_buffer_ms
+            + self.downstream_stage_ms()
+            + self.codec_lookahead_ms
     }
 
     pub fn codec_name(&self) -> &'static str {
@@ -78,6 +85,7 @@ pub fn codec_mode_name(mode: u8) -> &'static str {
         1 => "Raw PCM16",
         2 => "VBR Compressed",
         3 => "DTX Silence",
+        4 => "Opus RLD",
         _ => "Unknown",
     }
 }
@@ -131,11 +139,24 @@ mod tests {
     }
 
     #[test]
+    fn opus_lookahead_is_added_to_the_estimate() {
+        let snap = ClientLatencySnapshot {
+            packet_interval_ms: 5.0,
+            target_buffer_ms: 15.0,
+            output_buffer_ms: DESKTOP_OUTPUT_BUFFER_MS,
+            codec_lookahead_ms: crate::opus_codec::OPUS_LOOKAHEAD_MS,
+            ..Default::default()
+        };
+        assert_eq!(snap.estimated_one_way_ms(), 27.5);
+    }
+
+    #[test]
     fn codec_names_cover_all_wire_modes() {
         assert_eq!(codec_mode_name(0), "Lossless LPC");
         assert_eq!(codec_mode_name(1), "Raw PCM16");
         assert_eq!(codec_mode_name(2), "VBR Compressed");
         assert_eq!(codec_mode_name(3), "DTX Silence");
+        assert_eq!(codec_mode_name(4), "Opus RLD");
         assert_eq!(codec_mode_name(99), "Unknown");
     }
 }

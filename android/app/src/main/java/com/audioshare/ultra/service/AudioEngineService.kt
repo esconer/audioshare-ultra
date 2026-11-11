@@ -165,6 +165,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             prefs.getBoolean("night_mode", false),
             prefs.getBoolean("gaming_lock", false)
         )
+        // Restore the compressed-codec backend selection on every stream
+        // start: 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
+        nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
         return START_STICKY
     }
 

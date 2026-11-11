@@ -4,4 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# Zero mandatory external dependencies for instant cross-compilation on Windows, Linux, and Android NDK
+# Pure-Rust Opus codec (no C/CMake/NDK library dependency). The compressed
+# codec module is opt-in at runtime; lossless modes never touch it.
+opus-rs = "=0.1.42"
