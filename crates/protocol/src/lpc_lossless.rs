@@ -163,7 +163,10 @@ impl CvsdState {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            step: 256,
+            // Start at a quiet-friendly step. A loud block grows the step within
+            // a few identical bits, while silence no longer starts at a
+            // -42 dBFS granular limit cycle.
+            step: 64,
             history: 0b101,
         }
     }
@@ -175,12 +178,18 @@ impl CvsdState {
             // Three identical bits in a row: slope overload, grow the step.
             self.step = (self.step + (self.step >> 2) + 1).min(16_384);
         } else {
-            // Leaky decay keeps granular noise under control.
-            self.step = (self.step - (self.step >> 3)).max(32);
+            // Leaky decay keeps granular noise under control. The floor is
+            // deliberately tiny (6 LSB, about -75 dBFS) instead of 32 LSB,
+            // which was an audible constant hiss during silence.
+            self.step = (self.step - (self.step >> 3)).max(6);
         }
         self.step
     }
 }
+
+/// Smallest permitted Jayant step. At 4 LSB the mid-riser quantizer toggles
+/// by only +/-2 LSB, i.e. roughly -84 dBFS instead of the old -48 dBFS floor.
+const VBR_MIN_STEP: i32 = 4;
 
 /// Adaptive Jayant step update shared identically by encoder and decoder.
 #[inline(always)]
@@ -191,31 +200,89 @@ fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8) -> i32 {
             let next = if b == *prev_bit {
                 (step * 5) >> 2
             } else {
-                (step * 7) >> 3
+                // A sign change means the step overshot the waveform; decay
+                // faster than the old 7/8 so idle granular noise dies out.
+                (step * 3) >> 2
             };
             *prev_bit = b;
-            next.clamp(64, 8192)
+            next.clamp(VBR_MIN_STEP, 8192)
         }
         2 => {
             *prev_bit = (code >> 1) as u8;
             if code == 0 || code == 3 {
-                ((step * 5) >> 2).clamp(32, 8192)
+                ((step * 5) >> 2).clamp(VBR_MIN_STEP, 8192)
             } else {
-                ((step * 15) >> 4).clamp(32, 8192)
+                // Codes 1/2 are the codes a zero residual oscillates between.
+                // Decaying them is essential: keeping `step` unchanged here
+                // made the old quantizer hiss forever at its initial 256 LSB.
+                ((step * 13) >> 4).clamp(VBR_MIN_STEP, 8192)
             }
         }
         _ => {
             *prev_bit = (code >> (width - 1)) as u8;
             let max_c = (1u32 << width) - 1;
             if code <= 1 || code >= max_c - 1 {
-                ((step * 5) >> 2).clamp(16, 8192)
+                ((step * 5) >> 2).clamp(VBR_MIN_STEP, 8192)
             } else if code == 2 || code == max_c - 2 {
                 step
             } else {
-                ((step * 15) >> 4).clamp(16, 8192)
+                ((step * 13) >> 4).clamp(VBR_MIN_STEP, 8192)
             }
         }
     }
+}
+
+/// Initial Jayant step ladder. Index 0 (4 LSB) is used for silence/very quiet
+/// blocks, while index 7 leaves headroom for full-scale transients.
+const VBR_INIT_STEPS: [i32; 8] = [4, 16, 64, 160, 384, 896, 2048, 4096];
+
+/// Quantize the first sample of a block to the 5-bit seed carried in the
+/// block header. Rounding (instead of truncation) keeps the mid-range error
+/// within half a 2048-LSB bucket; only the positive full-scale clamp can use
+/// the full bucket.
+#[inline(always)]
+fn quantize_vbr_seed(first_sample: i16) -> i32 {
+    (((first_sample as i32 + 1024) >> 11).clamp(-16, 15)) << 11
+}
+
+/// Choose an initial step that covers both the block's measured slope and the
+/// unavoidable error between `first_sample` and its 5-bit seed. Without the
+/// seed-error term, a quiet block near a seed boundary would start at step 4
+/// and take most of the 2.5 ms block to converge.
+#[inline(always)]
+fn vbr_initial_step(first_sample: i16, max_slope: i32) -> i32 {
+    let seed_error = (first_sample as i32 - quantize_vbr_seed(first_sample)).abs();
+    let target = (max_slope.max(seed_error) >> 1).max(4);
+    VBR_INIT_STEPS
+        .iter()
+        .copied()
+        .find(|&step| step >= target)
+        .unwrap_or(VBR_INIT_STEPS[7])
+}
+
+/// Pack a 5-bit first-sample seed and a 3-bit initial-step index into the
+/// single per-block header byte. The top bit of `first_sample` is not lost:
+/// the seed is a rounded 5-bit value, and the decoder reconstructs it at the
+/// same 2048-LSB granularity.
+#[inline(always)]
+fn pack_vbr_block_header(first_sample: i16, max_slope: i32) -> u8 {
+    let seed5 = (quantize_vbr_seed(first_sample) >> 11).clamp(-16, 15) as i8 as u8 & 0x1F;
+    let step = vbr_initial_step(first_sample, max_slope);
+    let step_idx = VBR_INIT_STEPS
+        .iter()
+        .position(|&candidate| candidate == step)
+        .unwrap_or(0) as u8;
+    (seed5 << 3) | (step_idx & 0x07)
+}
+
+/// Inverse of [`pack_vbr_block_header`].
+#[inline(always)]
+fn unpack_vbr_block_header(header: u8) -> (i32, i32) {
+    let seed = ((header as i8) >> 3) as i32;
+    (
+        (seed << 11).clamp(-32_768, 32_767),
+        VBR_INIT_STEPS[(header & 0x07) as usize],
+    )
 }
 
 /// Encode a 2.5 ms stereo subframe with the user-selected VBR profile.
@@ -270,13 +337,22 @@ pub fn encode_vbr_subframe(
     let exponent_start = 2usize;
     let payload_start = exponent_start + 2 * blocks_per_channel;
 
-    // Store top 8 bits of initial sample per channel in `out[2..4]` so `prev1`
-    // starts within +/-128 of `pcm_stereo[ch]` instead of jumping from 0!
+    // Pack a 5-bit initial sample seed and a 3-bit initial step scale into
+    // `out[2..4]` so quiet blocks start at step 4 (no idle hiss) while loud
+    // blocks start near the measured signal slope without overload.
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
             let first_idx = (block * spec.block_len) * 2 + ch;
+            let first_s = pcm_stereo[first_idx];
+            let mut max_slope = 0i32;
+            let mut prev = first_s as i32;
+            for k in 1..spec.block_len.min(16) {
+                let s = pcm_stereo[(block * spec.block_len + k) * 2 + ch] as i32;
+                max_slope = max_slope.max((s - prev).abs());
+                prev = s;
+            }
             out[exponent_start + ch * blocks_per_channel + block] =
-                (pcm_stereo[first_idx] >> 8) as u8;
+                pack_vbr_block_header(first_s, max_slope);
         }
     }
 
@@ -286,9 +362,8 @@ pub fn encode_vbr_subframe(
     // Closed-loop adaptive DPCM quantization using reconstructed predictor + Jayant step.
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
-            let seed_i8 = out[exponent_start + ch * blocks_per_channel + block] as i8;
-            let mut prev1 = (seed_i8 as i32) << 8;
-            let mut step = 256i32;
+            let header = out[exponent_start + ch * blocks_per_channel + block];
+            let (mut prev1, mut step) = unpack_vbr_block_header(header);
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
@@ -371,9 +446,8 @@ pub fn decode_vbr_subframe_to_f32(
 
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
-            let seed_i8 = encoded[exponent_start + ch * blocks_per_channel + block] as i8;
-            let mut prev1 = (seed_i8 as i32) << 8;
-            let mut step = 256i32;
+            let header = encoded[exponent_start + ch * blocks_per_channel + block];
+            let (mut prev1, mut step) = unpack_vbr_block_header(header);
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
@@ -961,6 +1035,107 @@ mod tests {
             snr_high,
             snr_low
         );
+    }
+
+    #[test]
+    fn test_vbr_block_header_packs_seed_and_step() {
+        // Silence must select the 4-LSB step, not the old fixed 256 LSB.
+        let silent = pack_vbr_block_header(0, 0);
+        assert_eq!(silent & 0x07, 0);
+        let (seed, step) = unpack_vbr_block_header(silent);
+        assert_eq!(seed, 0);
+        assert_eq!(step, 4);
+
+        // A full-scale-ish slope must select a large initial step.
+        let loud = pack_vbr_block_header(0, 30_000);
+        let (_, step) = unpack_vbr_block_header(loud);
+        assert!(step >= 2048, "loud block step {} too small", step);
+
+        // A 5-bit linear seed has a 2048-LSB bucket; clamp at the positive
+        // full-scale edge gives at most one bucket of error there.
+        for sample in [-32_768i16, -20_000, -1_025, -1, 0, 1, 1_025, 20_000, 32_767] {
+            let header = pack_vbr_block_header(sample, 0);
+            let (seed, _) = unpack_vbr_block_header(header);
+            assert!(
+                (sample as i32 - seed).abs() <= 2048,
+                "seed error for {} was {}",
+                sample,
+                (sample as i32 - seed).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_vbr_two_bit_middle_codes_decay_to_floor() {
+        // A zero residual in the 2-bit profile alternates between the two
+        // middle codes. The old update kept `step` unchanged, producing a
+        // permanent +/-128 LSB (-48 dBFS) hiss.
+        let mut step = 256;
+        let mut prev_bit = 1;
+        for i in 0..96 {
+            let code = if i % 2 == 0 { 1 } else { 2 };
+            step = adapt_vbr_step(step, code, 2, &mut prev_bit);
+        }
+        assert_eq!(step, VBR_MIN_STEP);
+    }
+
+    #[test]
+    fn test_vbr_silence_has_no_constant_hiss() {
+        let silence = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for kbps in [96u16, 160, 256, 320] {
+            let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encode_vbr_subframe(&silence, kbps, &mut encoded);
+            let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(&encoded[..len], &mut decoded));
+
+            let peak_lsb = decoded
+                .iter()
+                .fold(0.0f32, |peak, &sample| peak.max(sample.abs()))
+                * 32_768.0;
+            // The block profiles toggle by at most +/-2 LSB. The 1-bit CVSD
+            // rung has no zero level, so keep a looser but still inaudible
+            // ceiling for it (about -54 dBFS).
+            let ceiling = if kbps == 96 { 96.0 } else { 4.0 };
+            assert!(
+                peak_lsb <= ceiling,
+                "{} kbps silence produced {:.1} LSB of constant noise",
+                kbps,
+                peak_lsb
+            );
+        }
+    }
+
+    #[test]
+    fn test_vbr_quiet_signal_does_not_spike_at_block_start() {
+        // 100 LSB (-50 dBFS) 1 kHz tone exercises the 5-bit seed boundary:
+        // the old fixed 256-step quantizer toggled by +/-128 LSB here.
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let phase = (i as f32) * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0 + 0.3;
+            let sample = (phase.sin() * 100.0).round() as i16;
+            pcm[i * 2] = sample;
+            pcm[i * 2 + 1] = sample;
+        }
+
+        for kbps in [160u16, 256, 320] {
+            let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encode_vbr_subframe(&pcm, kbps, &mut encoded);
+            let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(&encoded[..len], &mut decoded));
+
+            let peak_error_lsb =
+                pcm.iter()
+                    .zip(decoded.iter())
+                    .fold(0.0f32, |peak, (&original, &reconstructed)| {
+                        peak.max((original as f32 - reconstructed * 32_768.0).abs())
+                    });
+            assert!(
+                peak_error_lsb < 160.0,
+                "{} kbps quiet tone spiked by {:.1} LSB",
+                kbps,
+                peak_error_lsb
+            );
+        }
     }
 
     #[test]
