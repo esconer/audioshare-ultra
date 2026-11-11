@@ -410,22 +410,46 @@ impl NoiseShapedQuantizer {
     ) -> i16 {
         let mut max_abs: i16 = 0;
         for i in 0..120 {
+            let in_l = src_f32[i * 2].clamp(-1.0, 1.0);
+            let in_r = src_f32[i * 2 + 1].clamp(-1.0, 1.0);
+
+            // Exact digital silence must stay exactly zero: dither here would
+            // allocate bits in the lossless encoder and keep DTX from reaching
+            // a genuinely silent stream.
+            if in_l.abs() < 1.0e-7 && in_r.abs() < 1.0e-7 {
+                self.err_l = 0.0;
+                self.err_r = 0.0;
+                dst_i16[i * 2] = 0;
+                dst_i16[i * 2 + 1] = 0;
+                continue;
+            }
+
             self.rng ^= self.rng << 13;
             self.rng ^= self.rng >> 17;
             self.rng ^= self.rng << 5;
             let r1 = ((self.rng & 0xFFFF) as f32 / 65535.0) - 0.5;
             let r2 = (((self.rng >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5;
-            let dither = r1 + r2;
+            let dither_l = r1 + r2;
+            // Anti-phase dither doubles the noise in the Mid-Side encoder's
+            // Side channel (`L - R`), forcing 2-3 bits/sample even for a mono
+            // or centered signal. Use correlated dither when the channels are
+            // effectively identical so Side stays zero, and independent TPDF
+            // otherwise.
+            let dither_r = if (in_l - in_r).abs() < 1.0e-5 {
+                dither_l
+            } else {
+                r1 - r2
+            };
 
             // Left channel with 0.85 high-pass error feedback
-            let shaped_l = src_f32[i * 2].clamp(-1.0, 1.0) * 32766.0 - 0.85 * self.err_l;
-            let q_l = (shaped_l + dither).round().clamp(-32767.0, 32767.0);
+            let shaped_l = in_l * 32766.0 - 0.85 * self.err_l;
+            let q_l = (shaped_l + dither_l).round().clamp(-32767.0, 32767.0);
             self.err_l = q_l - shaped_l;
             let out_l = q_l as i16;
 
             // Right channel with 0.85 high-pass error feedback
-            let shaped_r = src_f32[i * 2 + 1].clamp(-1.0, 1.0) * 32766.0 - 0.85 * self.err_r;
-            let q_r = (shaped_r - dither).round().clamp(-32767.0, 32767.0);
+            let shaped_r = in_r * 32766.0 - 0.85 * self.err_r;
+            let q_r = (shaped_r + dither_r).round().clamp(-32767.0, 32767.0);
             self.err_r = q_r - shaped_r;
             let out_r = q_r as i16;
 
@@ -620,6 +644,48 @@ mod tests {
         let max_abs = quantizer.quantize_stereo_subframe(&src, &mut dst);
         assert!(max_abs > 0);
         assert!((dst[0] - 8192).abs() < 100);
+    }
+
+    #[test]
+    fn test_noise_shaped_quantizer_keeps_silence_and_mono_side_clean() {
+        // Digital silence must remain bit-exact zero so DTX can engage and
+        // the lossless encoder does not spend bits on dither.
+        let mut quantizer = NoiseShapedQuantizer::new();
+        let silence = [0.0f32; 240];
+        let mut silent_out = [123i16; 240];
+        assert_eq!(
+            quantizer.quantize_stereo_subframe(&silence, &mut silent_out),
+            0
+        );
+        assert!(silent_out.iter().all(|&sample| sample == 0));
+
+        // A centered/mono signal must quantize to identical L/R samples. The
+        // old anti-phase dither made L-R a random +/-2 LSB signal, which the
+        // Mid-Side lossless encoder had to transmit at 2-3 bits/sample.
+        let mut mono = [0.0f32; 240];
+        for i in 0..120 {
+            let sample = ((i as f32) * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0).sin() * 0.4;
+            mono[i * 2] = sample;
+            mono[i * 2 + 1] = sample;
+        }
+        let mut mono_out = [0i16; 240];
+        quantizer.quantize_stereo_subframe(&mono, &mut mono_out);
+        for frame in mono_out.chunks_exact(2) {
+            assert_eq!(
+                frame[0], frame[1],
+                "mono input must produce an exactly zero Side channel"
+            );
+        }
+
+        // Uncorrelated stereo still receives independent dither and must stay
+        // finite and within the 16-bit range.
+        let mut stereo = [0.0f32; 240];
+        for i in 0..240 {
+            stereo[i] = if i & 1 == 0 { 0.3 } else { -0.2 };
+        }
+        let mut stereo_out = [0i16; 240];
+        quantizer.quantize_stereo_subframe(&stereo, &mut stereo_out);
+        assert!(stereo_out.iter().all(|&sample| sample < i16::MAX));
     }
 
     #[test]

@@ -143,6 +143,13 @@ impl OpusStreamEncoder {
 /// from Opus, so a later switch back cannot decode with stale history.
 pub struct OpusStreamDecoder {
     inner: OpusDecoder,
+    /// Last sequence number whose payload reached the decoder.
+    ///
+    /// Opus/CELT keeps an MDCT overlap tail and leaky band-energy predictors,
+    /// so feeding frames in arrival order instead of stream order corrupts the
+    /// reconstruction. This tracker lets [`Self::decode_subframe_at_seq`]
+    /// reject duplicates/late frames and advance the codec across gaps.
+    last_seq: Option<u16>,
 }
 
 impl OpusStreamDecoder {
@@ -150,7 +157,10 @@ impl OpusStreamDecoder {
     pub fn new() -> Option<Self> {
         OpusDecoder::new(SAMPLE_RATE as i32, CHANNELS)
             .ok()
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner,
+                last_seq: None,
+            })
     }
 
     /// Decode a tagged `[TAG_OPUS_RLD][opus packet...]` subframe.
@@ -173,6 +183,48 @@ impl OpusStreamDecoder {
             .decode(&encoded[1..], SUBFRAME_FRAMES, out_f32)
             .map(|frames| frames == SUBFRAME_FRAMES)
             .unwrap_or(false)
+    }
+
+    /// Sequence-aware decode for a real-time stream.
+    ///
+    /// Opus is a stateful codec: the 120-sample MDCT overlap tail and CELT
+    /// band-energy predictors assume consecutive 2.5 ms frames. A duplicate,
+    /// a late out-of-order frame, or a skipped packet must therefore never be
+    /// fed into the codec as if it followed the last decoded frame.
+    ///
+    /// - `delta <= 0` (duplicate/late) is rejected without mutating state.
+    /// - `delta > 1` advances the codec with concealment frames first, capped
+    ///   at 4 frames (10 ms). Beyond that the stream is effectively new; the
+    ///   caller resets the decoder on a playhead resync, and decoding more PLC
+    ///   frames than the codec's useful concealment window would only add
+    ///   artefacts.
+    pub fn decode_subframe_at_seq(
+        &mut self,
+        seq: u16,
+        encoded: &[u8],
+        out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
+    ) -> bool {
+        if let Some(previous) = self.last_seq {
+            let delta = seq.wrapping_sub(previous) as i16;
+            if delta <= 0 {
+                return false;
+            }
+            if delta > 1 {
+                let missed = ((delta - 1) as usize).min(4);
+                let mut concealment = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                for _ in 0..missed {
+                    // An empty packet is libopus's packet-loss concealment
+                    // entry point; it advances the MDCT overlap state.
+                    let _ = self.inner.decode(&[], SUBFRAME_FRAMES, &mut concealment);
+                }
+            }
+        }
+
+        let decoded = self.decode_subframe(encoded, out_f32);
+        if decoded {
+            self.last_seq = Some(seq);
+        }
+        decoded
     }
 }
 
@@ -267,6 +319,40 @@ mod tests {
         assert!(!decoder.decode_subframe(&[TAG_OPUS_RLD], &mut out));
         assert!(!decoder.decode_subframe(&[0x7E, 0x00, 0x00], &mut out));
         assert!(!decoder.decode_subframe(&[0x00, 0x00, 0x00], &mut out));
+    }
+
+    #[test]
+    fn test_decoder_rejects_duplicates_and_conceals_sequence_gaps() {
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Establish state at seq 100.
+        let first = tone_frame(0);
+        let len = encoder.encode_subframe(&first, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(100, &payload[..len], &mut out));
+
+        // A duplicate of 100 and a late 99 must not be decoded through the
+        // stateful CELT history.
+        let second = tone_frame(1);
+        let second_len = encoder.encode_subframe(&second, 128, &mut payload).unwrap();
+        assert!(!decoder.decode_subframe_at_seq(100, &payload[..second_len], &mut out));
+        assert!(!decoder.decode_subframe_at_seq(99, &payload[..second_len], &mut out));
+
+        // Seq 103 is a two-frame gap: conceal 101 and 102, then decode 103.
+        let third = tone_frame(2);
+        let third_len = encoder.encode_subframe(&third, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(103, &payload[..third_len], &mut out));
+        assert!(out.iter().all(|sample| sample.is_finite()));
+
+        // Sequence wrap-around is a forward delta, not a late packet.
+        let fourth = tone_frame(3);
+        let fourth_len = encoder.encode_subframe(&fourth, 128, &mut payload).unwrap();
+        let mut wrap_decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        assert!(wrap_decoder.decode_subframe_at_seq(65534, &payload[..fourth_len], &mut out));
+        assert!(wrap_decoder.decode_subframe_at_seq(65535, &payload[..fourth_len], &mut out));
+        assert!(wrap_decoder.decode_subframe_at_seq(0, &payload[..fourth_len], &mut out));
     }
 
     #[test]

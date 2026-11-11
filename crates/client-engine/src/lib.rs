@@ -187,6 +187,7 @@ fn decode_raw_pcm16_payload(payload: &[u8], out: &mut [f32; SUBFRAME_STEREO_SAMP
 /// a backend switch or a stream resync.
 fn decode_compressed_payload(
     payload: &[u8],
+    seq: u16,
     opus_decoder: &mut Option<OpusStreamDecoder>,
     out: &mut [f32; SUBFRAME_STEREO_SAMPLES],
 ) -> bool {
@@ -196,7 +197,7 @@ fn decode_compressed_payload(
         }
         return opus_decoder
             .as_mut()
-            .map(|decoder| decoder.decode_subframe(payload, out))
+            .map(|decoder| decoder.decode_subframe_at_seq(seq, payload, out))
             .unwrap_or(false);
     }
 
@@ -654,6 +655,8 @@ impl ClientEngine {
                 }
             }
 
+            let active_key = *session_key.lock().unwrap();
+
             if last_feedback.elapsed() >= Duration::from_millis(500)
                 || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
             {
@@ -700,14 +703,13 @@ impl ClientEngine {
                     auth_mac32: 0,
                 };
                 let mut fb_bytes = [0u8; CONTROL_FEEDBACK_LEN];
-                fb.encode(&mut fb_bytes);
+                fb.encode_signed(active_key.as_ref(), &mut fb_bytes);
 
                 let _ = socket.send_to(&fb_bytes, config.server_addr);
 
                 last_feedback = Instant::now();
             }
 
-            let active_key = *session_key.lock().unwrap();
             let mut packets_drained = 0u8;
 
             while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
@@ -861,7 +863,13 @@ impl ClientEngine {
                                 CodecMode::CompressedLowDelay | CodecMode::OpusRld
                             ) {
                                 let payload = &prim[cursor..cursor + sub_len];
-                                decode_compressed_payload(payload, &mut opus_decoder, &mut pcm_f32)
+                                let seq = base_seq.wrapping_add(sub_idx);
+                                decode_compressed_payload(
+                                    payload,
+                                    seq,
+                                    &mut opus_decoder,
+                                    &mut pcm_f32,
+                                )
                             } else if parsed.header.mode == CodecMode::RawPcm16 {
                                 decode_raw_pcm16_payload(
                                     &prim[cursor..cursor + sub_len],
@@ -1458,6 +1466,7 @@ mod tests {
         let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_compressed_payload(
             &opus_payload[..opus_len],
+            10,
             &mut decoder,
             &mut out
         ));
@@ -1469,6 +1478,7 @@ mod tests {
         let mut vbr_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_compressed_payload(
             &vbr_payload[..vbr_len],
+            11,
             &mut decoder,
             &mut vbr_out
         ));
@@ -1481,6 +1491,7 @@ mod tests {
         let mut opus_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_compressed_payload(
             &opus_payload[..opus_len],
+            12,
             &mut decoder,
             &mut opus_out
         ));

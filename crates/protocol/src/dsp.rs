@@ -259,13 +259,32 @@ impl BurstDecouplerRing {
                 .store(r.wrapping_add(out.len()), Ordering::Release);
             true
         } else if (avail & !1) > 0 {
-            // Copy all available samples and smoothly decay the tail (NEVER drop to abrupt silence!)
+            // Partial underrun: copy what is left, but cross-fade the final
+            // frames to zero before the exponential tail. A callback that is
+            // only one frame short would otherwise leave the output at ~98.5%
+            // amplitude, and the next (empty) callback starts at -90 dBFS
+            // comfort dither: a full-scale step into the DAC.
             let safe_avail = avail & !1; // Keep stereo L/R alignment
+            let fade_frames = (safe_avail / 2).min(16);
+            let fade_samples = fade_frames * 2;
+            let fade_start = safe_avail - fade_samples;
             let buf_ptr = self.buf.get() as *const f32;
             let mut last_l = 0.0f32;
             let mut last_r = 0.0f32;
             for i in 0..safe_avail {
-                let s = unsafe { *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK) };
+                let mut s = unsafe { *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK) };
+                if i >= fade_start {
+                    let frame = (i - fade_start) / 2;
+                    // Raised-cosine fade: gain 1.0 on the first frame and
+                    // exactly 0.0 on the last, with no slope discontinuity.
+                    let gain = if fade_frames > 1 {
+                        let phase = core::f32::consts::PI * frame as f32 / (fade_frames - 1) as f32;
+                        0.5 * (1.0 + phase.cos())
+                    } else {
+                        0.0
+                    };
+                    s *= gain;
+                }
                 out[i] = s;
                 if i & 1 == 0 {
                     last_l = s;
@@ -432,12 +451,14 @@ mod tests {
         assert_eq!(ring.available_samples(), 960 - 768);
 
         // Third pull: only 192 samples remaining (< 384 request).
-        // Partial-read continuity copies all 192 samples and smoothly attenuates the tail!
+        // The ring cross-fades the last 16 stereo frames to zero so the next
+        // callback starts from silence instead of a full-scale step.
         assert!(ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
         assert_eq!(aaudio_burst[0], 0.42);
-        assert_eq!(aaudio_burst[191], 0.42);
-        assert!(aaudio_burst[192] < 0.42); // Exponential decay started
-        assert!(aaudio_burst[383] < aaudio_burst[192]); // Further decay towards end of tail
+        assert_eq!(aaudio_burst[159], 0.42); // last sample before the fade
+        assert!((aaudio_burst[160] - 0.42).abs() < 1.0e-6); // fade starts at unity
+        assert!(aaudio_burst[191].abs() < 1.0e-6); // last frame faded to zero
+        assert!(aaudio_burst[192..].iter().all(|&s| s == 0.0));
         assert_eq!(ring.available_samples(), 0);
 
         // Fourth pull: 0 samples remaining -> comfort dither injected and returns false
@@ -636,6 +657,26 @@ mod tests {
             resampler.integral_err, 0.0,
             "sub-deadband error must not wind up the integral term"
         );
+    }
+
+    #[test]
+    fn test_burst_decoupler_near_full_underrun_fades_to_zero() {
+        let ring = BurstDecouplerRing::new();
+        // One stereo frame short of a full 384-sample AAudio burst.
+        let input = [0.5f32; 382];
+        assert_eq!(ring.push_samples(&input), 382);
+
+        let mut out = [0.0f32; 384];
+        let mut rng = 7u32;
+        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert_eq!(out[0], 0.5);
+        // The old 0.985 tail left the final sample at ~98.5% amplitude and
+        // the next empty callback clicked at -90 dBFS comfort dither.
+        assert_eq!(out[383], 0.0);
+        assert_eq!(ring.available_samples(), 0);
+
+        assert!(!ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert!(out.iter().all(|sample| sample.abs() <= 0.0001));
     }
 
     #[test]

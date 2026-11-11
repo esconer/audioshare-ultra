@@ -1301,7 +1301,15 @@ impl HostEngine {
                         }
                     }
                 } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
-                    if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                    // Feedback carries remote-control commands (quality profile,
+                    // codec backend, media transport) and group-sync delays.
+                    // When a PIN is configured, require the keyed MAC over the
+                    // complete body before acting on any of it. Unencrypted LAN
+                    // and party mode have no key and stay backward compatible.
+                    let active_key = *session_key.lock().unwrap();
+                    if let Some(fb) =
+                        ClientFeedbackPacket::decode_verified(&ctrl_buf[..len], active_key.as_ref())
+                    {
                         // Compressed-codec backend selection from the phone UI:
                         // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
                         // This is separate from the quality profile and only

@@ -79,6 +79,43 @@ impl ClientFeedbackPacket {
         out[16..20].copy_from_slice(&self.auth_mac32.to_be_bytes());
     }
 
+    /// Domain-separated MAC input for a feedback packet.
+    ///
+    /// `SessionKey::compute_mac32` only consumes the header sequence,
+    /// timestamp, body length and body bytes. These fixed fields keep feedback
+    /// authentication from colliding with an audio packet MAC. The complete
+    /// 16-byte feedback body (magic, loss, delays, volume, requested mode) is
+    /// covered, so a LAN attacker cannot forge codec switches, media keys or
+    /// group-sync delay reports while PIN encryption is active.
+    fn auth_header(&self) -> WireHeader {
+        WireHeader {
+            mode: CodecMode::SilenceHeartbeat,
+            subframe_count: 0,
+            encrypted: true,
+            sequence: self.fec_rate_permille,
+            tx_timestamp_us: ((self.bluetooth_delay_ms as u32) << 16)
+                | (self.hardware_delay_ms as u32),
+            primary_len: 16,
+            fec_n1_len: self.client_volume,
+            fec_n2_len: self.requested_mode,
+            host_volume: 0,
+            stream_id: 0,
+            header_crc16: 0,
+        }
+    }
+
+    /// Encode, signing the 16-byte body when a session key is active.
+    ///
+    /// Without a key the MAC field is explicitly zeroed, matching the legacy
+    /// unencrypted control plane.
+    pub fn encode_signed(&self, key: Option<&SessionKey>, out: &mut [u8; CONTROL_FEEDBACK_LEN]) {
+        self.encode(out);
+        let mac = key
+            .map(|key| key.compute_mac32(&self.auth_header(), &out[..16]))
+            .unwrap_or(0);
+        out[16..20].copy_from_slice(&mac.to_be_bytes());
+    }
+
     pub fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < CONTROL_FEEDBACK_LEN || &buf[0..8] != CONTROL_FEEDBACK_MAGIC {
             return None;
@@ -91,6 +128,23 @@ impl ClientFeedbackPacket {
             hardware_delay_ms: u16::from_be_bytes([buf[14], buf[15]]),
             auth_mac32: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
         })
+    }
+
+    /// Decode and verify the feedback MAC when the host has a session key.
+    ///
+    /// With `key == None` this is equivalent to [`Self::decode`], preserving
+    /// unencrypted LAN/party mode. With a key configured, unsigned or
+    /// tampered feedback is rejected before it can register a client or issue
+    /// a command.
+    pub fn decode_verified(buf: &[u8], key: Option<&SessionKey>) -> Option<Self> {
+        let packet = Self::decode(buf)?;
+        if let Some(key) = key {
+            let expected = key.compute_mac32(&packet.auth_header(), &buf[..16]);
+            if packet.auth_mac32 != expected {
+                return None;
+            }
+        }
+        Some(packet)
     }
 }
 
@@ -460,6 +514,47 @@ mod tests {
         let decoded = WireHeader::decode(&buf).expect("Opus mode header must decode");
         assert_eq!(decoded.mode, CodecMode::OpusRld);
         assert_eq!(decoded.subframe_count, 2);
+    }
+
+    #[test]
+    fn test_feedback_authentication_rejects_forgery_and_tampering() {
+        let key = SessionKey::from_pin("4829");
+        let wrong_key = SessionKey::from_pin("0000");
+        let mut buf = [0u8; CONTROL_FEEDBACK_LEN];
+        let packet = ClientFeedbackPacket {
+            fec_rate_permille: 37,
+            bluetooth_delay_ms: 142,
+            hardware_delay_ms: 21,
+            client_volume: 76,
+            requested_mode: 20,
+            auth_mac32: 0,
+        };
+
+        packet.encode_signed(Some(&key), &mut buf);
+        let decoded =
+            ClientFeedbackPacket::decode_verified(&buf, Some(&key)).expect("signed feedback");
+        assert_eq!(decoded.fec_rate_permille, 37);
+        assert_eq!(decoded.requested_mode, 20);
+        assert_eq!(decoded.bluetooth_delay_ms, 142);
+
+        // Wrong key, unsigned legacy packet, and a tampered command must all
+        // be rejected while a key is configured.
+        assert!(ClientFeedbackPacket::decode_verified(&buf, Some(&wrong_key)).is_none());
+        let unsigned = ClientFeedbackPacket {
+            auth_mac32: 0,
+            ..decoded
+        };
+        unsigned.encode(&mut buf);
+        assert!(ClientFeedbackPacket::decode_verified(&buf, Some(&key)).is_none());
+
+        packet.encode_signed(Some(&key), &mut buf);
+        buf[13] = 21; // swap the codec backend command after signing
+        assert!(ClientFeedbackPacket::decode_verified(&buf, Some(&key)).is_none());
+
+        // Without a key the control plane remains backward compatible.
+        packet.encode_signed(None, &mut buf);
+        assert_eq!(&buf[16..20], &[0, 0, 0, 0]);
+        assert!(ClientFeedbackPacket::decode_verified(&buf, None).is_some());
     }
 
     #[test]
