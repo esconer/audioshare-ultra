@@ -857,16 +857,28 @@ impl ClientEngine {
                                 break;
                             }
 
+                            let s = base_seq.wrapping_add(sub_idx);
+                            // Skip redundant work before touching any decoder.
+                            // Party-mode broadcast and USB+Wi-Fi active-active
+                            // delivery send the same subframe twice, and a
+                            // packet that arrives after its playhead has
+                            // passed cannot be heard at all.
+                            if (s.wrapping_sub(next_play_seq) as i16) < 0
+                                || sequencer.has_primary(s)
+                            {
+                                cursor += sub_len;
+                                continue;
+                            }
+
                             let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             let decoded_ok = if matches!(
                                 parsed.header.mode,
                                 CodecMode::CompressedLowDelay | CodecMode::OpusRld
                             ) {
                                 let payload = &prim[cursor..cursor + sub_len];
-                                let seq = base_seq.wrapping_add(sub_idx);
                                 decode_compressed_payload(
                                     payload,
-                                    seq,
+                                    s,
                                     &mut opus_decoder,
                                     &mut pcm_f32,
                                 )
@@ -896,11 +908,7 @@ impl ClientEngine {
                             };
 
                             if decoded_ok {
-                                let s = base_seq.wrapping_add(sub_idx);
-                                // Only insert if this subframe has not already been played by the DAC
-                                if (s.wrapping_sub(next_play_seq) as i16) >= 0 {
-                                    sequencer.push_primary(s, &pcm_f32);
-                                }
+                                sequencer.push_primary(s, &pcm_f32);
                                 if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                     latest_rx_seq = s;
                                 }
@@ -1098,6 +1106,15 @@ impl ClientEngine {
                     }
                 }
 
+                // Move the popped subframe through the resampler and into the
+                // decoupler before measuring either queue. Measuring first
+                // counted this subframe in neither `net_subframes` (the
+                // playhead had already advanced) nor `fifo_subframes` (not
+                // pushed yet), leaving a permanent -1 subframe bias that the
+                // clock loop then "corrected" with negative drift.
+                let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
+                burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
+
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock).
                 // The decoupler is filled at the output rate, so convert its
                 // sample count through the active base ratio instead of
@@ -1128,9 +1145,6 @@ impl ClientEngine {
 
                 let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
                 telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
-
-                let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
-                burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
 
                 // Never synthesize more than one PLC subframe per loop pass
                 // without first polling the socket again. The previous code
@@ -1280,6 +1294,16 @@ mod tests {
         trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
         assert_eq!(next_play, 90);
         assert_eq!(net_subframes, 6.0);
+
+        // A normal 2-packet Wi-Fi A-MPDU burst (2 + 2 subframes) arriving on
+        // top of a full decoupler stays inside target + 6 and must be
+        // absorbed by the resampler, not skipped as a post-stall backlog.
+        let mut next_play = 97u16;
+        let mut net_subframes = 4.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        assert_eq!(next_play, 97);
+        assert_eq!(net_subframes, 4.0);
+        assert_eq!(net_subframes + 6.0, 10.0); // <= target_buf + 6
 
         // Never rewind, even if the FIFO estimate alone exceeds the cap.
         let mut next_play = 99u16;

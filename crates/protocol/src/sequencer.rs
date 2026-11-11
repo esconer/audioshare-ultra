@@ -71,6 +71,18 @@ impl ZeroJitterSequencer {
         cur_seq != target_seq || cur_status == STATUS_EMPTY
     }
 
+    /// Returns true if this exact sequence already holds a decoded primary
+    /// frame. Used by the receiver to skip a redundant decode when the same
+    /// packet arrives over two paths (USB + Wi-Fi, or party-mode unicast +
+    /// broadcast). FEC-healed slots deliberately return false so a late
+    /// primary copy can still replace the concealment.
+    #[inline]
+    pub fn has_primary(&self, seq: u16) -> bool {
+        let slot = &self.slots[(seq as usize) & RING_MASK];
+        let cur = slot.state.load(Ordering::Acquire);
+        (cur >> 16) as u16 == seq && (cur & 0xFFFF) == STATUS_PRIMARY_LOSSLESS
+    }
+
     #[inline]
     pub fn push_primary(&self, seq: u16, pcm_f32: &[f32; SUBFRAME_STEREO_SAMPLES]) -> bool {
         let slot = &self.slots[(seq as usize) & RING_MASK];
@@ -305,6 +317,29 @@ mod tests {
         seq.push_primary(4, &sine_frame);
         let mut rec_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(seq.pop_next(4, &mut rec_out), STATUS_PRIMARY_LOSSLESS);
+    }
+
+    #[test]
+    fn test_has_primary_skips_only_decoded_primary_slots() {
+        let mut seq = ZeroJitterSequencer::new();
+        let frame = [0.25f32; SUBFRAME_STEREO_SAMPLES];
+
+        assert!(!seq.has_primary(7));
+        assert!(seq.push_primary(7, &frame));
+        assert!(seq.has_primary(7));
+        assert!(!seq.has_primary(8));
+
+        // A FEC-healed slot is not a primary copy: a late real packet may
+        // still upgrade it.
+        assert!(seq.try_heal_with_fec(9, &frame));
+        assert!(!seq.has_primary(9));
+        assert!(!seq.is_slot_missing(9));
+
+        // Popping consumes the slot, so a duplicate arriving afterwards is
+        // no longer considered decoded and would be rejected by the playhead.
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(7, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(!seq.has_primary(7));
     }
 
     #[test]
