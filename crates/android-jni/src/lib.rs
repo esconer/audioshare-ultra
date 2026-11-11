@@ -36,6 +36,48 @@ pub struct PhoneMicTransmitter {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Anti-burst gaps for the phone-mic transmitter, mirroring the host capture
+/// pacer. OS record callbacks often deliver 10-20 ms at once; transmitting that
+/// backlog back-to-back overflows the phone's 2.4 GHz TX queue. Staying below
+/// the 2.5 ms packet cadence keeps the record clock in control.
+const PHONE_MIC_MIN_GAP_SINGLE_SUBFRAME_US: u64 = 800;
+const PHONE_MIC_MIN_GAP_MULTI_SUBFRAME_US: u64 = 1_500;
+
+#[inline]
+fn phone_mic_min_gap_us(subframes_per_pkt: usize) -> u64 {
+    if subframes_per_pkt >= 2 {
+        PHONE_MIC_MIN_GAP_MULTI_SUBFRAME_US
+    } else {
+        PHONE_MIC_MIN_GAP_SINGLE_SUBFRAME_US
+    }
+}
+
+/// Phone-mic backlog cap before old audio is discarded (50 ms).
+const PHONE_MIC_MAX_BACKLOG_SUBFRAMES: usize = 20;
+/// Headroom kept above one packet after an overflow trim.
+const PHONE_MIC_TRIM_HEADROOM_SUBFRAMES: usize = 2;
+
+/// Drop the oldest phone-mic audio when an OS scheduling stall has piled up
+/// more than 50 ms. Without this the backlog becomes permanent mic latency.
+fn trim_phone_mic_backlog(
+    ring: &BurstDecouplerRing,
+    subframes_per_pkt: usize,
+    dither_rng: &mut u32,
+) {
+    let max_samples = SUBFRAME_STEREO_SAMPLES * PHONE_MIC_MAX_BACKLOG_SUBFRAMES;
+    if ring.available_samples() <= max_samples {
+        return;
+    }
+    let keep_samples =
+        SUBFRAME_STEREO_SAMPLES * (subframes_per_pkt + PHONE_MIC_TRIM_HEADROOM_SUBFRAMES);
+    let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+    while ring.available_samples() > keep_samples {
+        if !ring.pop_exact_or_dither(&mut discard, dither_rng) {
+            break;
+        }
+    }
+}
+
 pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
     let mut targets = Vec::new();
     for item in target_hosts.split([',', ';', ' ']) {
@@ -137,6 +179,8 @@ impl PhoneMicTransmitter {
                 let mut ctrl_buf = [0u8; 64];
                 let mut peer_delays: HashMap<SocketAddr, u16> = HashMap::new();
                 let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
+                let mut last_tx: Option<Instant> = None;
+                let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
 
                 while run_clone.load(Ordering::Relaxed) {
                     if !use_hardware_mic {
@@ -167,8 +211,20 @@ impl PhoneMicTransmitter {
                         }
                     }
 
+                    trim_phone_mic_backlog(&ring_clone, subframes_per_pkt, &mut dither_rng);
+
                     if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES * subframes_per_pkt
                     {
+                        // Space catch-up packets. A 10-20 ms record burst
+                        // otherwise leaves in one 2.4 GHz TXOP and overflows
+                        // the phone's Wi-Fi queue.
+                        if let Some(last) = last_tx {
+                            let since_tx = last.elapsed();
+                            if since_tx < min_tx_gap {
+                                std::thread::sleep(min_tx_gap - since_tx);
+                            }
+                        }
+
                         let base_seq = seq;
                         let prev_n1 = fec_n1;
                         let prev_n2 = fec_n2;
@@ -227,6 +283,7 @@ impl PhoneMicTransmitter {
                             for target in &targets {
                                 let _ = socket.send_to(&dgram[..pkt_len], *target);
                             }
+                            last_tx = Some(Instant::now());
                         }
                     } else {
                         std::thread::sleep(Duration::from_micros(800));
@@ -323,10 +380,19 @@ pub fn android_report_bt_delay_ms(delay_ms: u16) {
 
 pub fn android_send_media_command(cmd_code: u8) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
-        client
-            .telemetry
-            .pending_media_command
-            .store(cmd_code, Ordering::Relaxed);
+        // Quality/media commands and the compressed-codec backend use
+        // separate slots so startup restoration cannot overwrite either one.
+        if cmd_code == 20 || cmd_code == 21 {
+            client
+                .telemetry
+                .pending_codec_backend_command
+                .store(cmd_code, Ordering::Relaxed);
+        } else {
+            client
+                .telemetry
+                .pending_media_command
+                .store(cmd_code, Ordering::Relaxed);
+        }
     }
 }
 
@@ -622,6 +688,47 @@ mod tests {
             65530,
             "hardware-mic mode must not occupy ClientEngine's speaker port"
         );
+    }
+
+    #[test]
+    fn test_phone_mic_gap_stays_below_packet_cadence() {
+        assert_eq!(phone_mic_min_gap_us(1), 800);
+        assert_eq!(phone_mic_min_gap_us(2), 1_500);
+        assert_eq!(phone_mic_min_gap_us(4), 1_500);
+        // The gap must never exceed the 2.5 ms capture cadence.
+        assert!(phone_mic_min_gap_us(1) < 2_500);
+        assert!(phone_mic_min_gap_us(2) < 5_000);
+    }
+
+    #[test]
+    fn test_phone_mic_backlog_trim_discards_oldest_audio() {
+        let ring = BurstDecouplerRing::new();
+        let mut rng = 7u32;
+        // 25 subframes tagged with their index so the trim boundary is visible.
+        for subframe in 0..25u16 {
+            let samples = [subframe as f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(ring.push_samples(&samples), SUBFRAME_STEREO_SAMPLES);
+        }
+
+        trim_phone_mic_backlog(&ring, 1, &mut rng);
+        // Keep one packet + two subframes of headroom.
+        assert_eq!(
+            ring.available_samples(),
+            SUBFRAME_STEREO_SAMPLES * 3,
+            "trim must keep exactly 7.5 ms"
+        );
+        let mut first = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(ring.pop_exact_or_dither(&mut first, &mut rng));
+        assert_eq!(first[0], 22.0, "oldest audio must be discarded");
+
+        // At or below the 20-subframe cap nothing is dropped.
+        let ring = BurstDecouplerRing::new();
+        for subframe in 0..20u16 {
+            let samples = [subframe as f32; SUBFRAME_STEREO_SAMPLES];
+            ring.push_samples(&samples);
+        }
+        trim_phone_mic_backlog(&ring, 2, &mut rng);
+        assert_eq!(ring.available_samples(), SUBFRAME_STEREO_SAMPLES * 20);
     }
 
     #[test]

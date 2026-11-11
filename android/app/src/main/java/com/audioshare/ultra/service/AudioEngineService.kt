@@ -195,8 +195,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
         // Lock and the Dolby/system-effects preference automatically!
         applyDspFromPrefs()
-        // Restore the compressed-codec backend selection on every stream
-        // start: 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
+        // Restore both the saved Host Quality Mode (1..=5) and the compressed
+        // codec backend (20 = Rust VBR, 21 = Opus RLD) on every stream start.
+        // The native client keeps these in separate pending slots, so the two
+        // calls cannot overwrite each other before the RX thread sends them.
+        val savedQuality = prefs.getInt("quality_mode", 0).coerceIn(0, 4)
+        nativeSendMediaCommand(savedQuality + 1)
         nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
         return START_STICKY
     }

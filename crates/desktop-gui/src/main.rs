@@ -59,6 +59,10 @@ enum AppTab {
 struct AudioShareApp {
     tab: AppTab,
     interfaces: Vec<NetworkInterfaceInfo>,
+    /// Index into `interfaces` used to build the pairing QR code. Defaults to
+    /// the first Wi-Fi/LAN adapter instead of the USB-RNDIS link that
+    /// `list_valid_host_interfaces()` sorts first.
+    selected_qr_iface_idx: usize,
     show_qr_modal: bool,
     dark_mode: bool,
     minimize_on_close: bool,
@@ -139,11 +143,35 @@ fn should_apply_lipsync(new_delay_ms: u16, last_delay_ms: u16) -> bool {
     new_delay_ms.abs_diff(last_delay_ms) >= 10
 }
 
+/// Default pairing adapter: the first Wi-Fi/Ethernet interface. The interface
+/// list sorts USB tethering first so the Android host page can surface it, but
+/// a QR code containing the RNDIS address is unreachable for a phone that is
+/// not plugged in.
+fn default_qr_iface_index(interfaces: &[NetworkInterfaceInfo]) -> usize {
+    interfaces
+        .iter()
+        .position(|i| !i.is_usb_tethering)
+        .unwrap_or(0)
+}
+
+/// Keep the operator's chosen adapter across a refresh, falling back to the
+/// Wi-Fi/LAN default only when the old index no longer exists.
+fn refreshed_qr_iface_index(interfaces: &[NetworkInterfaceInfo], selected: usize) -> usize {
+    if selected < interfaces.len() {
+        selected
+    } else {
+        default_qr_iface_index(interfaces)
+    }
+}
+
 impl AudioShareApp {
     fn new() -> Self {
+        let interfaces = list_valid_host_interfaces();
+        let selected_qr_iface_idx = default_qr_iface_index(&interfaces);
         let mut app = Self {
             tab: AppTab::HostSender,
-            interfaces: list_valid_host_interfaces(),
+            interfaces,
+            selected_qr_iface_idx,
             show_qr_modal: false,
             dark_mode: true,
             minimize_on_close: true,
@@ -614,6 +642,8 @@ impl eframe::App for AudioShareApp {
                     }
                     if ui.button("📱 Scan QR to Connect Phone").clicked() {
                         self.interfaces = list_valid_host_interfaces();
+                        self.selected_qr_iface_idx =
+                            refreshed_qr_iface_index(&self.interfaces, self.selected_qr_iface_idx);
                         self.show_qr_modal = !self.show_qr_modal;
                     }
                 });
@@ -628,19 +658,33 @@ impl eframe::App for AudioShareApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    let primary_ip = self
-                        .interfaces
-                        .first()
-                        .map(|i| i.ip.to_string())
-                        .unwrap_or_else(|| "192.168.1.100".into());
                     let pin_opt = if self.enable_pin_encryption {
                         Some(self.pairing_pin.as_str())
                     } else {
                         None
                     };
-                    let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
 
                     ui.vertical_centered(|ui| {
+                        if self.interfaces.len() > 1 {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Adapter:");
+                                for (idx, iface) in self.interfaces.iter().enumerate() {
+                                    ui.selectable_value(
+                                        &mut self.selected_qr_iface_idx,
+                                        idx,
+                                        format!("{} ({})", iface.name, iface.ip),
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                        }
+                        let primary_ip = self
+                            .interfaces
+                            .get(self.selected_qr_iface_idx)
+                            .or_else(|| self.interfaces.first())
+                            .map(|i| i.ip.to_string())
+                            .unwrap_or_else(|| "192.168.1.100".into());
+                        let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
                         ui.label("Scan with your Android Camera or AudioShare Ultra app:");
                         ui.add_space(6.0);
                         Self::draw_qr_code(ui, &uri);
@@ -1742,6 +1786,35 @@ mod tests {
             should_apply_lipsync(5, 60),
             "a large downward change must apply"
         );
+    }
+
+    #[test]
+    fn test_qr_iface_defaults_to_wifi_and_keeps_manual_choice() {
+        let usb = NetworkInterfaceInfo {
+            name: "enp0s20f0u1".into(),
+            ip: "192.168.42.100".parse().unwrap(),
+            is_usb_tethering: true,
+        };
+        let eth = NetworkInterfaceInfo {
+            name: "enp3s0".into(),
+            ip: "192.168.1.10".parse().unwrap(),
+            is_usb_tethering: false,
+        };
+        let wifi = NetworkInterfaceInfo {
+            name: "wlp2s0".into(),
+            ip: "192.168.1.20".parse().unwrap(),
+            is_usb_tethering: false,
+        };
+        // list_valid_host_interfaces() sorts USB first; the QR code must not
+        // default to that unreachable RNDIS address.
+        let interfaces = vec![usb.clone(), eth, wifi];
+        assert_eq!(default_qr_iface_index(&interfaces), 1);
+        // An operator selection survives a refresh, but a vanished index falls
+        // back to the Wi-Fi/LAN default.
+        assert_eq!(refreshed_qr_iface_index(&interfaces, 2), 2);
+        assert_eq!(refreshed_qr_iface_index(&interfaces, 99), 1);
+        assert_eq!(default_qr_iface_index(&[usb]), 0);
+        assert_eq!(default_qr_iface_index(&[]), 0);
     }
 
     #[test]

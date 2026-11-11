@@ -6,7 +6,9 @@ use audioshare_client_engine::{ClientConfig, ClientEngine};
 use audioshare_host_engine::discovery_and_os::{
     AdbUsbWatcher, DiscoveryBeacon, VirtualSpeakerAndRadioGuard,
 };
-use audioshare_host_engine::{list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT};
+use audioshare_host_engine::{
+    is_usb_subnet_ip, list_valid_host_interfaces, HostConfig, HostEngine, DEFAULT_PORT,
+};
 use audioshare_protocol::latency::{codec_mode_name, DESKTOP_OUTPUT_BUFFER_MS, SUBFRAME_MS};
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_subframe, encode_fec_subframe,
@@ -195,8 +197,8 @@ fn run_client(args: &[String]) {
         .parse()
         .expect("Invalid host address (expected IP or IP:PORT)");
 
-    let is_usb_or_local =
-        server_addr.ip().is_loopback() || server_addr.ip().to_string().starts_with("192.168.42.");
+    // Loopback + legacy and randomized Android USB-tethering subnets.
+    let is_usb_or_local = is_usb_subnet_ip(server_addr.ip());
 
     let cfg = ClientConfig {
         server_addr,
