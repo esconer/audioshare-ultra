@@ -66,6 +66,74 @@ fn decide_empty_playhead(
     }
 }
 
+/// Emergency PLC is allowed only after the output decoupler has less than one
+/// 2.5 ms subframe of real audio left. Keeping a full subframe of margin
+/// (instead of the old two) stops a slightly late packet from triggering
+/// WSOLA while the DAC still has audio it can play.
+const PLC_EMERGENCY_WATERMARK_SUBFRAMES: usize = 1;
+
+/// A post-stall fast-forward keeps the combined sequencer + decoupler backlog
+/// within `target_buf + 6` subframes (15 ms). The old `+16` allowance let one
+/// Wi-Fi stall leave up to 40 ms of permanent playback latency behind.
+const MAX_BACKLOG_OVER_TARGET_SUBFRAMES: f32 = 6.0;
+
+/// Gaming hard-lock uses a fixed target and never adds group-sync delay.
+/// Six subframes (15 ms) leaves a two-subframe Wi-Fi packet a full packet of
+/// jitter margin above the one-subframe PLC watermark; USB stays at four.
+#[inline]
+fn gaming_base_target_subframes(initial_floor: f32) -> f32 {
+    initial_floor.min(6.0)
+}
+
+/// Output decoupler watermark in 2.5 ms subframes (4..=12).
+#[inline]
+fn fifo_target_subframes(target_buf: f32) -> usize {
+    (target_buf.ceil() as usize).clamp(4, 12)
+}
+
+/// Number of subframes of real audio left after the current decoupler
+/// watermark and one sender packet are consumed, before emergency PLC starts.
+#[cfg(test)]
+#[inline]
+fn plc_jitter_margin_subframes(target_fifo: usize, packet_subframes: usize) -> i32 {
+    target_fifo as i32 - PLC_EMERGENCY_WATERMARK_SUBFRAMES as i32 - packet_subframes as i32
+}
+
+/// Fast-forward a post-stall backlog so `sequencer + decoupler` stays within
+/// `target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES`.
+///
+/// Only the sequencer portion can be shortened (the decoupler is already
+/// feeding the DAC), so `keep` is computed from the space left under the cap.
+/// It is clamped to the current sequencer depth so a decoupler that is already
+/// at the cap can never rewind `next_play_seq` and replay old audio.
+#[inline]
+fn trim_post_stall_backlog(
+    latest_rx_seq: u16,
+    next_play_seq: &mut u16,
+    net_subframes: &mut f32,
+    fifo_subframes: f32,
+    target_buf: f32,
+) {
+    let combined = *net_subframes + fifo_subframes;
+    if combined <= target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES {
+        return;
+    }
+
+    let max_net = (target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES - fifo_subframes)
+        .max(0.0)
+        .min(*net_subframes);
+    let keep = max_net.floor() as u16;
+    let new_next = latest_rx_seq.wrapping_add(1).wrapping_sub(keep);
+    // Never move the playhead backwards. With the invariants above this is
+    // already guaranteed, but the FIFO estimate is fractional and a defensive
+    // check is cheaper than replaying audio.
+    if (new_next.wrapping_sub(*next_play_seq) as i16) <= 0 {
+        return;
+    }
+    *next_play_seq = new_next;
+    *net_subframes = keep as f32;
+}
+
 /// A packet this far ahead of the playhead means the sequence tracker was
 /// lost or the sender restarted. 48 subframes = 120 ms.
 const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 48;
@@ -797,8 +865,9 @@ impl ClientEngine {
             }
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
-            let base_target = if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
-                initial_wifi_floor.min(4.0)
+            let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
+            let base_target = if gaming_lock {
+                gaming_base_target_subframes(initial_wifi_floor)
             } else {
                 adaptive_wifi_subframes
             };
@@ -810,20 +879,29 @@ impl ClientEngine {
             // jitter cushion. Group sync only aligns the fixed downstream
             // hardware/A2DP delay, so the network buffer is deliberately not
             // added here (that was the source of the 500ms oscillation).
-            let target_buf = group_sync.aligned_target_subframes(
-                base_target,
-                telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                my_downstream_delay_ms,
-            );
+            // Gaming hard-lock is an explicit lowest-latency, independent
+            // mode: adding room-wide alignment delay would defeat it and can
+            // push a 2-subframe Wi-Fi stream back into the PLC path.
+            let target_buf = if gaming_lock {
+                base_target
+            } else {
+                group_sync.aligned_target_subframes(
+                    base_target,
+                    telemetry.max_group_delay_ms.load(Ordering::Relaxed),
+                    my_downstream_delay_ms,
+                )
+            };
 
             // Two-Level DAC Watermark:
             // 1. `fifo_watermark` holds enough ready PCM (4 to 12 subframes = 10-30ms) so neither
             //    Desktop CPAL (480-1024 frame callbacks) nor Android AAudio ever starves.
-            // 2. `plc_emergency_watermark` (2 subframes = 5.0ms): If `next_play_seq` is missing in
-            //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 2 subframes!
+            // 2. `plc_emergency_watermark` (1 subframe = 2.5ms): If `next_play_seq` is missing in
+            //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 1 subframe!
             //    We wait for the delayed packet or Packet [K+1]'s FEC to arrive first!
-            let base_fifo_subframes = (base_target.ceil() as usize).clamp(4, 12);
-            let target_fifo_subframes = (target_buf.ceil() as usize).clamp(4, 12);
+            //    Gaming Mode targets 6 subframes on 2-subframe Wi-Fi, leaving
+            //    (6 - 1) - 2 = 3 subframes (7.5ms) of real jitter margin instead of 0.
+            let base_fifo_subframes = fifo_target_subframes(base_target);
+            let target_fifo_subframes = fifo_target_subframes(target_buf);
             telemetry
                 .target_buffer_us
                 .store((target_fifo_subframes as u32) * 2500, Ordering::Relaxed);
@@ -832,7 +910,8 @@ impl ClientEngine {
                 Ordering::Relaxed,
             );
             let fifo_watermark = target_fifo_subframes * SUBFRAME_STEREO_SAMPLES;
-            let plc_emergency_watermark = SUBFRAME_STEREO_SAMPLES * 2;
+            let plc_emergency_watermark =
+                SUBFRAME_STEREO_SAMPLES * PLC_EMERGENCY_WATERMARK_SUBFRAMES;
 
             while stream_initialized
                 && prebuffer_ready
@@ -840,7 +919,7 @@ impl ClientEngine {
                 && burst_fifo.available_samples() < fifo_watermark
             {
                 // If the missing slot is still within the in-flight/FEC
-                // recovery window, wait while the FIFO has at least 5ms of
+                // recovery window, wait while the FIFO has at least 2.5ms of
                 // real audio. Once a newer packet is already buffered
                 // (`missing_delta >= 3`), waiting can no longer heal the hole:
                 // skip it immediately instead of draining the FIFO first.
@@ -956,12 +1035,18 @@ impl ClientEngine {
                 let mut net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
-                if net_subframes + fifo_subframes > target_buf + 16.0 {
-                    // Preserve `target_buf` cushion on fast-forward so 2.4GHz doesn't immediately underrun!
-                    let keep = (target_buf.ceil() as u16).max(4);
-                    next_play_seq = latest_rx_seq.wrapping_add(1).wrapping_sub(keep);
-                    net_subframes = keep as f32;
-                }
+                // Cap the post-stall Hold-Playhead backlog at `target_buf + 6`
+                // subframes (15ms) instead of the old +16 (40ms), so 24-bit and
+                // 2.4GHz streams never accumulate permanent latency after a
+                // Wi-Fi stall. Only the sequencer share can be shortened; the
+                // decoupler is already feeding the DAC.
+                trim_post_stall_backlog(
+                    latest_rx_seq,
+                    &mut next_play_seq,
+                    &mut net_subframes,
+                    fifo_subframes,
+                    target_buf,
+                );
                 // Regulate COMBINED (Sequencer + FIFO) buffer so they never stack in series!
                 let buffered_subframes = net_subframes + fifo_subframes;
                 telemetry.buffered_audio_us.store(
@@ -1056,18 +1141,89 @@ mod tests {
         let latest_rx = 100u16;
         let mut next_play = 70u16; // 30 subframes lag (>20ms lag)
         let target_buf = 4.0f32;
+        let fifo_subframes = 4.0f32;
 
         let mut net_subframes = (latest_rx.wrapping_sub(next_play) as i16).max(0) as f32;
         assert_eq!(net_subframes, 30.0);
 
-        if net_subframes > target_buf + 14.0 {
-            let keep = (target_buf.ceil() as u16).max(2);
-            next_play = latest_rx.wrapping_sub(keep);
-            net_subframes = keep as f32;
-        }
+        trim_post_stall_backlog(
+            latest_rx,
+            &mut next_play,
+            &mut net_subframes,
+            fifo_subframes,
+            target_buf,
+        );
 
-        assert_eq!(net_subframes, 4.0);
-        assert_eq!(next_play, 96);
+        // The combined sequencer + decoupler backlog is capped at
+        // `target_buf + 6` = 10 subframes; the sequencer keeps the remaining
+        // 10 - 4 = 6.
+        assert_eq!(net_subframes, 6.0);
+        assert_eq!(net_subframes + fifo_subframes, 10.0);
+        assert_eq!(next_play, 95);
+    }
+
+    #[test]
+    fn test_gaming_mode_has_real_plc_jitter_margin() {
+        // Old gaming target (4 subframes) with the old 2-subframe PLC
+        // watermark left zero margin for a 2-subframe Wi-Fi packet, so every
+        // late packet triggered WSOLA PLC. Keep this regression explicit.
+        let old_margin = fifo_target_subframes(4.0) as i32 - 2 - 2;
+        assert_eq!(old_margin, 0);
+
+        // Wi-Fi: gaming caps the target at 6 subframes and the watermark is
+        // one subframe, leaving (6 - 1) - 2 = 3 subframes (7.5ms) of margin.
+        let wifi_target = fifo_target_subframes(gaming_base_target_subframes(6.0));
+        assert_eq!(wifi_target, 6);
+        assert_eq!(plc_jitter_margin_subframes(wifi_target, 2), 3);
+        // A larger configured/adaptive floor is still capped in gaming mode.
+        assert_eq!(gaming_base_target_subframes(14.0), 6.0);
+
+        // USB: one subframe per packet, (4 - 1) - 1 = 2 subframes (5ms).
+        let usb_target = fifo_target_subframes(gaming_base_target_subframes(4.0));
+        assert_eq!(usb_target, 4);
+        assert_eq!(plc_jitter_margin_subframes(usb_target, 1), 2);
+    }
+
+    #[test]
+    fn test_post_stall_trim_caps_combined_backlog_and_never_rewinds() {
+        // Gaming Wi-Fi: 6-subframe target with a full 6-subframe decoupler.
+        let mut next_play = 70u16;
+        let mut net_subframes = 20.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        assert_eq!(net_subframes, 6.0);
+        assert_eq!(next_play, 95);
+        assert_eq!(net_subframes + 6.0, 12.0); // target_buf + 6
+
+        // 2.4GHz normal mode: a 14-subframe target with the decoupler capped
+        // at 12. The trim must account for the decoupler, not just reset the
+        // sequencer to the target (which would retain 26 subframes).
+        let mut next_play = 50u16;
+        let mut net_subframes = 30.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 12.0, 14.0);
+        assert_eq!(net_subframes, 8.0);
+        assert_eq!(next_play, 93);
+        assert_eq!(net_subframes + 12.0, 20.0); // target_buf + 6
+
+        // At or below the cap the playhead and queue are untouched.
+        let mut next_play = 90u16;
+        let mut net_subframes = 6.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        assert_eq!(next_play, 90);
+        assert_eq!(net_subframes, 6.0);
+
+        // Never rewind, even if the FIFO estimate alone exceeds the cap.
+        let mut next_play = 99u16;
+        let mut net_subframes = 2.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 20.0, 6.0);
+        assert_eq!(next_play, 101);
+        assert_eq!(net_subframes, 0.0);
+
+        // Sequence wrap-around keeps the same forward-only invariant.
+        let mut next_play = 65533u16;
+        let mut net_subframes = 7.0f32;
+        trim_post_stall_backlog(3, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        assert_eq!(net_subframes, 6.0);
+        assert_eq!(next_play, 65534);
     }
 
     #[test]
