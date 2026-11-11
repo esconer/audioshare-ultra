@@ -33,6 +33,11 @@ pub struct ClientConfig {
     pub server_addr: SocketAddr,
     pub target_buffer_subframes: f32,
     pub preamp_gain_db: f32,
+    /// Android only: open the shared mixer path so OEM post-processing
+    /// (Dolby Atmos, Dirac, system equalizers) can process the stream.
+    /// `false` asks AAudio for the raw low-latency path and explicitly
+    /// disables spatialization. Ignored by the desktop CPAL sink.
+    pub dolby_effects: bool,
 }
 
 /// Decision for a missing sequencer slot at the current playhead.
@@ -211,6 +216,8 @@ fn decode_compressed_payload(
 /// ahead of the DAC. `AAudioStream_getTimestamp` reports the frame position at
 /// the last HAL interrupt, not at "now"; the position must be extrapolated by
 /// the elapsed monotonic time before subtracting it from frames written.
+/// `sample_rate_hz` is the rate the stream actually opened, which is not
+/// necessarily the 48 kHz network rate on a 44.1 kHz Bluetooth route.
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn pending_hardware_delay_ms(
@@ -218,16 +225,35 @@ fn pending_hardware_delay_ms(
     timestamp_ns: i64,
     now_ns: i64,
     frames_written: i64,
+    sample_rate_hz: u32,
 ) -> Option<u16> {
     if frame_position < 0 || timestamp_ns <= 0 {
         return None;
     }
+    let rate = sample_rate_hz.max(8_000) as i64;
     let elapsed_ns = (now_ns - timestamp_ns).clamp(0, 500_000_000);
-    let presented_now = frame_position
-        .saturating_add(elapsed_ns.saturating_mul(SAMPLE_RATE as i64) / 1_000_000_000);
+    let presented_now =
+        frame_position.saturating_add(elapsed_ns.saturating_mul(rate) / 1_000_000_000);
     let pending_frames = frames_written.saturating_sub(presented_now).max(0);
-    let delay_ms = ((pending_frames * 1000) / SAMPLE_RATE as i64).clamp(0, 120) as u16;
+    let delay_ms = ((pending_frames * 1000) / rate).clamp(0, 120) as u16;
     Some(delay_ms)
+}
+
+/// AAudio's output ring must hold at least one HAL burst. A2DP/Bluetooth
+/// bursts are commonly 480-960 frames (10-20 ms), so the old unconditional
+/// `burst * 3` turned them into 30-60 ms of output latency. Use one burst for
+/// large bursts and keep the verified 3x cushion (minimum 256 frames) for
+/// speaker/USB bursts, where it costs only a few milliseconds.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_buffer_frames_for_burst(burst: i32) -> Option<i32> {
+    if burst <= 0 {
+        None
+    } else if burst >= 240 {
+        Some(burst)
+    } else {
+        Some((burst * 3).max(256))
+    }
 }
 
 pub struct ClientTelemetry {
@@ -245,6 +271,9 @@ pub struct ClientTelemetry {
     pub enable_binaural_crossfeed: AtomicBool,
     pub enable_night_mode: AtomicBool,
     pub gaming_mode_hard_lock: AtomicBool,
+    /// Android: `true` keeps the shared mixer + OEM post-processing path
+    /// (Dolby/Atmos/system EQ); `false` selects the raw low-latency path.
+    pub enable_dolby_effects: AtomicBool,
     pub downstream_bt_delay_ms: AtomicU16,
     /// Hardware/DAC latency measured with `AAudioStream_getTimestamp` on
     /// Android. Kept separate from the A2DP codec estimate reported by Kotlin;
@@ -340,6 +369,7 @@ impl ClientEngine {
             enable_binaural_crossfeed: AtomicBool::new(false),
             enable_night_mode: AtomicBool::new(false),
             gaming_mode_hard_lock: AtomicBool::new(false),
+            enable_dolby_effects: AtomicBool::new(config.dolby_effects),
             downstream_bt_delay_ms: AtomicU16::new(0),
             downstream_hw_delay_ms: AtomicU16::new(0),
             pending_media_command: AtomicU8::new(0),
@@ -402,8 +432,7 @@ impl ClientEngine {
                 let _audio_stream = Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo)).ok();
 
                 #[cfg(target_os = "android")]
-                let mut _android_aaudio =
-                    android_aaudio::AAudioOutputGuard::open_low_latency(Arc::clone(&burst_fifo));
+                let mut _android_aaudio: Option<android_aaudio::AAudioOutputGuard> = None;
 
                 Self::realtime_rx_and_dsp_loop(
                     socket,
@@ -548,6 +577,10 @@ impl ClientEngine {
         let mut last_packet_instant = Instant::now();
         #[cfg(target_os = "android")]
         let mut last_hw_latency_poll = Instant::now();
+        #[cfg(target_os = "android")]
+        let mut last_dolby_state = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
+        #[cfg(target_os = "android")]
+        let mut last_aaudio_open_attempt: Option<Instant> = None;
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
@@ -563,22 +596,46 @@ impl ClientEngine {
         let mut prev_rx_us: Option<u32> = None;
         let mut prev_tx_us: u32 = 0;
         let mut jitter_estimate_us: f32 = 2500.0;
+        // Output at the device's native rate can be 44.1 kHz (A2DP) or more
+        // than 48 kHz (USB DAC). Size for up to ~384 kHz so the resampler can
+        // never truncate the tail of a subframe.
+        let mut resampled_out = vec![0.0f32; 4096];
         let start_instant = Instant::now();
         let _ = socket.set_nonblocking(false);
         let _ = socket.set_read_timeout(Some(Duration::from_micros(1000)));
 
         while running.load(Ordering::Relaxed) {
-            // Auto-recover Android AAudio stream within 25ms when headphones/Bluetooth route changes!
+            // Auto-recover the AAudio stream within 25 ms when the
+            // headphones/Bluetooth route changes, or reopen it when the user
+            // toggles Dolby/system post-processing. The resampler is pointed
+            // at the rate the new stream actually opened, so 44.1 kHz A2DP
+            // does not need a second AudioFlinger resampler.
             #[cfg(target_os = "android")]
-            if aaudio_guard
-                .as_ref()
-                .map(|g| g.needs_reopen())
-                .unwrap_or(true)
             {
-                *aaudio_guard =
-                    android_aaudio::AAudioOutputGuard::open_low_latency(Arc::clone(&burst_fifo));
-                // The previous route's measurement is no longer valid.
-                telemetry.downstream_hw_delay_ms.store(0, Ordering::Relaxed);
+                let want_dolby = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
+                let retry_due = aaudio_guard.is_none()
+                    && last_aaudio_open_attempt
+                        .map(|attempt| attempt.elapsed() >= Duration::from_millis(500))
+                        .unwrap_or(true);
+                let reopen = aaudio_guard
+                    .as_ref()
+                    .map(|g| g.needs_reopen())
+                    .unwrap_or(false)
+                    || want_dolby != last_dolby_state
+                    || retry_due;
+                if reopen {
+                    last_dolby_state = want_dolby;
+                    last_aaudio_open_attempt = Some(Instant::now());
+                    *aaudio_guard = android_aaudio::AAudioOutputGuard::open_with_mode(
+                        Arc::clone(&burst_fifo),
+                        want_dolby,
+                    );
+                    if let Some(guard) = aaudio_guard.as_ref() {
+                        resampler.set_output_sample_rate(guard.sample_rate());
+                    }
+                    // The previous route's measurement is no longer valid.
+                    telemetry.downstream_hw_delay_ms.store(0, Ordering::Relaxed);
+                }
             }
 
             // Sample the AAudio hardware timestamp twice a second. This is
@@ -909,9 +966,13 @@ impl ClientEngine {
                 (target_fifo_subframes.saturating_sub(base_fifo_subframes) as u32) * 2500,
                 Ordering::Relaxed,
             );
-            let fifo_watermark = target_fifo_subframes * SUBFRAME_STEREO_SAMPLES;
-            let plc_emergency_watermark =
-                SUBFRAME_STEREO_SAMPLES * PLC_EMERGENCY_WATERMARK_SUBFRAMES;
+            let fifo_capacity = burst_fifo.capacity_samples().saturating_sub(2);
+            let fifo_watermark = resampler
+                .subframes_to_samples(target_fifo_subframes)
+                .min(fifo_capacity);
+            let plc_emergency_watermark = resampler
+                .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                .min(fifo_capacity);
 
             while stream_initialized
                 && prebuffer_ready
@@ -1029,9 +1090,11 @@ impl ClientEngine {
                     }
                 }
 
-                // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock)
-                let fifo_subframes =
-                    (burst_fifo.available_samples() as f32) / (SUBFRAME_STEREO_SAMPLES as f32);
+                // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock).
+                // The decoupler is filled at the output rate, so convert its
+                // sample count through the active base ratio instead of
+                // assuming 48 kHz.
+                let fifo_subframes = resampler.samples_to_subframes(burst_fifo.available_samples());
                 let mut net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
@@ -1055,10 +1118,9 @@ impl ClientEngine {
                 );
                 resampler.update_clock_loop(buffered_subframes, target_buf);
 
-                let ppm = ((resampler.ratio - 1.0) * 1_000_000.0) as i32;
+                let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
                 telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
 
-                let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
                 let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
                 burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
 
@@ -1314,30 +1376,63 @@ mod tests {
         // The DAC has therefore presented ~48_480 frames by "now".
         let now_ns = timestamp_ns + 10_000_000;
         let frames_written = 48_000 + 480 + 240; // 240 frames = 5ms still queued
-        let delay = pending_hardware_delay_ms(48_000, timestamp_ns, now_ns, frames_written);
+        let delay = pending_hardware_delay_ms(48_000, timestamp_ns, now_ns, frames_written, 48_000);
         assert_eq!(delay, Some(5));
 
         // Without extrapolation the same snapshot would report 15ms.
         let unextrapolated = ((frames_written - 48_000) * 1000) / rate;
         assert_eq!(unextrapolated, 15);
 
+        // A 44.1 kHz A2DP stream must use its actual rate. 441 frames of
+        // pending audio are 10 ms, not 441 / 48 kHz.
+        let delay = pending_hardware_delay_ms(44_100, timestamp_ns, timestamp_ns, 44_541, 44_100);
+        assert_eq!(delay, Some(10));
+
         // A future timestamp (clock anomaly) must not underflow the subtraction.
-        let delay =
-            pending_hardware_delay_ms(48_000, timestamp_ns + 5_000_000, timestamp_ns, 48_100);
+        let delay = pending_hardware_delay_ms(
+            48_000,
+            timestamp_ns + 5_000_000,
+            timestamp_ns,
+            48_100,
+            48_000,
+        );
         assert_eq!(delay, Some(2));
 
         // Invalid snapshots are rejected instead of producing fake latency.
         assert_eq!(
-            pending_hardware_delay_ms(-1, timestamp_ns, now_ns, 48_000),
+            pending_hardware_delay_ms(-1, timestamp_ns, now_ns, 48_000, 48_000),
             None
         );
-        assert_eq!(pending_hardware_delay_ms(0, 0, now_ns, 48_000), None);
+        assert_eq!(
+            pending_hardware_delay_ms(0, 0, now_ns, 48_000, 48_000),
+            None
+        );
 
         // Very stale timestamps are bounded so a broken HAL cannot report
         // hundreds of milliseconds of fake hardware latency.
-        let stale =
-            pending_hardware_delay_ms(0, timestamp_ns, timestamp_ns + 5_000_000_000, 48_000);
+        let stale = pending_hardware_delay_ms(
+            0,
+            timestamp_ns,
+            timestamp_ns + 5_000_000_000,
+            48_000,
+            48_000,
+        );
         assert_eq!(stale, Some(120));
+    }
+
+    #[test]
+    fn test_aaudio_large_bluetooth_bursts_are_not_tripled() {
+        // Speaker/USB bursts keep the verified 3x cushion, minimum 256.
+        assert_eq!(aaudio_buffer_frames_for_burst(48), Some(256));
+        assert_eq!(aaudio_buffer_frames_for_burst(96), Some(288));
+        assert_eq!(aaudio_buffer_frames_for_burst(192), Some(576));
+        // A2DP bursts are already 5-20 ms; one burst is the minimum AAudio
+        // can use, and multiplying it would add 10-40 ms of dead latency.
+        assert_eq!(aaudio_buffer_frames_for_burst(240), Some(240));
+        assert_eq!(aaudio_buffer_frames_for_burst(480), Some(480));
+        assert_eq!(aaudio_buffer_frames_for_burst(960), Some(960));
+        assert_eq!(aaudio_buffer_frames_for_burst(0), None);
+        assert_eq!(aaudio_buffer_frames_for_burst(-1), None);
     }
 
     #[test]
@@ -1481,37 +1576,123 @@ pub mod android_aaudio {
     const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
     const AAUDIO_DIRECTION_INPUT: i32 = 1;
     const AAUDIO_FORMAT_PCM_FLOAT: i32 = 2;
+    const AAUDIO_UNSPECIFIED: i32 = 0;
     const AAUDIO_SHARING_MODE_EXCLUSIVE: i32 = 0;
     const AAUDIO_SHARING_MODE_SHARED: i32 = 1;
+    const AAUDIO_PERFORMANCE_MODE_NONE: i32 = 10;
     const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+    const AAUDIO_USAGE_MEDIA: i32 = 1;
     const AAUDIO_USAGE_GAME: i32 = 14;
+    const AAUDIO_CONTENT_TYPE_MUSIC: i32 = 2;
+    const AAUDIO_CONTENT_TYPE_SONIFICATION: i32 = 4;
+    const AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO: i32 = 1;
+    const AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER: i32 = 2;
     const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
 
+    /// 960 frames fits 3x a 240-frame speaker burst (720) and one full
+    /// 960-frame Bluetooth burst. Leaving the capacity unspecified lets some
+    /// HALs allocate a 1920-3840-frame ring, which excludes the stream from
+    /// the low-latency mixer path.
+    const AAUDIO_BUFFER_CAPACITY_FRAMES: i32 = 960;
+
+    #[derive(Clone, Copy)]
+    struct AAudioProfile {
+        sharing_mode: i32,
+        performance_mode: i32,
+        usage: i32,
+        content_type: i32,
+        spatialization_behavior: i32,
+    }
+
+    /// Raw path: exclusive MMAP first, game/sonification attributes, and
+    /// spatialization explicitly disabled. Exclusive mode bypasses
+    /// AudioFlinger effects entirely; the shared fallback still carries the
+    /// anti-spatialization flags so OEM post-processing does not attach.
+    const RAW_PROFILE: AAudioProfile = AAudioProfile {
+        sharing_mode: AAUDIO_SHARING_MODE_EXCLUSIVE,
+        performance_mode: AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+        usage: AAUDIO_USAGE_GAME,
+        content_type: AAUDIO_CONTENT_TYPE_SONIFICATION,
+        spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER,
+    };
+
+    const RAW_SHARED_PROFILE: AAudioProfile = AAudioProfile {
+        sharing_mode: AAUDIO_SHARING_MODE_SHARED,
+        performance_mode: AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+        usage: AAUDIO_USAGE_GAME,
+        content_type: AAUDIO_CONTENT_TYPE_SONIFICATION,
+        spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER,
+    };
+
+    /// Dolby/system-effects path: the shared mixer is mandatory because
+    /// exclusive MMAP streams cannot be processed by AudioFlinger effects.
+    /// `PERFORMANCE_MODE_NONE` selects the normal mixer where OEM Dolby,
+    /// Dirac, and system equalizers live; the low-latency shared profile is
+    /// only a fallback for devices that reject `NONE`.
+    const DOLBY_PROFILE: AAudioProfile = AAudioProfile {
+        sharing_mode: AAUDIO_SHARING_MODE_SHARED,
+        performance_mode: AAUDIO_PERFORMANCE_MODE_NONE,
+        usage: AAUDIO_USAGE_MEDIA,
+        content_type: AAUDIO_CONTENT_TYPE_MUSIC,
+        spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO,
+    };
+
+    const DOLBY_LOW_LATENCY_PROFILE: AAudioProfile = AAudioProfile {
+        sharing_mode: AAUDIO_SHARING_MODE_SHARED,
+        performance_mode: AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+        usage: AAUDIO_USAGE_MEDIA,
+        content_type: AAUDIO_CONTENT_TYPE_MUSIC,
+        spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO,
+    };
+
+    type SetI32Fn = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
+    type SetBoolFn = unsafe extern "C" fn(*mut AAudioStreamBuilder, bool);
+
+    static AAUDIO_LIB_HANDLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    /// Resolve an AAudio builder setter by name. Usage, content type, and
+    /// spatialization were added after the API 26 AAudio base, so a missing
+    /// symbol must degrade gracefully instead of blocking the stream open.
     #[inline]
-    unsafe fn try_set_aaudio_usage(builder: *mut AAudioStreamBuilder, usage: i32) {
-        type SetUsageFn = unsafe extern "C" fn(*mut AAudioStreamBuilder, i32);
-        static SET_USAGE: std::sync::OnceLock<Option<SetUsageFn>> = std::sync::OnceLock::new();
-        let func = SET_USAGE.get_or_init(|| {
-            let handle = libc::dlopen(
+    unsafe fn aaudio_builder_symbol(name: &[u8]) -> Option<*mut c_void> {
+        let handle = *AAUDIO_LIB_HANDLE.get_or_init(|| {
+            libc::dlopen(
                 b"libaaudio.so\0".as_ptr() as *const libc::c_char,
                 libc::RTLD_NOW,
-            );
-            if !handle.is_null() {
-                let sym = libc::dlsym(
-                    handle,
-                    b"AAudioStreamBuilder_setUsage\0".as_ptr() as *const libc::c_char,
-                );
-                if !sym.is_null() {
-                    Some(core::mem::transmute::<*mut libc::c_void, SetUsageFn>(sym))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+            ) as usize
         });
-        if let Some(f) = func {
-            f(builder, usage);
+        if handle == 0 {
+            return None;
+        }
+        let sym = libc::dlsym(handle as *mut c_void, name.as_ptr() as *const libc::c_char);
+        if sym.is_null() {
+            None
+        } else {
+            Some(sym)
+        }
+    }
+
+    #[inline]
+    unsafe fn apply_aaudio_profile(builder: *mut AAudioStreamBuilder, profile: AAudioProfile) {
+        if let Some(sym) = aaudio_builder_symbol(b"AAudioStreamBuilder_setUsage\0") {
+            let f: SetI32Fn = core::mem::transmute(sym);
+            f(builder, profile.usage);
+        }
+        if let Some(sym) = aaudio_builder_symbol(b"AAudioStreamBuilder_setContentType\0") {
+            let f: SetI32Fn = core::mem::transmute(sym);
+            f(builder, profile.content_type);
+        }
+        if let Some(sym) = aaudio_builder_symbol(b"AAudioStreamBuilder_setSpatializationBehavior\0")
+        {
+            let f: SetI32Fn = core::mem::transmute(sym);
+            f(builder, profile.spatialization_behavior);
+        }
+        if let Some(sym) = aaudio_builder_symbol(b"AAudioStreamBuilder_setIsContentSpatialized\0") {
+            let f: SetBoolFn = core::mem::transmute(sym);
+            // The engine always supplies plain stereo PCM, never Ambisonic or
+            // object audio. The behavior above decides whether the platform
+            // spatializer is allowed to process it.
+            f(builder, false);
         }
     }
 
@@ -1554,6 +1735,7 @@ pub mod android_aaudio {
         ) -> i32;
         fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> i32;
         fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
         fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
         fn AAudioStream_getTimestamp(
@@ -1613,6 +1795,7 @@ pub mod android_aaudio {
     pub struct AAudioOutputGuard {
         stream: *mut AAudioStream,
         ctx_ptr: *mut CallbackContext,
+        actual_sample_rate: u32,
     }
 
     unsafe impl Send for AAudioOutputGuard {}
@@ -1624,6 +1807,14 @@ pub mod android_aaudio {
                 return true;
             }
             unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
+        }
+
+        /// The rate AAudio actually opened, which may be 44.1 kHz on an A2DP
+        /// route even though the network stream is 48 kHz. The resampler must
+        /// convert to this rate; assuming 48 kHz lets the DAC run dry.
+        #[inline]
+        pub fn sample_rate(&self) -> u32 {
+            self.actual_sample_rate
         }
 
         /// Measure the downstream hardware/DAC pipeline latency from the
@@ -1654,16 +1845,46 @@ pub mod android_aaudio {
                 }
                 let now_ns = (now_ts.tv_sec as i64) * 1_000_000_000 + (now_ts.tv_nsec as i64);
                 let written = AAudioStream_getFramesWritten(self.stream);
-                pending_hardware_delay_ms(frame_position, time_nanoseconds, now_ns, written)
+                pending_hardware_delay_ms(
+                    frame_position,
+                    time_nanoseconds,
+                    now_ns,
+                    written,
+                    self.actual_sample_rate,
+                )
             }
         }
 
+        /// Raw low-latency path, kept for callers that do not expose the
+        /// Dolby toggle.
         pub fn open_low_latency(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
-            Self::open_internal(Arc::clone(&fifo), AAUDIO_SHARING_MODE_EXCLUSIVE)
-                .or_else(|| Self::open_internal(fifo, AAUDIO_SHARING_MODE_SHARED))
+            Self::open_with_mode(fifo, false)
         }
 
-        fn open_internal(fifo: Arc<BurstDecouplerRing>, sharing_mode: i32) -> Option<Self> {
+        /// Open the output stream in one of two deliberately different modes:
+        ///
+        /// * `enable_dolby_effects = false`: exclusive MMAP first, game /
+        ///   sonification attributes, spatialization never. This is the
+        ///   lowest-latency path and bypasses AudioFlinger effects.
+        /// * `enable_dolby_effects = true`: shared mixer with media / music
+        ///   attributes and automatic spatialization so OEM Dolby Atmos,
+        ///   Dirac, or the system equalizer can process the stream. The
+        ///   normal mixer (`PERFORMANCE_MODE_NONE`) is tried first because
+        ///   low-latency shared streams may still be excluded from effects.
+        pub fn open_with_mode(
+            fifo: Arc<BurstDecouplerRing>,
+            enable_dolby_effects: bool,
+        ) -> Option<Self> {
+            if enable_dolby_effects {
+                Self::open_internal(Arc::clone(&fifo), DOLBY_PROFILE)
+                    .or_else(|| Self::open_internal(fifo, DOLBY_LOW_LATENCY_PROFILE))
+            } else {
+                Self::open_internal(Arc::clone(&fifo), RAW_PROFILE)
+                    .or_else(|| Self::open_internal(fifo, RAW_SHARED_PROFILE))
+            }
+        }
+
+        fn open_internal(fifo: Arc<BurstDecouplerRing>, profile: AAudioProfile) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
                 if AAudio_createStreamBuilder(&mut builder) != 0 || builder.is_null() {
@@ -1678,18 +1899,20 @@ pub mod android_aaudio {
                 let ctx_ptr = Box::into_raw(ctx);
 
                 AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
-                AAudioStreamBuilder_setPerformanceMode(
-                    builder,
-                    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
-                );
-                // Bypasses Android Dolby/Media DSP post-processing and forces ULL Hardware Fast-Track!
-                try_set_aaudio_usage(builder, AAUDIO_USAGE_GAME);
-                AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
-                AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
+                AAudioStreamBuilder_setPerformanceMode(builder, profile.performance_mode);
+                apply_aaudio_profile(builder, profile);
+                AAudioStreamBuilder_setSharingMode(builder, profile.sharing_mode);
+                // Do not force 48 kHz. AAudio chooses the route's native rate
+                // when left unspecified, which is 44.1 kHz for many A2DP
+                // codecs. Requesting 48 kHz there forces AudioFlinger to
+                // resample through the normal mixer, where OEM effects live.
+                AAudioStreamBuilder_setSampleRate(builder, AAUDIO_UNSPECIFIED);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-                // Provide 1920-frame capacity so SoCs with 192/240-frame bursts can allocate 3x bursts cleanly
-                AAudioStreamBuilder_setBufferCapacityInFrames(builder, 1920);
+                AAudioStreamBuilder_setBufferCapacityInFrames(
+                    builder,
+                    AAUDIO_BUFFER_CAPACITY_FRAMES,
+                );
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,
@@ -1710,14 +1933,28 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                // Use 3 * hardware burst (minimum 256 frames = ~5.3ms) to prevent HAL DMA XRuns
-                let burst = AAudioStream_getFramesPerBurst(stream);
-                if burst > 0 {
-                    AAudioStream_setBufferSizeInFrames(stream, (burst * 3).max(256));
+                let actual_rate = AAudioStream_getSampleRate(stream);
+                let actual_sample_rate = if actual_rate >= 8_000 {
+                    actual_rate as u32
+                } else {
+                    SAMPLE_RATE
+                };
+
+                // A2DP bursts are already 10-20 ms. Use one burst there and
+                // keep the 3x speaker/USB cushion, otherwise the old code
+                // stacked another 30-60 ms of AAudio buffer on Bluetooth.
+                if let Some(target_frames) =
+                    aaudio_buffer_frames_for_burst(AAudioStream_getFramesPerBurst(stream))
+                {
+                    AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
 
                 AAudioStream_requestStart(stream);
-                Some(Self { stream, ctx_ptr })
+                Some(Self {
+                    stream,
+                    ctx_ptr,
+                    actual_sample_rate,
+                })
             }
         }
     }

@@ -456,6 +456,7 @@ impl AudioShareApp {
                 3.5
             },
             preamp_gain_db: self.preamp_gain_db,
+            dolby_effects: false,
         };
         let pin_opt = if self.enable_pin_encryption {
             Some(self.pairing_pin.as_str())

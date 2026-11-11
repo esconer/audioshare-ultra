@@ -30,7 +30,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             private set
 
         @JvmStatic
-        external fun nativeStartClient(hostAddr: String, isUsb: Boolean, gainDb: Float, pin: String): Boolean
+        external fun nativeStartClient(
+            hostAddr: String,
+            isUsb: Boolean,
+            gainDb: Float,
+            pin: String,
+            dolbyEffects: Boolean
+        ): Boolean
 
         @JvmStatic
         external fun nativeStopClient()
@@ -55,7 +61,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             role: Int,
             crossfeed: Boolean,
             nightMode: Boolean,
-            gamingLock: Boolean
+            gamingLock: Boolean,
+            dolbyEffects: Boolean
         )
 
         @JvmStatic
@@ -82,6 +89,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
+    // Raw low-latency output is the default. `true` opts into the shared
+    // mixer so OEM post-processing (Dolby Atmos, Dirac, system EQ) applies.
+    private var dolbyEffects: Boolean = false
+    // Only microphone / internal-audio capture may declare the MICROPHONE
+    // foreground-service type. Plain playback must never request it.
+    private var micCaptureActive: Boolean = false
+    private var foregroundStarted: Boolean = false
 
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
@@ -99,13 +113,35 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             stopStreamAndService()
             return START_NOT_STICKY
         }
+        if (intent?.action == "ACTION_SET_DOLBY") {
+            val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+            dolbyEffects = intent.getBooleanExtra("DOLBY_ENABLED", dolbyEffects)
+            prefs.edit().putBoolean("dolby_fx", dolbyEffects).apply()
+            // OEM Dolby daemons watch the focus attributes, so the focus
+            // request must match the AAudio stream profile. Re-requesting
+            // also abandons the stale attributes from the previous mode.
+            requestAudioFocus(dolbyEffects)
+            applyDspFromPrefs()
+            if (foregroundStarted) {
+                startForegroundNotification(currentHostAddr, currentIsUsb)
+            }
+            return START_STICKY
+        }
+        if (intent?.action == "ACTION_SET_MIC_CAPTURE") {
+            micCaptureActive = intent.getBooleanExtra("MIC_ACTIVE", false)
+            if (foregroundStarted) {
+                startForegroundNotification(currentHostAddr, currentIsUsb)
+            }
+            return START_STICKY
+        }
         if (intent?.action == "ACTION_START_CAST_GUARD") {
             // Standalone Mic / Party Host Mode: Hold ForegroundService + Low-Latency WifiLock + WakeLock
             // so Android never kills the microphone or Party Cast when the screen turns off!
             val label = intent.getStringExtra("CAST_LABEL") ?: "Mic / Party Broadcast"
             currentHostAddr = label
             currentIsUsb = false
-            startForegroundNotification(label, false)
+            micCaptureActive = true
+            startForegroundNotification(label, false, includeMicType = true)
             acquireRealtimeHardwareLocks()
             return START_STICKY
         }
@@ -135,6 +171,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } ?: isUsbHost(hostAddr)
         val gainDb = intent?.getFloatExtra("GAIN_DB", prefs.getFloat("gain_db", 0.0f)) ?: 0.0f
         val pin = intent?.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: ""
+        dolbyEffects = prefs.getBoolean("dolby_fx", false)
         currentGainDb = gainDb
         currentHostAddr = hostAddr
         currentIsUsb = isUsb
@@ -143,7 +180,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         startForegroundNotification(hostAddr, isUsb)
         acquireRealtimeHardwareLocks()
         setupHardwareBluetoothMediaSession()
-        requestAudioFocus()
+        requestAudioFocus(dolbyEffects)
         if (!noisyReceiverRegistered) {
             try {
                 registerReceiver(
@@ -154,17 +191,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             } catch (_: Exception) {}
         }
 
-        isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin)
-        // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode & Gaming Lock automatically!
-        nativeConfigureDsp(
-            prefs.getFloat("bass_db", 0.0f),
-            prefs.getFloat("vocal_db", 0.0f),
-            prefs.getFloat("treble_db", 0.0f),
-            prefs.getInt("channel_role", 0),
-            prefs.getBoolean("crossfeed", false),
-            prefs.getBoolean("night_mode", false),
-            prefs.getBoolean("gaming_lock", false)
-        )
+        isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
+        // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
+        // Lock and the Dolby/system-effects preference automatically!
+        applyDspFromPrefs()
         // Restore the compressed-codec backend selection on every stream
         // start: 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
         nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
@@ -196,23 +226,44 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    private fun requestAudioFocus() {
+    private fun requestAudioFocus(useDolby: Boolean) {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         // Reconnects call onStartCommand again; abandon the previous request
         // instead of overwriting it and leaking focus ownership.
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         audioManager = am
+        // Raw mode uses game/sonification attributes so the platform and OEM
+        // Dolby services do not treat the stream as media playback. Dolby mode
+        // deliberately matches the shared-mixer AAudio profile.
+        val attributes = AudioAttributes.Builder().apply {
+            if (useDolby) {
+                setUsage(AudioAttributes.USAGE_MEDIA)
+                setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            } else {
+                setUsage(AudioAttributes.USAGE_GAME)
+                setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            }
+        }.build()
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
+            .setAudioAttributes(attributes)
             .setOnAudioFocusChangeListener(this)
             .build()
         focusRequest = request
         am.requestAudioFocus(request)
+    }
+
+    private fun applyDspFromPrefs() {
+        val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+        AudioEngineService.nativeConfigureDsp(
+            prefs.getFloat("bass_db", 0.0f),
+            prefs.getFloat("vocal_db", 0.0f),
+            prefs.getFloat("treble_db", 0.0f),
+            prefs.getInt("channel_role", 0),
+            prefs.getBoolean("crossfeed", false),
+            prefs.getBoolean("night_mode", false),
+            prefs.getBoolean("gaming_lock", false),
+            prefs.getBoolean("dolby_fx", dolbyEffects)
+        )
     }
 
     private fun acquireRealtimeHardwareLocks() {
@@ -294,7 +345,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    private fun startForegroundNotification(hostAddr: String, isUsb: Boolean) {
+    private fun startForegroundNotification(
+        hostAddr: String,
+        isUsb: Boolean,
+        includeMicType: Boolean = micCaptureActive
+    ) {
         val channelId = "audioshare_ultra_stream"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val chan = NotificationChannel(
@@ -332,11 +387,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Include the microphone type only when RECORD_AUDIO is granted;
-            // otherwise startForeground() would throw for the mic type.
+            // Declare MICROPHONE only while a mic or internal-audio capture
+            // actually runs and RECORD_AUDIO is granted. Normal playback
+            // intentionally omits it, so the OS does not treat a plain
+            // music stream as microphone use.
             val micGranted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
-            val type = if (micGranted) {
+            val type = if (includeMicType && micGranted) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             } else {
@@ -348,6 +405,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } else {
             startForeground(101, notification)
         }
+        foregroundStarted = true
     }
 
     override fun onAudioFocusChange(focusChange: Int) {
@@ -367,6 +425,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopPhoneMic()
         nativeStopClient()
         isStreaming = false
+        micCaptureActive = false
+        foregroundStarted = false
         if (noisyReceiverRegistered) {
             try {
                 unregisterReceiver(becomingNoisyReceiver)

@@ -263,6 +263,7 @@ pub fn android_start_stream(
     is_usb: bool,
     gain_db: f32,
     pin: Option<&str>,
+    dolby_effects: bool,
 ) -> Result<(), String> {
     let addr: SocketAddr = host_ip_port
         .parse()
@@ -281,6 +282,7 @@ pub fn android_start_stream(
         server_addr: addr,
         target_buffer_subframes: if detected_usb { 2.0 } else { 3.5 },
         preamp_gain_db: gain_db,
+        dolby_effects,
     };
 
     let client = ClientEngine::connect_with_pin(cfg, pin)?;
@@ -336,6 +338,7 @@ pub fn android_configure_dsp(
     crossfeed: bool,
     night_mode: bool,
     gaming_lock: bool,
+    dolby_effects: bool,
 ) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
         client
@@ -363,6 +366,10 @@ pub fn android_configure_dsp(
             .telemetry
             .gaming_mode_hard_lock
             .store(gaming_lock, Ordering::Relaxed);
+        client
+            .telemetry
+            .enable_dolby_effects
+            .store(dolby_effects, Ordering::Relaxed);
     }
 }
 
@@ -401,6 +408,7 @@ pub mod android_native {
         is_usb: jboolean,
         gain_db: jfloat,
         pin: JString,
+        dolby_effects: jboolean,
     ) -> jboolean {
         let Ok(addr_str) = env.get_string(&host_addr) else {
             return 0;
@@ -415,7 +423,13 @@ pub mod android_native {
         } else {
             Some(pin_rust.as_str())
         };
-        match android_start_stream(&addr_rust, is_usb != 0, gain_db, pin_opt) {
+        match android_start_stream(
+            &addr_rust,
+            is_usb != 0,
+            gain_db,
+            pin_opt,
+            dolby_effects != 0,
+        ) {
             Ok(()) => 1,
             Err(_) => 0,
         }
@@ -467,6 +481,7 @@ pub mod android_native {
         crossfeed: jboolean,
         night_mode: jboolean,
         gaming_lock: jboolean,
+        dolby_effects: jboolean,
     ) {
         android_configure_dsp(
             bass_db,
@@ -476,6 +491,7 @@ pub mod android_native {
             crossfeed != 0,
             night_mode != 0,
             gaming_lock != 0,
+            dolby_effects != 0,
         );
     }
 

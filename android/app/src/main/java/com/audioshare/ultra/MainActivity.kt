@@ -1,25 +1,19 @@
 package com.audioshare.ultra
 
-import android.Manifest
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.core.content.ContextCompat
 import com.audioshare.ultra.service.AudioEngineService
 import com.audioshare.ultra.ui.MainScreen
 
 class MainActivity : ComponentActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
-    private val recordAudioPermission =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -29,14 +23,6 @@ class MainActivity : ComponentActivity() {
         multicastLock = wifiMgr?.createMulticastLock("AudioShareUltra::DiscoveryBroadcastLock")?.apply {
             setReferenceCounted(false)
             if (!isHeld) acquire()
-        }
-
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            recordAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
 
         // Check if launched via 1-Scan QR Code (asultra://connect?host=IP:PORT&pin=PIN)

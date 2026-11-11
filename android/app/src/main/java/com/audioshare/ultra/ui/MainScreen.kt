@@ -78,6 +78,10 @@ fun MainScreen() {
     var nightMode by remember { mutableStateOf(prefs.getBoolean("night_mode", false)) }
     var crossfeed by remember { mutableStateOf(prefs.getBoolean("crossfeed", false)) }
     var gamingLock by remember { mutableStateOf(prefs.getBoolean("gaming_lock", false)) }
+    // OFF (default) keeps the raw low-latency AAudio path. ON switches to the
+    // shared mixer so OEM Dolby Atmos / Dirac / system EQ can post-process.
+    var dolbyEffects by remember { mutableStateOf(prefs.getBoolean("dolby_fx", false)) }
+    var pendingInternalAudioCast by remember { mutableStateOf(false) }
     var latencyDebug by remember { mutableStateOf(prefs.getBoolean("latency_debug", false)) }
     var channelRole by remember { mutableIntStateOf(prefs.getInt("channel_role", 0)) }
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
@@ -104,10 +108,66 @@ fun MainScreen() {
             .putBoolean("night_mode", nightMode)
             .putBoolean("crossfeed", crossfeed)
             .putBoolean("gaming_lock", gamingLock)
+            .putBoolean("dolby_fx", dolbyEffects)
             .putInt("channel_role", channelRole)
             .apply()
         AudioEngineService.nativeSetGainDb(preampGainDb)
-        AudioEngineService.nativeConfigureDsp(bassDb, vocalDb, trebleDb, channelRole, crossfeed, nightMode, gamingLock)
+        AudioEngineService.nativeConfigureDsp(
+            bassDb, vocalDb, trebleDb, channelRole,
+            crossfeed, nightMode, gamingLock, dolbyEffects
+        )
+    }
+
+    fun setDolbyEffects(enabled: Boolean) {
+        dolbyEffects = enabled
+        prefs.edit().putBoolean("dolby_fx", enabled).apply()
+        // The native engine reopens AAudio when this atomic flips, so the
+        // toggle is live and does not require reconnecting the stream.
+        if (isConnected) {
+            val intent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_SET_DOLBY"
+                putExtra("DOLBY_ENABLED", enabled)
+            }
+            context.startService(intent)
+        }
+    }
+
+    // The foreground service must hold the MICROPHONE type before a mic or
+    // internal-audio capture starts, especially with targetSdk 34 and the
+    // screen off. Plain playback never calls this.
+    fun enterCaptureForeground(label: String) {
+        if (isConnected) {
+            val intent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_SET_MIC_CAPTURE"
+                putExtra("MIC_ACTIVE", true)
+            }
+            context.startService(intent)
+        } else {
+            val guardIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_START_CAST_GUARD"
+                putExtra("CAST_LABEL", label)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(guardIntent)
+            } else {
+                context.startService(guardIntent)
+            }
+        }
+    }
+
+    fun exitCaptureForeground(remainingCapture: Boolean) {
+        if (isConnected) {
+            val intent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_SET_MIC_CAPTURE"
+                putExtra("MIC_ACTIVE", remainingCapture)
+            }
+            context.startService(intent)
+        } else if (!remainingCapture) {
+            val stopIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = "ACTION_STOP"
+            }
+            context.startService(stopIntent)
+        }
     }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -115,17 +175,7 @@ fun MainScreen() {
     ) { granted ->
         if (granted) {
             sharePhoneMic = true
-            if (!isConnected) {
-                val guardIntent = Intent(context, AudioEngineService::class.java).apply {
-                    action = "ACTION_START_CAST_GUARD"
-                    putExtra("CAST_LABEL", "PC Video-Call Mic Active")
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(guardIntent)
-                } else {
-                    context.startService(guardIntent)
-                }
-            }
+            enterCaptureForeground("PC Video-Call Mic Active")
             AudioEngineService.nativeStartPhoneMic(hostAddress, true)
         } else {
             sharePhoneMic = false
@@ -136,25 +186,33 @@ fun MainScreen() {
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            if (!isConnected) {
-                val guardIntent = Intent(context, AudioEngineService::class.java).apply {
-                    action = "ACTION_START_CAST_GUARD"
-                    putExtra("CAST_LABEL", "Party Audio Broadcast Active")
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(guardIntent)
-                } else {
-                    context.startService(guardIntent)
-                }
-            }
+            enterCaptureForeground("Party Audio Broadcast Active")
             val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val proj = mgr.getMediaProjection(result.resultCode, result.data!!)
             if (proj != null) {
                 val targets = hostAddress.split(',', ';', ' ').map { it.trim() }.filter { it.isNotEmpty() }
                 activeCaster = PhoneAudioCaster(proj, if (targets.isEmpty()) listOf(hostAddress) else targets).also { it.startCasting() }
                 castPhoneInternalAudio = true
+            } else {
+                exitCaptureForeground(sharePhoneMic)
             }
         } else {
+            castPhoneInternalAudio = false
+        }
+    }
+
+    // Android 10+ playback capture requires RECORD_AUDIO. Ask at the moment
+    // the user enables internal-audio casting instead of at app launch, so a
+    // plain playback session never requests microphone permission.
+    val castAudioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val pendingCast = pendingInternalAudioCast
+        pendingInternalAudioCast = false
+        if (granted && pendingCast) {
+            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projectionLauncher.launch(mgr.createScreenCaptureIntent())
+        } else if (!granted) {
             castPhoneInternalAudio = false
         }
     }
@@ -184,7 +242,7 @@ fun MainScreen() {
     }
 
     // Poll 4Hz native telemetry & check if Bluetooth A2DP headphones are connected
-    LaunchedEffect(isConnected) {
+    LaunchedEffect(isConnected, dolbyEffects) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         while (isConnected) {
             telemetry = AudioEngineService.nativeGetTelemetry()
@@ -205,10 +263,19 @@ fun MainScreen() {
             // connected device, so a paired-but-idle headset used to report
             // +145ms even while the phone played through its own speaker.
             val hasBt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val attrs = AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
+                // Query the same usage/content type the AAudio stream was
+                // opened with. Raw mode uses GAME/SONIFICATION, so querying
+                // MEDIA/MUSIC could report the speaker while audio actually
+                // plays through Bluetooth.
+                val attrs = AudioAttributes.Builder().apply {
+                    if (dolbyEffects) {
+                        setUsage(AudioAttributes.USAGE_MEDIA)
+                        setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    } else {
+                        setUsage(AudioAttributes.USAGE_GAME)
+                        setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    }
+                }.build()
                 val routedType = audioManager.getAudioDevicesForAttributes(attrs)
                     .firstOrNull()?.type
                 routedType == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
@@ -630,8 +697,10 @@ fun MainScreen() {
                         }
 
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             FilterChip(
                                 selected = nightMode,
@@ -667,6 +736,11 @@ fun MainScreen() {
                                     val roleName = listOf("Stereo", "Left", "Right", "Vocal", "Surround")[channelRole]
                                     Text("🔊 $roleName")
                                 }
+                            )
+                            FilterChip(
+                                selected = dolbyEffects,
+                                onClick = { setDolbyEffects(!dolbyEffects) },
+                                label = { Text("🎬 Dolby") }
                             )
                         }
 
@@ -779,13 +853,23 @@ fun MainScreen() {
                                 checked = castPhoneInternalAudio,
                                 onCheckedChange = { enabled ->
                                     if (enabled) {
-                                        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                                        projectionLauncher.launch(mgr.createScreenCaptureIntent())
+                                        val hasPerm = ContextCompat.checkSelfPermission(
+                                            context,
+                                            Manifest.permission.RECORD_AUDIO
+                                        ) == PackageManager.PERMISSION_GRANTED
+                                        if (hasPerm) {
+                                            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                                            projectionLauncher.launch(mgr.createScreenCaptureIntent())
+                                        } else {
+                                            pendingInternalAudioCast = true
+                                            castAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                        }
                                     } else {
                                         activeCaster?.stopCasting()
                                         activeCaster = null
                                         castPhoneInternalAudio = false
                                         AudioEngineService.nativeStopPhoneMic()
+                                        exitCaptureForeground(sharePhoneMic)
                                     }
                                 }
                             )
@@ -815,6 +899,7 @@ fun MainScreen() {
                                 if (!enabled) {
                                     sharePhoneMic = false
                                     AudioEngineService.nativeStopPhoneMic()
+                                    exitCaptureForeground(castPhoneInternalAudio)
                                 } else {
                                     val hasPerm = ContextCompat.checkSelfPermission(
                                         context,
@@ -822,17 +907,7 @@ fun MainScreen() {
                                     ) == PackageManager.PERMISSION_GRANTED
                                     if (hasPerm) {
                                         sharePhoneMic = true
-                                        if (!isConnected) {
-                                            val guardIntent = Intent(context, AudioEngineService::class.java).apply {
-                                                action = "ACTION_START_CAST_GUARD"
-                                                putExtra("CAST_LABEL", "PC Video-Call Mic Active")
-                                            }
-                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                                context.startForegroundService(guardIntent)
-                                            } else {
-                                                context.startService(guardIntent)
-                                            }
-                                        }
+                                        enterCaptureForeground("PC Video-Call Mic Active")
                                         AudioEngineService.nativeStartPhoneMic(hostAddress, true)
                                     } else {
                                         micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)

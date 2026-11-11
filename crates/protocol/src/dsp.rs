@@ -9,6 +9,12 @@ const CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES: f64 = 0.15;
 /// 1. Jitter-Immune Windowed-Min DLL + 4-Point Hermite Cubic Fractional Resampler
 pub struct ClockDriftResampler {
     phase: f64,
+    /// Conversion from the 48 kHz network stream to the output device.
+    ///
+    /// This is the *input frames per output frame* ratio: an output device
+    /// running at 44.1 kHz needs `48_000 / 44_100`, while a 48 kHz device
+    /// needs `1.0`. `ratio` below is always `base_ratio * (1 + drift)`.
+    pub base_ratio: f64,
     pub ratio: f64,
     hist_l: [f32; 4],
     hist_r: [f32; 4],
@@ -22,6 +28,7 @@ impl ClockDriftResampler {
     pub fn new() -> Self {
         Self {
             phase: 0.0,
+            base_ratio: 1.0,
             ratio: 1.0,
             hist_l: [0.0; 4],
             hist_r: [0.0; 4],
@@ -29,6 +36,53 @@ impl ClockDriftResampler {
             min_queue_frames_window: 999.0,
             window_ticks: 0,
             integral_err: 0.0,
+        }
+    }
+
+    /// Point the resampler at the sample rate AAudio actually opened.
+    ///
+    /// Android may route output through a 44.1 kHz A2DP link even though the
+    /// network stream is 48 kHz. Forcing 48 kHz into that route makes
+    /// AudioFlinger resample through the normal mixer (where OEM effects such
+    /// as Dolby live). Letting AAudio pick the route's native rate keeps the
+    /// stream eligible for the low-latency mixer; this resampler then performs
+    /// the 48 kHz-to-native conversion and the clock-drift correction in one
+    /// pass. Changing the rate resets the drift controller because its queue
+    /// observations were expressed in the previous output rate.
+    #[inline]
+    pub fn set_output_sample_rate(&mut self, output_rate_hz: u32) {
+        let new_base = (crate::SAMPLE_RATE as f64) / (output_rate_hz.clamp(8_000, 384_000) as f64);
+        if (new_base - self.base_ratio).abs() > 1e-9 {
+            self.base_ratio = new_base;
+            self.ratio = new_base;
+            self.short_ema_queue = -1.0;
+            self.min_queue_frames_window = 999.0;
+            self.window_ticks = 0;
+            self.integral_err = 0.0;
+        }
+    }
+
+    /// Convert an output-sample count into 2.5 ms network subframes.
+    ///
+    /// The decoupler is filled at the output rate, so `240` samples are one
+    /// subframe only when that rate is 48 kHz. At 44.1 kHz one subframe is
+    /// `240 / 1.088...` ~= 220.5 samples; without this conversion the client
+    /// would overestimate its buffer depth and let the DAC run dry.
+    #[inline]
+    pub fn samples_to_subframes(&self, samples: usize) -> f32 {
+        (samples as f64 * self.base_ratio / crate::SUBFRAME_STEREO_SAMPLES as f64) as f32
+    }
+
+    /// Convert 2.5 ms subframes into an output-sample count for the current
+    /// output rate. Rounded to a whole stereo frame so L/R stay aligned.
+    #[inline]
+    pub fn subframes_to_samples(&self, subframes: usize) -> usize {
+        let samples = (subframes as f64 * crate::SUBFRAME_STEREO_SAMPLES as f64) / self.base_ratio;
+        let rounded = (samples.round() as usize) & !1;
+        if subframes == 0 {
+            0
+        } else {
+            rounded.max(2)
         }
     }
 
@@ -65,7 +119,7 @@ impl ClockDriftResampler {
                 (0.00005, 0.0005)
             };
             let corr = (kp * err + 0.000005 * self.integral_err).clamp(-0.0005, max_clamp);
-            let target_ratio = 1.0 + corr;
+            let target_ratio = self.base_ratio * (1.0 + corr);
 
             // A ratio step every 500 ms modulates pitch. Large burst errors
             // still snap immediately, but normal corrections slew over a few
@@ -156,6 +210,15 @@ impl BurstDecouplerRing {
         let w = self.write_idx.load(Ordering::Acquire);
         let r = self.read_idx.load(Ordering::Acquire);
         w.wrapping_sub(r)
+    }
+
+    /// Total interleaved samples the ring can hold. Callers that translate a
+    /// time-based target (subframes) into samples must clamp to this, or a
+    /// high-rate output device could produce a watermark the ring can never
+    /// reach and keep the prebuffer loop running forever.
+    #[inline]
+    pub fn capacity_samples(&self) -> usize {
+        FIFO_CAPACITY
     }
 
     #[inline]
@@ -420,6 +483,69 @@ mod tests {
             assert!((frame[0] - 0.25).abs() < 1e-4, "L drift: {}", frame[0]);
             assert!((frame[1] + 0.5).abs() < 1e-4, "R drift: {}", frame[1]);
         }
+    }
+
+    #[test]
+    fn test_resampler_follows_native_output_sample_rate() {
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(44_100);
+
+        // 48 kHz input to 44.1 kHz output: 240 input frames produce ~220.5
+        // output frames, not 240.
+        let expected_base = 48_000.0 / 44_100.0;
+        assert!((resampler.base_ratio - expected_base).abs() < 1e-12);
+        assert!((resampler.ratio - expected_base).abs() < 1e-12);
+
+        let input = [0.1f32; 480];
+        let mut output = [0.0f32; 4096];
+        let out_frames = resampler.process(&input, &mut output);
+        assert!(
+            (219..=221).contains(&out_frames),
+            "44.1 kHz output frame count: {}",
+            out_frames
+        );
+
+        // One 2.5 ms subframe at 44.1 kHz must stay one subframe in the
+        // client's buffer accounting, and the sample counts must be even.
+        assert_eq!(resampler.subframes_to_samples(1), 220);
+        assert_eq!(resampler.subframes_to_samples(2), 440);
+        assert_eq!(resampler.subframes_to_samples(0), 0);
+        let subframes = resampler.samples_to_subframes(220);
+        assert!((subframes - 1.0).abs() < 0.01, "got {}", subframes);
+
+        // A high-rate USB DAC needs more output samples than the input
+        // subframe provides; the old +16 sample buffer would have truncated it.
+        resampler.set_output_sample_rate(96_000);
+        assert_eq!(resampler.subframes_to_samples(1), 480);
+        let out_frames = resampler.process(&input, &mut output);
+        assert!(
+            (479..=481).contains(&out_frames),
+            "96 kHz output frame count: {}",
+            out_frames
+        );
+
+        // Re-applying the same rate must not discard the current drift
+        // correction or reset the phase history.
+        let corrected = resampler.base_ratio * 1.0001;
+        resampler.ratio = corrected;
+        resampler.set_output_sample_rate(96_000);
+        assert!((resampler.ratio - corrected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_clock_loop_correction_is_relative_to_base_ratio() {
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(44_100);
+        let base = resampler.base_ratio;
+        for _ in 0..200 {
+            resampler.update_clock_loop(3.0, 2.0);
+        }
+        let correction = resampler.ratio / base - 1.0;
+        assert!(
+            correction > 0.0 && correction <= 0.0005,
+            "correction must be reported around the output base ratio: {}",
+            correction
+        );
     }
 
     #[test]

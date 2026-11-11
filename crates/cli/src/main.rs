@@ -202,6 +202,7 @@ fn run_client(args: &[String]) {
         server_addr,
         target_buffer_subframes: if is_usb_or_local { 2.0 } else { 3.5 },
         preamp_gain_db: 0.0,
+        dolby_effects: false,
     };
 
     println!("================================================================");
