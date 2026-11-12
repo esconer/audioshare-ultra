@@ -11,7 +11,7 @@ use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeak
 use audioshare_protocol::latency::ClientLatencySnapshot;
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
-    decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+    decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
 };
 use audioshare_protocol::opus_codec::{OpusStreamDecoder, OPUS_LOOKAHEAD_MS, TAG_OPUS_RLD};
 use audioshare_protocol::sequencer::{
@@ -233,6 +233,48 @@ fn take_pending_command(
     gaming.swap(0, Ordering::Relaxed)
 }
 
+/// Accounting for one 500 ms FEC/loss feedback window.
+///
+/// The window is deliberately closed only by the periodic timer. Control
+/// commands used to share the send condition and reset the counters, so a
+/// chip tap 1 ms after a heal reported a 50-100% loss rate and tripped the
+/// host's Smart Auto governor for three seconds.
+#[derive(Default)]
+struct LossWindow {
+    primary: u32,
+    fec: u32,
+    last_permille: u16,
+}
+
+impl LossWindow {
+    #[inline]
+    fn record_primary(&mut self) {
+        self.primary += 1;
+    }
+
+    #[inline]
+    fn record_fec(&mut self) {
+        self.fec += 1;
+    }
+
+    /// Close the window and return the FEC recovery rate in permille.
+    #[inline]
+    fn close(&mut self) -> u16 {
+        let total = (self.primary + self.fec).max(1);
+        self.last_permille = ((self.fec * 1000) / total) as u16;
+        self.primary = 0;
+        self.fec = 0;
+        self.last_permille
+    }
+
+    /// Rate from the most recently closed window. Command-only feedback
+    /// packets reuse this instead of sampling a partial window.
+    #[inline]
+    fn last_permille(&self) -> u16 {
+        self.last_permille
+    }
+}
+
 /// A packet this far ahead of the playhead means the sequence tracker was
 /// lost or the sender restarted. 48 subframes = 120 ms.
 const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 48;
@@ -336,6 +378,67 @@ fn decode_compressed_payload(
         // the compressed primary payload. The FEC decoder also reads those.
         decode_fec_subframe_to_f32(payload, out)
     }
+}
+
+/// Heal one missing sequencer slot from a 124-byte ADPCM FEC frame.
+///
+/// Only slots still ahead of the playhead and genuinely missing are touched;
+/// a late primary copy can always replace the concealment afterwards.
+#[inline]
+fn heal_fec_slot(sequencer: &ZeroJitterSequencer, seq: u16, next_play_seq: u16, payload: &[u8]) {
+    if (seq.wrapping_sub(next_play_seq) as i16).is_negative() || !sequencer.is_slot_missing(seq) {
+        return;
+    }
+    let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+    if decode_fec_subframe_to_f32(payload, &mut pcm_f32) {
+        sequencer.try_heal_with_fec(seq, &pcm_f32);
+    }
+}
+
+/// Heal every complete 124-byte frame in one FEC field. `first_back` is the
+/// sequence distance of the first frame from the packet base, and `step` is
+/// the distance between frames (1 for legacy fields, 2 for interleaved
+/// paired fields). A trailing partial frame is ignored.
+fn heal_fec_field(
+    sequencer: &ZeroJitterSequencer,
+    base_seq: u16,
+    next_play_seq: u16,
+    payload: &[u8],
+    first_back: u16,
+    step: u16,
+) {
+    let mut remaining = payload;
+    let mut back = first_back;
+    while remaining.len() >= ADPCM_FEC_BYTES {
+        let (chunk, tail) = remaining.split_at(ADPCM_FEC_BYTES);
+        heal_fec_slot(sequencer, base_seq.wrapping_sub(back), next_play_seq, chunk);
+        remaining = tail;
+        back = back.wrapping_add(step);
+    }
+}
+
+/// Heal the slots covered by a packet's two FEC fields.
+///
+/// Normal framing carries one 124-byte frame per field (`N-1` and `N-2`).
+/// Four-subframe 2.4 GHz framing carries two frames per field, interleaved:
+/// `fec_n1 = [N-1, N-3]` and `fec_n2 = [N-2, N-4]`, so dropping a whole
+/// 10 ms packet no longer leaves all four subframes unrecoverable. The
+/// interleaving is a compatibility contract: the first frame of each field
+/// keeps its legacy N-1/N-2 meaning, so an older client that only knows the
+/// 124-byte layout still heals the right slots. A contiguous
+/// `[N-1,N-2]`/`[N-3,N-4]` layout would make old clients place N-3 audio in
+/// N-2's slot. A trailing partial frame is ignored.
+fn heal_packet_fec(
+    base_seq: u16,
+    next_play_seq: u16,
+    fec_n1: &[u8],
+    fec_n2: &[u8],
+    sequencer: &ZeroJitterSequencer,
+) {
+    let paired = fec_n1.len() >= ADPCM_FEC_BYTES * 2;
+    let step = if paired { 2 } else { 1 };
+    heal_fec_field(sequencer, base_seq, next_play_seq, fec_n1, 1, step);
+    heal_fec_field(sequencer, base_seq, next_play_seq, fec_n2, 2, step);
 }
 
 /// Convert an AAudio timestamp snapshot into the milliseconds still queued
@@ -718,8 +821,7 @@ impl ClientEngine {
         let mut last_dolby_state = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
         #[cfg(target_os = "android")]
         let mut last_aaudio_open_attempt: Option<Instant> = None;
-        let mut window_primary = 0u32;
-        let mut window_fec = 0u32;
+        let mut window = LossWindow::default();
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
         let configured_floor = configured_wifi_floor(config.target_buffer_subframes);
         let mut initial_wifi_floor = configured_floor;
@@ -814,7 +916,8 @@ impl ClientEngine {
                 last_gaming_feedback = Instant::now();
             }
 
-            if last_feedback.elapsed() >= Duration::from_millis(500)
+            let periodic_due = last_feedback.elapsed() >= Duration::from_millis(500);
+            if periodic_due
                 || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
                 || telemetry
                     .pending_codec_backend_command
@@ -831,19 +934,24 @@ impl ClientEngine {
                     Ordering::Relaxed,
                 );
 
-                let total_win = (window_primary + window_fec).max(1);
-                let fec_permille = ((window_fec * 1000) / total_win) as u16;
-                window_primary = 0;
-                window_fec = 0;
+                // Only the periodic timer owns the loss window. A command
+                // flush must never close a 1 ms partial window (which used to
+                // report a single heal as 50-100% loss and trip Smart Auto
+                // for three seconds); command packets reuse the last closed
+                // window's rate instead.
+                let fec_permille = if periodic_due {
+                    let closed = window.close();
 
-                // Decay the 2.4 GHz cushion when the link is healthy enough
-                // that FEC is keeping up. Minor background recovery must not
-                // pin the cushion at its 35 ms ceiling forever.
-                adaptive_wifi_subframes = decay_adaptive_cushion(
-                    adaptive_wifi_subframes,
-                    initial_wifi_floor,
-                    fec_permille,
-                );
+                    // Decay the 2.4 GHz cushion when the link is healthy
+                    // enough that FEC is keeping up. Minor background recovery
+                    // must not pin the cushion at its 35 ms ceiling forever.
+                    adaptive_wifi_subframes =
+                        decay_adaptive_cushion(adaptive_wifi_subframes, initial_wifi_floor, closed);
+                    last_feedback = Instant::now();
+                    closed
+                } else {
+                    window.last_permille()
+                };
 
                 // Transport/quality commands take the current packet; a
                 // simultaneous codec-backend selection stays pending and is
@@ -883,8 +991,6 @@ impl ClientEngine {
                 fb.encode_signed(active_key.as_ref(), &mut fb_bytes);
 
                 let _ = socket.send_to(&fb_bytes, config.server_addr);
-
-                last_feedback = Instant::now();
             }
 
             // A blocking recv_from (up to 1 ms, often longer under Windows or
@@ -1010,8 +1116,11 @@ impl ClientEngine {
                             opus_decoder = None;
                         }
 
-                        // Lazy FEC Decoding: Only decode FEC [N-1] / [N-2] if that slot is ACTUALLY missing
-                        // and still ahead of the DAC playhead (saves 99.5% of FEC CPU work!).
+                        // Lazy FEC Decoding: only decode the backup frames that
+                        // cover slots that are ACTUALLY missing and still
+                        // ahead of the DAC playhead (saves 99.5% of FEC CPU
+                        // work!). A 10 ms packet carries four frames across
+                        // its two fields, so one lost packet is fully healed.
                         //
                         // Opus RLD has a 2.5 ms codec lookahead, while the
                         // IMA-ADPCM FEC backup has zero lookahead. Splicing
@@ -1021,29 +1130,17 @@ impl ClientEngine {
                         // instead.
                         let opus_primary =
                             primary_is_opus(parsed.header.mode, parsed.primary_payload);
-                        if !opus_primary && !parsed.fec_n1_payload.is_empty() {
-                            let s1 = base_seq.wrapping_sub(1);
-                            if (s1.wrapping_sub(next_play_seq) as i16) >= 0
-                                && sequencer.is_slot_missing(s1)
-                            {
-                                let mut fec1_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                if decode_fec_subframe_to_f32(parsed.fec_n1_payload, &mut fec1_f32)
-                                {
-                                    sequencer.try_heal_with_fec(s1, &fec1_f32);
-                                }
-                            }
-                        }
-                        if !opus_primary && !parsed.fec_n2_payload.is_empty() {
-                            let s2 = base_seq.wrapping_sub(2);
-                            if (s2.wrapping_sub(next_play_seq) as i16) >= 0
-                                && sequencer.is_slot_missing(s2)
-                            {
-                                let mut fec2_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                if decode_fec_subframe_to_f32(parsed.fec_n2_payload, &mut fec2_f32)
-                                {
-                                    sequencer.try_heal_with_fec(s2, &fec2_f32);
-                                }
-                            }
+                        if !opus_primary
+                            && (!parsed.fec_n1_payload.is_empty()
+                                || !parsed.fec_n2_payload.is_empty())
+                        {
+                            heal_packet_fec(
+                                base_seq,
+                                next_play_seq,
+                                parsed.fec_n1_payload,
+                                parsed.fec_n2_payload,
+                                &sequencer,
+                            );
                         }
 
                         let mut cursor = 0usize;
@@ -1235,7 +1332,7 @@ impl ClientEngine {
                     STATUS_PRIMARY_LOSSLESS => {
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = 0;
-                        window_primary += 1;
+                        window.record_primary();
                         telemetry
                             .primary_frames_played
                             .fetch_add(1, Ordering::Relaxed);
@@ -1243,7 +1340,7 @@ impl ClientEngine {
                     STATUS_HEALED_BY_FEC => {
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = 0;
-                        window_fec += 1;
+                        window.record_fec();
                         // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 14.0 = 35.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(14.0);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
@@ -1259,7 +1356,7 @@ impl ClientEngine {
                         // right tradeoff once its slot has been concealed.
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
-                        window_fec += 1;
+                        window.record_fec();
                         // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(14.0);
                         telemetry
@@ -2054,6 +2151,92 @@ mod tests {
             let expected = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
             assert_eq!(out[i], expected, "unfilled sample at {}", i);
         }
+    }
+
+    #[test]
+    fn test_loss_window_keeps_partial_accounting_until_close() {
+        let mut window = LossWindow::default();
+
+        // A command flush must not sample a 1 ms window and report 100% loss.
+        window.record_primary();
+        window.record_fec();
+        assert_eq!(window.last_permille(), 0);
+        window.record_primary();
+
+        // The periodic timer closes the window: 1 heal of 3 subframes.
+        assert_eq!(window.close(), 333);
+        assert_eq!(window.last_permille(), 333);
+
+        // A later command packet reuses the closed rate without resetting
+        // the counters of the next window.
+        window.record_primary();
+        assert_eq!(window.last_permille(), 333);
+
+        // A fully healthy window closes at 0%.
+        assert_eq!(window.close(), 0);
+        assert_eq!(window.last_permille(), 0);
+    }
+
+    #[test]
+    fn test_heal_packet_fec_maps_paired_and_legacy_layouts() {
+        use audioshare_protocol::lpc_lossless::encode_fec_subframe;
+
+        // Four subframes for sequences 96..=99 with distinguishable levels.
+        let levels = [1000i16, 2000, 3000, 4000];
+        let mut encoded = [[0u8; ADPCM_FEC_BYTES]; 4];
+        for (i, level) in levels.iter().enumerate() {
+            let pcm = [*level; SUBFRAME_STEREO_SAMPLES];
+            encode_fec_subframe(&pcm, &mut encoded[i]);
+        }
+
+        // Paired 10 ms layout for base_seq 100, interleaved for backward
+        // compatibility: fec_n1 = [N-1(99), N-3(97)],
+        // fec_n2 = [N-2(98), N-4(96)].
+        let mut n1 = [0u8; ADPCM_FEC_BYTES * 2];
+        n1[..ADPCM_FEC_BYTES].copy_from_slice(&encoded[3]);
+        n1[ADPCM_FEC_BYTES..].copy_from_slice(&encoded[1]);
+        let mut n2 = [0u8; ADPCM_FEC_BYTES * 2];
+        n2[..ADPCM_FEC_BYTES].copy_from_slice(&encoded[2]);
+        n2[ADPCM_FEC_BYTES..].copy_from_slice(&encoded[0]);
+
+        // Legacy clients read the first frame of each field and must still see
+        // N-1/N-2, never N-3 in N-2's slot.
+        assert_eq!(&n1[..ADPCM_FEC_BYTES], &encoded[3]);
+        assert_eq!(&n2[..ADPCM_FEC_BYTES], &encoded[2]);
+
+        let mut sequencer = ZeroJitterSequencer::new();
+        heal_packet_fec(100, 96, &n1, &n2, &sequencer);
+
+        for (i, level) in levels.iter().enumerate() {
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            let status = sequencer.pop_next(96 + i as u16, &mut out);
+            assert_eq!(status, STATUS_HEALED_BY_FEC, "slot {} not healed", 96 + i);
+            let expected = *level as f32 / 32768.0;
+            assert!(
+                (out[0] - expected).abs() < 0.02,
+                "slot {} expected ~{}, got {}",
+                96 + i,
+                expected,
+                out[0]
+            );
+        }
+
+        // Legacy one-frame-per-field layout: fec_n1 = N-1, fec_n2 = N-2.
+        let legacy = ZeroJitterSequencer::new();
+        heal_packet_fec(100, 98, &encoded[3], &encoded[2], &legacy);
+        assert!(legacy.is_slot_missing(96));
+        assert!(legacy.is_slot_missing(97));
+        assert!(!legacy.is_slot_missing(98));
+        assert!(!legacy.is_slot_missing(99));
+
+        // A trailing partial frame is ignored instead of being decoded as a
+        // corrupt 124-byte backup.
+        let malformed = ZeroJitterSequencer::new();
+        let mut partial = [0u8; ADPCM_FEC_BYTES + 17];
+        partial[..ADPCM_FEC_BYTES].copy_from_slice(&encoded[3]);
+        heal_packet_fec(100, 99, &partial, &[], &malformed);
+        assert!(!malformed.is_slot_missing(99));
+        assert!(malformed.is_slot_missing(98));
     }
 }
 
