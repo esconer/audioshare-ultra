@@ -73,6 +73,41 @@ fn gaming_base_target_subframes(pkt_subframes: u8, jitter_us: f32) -> f32 {
     (packet_floor + jitter_extra).min(GAMING_MAX_TARGET_SUBFRAMES)
 }
 
+/// Loss at or below this is treated as a healthy link for cushion decay. FEC
+/// heals count as loss in the feedback window, so requiring exactly zero
+/// pinned a 35 ms cushion forever on a link with even 0.5% background
+/// recovery.
+const ADAPTIVE_DECAY_MAX_FEC_PERMILLE: u16 = 15;
+
+/// Shrink the adaptive cushion toward the floor after a healthy feedback
+/// window. Proportional decay removes most of a large burst-induced cushion in
+/// a few seconds; the old fixed 0.15-subframe step needed ~27 seconds from the
+/// 35 ms cap, and any FEC heal reset the timer.
+#[inline]
+fn decay_adaptive_cushion(adaptive: f32, floor: f32, fec_permille: u16) -> f32 {
+    if adaptive <= floor || fec_permille > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
+        return adaptive;
+    }
+    let step = ((adaptive - floor) * 0.12).max(0.15);
+    (adaptive - step).max(floor)
+}
+
+/// Observation fed to the clock-drift controller.
+///
+/// An AAudio/CPAL callback drains a whole HAL burst (4-20 ms on Bluetooth)
+/// from the decoupler at once, so the instantaneous combined depth spends most
+/// of each callback period at a structural trough. Feeding that trough to the
+/// windowed-min controller makes it compare "post-burst low" against the mean
+/// target and wind the integral negative until the sequencer piles up the same
+/// burst worth of latency. Regulate the planned cushion instead: the sequencer
+/// backlog plus the decoupler target. Genuine starvation is signalled by
+/// `STATUS_EMPTY`/FEC and grows the adaptive target; slowing the resampler by
+/// a few hundred ppm cannot replace the missing audio.
+#[inline]
+fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
+    net_subframes.max(0.0) + target_buf.max(0.0)
+}
+
 /// Output decoupler watermark in 2.5 ms subframes (4..=12).
 #[inline]
 fn fifo_target_subframes(target_buf: f32) -> usize {
@@ -763,11 +798,14 @@ impl ClientEngine {
                 window_primary = 0;
                 window_fec = 0;
 
-                // If 500ms window had zero drops/late packets, gently decay 2.4GHz cushion back toward floor
-                if fec_permille == 0 && adaptive_wifi_subframes > initial_wifi_floor {
-                    adaptive_wifi_subframes =
-                        (adaptive_wifi_subframes - 0.15).max(initial_wifi_floor);
-                }
+                // Decay the 2.4 GHz cushion when the link is healthy enough
+                // that FEC is keeping up. Minor background recovery must not
+                // pin the cushion at its 35 ms ceiling forever.
+                adaptive_wifi_subframes = decay_adaptive_cushion(
+                    adaptive_wifi_subframes,
+                    initial_wifi_floor,
+                    fec_permille,
+                );
 
                 // Transport/quality commands take the current packet; a
                 // simultaneous codec-backend selection stays pending and is
@@ -1267,16 +1305,6 @@ impl ClientEngine {
                     fifo_subframes,
                     target_buf,
                 );
-                // Regulate COMBINED (Sequencer + FIFO) buffer so they never stack in series!
-                let buffered_subframes = net_subframes + fifo_subframes;
-                telemetry.buffered_audio_us.store(
-                    (buffered_subframes.max(0.0) * 2500.0) as u32,
-                    Ordering::Relaxed,
-                );
-                resampler.update_clock_loop(buffered_subframes, target_buf);
-
-                let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
-                telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
 
                 // Never synthesize more than one PLC subframe per loop pass
                 // without first polling the socket again. The previous code
@@ -1285,6 +1313,31 @@ impl ClientEngine {
                 if status == STATUS_EMPTY {
                     break;
                 }
+            }
+
+            // Feed the clock-drift controller once per pass, using the planned
+            // cushion rather than the decoupler level the output callback just
+            // drained. A whole AAudio/CPAL burst (4-20 ms on Bluetooth) makes
+            // the instantaneous combined depth look permanently low even when
+            // the network clock is locked; see `clock_loop_observation`.
+            if stream_initialized
+                && prebuffer_ready
+                && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
+            {
+                let fifo_subframes = resampler.samples_to_subframes(burst_fifo.available_samples());
+                let net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
+                    as i16)
+                    .max(0) as f32;
+                telemetry.buffered_audio_us.store(
+                    ((net_subframes + fifo_subframes).max(0.0) * 2500.0) as u32,
+                    Ordering::Relaxed,
+                );
+                resampler.update_clock_loop(
+                    clock_loop_observation(net_subframes, target_buf),
+                    target_buf,
+                );
+                let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
+                telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
             }
 
             // Publish the adaptive cushion and prebuffer state for the live
@@ -1534,6 +1587,71 @@ mod tests {
             adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(12.0);
         }
         assert_eq!(adaptive_wifi_subframes, 12.0);
+    }
+
+    #[test]
+    fn test_adaptive_cushion_decays_under_minor_fec_loss() {
+        let floor = 6.0f32;
+        let mut adaptive = 14.0f32;
+
+        // 0.5% background FEC recovery = 5 permille. The old `== 0`
+        // condition held the cushion at 35 ms forever.
+        for _ in 0..40 {
+            adaptive = decay_adaptive_cushion(adaptive, floor, 5);
+        }
+        assert!(
+            adaptive < 7.0,
+            "minor loss must not pin the cushion: {}",
+            adaptive
+        );
+
+        // A genuinely lossy window (4%) holds the current cushion.
+        assert_eq!(decay_adaptive_cushion(10.0, floor, 40), 10.0);
+
+        // The floor is a hard lower bound.
+        let mut at_floor = floor;
+        for _ in 0..100 {
+            at_floor = decay_adaptive_cushion(at_floor, floor, 0);
+        }
+        assert_eq!(at_floor, floor);
+
+        // The first healthy step removes most of one subframe, not 0.15.
+        let first = decay_adaptive_cushion(14.0, floor, 0);
+        assert!(first < 13.2, "first decay step is too slow: {}", first);
+    }
+
+    #[test]
+    fn test_clock_loop_ignores_output_burst_troughs() {
+        // A 20 ms A2DP callback drains six subframes from a six-subframe
+        // decoupler at once, then the refill loop observes levels 1..=6.
+        // Feeding that sawtooth to the old windowed-min controller made it
+        // compare "post-burst low" with the mean target.
+        let target = 6.0f32;
+        let mut old = ClockDriftResampler::new();
+        for _ in 0..200 {
+            for level in 1..=6 {
+                old.update_clock_loop(level as f32, target);
+            }
+        }
+        let old_ppm = ((old.ratio - 1.0) * 1_000_000.0) as i32;
+        assert!(
+            old_ppm < -50,
+            "trough observation should bias the old loop slow, got {} ppm",
+            old_ppm
+        );
+
+        // The fixed loop regulates sequencer backlog + target. A network that
+        // keeps up keeps the observation at target even while the decoupler
+        // dips after every callback, so the ratio stays at the base rate.
+        let mut fixed = ClockDriftResampler::new();
+        for _ in 0..1200 {
+            fixed.update_clock_loop(clock_loop_observation(0.0, target), target);
+        }
+        let fixed_ppm = ((fixed.ratio - 1.0) * 1_000_000.0) as i32;
+        assert_eq!(
+            fixed_ppm, 0,
+            "structural output bursts must not change the clock ratio"
+        );
     }
 
     #[test]
