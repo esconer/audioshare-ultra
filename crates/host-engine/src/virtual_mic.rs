@@ -7,15 +7,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use audioshare_protocol::dsp::{BurstDecouplerRing, TruePeakLimiter};
-use audioshare_protocol::lpc_lossless::{decode_fec_subframe_to_f32, decode_lossless_subframe};
+use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
+use audioshare_protocol::lpc_lossless::{
+    decode_fec_subframe_to_f32, decode_lossless_subframe, decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+};
 use audioshare_protocol::sequencer::ZeroJitterSequencer;
-use audioshare_protocol::wire::ParsedPacket;
+use audioshare_protocol::wire::{CodecMode, ParsedPacket};
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 
 use crate::{configure_realtime_udp_socket, promote_thread_realtime};
 
 pub const PHONE_MIC_PORT: u16 = 65532;
+
+/// Keep roughly 5 ms queued in the output decoupler. The writer drains whole
+/// 2.5 ms subframes, so a two-subframe cushion absorbs the poll interval
+/// without adding audible call latency.
+const MIC_FIFO_TARGET_SUBFRAMES: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhoneRxRoutingMode {
@@ -69,12 +76,26 @@ fn decode_primary_bundle(
             break;
         }
 
-        let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
-        if decode_lossless_subframe(&primary[cursor..cursor + sub_len], &mut pcm_i16).is_ok() {
-            let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-            for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
-                *dst = (s as f32) * (1.0 / 32768.0);
+        let payload = &primary[cursor..cursor + sub_len];
+        let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let ok = if payload.first() == Some(&TAG_VBR_BFP) {
+            // The Party host switches between lossless and VBR without
+            // changing the header's mode. A VBR subframe is self-identifying
+            // through its tag, so sniff every payload instead of trusting one
+            // codec mode for the whole stream.
+            decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
+        } else {
+            let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+            if decode_lossless_subframe(payload, &mut pcm_i16).is_ok() {
+                for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
+                    *dst = (s as f32) * (1.0 / 32768.0);
+                }
+                true
+            } else {
+                false
             }
+        };
+        if ok {
             on_subframe(sub_idx, &pcm_f32);
             decoded += 1;
         }
@@ -327,6 +348,8 @@ impl PhoneMicReceiver {
                 let mut next_seq: u16 = 0;
                 let mut latest_seq: u16 = 0;
                 let mut next_tick = Instant::now() + Duration::from_micros(2500);
+                let mut resampler = ClockDriftResampler::new();
+                let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
 
                 while run_clone.load(Ordering::Relaxed) {
                     while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
@@ -337,6 +360,19 @@ impl PhoneMicReceiver {
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 initialized = true;
+                            }
+
+                            // DTX heartbeat: the host stopped sending audio
+                            // but kept the NAT mapping and clock alive. Drop
+                            // every held slot and park the playhead here, so
+                            // the next real packet starts a fresh cushion
+                            // instead of replaying stale concealment.
+                            if parsed.header.mode == CodecMode::SilenceHeartbeat {
+                                sequencer.reset();
+                                next_seq = base_seq;
+                                latest_seq = base_seq;
+                                prebuffer_ready = false;
+                                continue;
                             }
 
                             // The phone transmitter can restart (or the phone
@@ -443,7 +479,20 @@ impl PhoneMicReceiver {
                                 mic_gate.process_in_place(&mut frame);
                             }
                             limiter.process_in_place(&mut frame);
-                            mic_fifo_thread.push_samples(&frame);
+
+                            // The phone ADC and the PC output device run on
+                            // independent crystals. Push through the clock
+                            // resampler and steer its ratio from the measured
+                            // decoupler depth; without this the FIFO slowly
+                            // overflows or runs dry even when every packet
+                            // arrives on time.
+                            let frames = resampler.process(&frame, &mut resampled_out);
+                            if frames > 0 {
+                                mic_fifo_thread.push_samples(&resampled_out[..frames * 2]);
+                            }
+                            let fifo_subframes = resampler
+                                .samples_to_subframes(mic_fifo_thread.available_samples());
+                            resampler.update_clock_loop(fifo_subframes, MIC_FIFO_TARGET_SUBFRAMES);
                         }
                     }
 
@@ -496,7 +545,7 @@ impl Drop for PhoneMicReceiver {
 mod tests {
     use super::*;
     use audioshare_protocol::lpc_lossless::{
-        encode_lossless_subframe, MAX_LOSSLESS_SUBFRAME_BYTES,
+        encode_lossless_subframe, encode_vbr_subframe, MAX_LOSSLESS_SUBFRAME_BYTES, TAG_VBR_BFP,
     };
 
     #[test]
@@ -545,6 +594,43 @@ mod tests {
         short[0..2].copy_from_slice(&100u16.to_be_bytes());
         let count = decode_primary_bundle(&short, 1, |_, _| panic!("must not decode"));
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_decode_primary_bundle_handles_tagged_vbr() {
+        let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / 48_000.0;
+            pcm_i16[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm_i16[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let len = encode_vbr_subframe(&pcm_i16, 256, &mut enc);
+        assert_eq!(enc[0], TAG_VBR_BFP);
+
+        let mut bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        bundle[2..2 + len].copy_from_slice(&enc[..len]);
+
+        let mut peak = 0.0f32;
+        let count = decode_primary_bundle(&bundle[..2 + len], 1, |idx, pcm| {
+            assert_eq!(idx, 0);
+            for &v in pcm {
+                peak = peak.max(v.abs());
+            }
+        });
+        assert_eq!(count, 1, "tagged VBR payload must decode");
+        assert!(peak > 0.05, "decoded music must not be silence");
+    }
+
+    #[test]
+    fn test_mic_clock_resampler_depth_conversion() {
+        let resampler = ClockDriftResampler::new();
+        let one = resampler.samples_to_subframes(SUBFRAME_STEREO_SAMPLES);
+        assert!((one - 1.0).abs() < 1e-6);
+        let target = resampler.samples_to_subframes(SUBFRAME_STEREO_SAMPLES * 2);
+        assert!((target - MIC_FIFO_TARGET_SUBFRAMES).abs() < 1e-6);
     }
 
     #[test]

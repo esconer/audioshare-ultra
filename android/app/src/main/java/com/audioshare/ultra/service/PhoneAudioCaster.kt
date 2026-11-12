@@ -9,6 +9,7 @@ import android.media.projection.MediaProjection
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import androidx.annotation.RequiresApi
 import kotlin.concurrent.thread
 
@@ -75,6 +76,10 @@ class PhoneAudioCaster(
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                // Never capture AudioShare Ultra's own playback. Without this,
+                // a phone that is also listening to the Party stream would
+                // feed its own speaker output back into the transmitter.
+                .excludeUid(Process.myUid())
                 .build()
 
             val format = AudioFormat.Builder()
@@ -140,6 +145,7 @@ class PhoneAudioCaster(
                         android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
                     )
                     val subframe = FloatArray(240) // 120 stereo frames = 2.5 ms
+                    var consecutiveZeroReads = 0
                     while (running) {
                         var offset = 0
                         while (offset < subframe.size && running) {
@@ -149,7 +155,21 @@ class PhoneAudioCaster(
                                 subframe.size - offset,
                                 AudioRecord.READ_BLOCKING
                             )
-                            if (read <= 0) break
+                            if (read < 0) break
+                            if (read == 0) {
+                                // A transient route switch or a momentarily
+                                // empty capture FIFO can return 0 without
+                                // ending the projection. Retry instead of
+                                // silently killing Party Mode while the UI
+                                // switch still says it is casting. Bound the
+                                // retry so a permanently dead route still
+                                // tears down and notifies the service.
+                                consecutiveZeroReads++
+                                if (consecutiveZeroReads > 2000) break
+                                Thread.sleep(1)
+                                continue
+                            }
+                            consecutiveZeroReads = 0
                             offset += read
                         }
                         // Never push a partially filled subframe: its tail

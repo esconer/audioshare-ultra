@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -9,10 +9,13 @@ use audioshare_client_engine::android_aaudio::AAudioInputGuard;
 use audioshare_client_engine::{ClientConfig, ClientEngine};
 use audioshare_host_engine::discovery_and_os::{DiscoveryBeacon, DiscoveryScanner};
 use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
-use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
+use audioshare_host_engine::{
+    configure_realtime_udp_socket, list_valid_host_interfaces, promote_thread_realtime,
+};
 use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
-    encode_fec_subframe, encode_lossless_subframe, ADPCM_FEC_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES,
+    encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
+    MAX_LOSSLESS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::wire::{
     pack_datagram, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
@@ -78,7 +81,32 @@ fn trim_phone_mic_backlog(
     }
 }
 
-pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
+/// The legacy Android RNDIS host address. It is only meaningful while a USB
+/// tethering interface actually exists; otherwise it is a dead unicast target
+/// that would otherwise receive 400 packets per second on Wi-Fi.
+const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
+
+/// Peer phones register on the well-known Party port, while PC receivers use
+/// `PHONE_MIC_PORT` (65532).
+const PARTY_PHONE_PORT: u16 = 65530;
+const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+const PARTY_VBR_LOSS_THRESHOLD_PERMILLE: u16 = 45;
+const PARTY_VBR_BITRATE_KBPS: u16 = 256;
+const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
+const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
+
+#[derive(Clone, Copy)]
+struct PartyPeerState {
+    last_seen: Instant,
+    delay_ms: u16,
+    fec_permille: u16,
+}
+
+fn parse_target_endpoints_with_locals(
+    target_hosts: &str,
+    local_ips: &[IpAddr],
+    has_usb_iface: bool,
+) -> Vec<SocketAddr> {
     let mut targets = Vec::new();
     for item in target_hosts.split([',', ';', ' ']) {
         let item = item.trim();
@@ -86,13 +114,144 @@ pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
             continue;
         }
         let host_only = item.split(':').next().unwrap_or(item);
-        if let Ok(addr) = format!("{}:{}", host_only, PHONE_MIC_PORT).parse::<SocketAddr>() {
-            if !targets.contains(&addr) {
-                targets.push(addr);
+        let Ok(addr) = format!("{}:{}", host_only, PHONE_MIC_PORT).parse::<SocketAddr>() else {
+            continue;
+        };
+
+        // A unicast phone-to-phone transmitter must never send to a broadcast,
+        // multicast or unspecified address: 802.11 transmits those at the
+        // mandatory basic rate, which can consume the entire channel airtime.
+        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            continue;
+        }
+        if let IpAddr::V4(ipv4) = addr.ip() {
+            if ipv4.is_broadcast() {
+                continue;
             }
+            if ipv4 == LEGACY_RNDIS_HOST && !has_usb_iface {
+                continue;
+            }
+        }
+        // The Party host must never register its own beacon or send audio back
+        // to its own capture path.
+        if local_ips.contains(&addr.ip()) {
+            continue;
+        }
+        if !targets.contains(&addr) {
+            targets.push(addr);
         }
     }
     targets
+}
+
+pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
+    let ifaces = list_valid_host_interfaces();
+    let local_ips: Vec<IpAddr> = ifaces.iter().map(|iface| iface.ip).collect();
+    let has_usb_iface = ifaces.iter().any(|iface| iface.is_usb_tethering);
+    parse_target_endpoints_with_locals(target_hosts, &local_ips, has_usb_iface)
+}
+
+fn initial_party_peers(
+    static_targets: &[SocketAddr],
+    add_phone_peers: bool,
+    now: Instant,
+) -> HashMap<SocketAddr, PartyPeerState> {
+    let fresh = PartyPeerState {
+        last_seen: now,
+        delay_ms: 0,
+        fec_permille: 0,
+    };
+    let mut peers = HashMap::new();
+    for &addr in static_targets {
+        peers.insert(addr, fresh);
+        if add_phone_peers {
+            peers
+                .entry(SocketAddr::new(addr.ip(), PARTY_PHONE_PORT))
+                .or_insert(fresh);
+        }
+    }
+    peers
+}
+
+/// Replace any old dynamic port for this IP, but keep the configured PC
+/// receiver endpoints. A peer that reconnects on a new ephemeral port must not
+/// leave the old port receiving packets forever.
+fn retain_static_and_current(
+    peers: &mut HashMap<SocketAddr, PartyPeerState>,
+    src: SocketAddr,
+    static_targets: &[SocketAddr],
+) {
+    peers.retain(|addr, _| addr.ip() != src.ip() || *addr == src || static_targets.contains(addr));
+}
+
+fn register_party_peer(
+    peers: &mut HashMap<SocketAddr, PartyPeerState>,
+    src: SocketAddr,
+    static_targets: &[SocketAddr],
+    now: Instant,
+) {
+    retain_static_and_current(peers, src, static_targets);
+    peers.insert(
+        src,
+        PartyPeerState {
+            last_seen: now,
+            delay_ms: 0,
+            fec_permille: 0,
+        },
+    );
+}
+
+fn update_party_peer_feedback(
+    peers: &mut HashMap<SocketAddr, PartyPeerState>,
+    src: SocketAddr,
+    delay_ms: u16,
+    fec_permille: u16,
+    static_targets: &[SocketAddr],
+    now: Instant,
+) {
+    retain_static_and_current(peers, src, static_targets);
+    peers.insert(
+        src,
+        PartyPeerState {
+            last_seen: now,
+            delay_ms,
+            fec_permille,
+        },
+    );
+}
+
+fn expire_party_peers(
+    peers: &mut HashMap<SocketAddr, PartyPeerState>,
+    static_targets: &[SocketAddr],
+    now: Instant,
+) {
+    peers.retain(|addr, state| {
+        static_targets.contains(addr)
+            || now.saturating_duration_since(state.last_seen) < PARTY_PEER_TIMEOUT
+    });
+}
+
+fn party_codec_mode(peer_count: usize, worst_loss_permille: u16) -> CodecMode {
+    if peer_count >= 2 || worst_loss_permille > PARTY_VBR_LOSS_THRESHOLD_PERMILLE {
+        CodecMode::CompressedLowDelay
+    } else {
+        CodecMode::StudioLosslessLpc
+    }
+}
+
+fn party_dtx_active(packet_is_silent: bool, silent_subframes: u32) -> bool {
+    packet_is_silent && silent_subframes > PARTY_DTX_SILENT_SUBFRAMES
+}
+
+fn party_dtx_heartbeat_due(base_seq: u16, subframes_per_pkt: usize) -> bool {
+    // `base_seq` counts 2.5 ms subframes, not packets. Two subframes per
+    // datagram means one heartbeat every 80 packets (200 ms).
+    let interval_subframes = PARTY_DTX_HEARTBEAT_INTERVAL as usize * subframes_per_pkt.max(1);
+    base_seq as usize % interval_subframes == 0
+}
+
+fn party_beacon_port(use_hardware_mic: bool, bound_port: u16) -> Option<u16> {
+    (!use_hardware_mic).then_some(bound_port)
 }
 
 /// Bind the transmitter socket.
@@ -115,45 +274,33 @@ fn bind_phone_mic_socket(use_hardware_mic: bool) -> std::io::Result<UdpSocket> {
 
 impl PhoneMicTransmitter {
     pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
-        let mut targets = parse_target_endpoints(target_hosts);
-        if !use_hardware_mic {
-            // When casting internal phone system audio (Party Mode), also stream to port 65530 for other phones
-            for item in target_hosts.split([',', ';', ' ']) {
-                let item = item.trim();
-                if item.is_empty() {
-                    continue;
-                }
-                let host_only = item.split(':').next().unwrap_or(item);
-                if let Ok(phone_peer_addr) = format!("{}:65530", host_only).parse::<SocketAddr>() {
-                    if !targets.contains(&phone_peer_addr) {
-                        targets.push(phone_peer_addr);
-                    }
-                }
-            }
-            // Include LAN/Hotspot broadcast on port 65530 so multiple phones can tune in simultaneously!
-            let bcast = SocketAddr::from(([255, 255, 255, 255], 65530));
-            if !targets.contains(&bcast) {
-                targets.push(bcast);
-            }
-        }
-        if targets.is_empty() {
+        let static_targets = parse_target_endpoints(target_hosts);
+        // Hardware-mic mode streams to explicitly configured PC receivers. A
+        // Party host is allowed to start with only its beacon: peer phones
+        // register themselves by HELLO/feedback and never rely on broadcast.
+        if use_hardware_mic && static_targets.is_empty() {
             return Err("No valid target endpoints found for transmitter".into());
         }
 
         let socket = bind_phone_mic_socket(use_hardware_mic).map_err(|e| e.to_string())?;
+        let bound_port = socket
+            .local_addr()
+            .map_err(|e| format!("Failed to read party socket port: {}", e))?
+            .port();
         let _ = socket.set_broadcast(true);
         let _ = socket.set_nonblocking(true);
         configure_realtime_udp_socket(&socket).map_err(|e| e.to_string())?;
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
+        let initial_peers = initial_party_peers(&static_targets, !use_hardware_mic, Instant::now());
 
-        // When casting internal phone audio (Party Mode), broadcast DiscoveryBeacon so other phones discover this phone in 1 tap!
-        let _party_beacon = if !use_hardware_mic {
-            Some(DiscoveryBeacon::start(65530, "Android-Party-Host".into()))
-        } else {
-            None
-        };
+        // Party peers discover this phone through the beacon on the port the
+        // transmitter actually bound. Advertising a hardcoded 65530 after a
+        // fallback bind leaves every listener sending HELLO to a port nobody
+        // reads.
+        let _party_beacon = party_beacon_port(use_hardware_mic, bound_port)
+            .map(|bound_port| DiscoveryBeacon::start(bound_port, "Android-Party-Host".into()));
 
         #[cfg(target_os = "android")]
         let _mic_input_stream = if use_hardware_mic {
@@ -164,6 +311,10 @@ impl PhoneMicTransmitter {
 
         let run_clone = Arc::clone(&running);
         let ring_clone = Arc::clone(&mic_input_ring);
+        let local_ips: Vec<IpAddr> = list_valid_host_interfaces()
+            .into_iter()
+            .map(|iface| iface.ip)
+            .collect();
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-phone-mic-tx".into())
@@ -177,7 +328,9 @@ impl PhoneMicTransmitter {
                 let mut has_fec_n2 = false;
                 let mut dither_rng = 1u32;
                 let mut ctrl_buf = [0u8; 64];
-                let mut peer_delays: HashMap<SocketAddr, u16> = HashMap::new();
+                let mut peers = initial_peers;
+                let mut last_sweep = Instant::now();
+                let mut silent_subframes: u32 = 0;
                 let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
                 let mut last_tx: Option<Instant> = None;
                 let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
@@ -190,24 +343,41 @@ impl PhoneMicTransmitter {
                         // socket is ephemeral and port 65530 belongs to
                         // ClientEngine, so there is nothing to listen for.
                         while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
+                            // A phone that receives its own beacon/feedback
+                            // must never register itself as a listener.
+                            if local_ips.contains(&src_addr.ip()) {
+                                continue;
+                            }
                             if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
-                                if !targets.contains(&src_addr) {
-                                    targets.push(src_addr);
-                                }
+                                register_party_peer(
+                                    &mut peers,
+                                    src_addr,
+                                    &static_targets,
+                                    Instant::now(),
+                                );
                             } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
-                                if !targets.contains(&src_addr) {
-                                    targets.push(src_addr);
-                                }
                                 if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
                                     // Align the fixed downstream delay (A2DP or
                                     // measured DAC), never the adaptive network
                                     // jitter buffer.
-                                    peer_delays.insert(
+                                    update_party_peer_feedback(
+                                        &mut peers,
                                         src_addr,
                                         fb.bluetooth_delay_ms.max(fb.hardware_delay_ms),
+                                        fb.fec_rate_permille,
+                                        &static_targets,
+                                        Instant::now(),
                                     );
                                 }
                             }
+                        }
+                        // Peers send feedback every 500 ms. A peer that stopped
+                        // sending is removed after 10 s so its old port and
+                        // Bluetooth delay cannot pin the group-sync alignment
+                        // forever. Configured PC endpoints stay.
+                        if last_sweep.elapsed() >= Duration::from_secs(1) {
+                            last_sweep = Instant::now();
+                            expire_party_peers(&mut peers, &static_targets, last_sweep);
                         }
                     }
 
@@ -232,22 +402,45 @@ impl PhoneMicTransmitter {
                         let send_n2 = has_fec_n2;
                         let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
                         let mut cursor = 0usize;
+                        let mut packet_is_silent = true;
+                        let worst_loss_permille =
+                            peers.values().map(|p| p.fec_permille).max().unwrap_or(0);
+                        // A Party host feeding several phones cannot afford a
+                        // lossless unicast copy per listener on 2.4 GHz. Step
+                        // down to 256 kbps VBR when a second listener joins or
+                        // when any listener reports more than 4.5% loss.
+                        let codec_mode = party_codec_mode(peers.len(), worst_loss_permille);
+                        let use_compressed =
+                            !use_hardware_mic && codec_mode == CodecMode::CompressedLowDelay;
 
                         for _ in 0..subframes_per_pkt {
                             let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
 
                             let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
+                            let mut max_abs = 0i16;
                             for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
                                 // Round rather than truncate toward zero: the
                                 // latter doubles the zero-crossing quantization
                                 // bin and adds odd-harmonic distortion to the
                                 // phone-mic capture.
-                                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                                let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                                *dst = v;
+                                max_abs = max_abs.max(v.saturating_abs());
+                            }
+                            if max_abs > 3 {
+                                packet_is_silent = false;
+                                silent_subframes = 0;
+                            } else {
+                                silent_subframes = silent_subframes.saturating_add(1);
                             }
 
                             let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                            let enc_len = encode_lossless_subframe(&i16_buf, &mut enc);
+                            let enc_len = if use_compressed {
+                                encode_vbr_subframe(&i16_buf, PARTY_VBR_BITRATE_KBPS, &mut enc)
+                            } else {
+                                encode_lossless_subframe(&i16_buf, &mut enc)
+                            };
                             let len_be = (enc_len as u16).to_be_bytes();
                             primary_bundle[cursor] = len_be[0];
                             primary_bundle[cursor + 1] = len_be[1];
@@ -263,10 +456,28 @@ impl PhoneMicTransmitter {
                             seq = seq.wrapping_add(1);
                         }
 
-                        let max_peer_delay_ms = peer_delays.values().copied().max().unwrap_or(0);
+                        // After 500 ms of silence, keep only a 200 ms
+                        // heartbeat. Every heartbeat advances the sequence and
+                        // wakes the receiver's jitter buffer; audio resumes on
+                        // the next non-silent packet.
+                        let dtx = !use_hardware_mic
+                            && party_dtx_active(packet_is_silent, silent_subframes);
+                        if dtx && !party_dtx_heartbeat_due(base_seq, subframes_per_pkt) {
+                            last_tx = Some(Instant::now());
+                            continue;
+                        }
+                        let max_peer_delay_ms = if peers.len() >= 2 {
+                            peers.values().map(|p| p.delay_ms).max().unwrap_or(0)
+                        } else {
+                            0
+                        };
                         let hdr = WireHeader {
-                            mode: CodecMode::StudioLosslessLpc,
-                            subframe_count: subframes_per_pkt as u8,
+                            mode: if dtx {
+                                CodecMode::SilenceHeartbeat
+                            } else {
+                                codec_mode
+                            },
+                            subframe_count: if dtx { 0 } else { subframes_per_pkt as u8 },
                             encrypted: false,
                             sequence: base_seq,
                             tx_timestamp_us: start.elapsed().as_micros() as u32,
@@ -279,12 +490,15 @@ impl PhoneMicTransmitter {
                         };
 
                         let mut dgram = [0u8; MAX_SAFE_UDP_PAYLOAD];
-                        let f1 = if send_n1 { &prev_n1[..] } else { &[] };
-                        let f2 = if send_n2 { &prev_n2[..] } else { &[] };
-                        if let Ok(pkt_len) =
-                            pack_datagram(hdr, &primary_bundle[..cursor], f1, f2, &mut dgram)
-                        {
-                            for target in &targets {
+                        let primary = if dtx {
+                            &[][..]
+                        } else {
+                            &primary_bundle[..cursor]
+                        };
+                        let f1 = if !dtx && send_n1 { &prev_n1[..] } else { &[] };
+                        let f2 = if !dtx && send_n2 { &prev_n2[..] } else { &[] };
+                        if let Ok(pkt_len) = pack_datagram(hdr, primary, f1, f2, &mut dgram) {
+                            for target in peers.keys() {
                                 let _ = socket.send_to(&dgram[..pkt_len], *target);
                             }
                             last_tx = Some(Instant::now());
@@ -451,9 +665,19 @@ pub fn android_configure_dsp(
 
 /// Returns newline-delimited list of auto-discovered hosts: "Hostname|IP:Port|USB_or_WiFi"
 pub fn android_get_discovered_hosts_csv() -> String {
+    let local_ips: Vec<IpAddr> = list_valid_host_interfaces()
+        .into_iter()
+        .map(|iface| iface.ip)
+        .collect();
     let hosts = get_or_start_scanner().discovered_hosts();
     let mut out = String::new();
     for h in hosts {
+        // Party hosts beacon their own label. Showing it in the listener list
+        // would let the phone connect to itself and feed its own speaker
+        // output back into the capture path.
+        if local_ips.contains(&h.addr.ip()) {
+            continue;
+        }
         let mode = if h.is_usb { "USB" } else { "WiFi" };
         out.push_str(&format!("{}|{}|{}\n", h.hostname, h.addr, mode));
     }
@@ -663,11 +887,122 @@ mod tests {
     #[test]
     fn test_parse_target_endpoints_party_mode() {
         let input = "192.168.1.100, 192.168.1.101:65532; 10.0.0.5  192.168.1.100";
-        let addrs = parse_target_endpoints(input);
+        let addrs = parse_target_endpoints_with_locals(input, &[], false);
         assert_eq!(addrs.len(), 3);
         assert_eq!(addrs[0], "192.168.1.100:65532".parse().unwrap());
         assert_eq!(addrs[1], "192.168.1.101:65532".parse().unwrap());
         assert_eq!(addrs[2], "10.0.0.5:65532".parse().unwrap());
+    }
+
+    #[test]
+    fn test_party_targets_filter_self_broadcast_and_legacy_rndis() {
+        let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let input = "192.168.1.50, 192.168.1.60, 255.255.255.255, \
+                     239.255.77.77, 0.0.0.0, 192.168.42.129:65530";
+        let targets = parse_target_endpoints_with_locals(input, &[local], false);
+        assert_eq!(
+            targets,
+            vec!["192.168.1.60:65532".parse().unwrap()],
+            "self, broadcast, multicast, unspecified and dead RNDIS hosts must be dropped"
+        );
+
+        // A real USB tethering interface makes the legacy RNDIS target reachable.
+        let targets = parse_target_endpoints_with_locals("192.168.42.129", &[local], true);
+        assert_eq!(targets, vec!["192.168.42.129:65532".parse().unwrap()]);
+    }
+
+    #[test]
+    fn test_party_peer_lifecycle_dedupes_and_expires() {
+        let now = Instant::now();
+        let pc: SocketAddr = "192.168.1.60:65532".parse().unwrap();
+        let static_targets = vec![pc];
+        let mut peers = initial_party_peers(&static_targets, true, now);
+        assert!(peers.contains_key(&pc));
+        assert!(peers.contains_key(&"192.168.1.60:65530".parse().unwrap()));
+
+        let phone_old: SocketAddr = "192.168.1.70:40000".parse().unwrap();
+        let phone_new: SocketAddr = "192.168.1.70:40002".parse().unwrap();
+        register_party_peer(&mut peers, phone_old, &static_targets, now);
+        register_party_peer(&mut peers, phone_new, &static_targets, now);
+        assert!(
+            !peers.contains_key(&phone_old),
+            "a reconnect on a new port must evict the stale port"
+        );
+        assert!(peers.contains_key(&phone_new));
+
+        update_party_peer_feedback(&mut peers, phone_new, 120, 80, &static_targets, now);
+        assert_eq!(peers[&phone_new].delay_ms, 120);
+        assert_eq!(peers[&phone_new].fec_permille, 80);
+
+        expire_party_peers(&mut peers, &static_targets, now + Duration::from_secs(11));
+        assert!(
+            peers.contains_key(&pc),
+            "configured PC endpoints never expire"
+        );
+        assert!(
+            !peers.contains_key(&phone_new),
+            "a silent dynamic peer must expire"
+        );
+    }
+
+    #[test]
+    fn test_party_codec_vbr_engages_for_multi_peer_or_loss() {
+        assert_eq!(party_codec_mode(0, 0), CodecMode::StudioLosslessLpc);
+        assert_eq!(
+            party_codec_mode(1, PARTY_VBR_LOSS_THRESHOLD_PERMILLE),
+            CodecMode::StudioLosslessLpc
+        );
+        assert_eq!(
+            party_codec_mode(1, PARTY_VBR_LOSS_THRESHOLD_PERMILLE + 1),
+            CodecMode::CompressedLowDelay
+        );
+        assert_eq!(party_codec_mode(2, 0), CodecMode::CompressedLowDelay);
+    }
+
+    #[test]
+    fn test_party_dtx_threshold_and_heartbeat_cadence() {
+        assert!(!party_dtx_active(false, 10_000));
+        assert!(!party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES));
+        assert!(party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES + 1));
+
+        // Two subframes per packet: a heartbeat every 160 subframes is one
+        // every 80 packets, i.e. every 200 ms.
+        assert!(party_dtx_heartbeat_due(0, 2));
+        assert!(!party_dtx_heartbeat_due(80, 2));
+        assert!(party_dtx_heartbeat_due(160, 2));
+        assert!(!party_dtx_heartbeat_due(159, 2));
+        assert!(party_dtx_heartbeat_due(80, 1));
+    }
+
+    #[test]
+    fn test_party_beacon_advertises_bound_port() {
+        assert_eq!(party_beacon_port(false, 49_152), Some(49_152));
+        assert_eq!(
+            party_beacon_port(true, 49_152),
+            None,
+            "hardware-mic mode must not advertise a Party beacon"
+        );
+    }
+
+    #[test]
+    fn test_party_vbr_256_saves_bytes_on_music() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / 48_000.0;
+            pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut vbr = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let mut lossless = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let vbr_len = encode_vbr_subframe(&pcm, PARTY_VBR_BITRATE_KBPS, &mut vbr);
+        let lossless_len = encode_lossless_subframe(&pcm, &mut lossless);
+        assert_eq!(vbr[0], audioshare_protocol::lpc_lossless::TAG_VBR_BFP);
+        assert_eq!(vbr_len, 83, "256 kbps VBR subframe is fixed at 83 bytes");
+        assert!(
+            vbr_len < lossless_len,
+            "VBR ({vbr_len} B) must beat lossless ({lossless_len} B) on music"
+        );
     }
 
     #[test]
