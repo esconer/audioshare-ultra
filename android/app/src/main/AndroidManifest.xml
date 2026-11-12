@@ -43,7 +43,7 @@
             android:name=".service.AudioEngineService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback|microphone" />
+            android:foregroundServiceType="mediaPlayback|microphone|mediaProjection" />
 
         <service
             android:name=".service.QuickConnectTileService"

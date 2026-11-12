@@ -11,6 +11,8 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.net.wifi.WifiManager
@@ -20,6 +22,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.PerformanceHintManager
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
@@ -31,6 +34,18 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @Volatile
         var isStreaming: Boolean = false
+            private set
+
+        // Party Mode (internal-audio cast) is owned by this service, not the
+        // Compose UI: the MediaProjection consent token is one-shot and must
+        // be redeemed only after startForeground(...MEDIA_PROJECTION).
+        const val ACTION_START_PARTY_CAST = "ACTION_START_PARTY_CAST"
+        const val ACTION_STOP_PARTY_CAST = "ACTION_STOP_PARTY_CAST"
+        const val ACTION_PARTY_CAST_STATE = "ACTION_PARTY_CAST_STATE"
+        const val EXTRA_PARTY_CAST_ACTIVE = "PARTY_CAST_ACTIVE"
+
+        @Volatile
+        var isPartyCasting: Boolean = false
             private set
 
         @JvmStatic
@@ -100,6 +115,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // Only microphone / internal-audio capture may declare the MICROPHONE
     // foreground-service type. Plain playback must never request it.
     private var micCaptureActive: Boolean = false
+    // Internal-audio playback capture is a mediaProjection foreground
+    // service, not a microphone one.
+    private var projectionActive: Boolean = false
+    private var activeCaster: PhoneAudioCaster? = null
     private var foregroundStarted: Boolean = false
 
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
@@ -141,6 +160,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 startForegroundNotification(currentHostAddr, currentIsUsb)
             }
             return START_STICKY
+        }
+        if (intent?.action == ACTION_START_PARTY_CAST) {
+            return startPartyCast(intent)
+        }
+        if (intent?.action == ACTION_STOP_PARTY_CAST) {
+            return stopPartyCast()
         }
         if (intent?.action == "ACTION_START_CAST_GUARD") {
             // Standalone Mic / Party Host Mode: Hold ForegroundService + Low-Latency WifiLock + WakeLock
@@ -429,10 +454,180 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
+    /**
+     * Redeem the one-shot MediaProjection consent in the service, after the
+     * MEDIA_PROJECTION foreground-service type is active. Android 14+ throws
+     * `SecurityException: Media projections require a foreground service of
+     * type ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` if
+     * getMediaProjection() runs first.
+     */
+    private fun startPartyCast(intent: Intent): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            broadcastPartyCastState(false)
+            if (isStreaming) return START_STICKY
+            stopStreamAndService()
+            return START_NOT_STICKY
+        }
+
+        val resultCode = intent.getIntExtra(
+            "PROJECTION_RESULT_CODE",
+            Activity.RESULT_CANCELED
+        )
+        @Suppress("DEPRECATION")
+        val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra("PROJECTION_DATA", Intent::class.java)
+        } else {
+            intent.getParcelableExtra("PROJECTION_DATA")
+        }
+        if (resultCode != Activity.RESULT_OK || resultData == null) {
+            broadcastPartyCastState(false)
+            if (isStreaming) return START_STICKY
+            stopStreamAndService()
+            return START_NOT_STICKY
+        }
+
+        // A repeated toggle can leave the previous caster alive. Drop it
+        // before installing the new projection.
+        val previous = activeCaster
+        activeCaster = null
+        projectionActive = false
+        previous?.stopCasting()
+
+        val rawTargets = intent.getStringExtra("TARGET_HOSTS")
+            ?: "255.255.255.255:65530"
+        val targets = rawTargets
+            .split(',', ';', ' ')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .ifEmpty { listOf("255.255.255.255:65530") }
+
+        if (!isStreaming) {
+            currentHostAddr = "Party Audio Broadcast"
+            currentIsUsb = false
+        }
+
+        // Playback capture is not microphone capture. A previous video-call
+        // session may still hold the MICROPHONE type; clear it before
+        // declaring mediaProjection.
+        micCaptureActive = false
+        projectionActive = true
+        var projection: MediaProjection? = null
+        try {
+            // This must complete BEFORE getMediaProjection(). The consent
+            // data is already in hand, so the system can validate the type.
+            startForegroundNotification(
+                currentHostAddr,
+                currentIsUsb,
+                includeProjectionType = true
+            )
+            acquireRealtimeHardwareLocks()
+
+            val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val acquired = mgr.getMediaProjection(resultCode, resultData)
+                ?: return failPartyCastStart()
+            projection = acquired
+
+            var casterRef: PhoneAudioCaster? = null
+            val caster = PhoneAudioCaster(acquired, targets) {
+                // Ignore a late callback from a caster that was already
+                // replaced or explicitly stopped.
+                val stopped = casterRef
+                if (stopped != null && activeCaster === stopped) {
+                    activeCaster = null
+                    handlePartyCastStopped()
+                }
+            }
+            casterRef = caster
+            if (!caster.startCasting()) {
+                return failPartyCastStart()
+            }
+            activeCaster = caster
+            broadcastPartyCastState(true)
+            // A projection token cannot be resumed after process death, so a
+            // party-cast-only service must not be sticky. A concurrent PC
+            // stream keeps its normal sticky restart behavior.
+            return if (isStreaming) START_STICKY else START_NOT_STICKY
+        } catch (e: Exception) {
+            runCatching { projection?.stop() }
+            Log.e("AudioEngineService", "Unable to start party cast", e)
+            return failPartyCastStart()
+        }
+    }
+
+    private fun failPartyCastStart(): Int {
+        val caster = activeCaster
+        activeCaster = null
+        caster?.stopCasting()
+        projectionActive = false
+        micCaptureActive = false
+        AudioEngineService.nativeStopPhoneMic()
+        broadcastPartyCastState(false)
+        if (isStreaming) {
+            runCatching {
+                startForegroundNotification(
+                    currentHostAddr,
+                    currentIsUsb,
+                    includeProjectionType = false
+                )
+            }
+            return START_STICKY
+        }
+        stopStreamAndService()
+        return START_NOT_STICKY
+    }
+
+    private fun stopPartyCast(): Int {
+        val caster = activeCaster
+        activeCaster = null
+        projectionActive = false
+        caster?.stopCasting()
+        AudioEngineService.nativeStopPhoneMic()
+        broadcastPartyCastState(false)
+        if (isStreaming) {
+            runCatching {
+                startForegroundNotification(
+                    currentHostAddr,
+                    currentIsUsb,
+                    includeProjectionType = false
+                )
+            }
+            return START_STICKY
+        }
+        stopStreamAndService()
+        return START_NOT_STICKY
+    }
+
+    private fun handlePartyCastStopped() {
+        projectionActive = false
+        AudioEngineService.nativeStopPhoneMic()
+        broadcastPartyCastState(false)
+        if (isStreaming && foregroundStarted) {
+            runCatching {
+                startForegroundNotification(
+                    currentHostAddr,
+                    currentIsUsb,
+                    includeProjectionType = false
+                )
+            }
+        } else {
+            stopStreamAndService()
+        }
+    }
+
+    private fun broadcastPartyCastState(active: Boolean) {
+        isPartyCasting = active
+        val intent = Intent(ACTION_PARTY_CAST_STATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_PARTY_CAST_ACTIVE, active)
+        }
+        sendBroadcast(intent)
+    }
+
     private fun startForegroundNotification(
         hostAddr: String,
         isUsb: Boolean,
-        includeMicType: Boolean = micCaptureActive
+        includeMicType: Boolean = micCaptureActive,
+        includeProjectionType: Boolean = projectionActive
     ) {
         val channelId = "audioshare_ultra_stream"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -471,21 +666,25 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Declare MICROPHONE only while a mic or internal-audio capture
-            // actually runs and RECORD_AUDIO is granted. Normal playback
-            // intentionally omits it, so the OS does not treat a plain
-            // music stream as microphone use.
+            // Declare MICROPHONE only while a mic capture actually runs and
+            // RECORD_AUDIO is granted. Internal-audio playback capture is a
+            // mediaProjection service, not a microphone one.
             val micGranted = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                 android.content.pm.PackageManager.PERMISSION_GRANTED
-            val type = if (includeMicType && micGranted) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            if (includeMicType && micGranted) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            if (includeProjectionType) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             }
             startForeground(101, notification, type)
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(101, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+            var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            if (includeProjectionType) {
+                type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+            startForeground(101, notification, type)
         } else {
             startForeground(101, notification)
         }
@@ -503,6 +702,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun stopStreamAndService() {
+        // Drop the caster before stopping the foreground service so a late
+        // projection callback cannot re-enter teardown.
+        val caster = activeCaster
+        activeCaster = null
+        projectionActive = false
+        caster?.stopCasting()
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
         audioDeviceCallback?.let { callback ->
@@ -517,6 +722,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopClient()
         isStreaming = false
         micCaptureActive = false
+        broadcastPartyCastState(false)
         foregroundStarted = false
         if (noisyReceiverRegistered) {
             try {

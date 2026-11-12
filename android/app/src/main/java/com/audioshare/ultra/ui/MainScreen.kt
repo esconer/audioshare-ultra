@@ -2,12 +2,15 @@ package com.audioshare.ultra.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -29,7 +32,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.audioshare.ultra.service.AudioEngineService
-import com.audioshare.ultra.service.PhoneAudioCaster
 import kotlinx.coroutines.delay
 
 private fun usToMs(us: Long): String = "%.1f".format(us / 1000.0)
@@ -100,8 +102,10 @@ fun MainScreen() {
     // Sent to the host as feedback code 20/21; only affects compressed modes.
     var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", false)) }
     var sharePhoneMic by remember { mutableStateOf(false) }
-    var castPhoneInternalAudio by remember { mutableStateOf(false) }
-    var activeCaster by remember { mutableStateOf<PhoneAudioCaster?>(null) }
+    // The service owns the MediaProjection token and the caster. The UI only
+    // mirrors the service's broadcast so a system-revoked projection turns
+    // the switch off even if the app was backgrounded.
+    var castPhoneInternalAudio by remember { mutableStateOf(AudioEngineService.isPartyCasting) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
     // 0..10 legacy counters, 11..21 live latency breakdown.
@@ -141,9 +145,38 @@ fun MainScreen() {
         }
     }
 
-    // The foreground service must hold the MICROPHONE type before a mic or
-    // internal-audio capture starts, especially with targetSdk 34 and the
-    // screen off. Plain playback never calls this.
+    // The service is the single owner of the projection session. Mirror its
+    // state so a system-revoked projection (or a failed start) flips the
+    // switch back even when this screen was not the caller.
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent?.action == AudioEngineService.ACTION_PARTY_CAST_STATE) {
+                    castPhoneInternalAudio = intent.getBooleanExtra(
+                        AudioEngineService.EXTRA_PARTY_CAST_ACTIVE,
+                        false
+                    )
+                }
+            }
+        }
+        val filter = IntentFilter(AudioEngineService.ACTION_PARTY_CAST_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // The foreground service must hold the MICROPHONE type before a hardware
+    // mic capture starts, especially with targetSdk 34 and the screen off.
+    // Plain playback and playback capture never call this.
     fun enterCaptureForeground(label: String) {
         if (isConnected) {
             val intent = Intent(context, AudioEngineService::class.java).apply {
@@ -191,19 +224,44 @@ fun MainScreen() {
         }
     }
 
+    fun createAudioCaptureProjectionIntent(): Intent {
+        val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Android 14+ defaults createScreenCaptureIntent() to the
+            // single-app video window picker, which cannot feed
+            // AudioPlaybackCapture. Request the default-display audio mix.
+            mgr.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+        } else {
+            mgr.createScreenCaptureIntent()
+        }
+    }
+
     val projectionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK && result.data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            enterCaptureForeground("Party Audio Broadcast Active")
-            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            val proj = mgr.getMediaProjection(result.resultCode, result.data!!)
-            if (proj != null) {
-                val targets = hostAddress.split(',', ';', ' ').map { it.trim() }.filter { it.isNotEmpty() }
-                activeCaster = PhoneAudioCaster(proj, if (targets.isEmpty()) listOf(hostAddress) else targets).also { it.startCasting() }
+        val resultData = result.data
+        if (result.resultCode == Activity.RESULT_OK && resultData != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // The native phone-mic transmitter is a single global. Release
+            // the hardware mic before the service hands it to the caster.
+            if (sharePhoneMic) {
+                sharePhoneMic = false
+                AudioEngineService.nativeStopPhoneMic()
+            }
+            val svcIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = AudioEngineService.ACTION_START_PARTY_CAST
+                putExtra("PROJECTION_RESULT_CODE", result.resultCode)
+                putExtra("PROJECTION_DATA", resultData)
+                putExtra("TARGET_HOSTS", hostAddress)
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(svcIntent)
+                } else {
+                    context.startService(svcIntent)
+                }
                 castPhoneInternalAudio = true
-            } else {
-                exitCaptureForeground(sharePhoneMic)
+            } catch (_: Exception) {
+                castPhoneInternalAudio = false
             }
         } else {
             castPhoneInternalAudio = false
@@ -219,8 +277,7 @@ fun MainScreen() {
         val pendingCast = pendingInternalAudioCast
         pendingInternalAudioCast = false
         if (granted && pendingCast) {
-            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            projectionLauncher.launch(mgr.createScreenCaptureIntent())
+            projectionLauncher.launch(createAudioCaptureProjectionIntent())
         } else if (!granted) {
             castPhoneInternalAudio = false
         }
@@ -883,7 +940,7 @@ fun MainScreen() {
                     }
                 }
 
-                // Cast Phone Internal Media & Games (PhoneAudioCaster - Party Mode)
+                // Cast Phone Internal Media & Games (service-owned caster - Party Mode)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                         Row(
@@ -909,18 +966,17 @@ fun MainScreen() {
                                             Manifest.permission.RECORD_AUDIO
                                         ) == PackageManager.PERMISSION_GRANTED
                                         if (hasPerm) {
-                                            val mgr = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                                            projectionLauncher.launch(mgr.createScreenCaptureIntent())
+                                            projectionLauncher.launch(createAudioCaptureProjectionIntent())
                                         } else {
                                             pendingInternalAudioCast = true
                                             castAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                         }
                                     } else {
-                                        activeCaster?.stopCasting()
-                                        activeCaster = null
                                         castPhoneInternalAudio = false
-                                        AudioEngineService.nativeStopPhoneMic()
-                                        exitCaptureForeground(sharePhoneMic)
+                                        val stopIntent = Intent(context, AudioEngineService::class.java).apply {
+                                            action = AudioEngineService.ACTION_STOP_PARTY_CAST
+                                        }
+                                        context.startService(stopIntent)
                                     }
                                 }
                             )
@@ -946,6 +1002,7 @@ fun MainScreen() {
                         }
                         Switch(
                             checked = sharePhoneMic,
+                            enabled = !castPhoneInternalAudio,
                             onCheckedChange = { enabled ->
                                 if (!enabled) {
                                     sharePhoneMic = false
