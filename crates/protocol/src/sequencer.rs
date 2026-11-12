@@ -166,7 +166,14 @@ impl ZeroJitterSequencer {
         self.history[keep..].copy_from_slice(frame);
     }
 
-    /// Find best pitch period P in [48..=240] frames via energy-normalized autocorrelation on Stereo Mid
+    /// Find best pitch period P in [48..=240] frames via energy-normalized
+    /// joint-stereo autocorrelation.
+    ///
+    /// Summing L+R before correlating cancels anti-phase content (`L ~= -R`)
+    /// to zero, so every candidate scored 0 and the search fell back to the
+    /// first lag (48 frames = 1 kHz), turning concealment into a buzz. The
+    /// joint inner product `Lt*Lc + Rt*Rc` keeps both channels at the cost of
+    /// two extra multiplies per tap, still negligible against the PLC budget.
     #[inline]
     fn find_best_pitch_period(&self) -> usize {
         let template_start = HISTORY_FRAMES - CROSSFADE_FRAMES;
@@ -179,12 +186,12 @@ impl ZeroJitterSequencer {
             let mut corr = 0.0f32;
             let mut energy = 1e-6f32;
             for k in 0..CROSSFADE_FRAMES {
-                let t_m = self.history[(template_start + k) * 2]
-                    + self.history[(template_start + k) * 2 + 1];
-                let c_m =
-                    self.history[(cand_start + k) * 2] + self.history[(cand_start + k) * 2 + 1];
-                corr += t_m * c_m;
-                energy += c_m * c_m;
+                let t_l = self.history[(template_start + k) * 2];
+                let t_r = self.history[(template_start + k) * 2 + 1];
+                let c_l = self.history[(cand_start + k) * 2];
+                let c_r = self.history[(cand_start + k) * 2 + 1];
+                corr += t_l * c_l + t_r * c_r;
+                energy += c_l * c_l + c_r * c_r;
             }
             // Signed squared correlation normalized by candidate window energy (avoids sqrt!)
             let score = (corr * corr.abs()) / energy;
@@ -415,6 +422,28 @@ mod tests {
         assert!(
             end_energy < start_energy,
             "PLC attenuation must ramp down across the subframe"
+        );
+    }
+
+    #[test]
+    fn test_plc_pitch_search_survives_anti_phase_stereo() {
+        let mut seq = ZeroJitterSequencer::new();
+        // 240 Hz => a 200-frame period, comfortably inside the 48..=240 search
+        // range. L and R are exact opposites, so summing them before the
+        // correlation cancels the signal to zero at every candidate lag.
+        for n in 0..HISTORY_FRAMES {
+            let v = ((n as f32) * 2.0 * std::f32::consts::PI * 240.0 / 48_000.0).sin() * 0.5;
+            seq.history[n * 2] = v;
+            seq.history[n * 2 + 1] = -v;
+        }
+
+        let lag = seq.find_best_pitch_period();
+        println!("anti-phase pitch lag: {}", lag);
+        assert!(
+            (lag as i32 - 200).abs() <= 2,
+            "anti-phase stereo chose lag {} ({} Hz), expected 200 frames",
+            lag,
+            48_000 / lag
         );
     }
 

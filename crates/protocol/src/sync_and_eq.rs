@@ -10,9 +10,9 @@ pub enum ChannelRole {
     LeftMono = 1,
     /// Right Speaker Only (Both speakers play Right channel)
     RightMono = 2,
-    /// Center Vocal / Dialogue Extraction: Mid = (L + R) * 0.7071
+    /// Center Vocal / Dialogue Extraction: Mid = (L + R) * 0.5
     CenterDialogue = 3,
-    /// Side/Surround Difference Extraction: Side = (L - R) * 0.7071
+    /// Side/Surround Difference Extraction: Side = (L - R) * 0.5
     SurroundAmbient = 4,
 }
 
@@ -46,12 +46,20 @@ impl ChannelRole {
                     frame[1] = r;
                 }
                 Self::CenterDialogue => {
-                    let mid = (l + r) * std::f32::consts::FRAC_1_SQRT_2;
+                    // -6 dB center law. A coherent center (L == R == 1.0)
+                    // previously became 1.414 on both speakers because the
+                    // 0.7071 constant-power factor doubled the sum. 0.5 keeps
+                    // full-scale center content at full scale.
+                    let mid = (l + r) * 0.5;
                     frame[0] = mid;
                     frame[1] = mid;
                 }
                 Self::SurroundAmbient => {
-                    let side = (l - r) * std::f32::consts::FRAC_1_SQRT_2;
+                    // Also -6 dB: anti-phase input (L = -R = 1.0) produced
+                    // +/-1.414 and clipped. Side extraction remains exactly
+                    // anti-phase between the ears by design; scaling it down
+                    // only fixes the overload.
+                    let side = (l - r) * 0.5;
                     frame[0] = side;
                     frame[1] = -side;
                 }
@@ -436,6 +444,12 @@ impl NoiseShapedQuantizer {
             // effectively identical so Side stays zero, and independent TPDF
             // otherwise.
             let dither_r = if (in_l - in_r).abs() < 1.0e-5 {
+                // Correlated dither alone is not enough: after any genuinely
+                // stereo sample the two 0.85 error integrators hold different
+                // fractional values, so equal inputs still round differently
+                // and the Mid-Side encoder sees phantom Side energy. Converge
+                // the states so centered passages quantize to out_l == out_r.
+                self.err_r = self.err_l;
                 dither_l
             } else {
                 r1 - r2
@@ -686,6 +700,80 @@ mod tests {
         let mut stereo_out = [0i16; 240];
         quantizer.quantize_stereo_subframe(&stereo, &mut stereo_out);
         assert!(stereo_out.iter().all(|&sample| sample < i16::MAX));
+    }
+
+    #[test]
+    fn test_channel_roles_do_not_boost_centered_or_anti_phase_peaks() {
+        // Coherent center at full scale: (L + R) must not exceed the original
+        // per-speaker amplitude. 1/sqrt(2) produced 1.414 (+3.01 dB) and
+        // clipped any centered full-scale passage.
+        let mut center = [1.0f32; 240];
+        ChannelRole::CenterDialogue.apply_in_place(&mut center);
+        let center_peak = center.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
+
+        // Anti-phase stereo at full scale: the extracted side signal reached
+        // 1.414 and clipped before the output limiter even saw it.
+        let mut anti_phase = [0.0f32; 240];
+        for frame in anti_phase.chunks_exact_mut(2) {
+            frame[0] = 1.0;
+            frame[1] = -1.0;
+        }
+        ChannelRole::SurroundAmbient.apply_in_place(&mut anti_phase);
+        let surround_peak = anti_phase.iter().fold(0.0f32, |peak, &s| peak.max(s.abs()));
+
+        println!(
+            "center-dialogue peak: {:.6}, surround-ambient peak: {:.6}",
+            center_peak, surround_peak
+        );
+        assert!(
+            center_peak <= 1.0 + 1.0e-6,
+            "center dialogue boosted full scale to {}",
+            center_peak
+        );
+        assert!(
+            surround_peak <= 1.0 + 1.0e-6,
+            "surround extraction boosted anti-phase full scale to {}",
+            surround_peak
+        );
+    }
+
+    #[test]
+    fn test_noise_shaped_quantizer_centered_audio_converges_after_stereo() {
+        let mut quantizer = NoiseShapedQuantizer::new();
+
+        // Any preceding uncorrelated stereo sample can leave the two error
+        // integrators at different fractional values. Reproduce a concrete
+        // divergence directly so the test does not depend on whatever the
+        // final sample of one particular stereo waveform happened to be.
+        quantizer.err_l = 0.4;
+        quantizer.err_r = -0.4;
+
+        // A quiet centered passage is where the residual error-state mismatch
+        // dominates: 0.01 is only ~328 LSB, so a fraction of an LSB of
+        // feedback difference flips the rounding decision.
+        let mut mono = [0.0f32; 240];
+        for i in 0..120 {
+            let sample =
+                ((i as f32) * 2.0 * std::f32::consts::PI * 997.0 / 48_000.0 + 0.3).sin() * 0.01;
+            mono[i * 2] = sample;
+            mono[i * 2 + 1] = sample;
+        }
+
+        let mut mismatches = 0usize;
+        let mut mono_out = [0i16; 240];
+        for _ in 0..4 {
+            quantizer.quantize_stereo_subframe(&mono, &mut mono_out);
+            mismatches += mono_out
+                .chunks_exact(2)
+                .filter(|frame| frame[0] != frame[1])
+                .count();
+        }
+        println!("centered L/R mismatches after stereo: {}", mismatches);
+        assert_eq!(
+            mismatches, 0,
+            "centered audio produced {} non-zero Side samples after stereo",
+            mismatches
+        );
     }
 
     #[test]

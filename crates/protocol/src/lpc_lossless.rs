@@ -929,30 +929,43 @@ pub fn encode_fec_subframe(
     // near-zero first difference but a large slope a few samples later; the
     // old one-sample estimate left the ADPCM step too small and the FEC
     // backup distorted the first ~1 ms of every such subframe.
-    let mut max_slope = 60i32;
+    //
+    // Track the channels independently. A shared maximum let a loud transient
+    // in one ear select the step for both, so a hard-panned hit drove the
+    // silent opposite channel by thousands of LSB for the first milliseconds.
+    let mut max_slope_l = 60i32;
+    let mut max_slope_r = 60i32;
     for i in 1..SUBFRAME_FRAMES.min(16) {
         let d_l = (pcm_stereo[i * 2] as i32 - pcm_stereo[(i - 1) * 2] as i32).abs();
         let d_r = (pcm_stereo[i * 2 + 1] as i32 - pcm_stereo[(i - 1) * 2 + 1] as i32).abs();
-        max_slope = max_slope.max(d_l).max(d_r);
+        max_slope_l = max_slope_l.max(d_l);
+        max_slope_r = max_slope_r.max(d_r);
     }
-    let init_idx = IMA_STEP_TABLE
+    let init_idx_l = IMA_STEP_TABLE
         .iter()
-        .position(|&s| s >= max_slope)
+        .position(|&s| s >= max_slope_l)
         .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8;
-    let mut idx_l = init_idx;
-    let mut idx_r = init_idx;
+    let init_idx_r = IMA_STEP_TABLE
+        .iter()
+        .position(|&s| s >= max_slope_r)
+        .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8;
+    let mut idx_l = init_idx_l;
+    let mut idx_r = init_idx_r;
 
-    let l_tagged = (pcm_stereo[0] & !0x007F) | ((init_idx as i16) & 0x007F);
+    let l_tagged = (pcm_stereo[0] & !0x007F) | ((init_idx_l as i16) & 0x007F);
     out[0..2].copy_from_slice(&l_tagged.to_le_bytes());
     out[2..4].copy_from_slice(&pcm_stereo[1].to_le_bytes());
     pred_l = l_tagged as i32;
 
     // Sample 0 is represented by the 4-byte header (L is quantized to the
-    // 7-bit index tag, R is exact). Re-encoding it with `init_idx` would apply
-    // an ADPCM step of up to step/8 to a near-zero residual, biasing the
+    // 7-bit index tag, R is exact). Re-encoding it with the initial step would
+    // apply an ADPCM step of up to step/8 to a near-zero residual, biasing the
     // predictor before sample 1. Keep the first nibble for wire compatibility
-    // but start the ADPCM stream at sample 1.
-    out[4] = 0;
+    // and use its byte for the right channel's independent initial step:
+    // bit 7 marks its presence, bits 0..6 hold the index. Frames from older
+    // encoders leave this byte zero, so the decoder falls back to the left
+    // index exactly as before.
+    out[4] = 0x80 | (init_idx_r as u8 & 0x7F);
     for i in 1..SUBFRAME_FRAMES {
         let nib_l = encode_adpcm_sample(pcm_stereo[i * 2], &mut pred_l, &mut idx_l);
         let nib_r = encode_adpcm_sample(pcm_stereo[i * 2 + 1], &mut pred_r, &mut idx_r);
@@ -969,11 +982,18 @@ pub fn decode_fec_subframe_to_f32(
         return false;
     }
     let l_tagged = i16::from_le_bytes([fec_bytes[0], fec_bytes[1]]);
-    let init_idx = ((l_tagged & 0x007F) as i8).clamp(0, 88);
+    let init_idx_l = ((l_tagged & 0x007F) as i8).clamp(0, 88);
+    // Byte 4 carries the right channel's independent step index when bit 7 is
+    // set. Legacy frames wrote zero there and shared the left index.
+    let init_idx_r = if (fec_bytes[4] & 0x80) != 0 {
+        ((fec_bytes[4] & 0x7F) as i8).clamp(0, 88)
+    } else {
+        init_idx_l
+    };
     let mut pred_l = l_tagged as i32;
     let mut pred_r = i16::from_le_bytes([fec_bytes[2], fec_bytes[3]]) as i32;
-    let mut idx_l = init_idx;
-    let mut idx_r = init_idx;
+    let mut idx_l = init_idx_l;
+    let mut idx_r = init_idx_r;
 
     // The 4-byte header already carries the first stereo frame (L is
     // quantized to the 7-bit index tag, R is exact). The first nibble is
@@ -1072,7 +1092,10 @@ mod tests {
 
         let mut fec = [0u8; ADPCM_FEC_BYTES];
         encode_fec_subframe(&pcm, &mut fec);
-        assert_eq!(fec[4], 0, "first nibble must be reserved/unused");
+        // Byte 4 is the reserved sample-0 nibble. It now carries the right
+        // channel's independent step index, marked by bit 7.
+        assert_ne!(fec[4] & 0x80, 0, "right step-index flag must be present");
+        assert!(((fec[4] & 0x7F) as usize) < IMA_STEP_TABLE.len());
 
         let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_fec_subframe_to_f32(&fec, &mut decoded));
@@ -1090,6 +1113,56 @@ mod tests {
             "sample 0 R bias: {}",
             decoded[1] - (pcm[1] as f32) / 32768.0
         );
+    }
+
+    #[test]
+    fn test_fec_hard_panned_transient_does_not_leak_into_quiet_channel() {
+        // A full-scale transient panned hard left with digital silence on the
+        // right used to share the left channel's initial IMA step index. That
+        // step (up to 32767) then drove the silent right predictor by
+        // thousands of LSB for the first milliseconds of the FEC backup.
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        pcm[0] = 20_000;
+        pcm[1] = 0;
+        for i in 1..SUBFRAME_FRAMES {
+            pcm[i * 2] = if i % 2 == 0 { 20_000 } else { -20_000 };
+            pcm[i * 2 + 1] = 0;
+        }
+
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut decoded));
+
+        let right_peak = decoded
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .fold(0.0f32, |peak, &sample| peak.max(sample.abs()));
+        let right_peak_lsb = right_peak * 32_768.0;
+        println!(
+            "hard-panned FEC quiet-channel peak: {:.1} LSB",
+            right_peak_lsb
+        );
+        assert!(
+            right_peak_lsb < 32.0,
+            "hard-panned left leaked {:.1} LSB into the silent right channel",
+            right_peak_lsb
+        );
+
+        // The left channel must still track the transient.
+        let left_peak = decoded
+            .iter()
+            .step_by(2)
+            .fold(0.0f32, |peak, &sample| peak.max(sample.abs()));
+        assert!(left_peak > 0.5, "left transient collapsed to {}", left_peak);
+
+        // Legacy 124-byte frames leave byte 4 at zero and share the left
+        // index. They must still decode instead of being rejected.
+        let mut legacy = fec;
+        legacy[4] = 0;
+        let mut legacy_decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&legacy, &mut legacy_decoded));
     }
 
     fn make_sine(samples: &mut [i16; SUBFRAME_STEREO_SAMPLES]) {
