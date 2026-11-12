@@ -13,7 +13,7 @@ use audioshare_protocol::lpc_lossless::{
     encode_vbr_subframe, QualityProfile, ADPCM_FEC_BYTES, MAX_LOSSLESS_PCM24_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::opus_codec::OpusStreamEncoder;
+use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
     HEADER_LEN, MAC_TAG_LEN,
@@ -45,20 +45,83 @@ const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
 /// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
 /// encoder every 500 ms.
 const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(3);
+/// Release pace after the hold expires. The estimate steps down by this much
+/// at most once per interval, so a 130 permille report walks
+/// Tier 2 -> Tier 1 -> Tier 0 instead of jumping back to lossless in one
+/// feedback tick and immediately re-congesting the link.
+const SMART_AUTO_RELEASE_STEP_PERMILLE: u16 = 25;
+const SMART_AUTO_RELEASE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Fast-attack / slow-release governor for Smart Auto.
+/// Fast-attack / paced-release governor for Smart Auto.
 ///
 /// A new loss report above the compression threshold immediately wins and
 /// re-arms the hold window. While the window is open the highest reported
 /// value is kept, so a brief good window cannot step back up to lossless.
-fn governed_worst_loss(previous: u16, raw: u16, now: Instant, hold_until: &mut Instant) -> u16 {
-    if raw > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
-        *hold_until = now + SMART_AUTO_LOSS_HOLD;
+/// After the hold expires the estimate decays by
+/// [`SMART_AUTO_RELEASE_STEP_PERMILLE`] no more than once per
+/// [`SMART_AUTO_RELEASE_INTERVAL`]. The wall-clock gate matters because every
+/// connected client sends its own feedback packet: a per-call subtraction
+/// would make a multi-client session release several times faster than a
+/// single-client one.
+struct LossGovernor {
+    value: u16,
+    hold_until: Instant,
+    last_step: Instant,
+}
+
+impl LossGovernor {
+    fn new(now: Instant) -> Self {
+        Self {
+            value: 0,
+            hold_until: now,
+            last_step: now,
+        }
     }
-    if now < *hold_until {
-        previous.max(raw)
-    } else {
-        raw
+
+    fn update(&mut self, raw: u16, now: Instant) -> u16 {
+        if raw > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+            self.hold_until = now + SMART_AUTO_LOSS_HOLD;
+            self.last_step = now;
+            self.value = self.value.max(raw);
+            return self.value;
+        }
+        if now < self.hold_until {
+            self.value = self.value.max(raw);
+            return self.value;
+        }
+        // Below the compression threshold the exact value no longer changes
+        // the tier, so snap to the fresh report instead of stretching a
+        // harmless 4% blip across the release interval.
+        if self.value <= SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+            self.value = raw;
+            return self.value;
+        }
+        if now.saturating_duration_since(self.last_step) >= SMART_AUTO_RELEASE_INTERVAL {
+            self.value = self
+                .value
+                .saturating_sub(SMART_AUTO_RELEASE_STEP_PERMILLE)
+                .max(raw);
+            self.last_step = now;
+        } else {
+            self.value = self.value.max(raw);
+        }
+        self.value
+    }
+}
+
+/// Advance a warm Opus encoder with one live subframe while Smart Auto is in
+/// its lossless tier. The encoded output is intentionally discarded: this
+/// only keeps the encoder's 2.5 ms lookahead primed so the first compressed
+/// packet carries the previous live subframe instead of codec warm-up silence.
+#[inline]
+fn warm_opus_lookahead(
+    encoder: &mut Option<OpusStreamEncoder>,
+    pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
+    kbps: u16,
+) {
+    if let Some(encoder) = encoder.as_mut() {
+        let mut discard = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let _ = encoder.encode_subframe(pcm_stereo, kbps, &mut discard);
     }
 }
 
@@ -1400,12 +1463,12 @@ impl HostEngine {
         let mut ctrl_buf = [0u8; 64];
         let mut dynamic_codec_mode;
         let mut tx_bitrate_kbps;
-        let mut worst_loss_permille: u16 = 0;
-        let mut loss_hold_until = Instant::now();
+        let mut loss_governor = LossGovernor::new(Instant::now());
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         // Lazily created on the first compressed packet after the user enables
-        // the Opus backend. Dropped when the backend is disabled or the
-        // profile is lossless, so a later switch starts with clean state.
+        // the Opus backend. Smart Auto also keeps it warm through Tier 0 so
+        // entering the compressed tier does not emit lookahead silence.
+        // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
         let mut opus_encoder_failed = false;
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
@@ -1560,7 +1623,7 @@ impl HostEngine {
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
 
-                        // Fast attack / 3-second release. A borderline link
+                        // Fast attack / paced release. A borderline link
                         // that alternates between 5% and 0% loss must not
                         // recreate the Opus encoder every 500 ms. Muted
                         // clients do not receive audio, so they cannot drive
@@ -1571,12 +1634,7 @@ impl HostEngine {
                             .map(|c| c.fec_rate_permille)
                             .max()
                             .unwrap_or(0);
-                        worst_loss_permille = governed_worst_loss(
-                            worst_loss_permille,
-                            raw_worst,
-                            Instant::now(),
-                            &mut loss_hold_until,
-                        );
+                        loss_governor.update(raw_worst, Instant::now());
                         Self::refresh_client_delay_telemetry(&map, &telemetry);
                         Self::refresh_gaming_lock_telemetry(&map, &telemetry);
 
@@ -1607,12 +1665,7 @@ impl HostEngine {
                         .map(|c| c.fec_rate_permille)
                         .max()
                         .unwrap_or(0);
-                    worst_loss_permille = governed_worst_loss(
-                        worst_loss_permille,
-                        raw_worst,
-                        Instant::now(),
-                        &mut loss_hold_until,
-                    );
+                    loss_governor.update(raw_worst, Instant::now());
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
@@ -1643,6 +1696,10 @@ impl HostEngine {
             } else {
                 config.subframes_per_packet.clamp(1, 2) as usize
             };
+            // Tier selection uses the governor's paced estimate, not the raw
+            // last report, so a post-hold release walks through Tier 1 instead
+            // of jumping straight from Tier 2 back to lossless.
+            let worst_loss_permille = loss_governor.value;
             match profile {
                 QualityProfile::StudioLossless => {
                     dynamic_codec_mode = CodecMode::StudioLosslessLpc;
@@ -1694,19 +1751,24 @@ impl HostEngine {
             // Compressed-codec backend selection. Opus is opt-in and only
             // replaces the payload of compressed profiles; lossless and
             // 24-bit modes are untouched. If encoder creation fails we stay
-            // on the pure-Rust VBR path instead of dropping audio.
+            // on the pure-Rust VBR path instead of dropping audio. Smart Auto
+            // also keeps the encoder warm during Tier 0 so the first
+            // compressed packet contains live lookahead audio rather than a
+            // silent pre-roll; other lossless profiles still drop it.
             let prefer_opus = telemetry.prefer_opus.load(Ordering::Relaxed);
             if !prefer_opus {
                 opus_encoder = None;
                 opus_encoder_failed = false;
-            } else if dynamic_codec_mode == CodecMode::CompressedLowDelay {
+            } else if dynamic_codec_mode == CodecMode::CompressedLowDelay
+                || profile == QualityProfile::SmartAuto
+            {
                 if opus_encoder.is_none() && !opus_encoder_failed {
                     opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                     if opus_encoder.is_none() {
                         opus_encoder_failed = true;
                     }
                 }
-                if opus_encoder.is_some() {
+                if dynamic_codec_mode == CodecMode::CompressedLowDelay && opus_encoder.is_some() {
                     dynamic_codec_mode = CodecMode::OpusRld;
                 }
             } else {
@@ -1880,6 +1942,12 @@ impl HostEngine {
                         .copy_from_slice(&enc_24[..enc_len]);
                     primary_cursor += enc_len;
                 } else {
+                    // Tier 0 of Smart Auto is lossless, but the Opus encoder
+                    // is kept primed so a sudden loss spike does not start
+                    // with 2.5 ms of codec warm-up silence.
+                    if profile == QualityProfile::SmartAuto && prefer_opus {
+                        warm_opus_lookahead(&mut opus_encoder, &i16_subframe, tx_bitrate_kbps);
+                    }
                     let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
                     let enc_len = encode_lossless_subframe(&i16_subframe, &mut enc_sub);
                     let len_be = (enc_len as u16).to_be_bytes();
@@ -2652,46 +2720,127 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_auto_loss_governor_holds_compressed_mode() {
+    fn test_smart_auto_loss_governor_holds_then_steps_down() {
         let base = Instant::now();
-        let mut hold_until = base;
+        let mut governor = LossGovernor::new(base);
 
         // 5% loss arms compressed mode.
-        assert_eq!(governed_worst_loss(0, 50, base, &mut hold_until), 50);
+        assert_eq!(governor.update(50, base), 50);
         // The next 0% report cannot step back up while the hold is open.
-        assert_eq!(
-            governed_worst_loss(50, 0, base + Duration::from_millis(500), &mut hold_until),
-            50
-        );
-        assert_eq!(
-            governed_worst_loss(50, 0, base + Duration::from_millis(2_999), &mut hold_until),
-            50
-        );
-        // Three seconds after the last high report it releases.
-        assert_eq!(
-            governed_worst_loss(50, 0, base + Duration::from_millis(3_000), &mut hold_until),
-            0
-        );
+        assert_eq!(governor.update(0, base + Duration::from_millis(500)), 50);
+        assert_eq!(governor.update(0, base + Duration::from_millis(2_999)), 50);
+        // The hold expires: first 25-permille step instead of a cliff to 0.
+        assert_eq!(governor.update(0, base + Duration::from_millis(3_000)), 25);
+        // Once below the 4.5% tier boundary the residual estimate no longer
+        // changes the profile, so the next report snaps to the live value.
+        assert_eq!(governor.update(0, base + Duration::from_millis(3_001)), 0);
 
-        // A high-loss burst re-arms the window and keeps the 160 kbps profile.
+        // A high-loss burst re-arms the window and walks Tier 2 -> Tier 1 ->
+        // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump.
         let t = base + Duration::from_millis(3_500);
-        assert_eq!(governed_worst_loss(0, 130, t, &mut hold_until), 130);
-        assert_eq!(
-            governed_worst_loss(130, 0, t + Duration::from_millis(2_900), &mut hold_until),
-            130
-        );
-        assert_eq!(
-            governed_worst_loss(130, 0, t + Duration::from_millis(3_001), &mut hold_until),
-            0
-        );
+        assert_eq!(governor.update(130, t), 130);
+        assert_eq!(governor.update(0, t + Duration::from_millis(2_900)), 130);
+        assert_eq!(governor.update(0, t + Duration::from_millis(3_000)), 105);
+        // Several clients may report inside one 500 ms interval; the decay
+        // must not run once per call.
+        assert_eq!(governor.update(0, t + Duration::from_millis(3_001)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(3_400)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(3_500)), 80);
+        assert_eq!(governor.update(0, t + Duration::from_millis(4_000)), 55);
+        assert_eq!(governor.update(0, t + Duration::from_millis(4_500)), 30);
+        assert_eq!(governor.update(0, t + Duration::from_millis(4_501)), 0);
 
-        // Sub-threshold noise never arms the hold.
-        let mut hold_until = base;
-        assert_eq!(governed_worst_loss(0, 40, base, &mut hold_until), 40);
-        assert_eq!(
-            governed_worst_loss(40, 0, base + Duration::from_millis(1), &mut hold_until),
-            0
+        // Sub-threshold noise never arms the hold and does not linger.
+        let mut governor = LossGovernor::new(base);
+        assert_eq!(governor.update(40, base), 40);
+        assert_eq!(governor.update(0, base + Duration::from_millis(1)), 0);
+    }
+
+    #[test]
+    fn test_warm_opus_lookahead_primes_first_packet() {
+        use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
+
+        fn tone(freq: f32, start_sample: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let t = ((start_sample + i) as f32) / (SAMPLE_RATE as f32);
+                let sample = (t * freq * std::f32::consts::TAU).sin() * 0.25 * 32767.0;
+                pcm[i * 2] = sample as i16;
+                pcm[i * 2 + 1] = sample as i16;
+            }
+            pcm
+        }
+
+        let previous = tone(440.0, 0);
+        let current = tone(1200.0, SUBFRAME_FRAMES);
+        let mut encoder = Some(OpusStreamEncoder::new(128).expect("create Opus encoder"));
+
+        // Tier 0 keeps the encoder primed with live lossless audio.
+        warm_opus_lookahead(&mut encoder, &previous, 128);
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let len = encoder
+            .as_mut()
+            .expect("warm encoder")
+            .encode_subframe(&current, 128, &mut payload)
+            .expect("encode first transmitted frame");
+        assert_eq!(payload[0], TAG_OPUS_RLD);
+
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decoder.decode_subframe(&payload[..len], &mut decoded));
+
+        let dot = |lhs: &[f32; SUBFRAME_STEREO_SAMPLES], rhs: &[i16; SUBFRAME_STEREO_SAMPLES]| {
+            lhs.iter()
+                .zip(rhs.iter())
+                .map(|(a, b)| *a * (*b as f32 / 32768.0))
+                .sum::<f32>()
+        };
+        let dot_previous = dot(&decoded, &previous);
+        let dot_current = dot(&decoded, &current);
+        assert!(
+            dot_previous > 1.0,
+            "warm packet was silent: dot_previous={dot_previous}"
         );
+        assert!(
+            dot_previous > dot_current * 2.0,
+            "warm packet did not carry the previous frame: \
+             dot_previous={dot_previous}, dot_current={dot_current}"
+        );
+    }
+
+    #[test]
+    fn test_smart_auto_keeps_opus_warm_without_compressing_healthy_link() {
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 1,
+            enable_smart_dtx: false,
+        };
+        let mut engine = HostEngine::start(config, vec![]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::SmartAuto as u8, Ordering::Relaxed);
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        // Wait until the TX loop has encoded at least one test-tone subframe,
+        // then verify that the warm backend did not leave the lossless tier.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut vu = 0u8;
+        while Instant::now() < deadline {
+            vu = engine.telemetry.host_vu_peak_pct.load(Ordering::Relaxed);
+            if vu > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(vu > 0, "host TX loop did not encode a test-tone subframe");
+        assert_eq!(
+            engine.telemetry.active_codec_mode.load(Ordering::Relaxed),
+            CodecMode::StudioLosslessLpc as u8,
+            "Smart Auto must stay lossless on a healthy link even with Opus warm"
+        );
+        engine.stop();
     }
 
     #[test]
