@@ -92,15 +92,16 @@ impl BauerCrossfeedFilter {
 
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
+        const ANTI_DENORMAL: f32 = 1.0e-25;
         // 700 Hz 1-pole low-pass coefficient at 48kHz: 1 - exp(-2*pi*700/48000)
         const ALPHA_700HZ: f32 = 0.0875;
-        const DIRECT_GAIN: f32 = 0.84;
-        const CROSS_GAIN: f32 = 0.24;
-        const ITD_SAMPLES: usize = 13; // 270 microseconds Interaural Time Difference
+        const DIRECT_GAIN: f32 = 0.78;
+        const CROSS_GAIN: f32 = 0.22; // DIRECT_GAIN + CROSS_GAIN == 1.00 (0.0 dB unity center)
+        const ITD_SAMPLES: usize = 7; // 146 us ITD (+/-30 deg studio monitor angle, no 1.8kHz notch)
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0];
-            let in_r = frame[1];
+            let in_l = frame[0] + ANTI_DENORMAL;
+            let in_r = frame[1] + ANTI_DENORMAL;
 
             // Low-pass filter current samples (head shadow simulation)
             self.lp_l += ALPHA_700HZ * (in_l - self.lp_l);
@@ -113,8 +114,14 @@ impl BauerCrossfeedFilter {
             let cross_from_l = self.delay_l[delayed_idx];
             let cross_from_r = self.delay_r[delayed_idx];
 
-            frame[0] = in_l * DIRECT_GAIN + cross_from_r * CROSS_GAIN;
-            frame[1] = in_r * DIRECT_GAIN + cross_from_l * CROSS_GAIN;
+            // Linkwitz/Bauer all-pass shelf: preserve high-frequency direct
+            // energy `(in - lp) * CROSS_GAIN` so centered vocals stay flat.
+            // The residual 1-pole low-pass at 10 kHz is ~7.5%, leaving
+            // -0.21 dB instead of the old -1.41 dB treble loss.
+            let hf_l = in_l - self.lp_l;
+            let hf_r = in_r - self.lp_r;
+            frame[0] = in_l * DIRECT_GAIN + (hf_l + cross_from_r) * CROSS_GAIN;
+            frame[1] = in_r * DIRECT_GAIN + (hf_r + cross_from_l) * CROSS_GAIN;
 
             self.idx = (self.idx + 1) & 15;
         }
@@ -203,6 +210,14 @@ impl StereoBiquad {
             self.b2 = 0.0;
             self.a1 = 0.0;
             self.a2 = 0.0;
+            // `StudioEqualizer::process` bypasses all biquads while every band
+            // is flat, so these delay states freeze instead of decaying. Clear
+            // them here or re-engaging the band discharges the old history as
+            // a click on the first frame.
+            self.z1_l = 0.0;
+            self.z2_l = 0.0;
+            self.z1_r = 0.0;
+            self.z2_r = 0.0;
             return;
         }
         let a = 10.0f32.powf(gain_db / 40.0);
@@ -625,6 +640,122 @@ mod tests {
         eq.process(&mut samples);
         assert!(samples[0].is_finite());
         assert!(samples[1].is_finite());
+    }
+
+    /// Measure the steady-state magnitude response of the crossfeed for a
+    /// centered signal (`L == R`). The measurement window is 4800 samples, an
+    /// integer number of cycles at 700 Hz, 1.8 kHz and 10 kHz, so the DFT has
+    /// no rectangular-window leakage at those probes.
+    fn crossfeed_centered_gain(freq_hz: f32) -> f32 {
+        const SETTLE: usize = 2400;
+        const MEASURE: usize = 4800;
+        let mut filter = BauerCrossfeedFilter::new();
+        let w = 2.0 * std::f32::consts::PI * freq_hz / 48_000.0;
+        let mut out = vec![0.0f32; SETTLE + MEASURE];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let v = if freq_hz == 0.0 {
+                0.25
+            } else {
+                (w * i as f32).sin() * 0.25
+            };
+            let mut frame = [v, v];
+            filter.process_in_place(&mut frame);
+            *slot = frame[0];
+        }
+        let settled = &out[SETTLE..];
+        if freq_hz == 0.0 {
+            (settled.iter().sum::<f32>() / MEASURE as f32) / 0.25
+        } else {
+            (tone_amplitude(settled, freq_hz) / 0.25) as f32
+        }
+    }
+
+    #[test]
+    fn test_bauer_crossfeed_centered_response_is_flat() {
+        // The old direct gain (0.84) plus a low-passed crossfeed (0.24) gave
+        // centered audio +0.67 dB of bass, -1.51 dB of treble, and a -2.44 dB
+        // comb notch near 1.85 kHz. 3D Mode must not change the timbre of
+        // centered vocals; it should only widen hard-panned content.
+        let dc = crossfeed_centered_gain(0.0);
+        let low_mid = crossfeed_centered_gain(700.0);
+        let notch = crossfeed_centered_gain(1800.0);
+        let high = crossfeed_centered_gain(10_000.0);
+        println!(
+            "crossfeed centered gain: DC {:.4}, 700 Hz {:.4}, 1800 Hz {:.4}, 10 kHz {:.4}",
+            dc, low_mid, notch, high
+        );
+
+        assert!(
+            (dc - 1.0).abs() < 0.02,
+            "centered DC gain is {:.4} instead of 1.0",
+            dc
+        );
+        // The 1-pole 700 Hz low-pass still passes ~7.5% at 10 kHz, so the
+        // HF complement leaves -0.21 dB rather than absolute unity. That is a
+        // 1.2 dB improvement over the old 0.8502 (-1.41 dB) and well inside
+        // the 0.03 bound.
+        assert!(
+            (high - 1.0).abs() < 0.03,
+            "centered 10 kHz gain is {:.4} instead of ~1.0",
+            high
+        );
+        assert!(
+            notch > 0.85,
+            "centered midrange gain is {:.4}; the old comb notch was ~0.755",
+            notch
+        );
+    }
+
+    #[test]
+    fn test_bauer_crossfeed_still_mixes_opposite_channel() {
+        // Fixing the center response must not turn the crossfeed into a plain
+        // passthrough: a hard-left signal still needs to reach the right ear.
+        const SETTLE: usize = 2400;
+        const MEASURE: usize = 4800;
+        let mut filter = BauerCrossfeedFilter::new();
+        let w = 2.0 * std::f32::consts::PI * 700.0 / 48_000.0;
+        let mut right = vec![0.0f32; SETTLE + MEASURE];
+        for (i, slot) in right.iter_mut().enumerate() {
+            let v = (w * i as f32).sin() * 0.5;
+            let mut frame = [v, 0.0];
+            filter.process_in_place(&mut frame);
+            *slot = frame[1];
+        }
+        let leak = (tone_amplitude(&right[SETTLE..], 700.0) / 0.5) as f32;
+        println!("crossfeed opposite-ear leak at 700 Hz: {:.4}", leak);
+        assert!(
+            leak > 0.05,
+            "crossfeed no longer mixes into the opposite ear: {:.4}",
+            leak
+        );
+        assert!(
+            leak < 0.30,
+            "crossfeed leaks too much into the opposite ear: {:.4}",
+            leak
+        );
+    }
+
+    #[test]
+    fn test_eq_reset_to_flat_clears_filter_history() {
+        // While all three bands are at 0 dB `StudioEqualizer::process`
+        // bypasses the biquads, so their delay state freezes. Re-engaging a
+        // band then discharged that stale state as a click on the first frame.
+        let mut eq = StudioEqualizer::new();
+        eq.update_if_changed(60, 0, 0); // +6 dB bass
+        let mut warmup = [0.25f32; 480];
+        eq.process(&mut warmup);
+
+        eq.update_if_changed(0, 0, 0); // user clicks Flat
+        eq.update_if_changed(60, 0, 0); // re-engage the same bass boost
+
+        let mut first = [0.0f32; 2];
+        eq.process(&mut first);
+        println!("first sample after EQ re-engage: {:?}", first);
+        assert!(
+            first[0].abs() < 1.0e-6 && first[1].abs() < 1.0e-6,
+            "stale biquad state produced a click: {:?}",
+            first
+        );
     }
 
     #[test]

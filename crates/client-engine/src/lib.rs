@@ -485,6 +485,22 @@ fn aaudio_buffer_frames_for_burst(burst: i32) -> Option<i32> {
     }
 }
 
+/// AAudio ring capacity. The Dolby/system-effects path opens with
+/// `AAUDIO_PERFORMANCE_MODE_NONE`, where AudioFlinger's normal mixer uses
+/// 960-1920-frame bursts. A 960-frame capacity leaves no double-buffering
+/// headroom for the larger burst; 1920 frames covers one full 40 ms burst.
+/// The raw low-latency path keeps the 960-frame ring that fits 3x speaker
+/// bursts and one full Bluetooth burst.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_capacity_frames(normal_mixer: bool) -> i32 {
+    if normal_mixer {
+        1920
+    } else {
+        960
+    }
+}
+
 pub struct ClientTelemetry {
     pub packets_received: AtomicU64,
     pub primary_frames_played: AtomicU64,
@@ -876,6 +892,14 @@ impl ClientEngine {
                 if reopen {
                     last_dolby_state = want_dolby;
                     last_aaudio_open_attempt = Some(Instant::now());
+                    // Stop and close the previous AAudio stream before opening
+                    // the new one. Rust evaluates the assignment's RHS first,
+                    // so without this explicit drop `open_with_mode` starts a
+                    // second callback thread while the old stream is still
+                    // running: two consumers race on the SPSC decoupler, and
+                    // the old stream keeps the device busy during an
+                    // exclusive-mode reopen.
+                    *aaudio_guard = None;
                     *aaudio_guard = android_aaudio::AAudioOutputGuard::open_with_mode(
                         Arc::clone(&burst_fifo),
                         want_dolby,
@@ -1965,6 +1989,16 @@ mod tests {
     }
 
     #[test]
+    fn test_aaudio_capacity_covers_normal_mixer_burst() {
+        // The Dolby path opens PERFORMANCE_MODE_NONE, where the normal mixer
+        // can use a 1920-frame (40 ms) burst. The old 960-frame ring was
+        // smaller than that burst, causing periodic underruns.
+        assert_eq!(aaudio_capacity_frames(true), 1920);
+        // The raw low-latency path keeps the 960-frame ring.
+        assert_eq!(aaudio_capacity_frames(false), 960);
+    }
+
+    #[test]
     fn test_compressed_payload_auto_detects_opus_and_vbr() {
         use audioshare_protocol::lpc_lossless::{encode_vbr_subframe, MAX_LOSSLESS_SUBFRAME_BYTES};
         use audioshare_protocol::opus_codec::OpusStreamEncoder;
@@ -2272,12 +2306,6 @@ pub mod android_aaudio {
     const AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO: i32 = 1;
     const AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER: i32 = 2;
     const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
-
-    /// 960 frames fits 3x a 240-frame speaker burst (720) and one full
-    /// 960-frame Bluetooth burst. Leaving the capacity unspecified lets some
-    /// HALs allocate a 1920-3840-frame ring, which excludes the stream from
-    /// the low-latency mixer path.
-    const AAUDIO_BUFFER_CAPACITY_FRAMES: i32 = 960;
 
     #[derive(Clone, Copy)]
     struct AAudioProfile {
@@ -2593,10 +2621,10 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setSampleRate(builder, AAUDIO_UNSPECIFIED);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-                AAudioStreamBuilder_setBufferCapacityInFrames(
-                    builder,
-                    AAUDIO_BUFFER_CAPACITY_FRAMES,
+                let capacity_frames = aaudio_capacity_frames(
+                    profile.performance_mode == AAUDIO_PERFORMANCE_MODE_NONE,
                 );
+                AAudioStreamBuilder_setBufferCapacityInFrames(builder, capacity_frames);
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,
