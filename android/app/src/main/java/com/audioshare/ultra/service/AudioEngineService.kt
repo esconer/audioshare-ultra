@@ -7,13 +7,17 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PerformanceHintManager
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
@@ -84,6 +88,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private var mediaSession: MediaSession? = null
+    private var audioDeviceCallback: AudioDeviceCallback? = null
     private var currentGainDb = 0.0f
     private var isLocallyMuted: Boolean = false
     private var currentHostAddr: String = ""
@@ -121,6 +126,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             // request must match the AAudio stream profile. Re-requesting
             // also abandons the stale attributes from the previous mode.
             requestAudioFocus(dolbyEffects)
+            // The routed device query follows the focus attributes, so the
+            // Bluetooth report must be refreshed after the mode change.
+            reportBluetoothRoute()
             applyDspFromPrefs()
             if (foregroundStarted) {
                 startForegroundNotification(currentHostAddr, currentIsUsb)
@@ -181,6 +189,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         acquireRealtimeHardwareLocks()
         setupHardwareBluetoothMediaSession()
         requestAudioFocus(dolbyEffects)
+        startBluetoothRouteMonitoring()
         if (!noisyReceiverRegistered) {
             try {
                 registerReceiver(
@@ -237,6 +246,68 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             )
             isActive = true
         }
+    }
+
+    /// Report the active Bluetooth route independently of the Compose UI.
+    ///
+    /// `MainScreen` polls the same route while it is visible, but playback can
+    /// be started from the Quick Settings tile, the screen can be off, or
+    /// another app can be in front. `AudioDeviceCallback` fires on every route
+    /// add/remove, so the 145 ms A2DP allowance stays correct without the UI.
+    private fun startBluetoothRouteMonitoring() {
+        if (audioDeviceCallback == null) {
+            val callback = object : AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                    reportBluetoothRoute()
+                }
+
+                override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                    reportBluetoothRoute()
+                }
+            }
+            try {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                am.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
+                audioDeviceCallback = callback
+            } catch (_: Exception) {
+            }
+        }
+        reportBluetoothRoute()
+    }
+
+    private fun reportBluetoothRoute() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val hasBt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // Match the attributes of the active AAudio stream: raw mode opens
+            // with GAME/SONIFICATION, Dolby mode with MEDIA/MUSIC. Querying
+            // the wrong usage can report the speaker while audio is routed to
+            // Bluetooth.
+            val attrs = AudioAttributes.Builder().apply {
+                if (dolbyEffects) {
+                    setUsage(AudioAttributes.USAGE_MEDIA)
+                    setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                } else {
+                    setUsage(AudioAttributes.USAGE_GAME)
+                    setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                }
+            }.build()
+            val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
+            routedType == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                routedType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                routedType == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                routedType == AudioDeviceInfo.TYPE_BLE_SPEAKER
+        } else {
+            // API < 31 has no per-attributes routing query; the deprecated
+            // flags are the only way to distinguish a routed headset from a
+            // paired-but-idle one.
+            @Suppress("DEPRECATION")
+            val a2dpRouted = am.isBluetoothA2dpOn
+            @Suppress("DEPRECATION")
+            val scoRouted = am.isBluetoothScoOn()
+            a2dpRouted || scoRouted
+        }
+        // 0 means "no BT route"; never fake the A2DP allowance.
+        nativeReportBluetoothDelayMs(if (hasBt) 145 else 0)
     }
 
     private fun requestAudioFocus(useDolby: Boolean) {
@@ -434,6 +505,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private fun stopStreamAndService() {
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
+        audioDeviceCallback?.let { callback ->
+            try {
+                audioManager?.unregisterAudioDeviceCallback(callback)
+            } catch (_: Exception) {
+            }
+        }
+        audioDeviceCallback = null
         audioManager = null
         nativeStopPhoneMic()
         nativeStopClient()
