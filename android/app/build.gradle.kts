@@ -11,8 +11,8 @@ android {
         applicationId = "com.audioshare.ultra"
         minSdk = 26 // Android 8.0+ (Native AAudio support)
         targetSdk = 34
-        versionCode = 7
-        versionName = "0.1.6"
+        versionCode = 8
+        versionName = "0.1.7"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
