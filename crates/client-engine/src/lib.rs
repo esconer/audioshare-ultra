@@ -40,37 +40,6 @@ pub struct ClientConfig {
     pub dolby_effects: bool,
 }
 
-/// Decision for a missing sequencer slot at the current playhead.
-///
-/// RFC 1982 signed deltas make `latest_rx_seq - next_play_seq < 0` mean the
-/// packet is still in flight. Advancing in that state would make the playhead
-/// reject that packet when it finally arrives, so the playhead must hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlayheadDecision {
-    Hold,
-    Advance,
-}
-
-#[inline]
-fn decide_empty_playhead(
-    latest_rx_seq: u16,
-    next_play_seq: u16,
-    consecutive_holds: u8,
-) -> PlayheadDecision {
-    let delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
-    if delta < 0 {
-        // The missing packet has not arrived yet. Never skip it, even after
-        // a long hold: the next real packet/FEC will move `latest_rx_seq`.
-        PlayheadDecision::Hold
-    } else if delta >= 2 || consecutive_holds >= 2 {
-        // A newer packet is already buffered (or the missing slot had its
-        // bounded 5ms grace period), so it is safe to skip the hole.
-        PlayheadDecision::Advance
-    } else {
-        PlayheadDecision::Hold
-    }
-}
-
 /// Emergency PLC is allowed only after the output decoupler has less than one
 /// 2.5 ms subframe of real audio left. Keeping a full subframe of margin
 /// (instead of the old two) stops a slightly late packet from triggering
@@ -82,12 +51,26 @@ const PLC_EMERGENCY_WATERMARK_SUBFRAMES: usize = 1;
 /// Wi-Fi stall leave up to 40 ms of permanent playback latency behind.
 const MAX_BACKLOG_OVER_TARGET_SUBFRAMES: f32 = 6.0;
 
-/// Gaming hard-lock uses a fixed target and never adds group-sync delay.
-/// Six subframes (15 ms) leaves a two-subframe Wi-Fi packet a full packet of
-/// jitter margin above the one-subframe PLC watermark; USB stays at four.
+/// Gaming hard-lock never adds group-sync delay. The target must stay above
+/// the sender's packet size plus the one-subframe PLC watermark, otherwise
+/// every packet arrival starts from behind and the clock loop has to drain.
+/// One measured packet interval (2.5 ms) is already covered by the packet
+/// floor; only jitter above that adds cushion.
+const GAMING_MAX_TARGET_SUBFRAMES: f32 = 8.0;
+const GAMING_JITTER_MARGIN_GAIN: f32 = 1.4;
+
 #[inline]
-fn gaming_base_target_subframes(initial_floor: f32) -> f32 {
-    initial_floor.min(6.0)
+fn gaming_base_target_subframes(pkt_subframes: u8, jitter_us: f32) -> f32 {
+    let packet_subframes = pkt_subframes.max(1);
+    let packet_floor = match packet_subframes {
+        1 => 4.0, // 10.0 ms: one in-flight packet + 2 subframes above PLC
+        2 => 6.0, // 15.0 ms: one pkt of margin above the 2-subframe stream
+        n => (n as f32) * 1.5 + 1.0,
+    };
+    let jitter_extra = ((jitter_us.max(0.0) / 2500.0) * GAMING_JITTER_MARGIN_GAIN
+        - GAMING_JITTER_MARGIN_GAIN)
+        .max(0.0);
+    (packet_floor + jitter_extra).min(GAMING_MAX_TARGET_SUBFRAMES)
 }
 
 /// Output decoupler watermark in 2.5 ms subframes (4..=12).
@@ -142,12 +125,19 @@ fn trim_post_stall_backlog(
 /// Take at most one pending control command for this feedback packet.
 ///
 /// Quality/media commands win the current packet, then the compressed bitrate,
-/// then the codec backend. Every command has its own slot, so a startup
-/// restore of all three is delivered over consecutive loop passes (the
-/// feedback send condition stays true while any slot is non-zero) instead of
-/// the later store overwriting the earlier one.
+/// then the codec backend, and finally the periodic gaming-lock refresh. Every
+/// command has its own slot, so a startup restore of all of them is delivered
+/// over consecutive loop passes (the feedback send condition stays true while
+/// any slot is non-zero) instead of the later store overwriting the earlier
+/// one. Gaming lock is last because it is refreshed every two seconds and must
+/// never delay a one-shot user action.
 #[inline]
-fn take_pending_command(media: &AtomicU8, bitrate: &AtomicU8, codec: &AtomicU8) -> u8 {
+fn take_pending_command(
+    media: &AtomicU8,
+    bitrate: &AtomicU8,
+    codec: &AtomicU8,
+    gaming: &AtomicU8,
+) -> u8 {
     let media_cmd = media.swap(0, Ordering::Relaxed);
     if media_cmd != 0 {
         return media_cmd;
@@ -156,7 +146,11 @@ fn take_pending_command(media: &AtomicU8, bitrate: &AtomicU8, codec: &AtomicU8) 
     if bitrate_cmd != 0 {
         return bitrate_cmd;
     }
-    codec.swap(0, Ordering::Relaxed)
+    let codec_cmd = codec.swap(0, Ordering::Relaxed);
+    if codec_cmd != 0 {
+        return codec_cmd;
+    }
+    gaming.swap(0, Ordering::Relaxed)
 }
 
 /// A packet this far ahead of the playhead means the sequence tracker was
@@ -340,6 +334,10 @@ pub struct ClientTelemetry {
     /// kbps). A third slot keeps a startup restore of quality + bitrate +
     /// backend from collapsing into a single command.
     pub pending_bitrate_command: AtomicU8,
+    /// Host framing request for 5 ms gaming lock (40 = off, 41 = on). Kept
+    /// separate from the user-action slots so the periodic refresh cannot
+    /// overwrite a pending quality/bitrate/codec command.
+    pub pending_gaming_lock_command: AtomicU8,
     pub host_volume: AtomicU8,
     pub max_group_delay_ms: AtomicU16,
     pub seconds_since_last_packet: AtomicU16,
@@ -435,6 +433,7 @@ impl ClientEngine {
             pending_media_command: AtomicU8::new(0),
             pending_codec_backend_command: AtomicU8::new(0),
             pending_bitrate_command: AtomicU8::new(0),
+            pending_gaming_lock_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
             max_group_delay_ms: AtomicU16::new(0),
             seconds_since_last_packet: AtomicU16::new(0),
@@ -652,7 +651,12 @@ impl ClientEngine {
             config.target_buffer_subframes.max(6.0)
         };
         let mut adaptive_wifi_subframes = initial_wifi_floor;
-        let mut consecutive_holds: u8 = 0;
+        let mut last_pkt_subframe_count: u8 = 1;
+        // The refill loop targets this watermark. Keeping the last value lets
+        // the socket poll below decide whether the decoupler needs audio
+        // before the new target is recomputed for this pass.
+        let mut last_fifo_watermark =
+            resampler.subframes_to_samples(fifo_target_subframes(initial_wifi_floor));
         let mut consecutive_empty_ticks: u16 = 0;
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
@@ -665,6 +669,11 @@ impl ClientEngine {
         let start_instant = Instant::now();
         let _ = socket.set_nonblocking(false);
         let _ = socket.set_read_timeout(Some(Duration::from_micros(1000)));
+        // Send the current gaming-lock state on the first pass, then refresh it
+        // every two seconds so a restarted host converges even if the client
+        // never toggles again.
+        let mut last_gaming_lock_state: Option<bool> = None;
+        let mut last_gaming_feedback = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             // Auto-recover the AAudio stream within 25 ms when the
@@ -718,6 +727,20 @@ impl ClientEngine {
 
             let active_key = *session_key.lock().unwrap();
 
+            // Tell the host whenever 5 ms hard-lock changes, and refresh the
+            // state every two seconds so a host restart or client reconnect
+            // converges even if the user never toggles again.
+            let gaming_lock_now = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
+            if last_gaming_lock_state != Some(gaming_lock_now)
+                || last_gaming_feedback.elapsed() >= Duration::from_secs(2)
+            {
+                telemetry
+                    .pending_gaming_lock_command
+                    .store(if gaming_lock_now { 41 } else { 40 }, Ordering::Relaxed);
+                last_gaming_lock_state = Some(gaming_lock_now);
+                last_gaming_feedback = Instant::now();
+            }
+
             if last_feedback.elapsed() >= Duration::from_millis(500)
                 || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
                 || telemetry
@@ -725,6 +748,10 @@ impl ClientEngine {
                     .load(Ordering::Relaxed)
                     != 0
                 || telemetry.pending_bitrate_command.load(Ordering::Relaxed) != 0
+                || telemetry
+                    .pending_gaming_lock_command
+                    .load(Ordering::Relaxed)
+                    != 0
             {
                 telemetry.seconds_since_last_packet.store(
                     last_packet_instant.elapsed().as_secs().min(65535) as u16,
@@ -749,6 +776,7 @@ impl ClientEngine {
                     &telemetry.pending_media_command,
                     &telemetry.pending_bitrate_command,
                     &telemetry.pending_codec_backend_command,
+                    &telemetry.pending_gaming_lock_command,
                 );
 
                 let gain_db =
@@ -783,6 +811,19 @@ impl ClientEngine {
                 last_feedback = Instant::now();
             }
 
+            // A blocking recv_from (up to 1 ms, often longer under Windows or
+            // Android power-save) can starve the decoupler even when the
+            // sequencer already holds the next playable subframe. Poll
+            // non-blocking in that case so refill runs before waiting on the
+            // network.
+            let refill_poll = stream_initialized
+                && prebuffer_ready
+                && burst_fifo.available_samples() < last_fifo_watermark
+                && !sequencer.is_slot_missing(next_play_seq);
+            if refill_poll {
+                let _ = socket.set_nonblocking(true);
+            }
+
             let mut packets_drained = 0u8;
 
             while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
@@ -814,6 +855,7 @@ impl ClientEngine {
                             (parsed.header.subframe_count.max(1) as u32) * 2500,
                             Ordering::Relaxed,
                         );
+                        last_pkt_subframe_count = parsed.header.subframe_count.max(1);
                         telemetry
                             .codec_mode
                             .store(parsed.header.mode as u8, Ordering::Relaxed);
@@ -1003,7 +1045,21 @@ impl ClientEngine {
                         let buffered = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                             as i16)
                             .max(0) as f32;
-                        if buffered >= initial_wifi_floor {
+                        // Gaming lock uses the same live target as the refill
+                        // loop. Waiting for the non-gaming packet floor (for
+                        // example 11 subframes on a 4-subframe stream) while
+                        // the target is only 7 makes the first playback pass
+                        // trim several subframes immediately.
+                        let prebuffer_floor =
+                            if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
+                                gaming_base_target_subframes(
+                                    last_pkt_subframe_count,
+                                    jitter_estimate_us,
+                                )
+                            } else {
+                                initial_wifi_floor
+                            };
+                        if buffered >= prebuffer_floor {
                             prebuffer_ready = true;
                             telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
                         }
@@ -1017,14 +1073,14 @@ impl ClientEngine {
                     break;
                 }
             }
-            if packets_drained > 0 {
+            if packets_drained > 0 || refill_poll {
                 let _ = socket.set_nonblocking(false);
             }
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
             let base_target = if gaming_lock {
-                gaming_base_target_subframes(initial_wifi_floor)
+                gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
             } else {
                 adaptive_wifi_subframes
             };
@@ -1073,6 +1129,7 @@ impl ClientEngine {
             let plc_emergency_watermark = resampler
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
                 .min(fifo_capacity);
+            last_fifo_watermark = fifo_watermark;
 
             while stream_initialized
                 && prebuffer_ready
@@ -1098,7 +1155,6 @@ impl ClientEngine {
                 match status {
                     STATUS_PRIMARY_LOSSLESS => {
                         next_play_seq = next_play_seq.wrapping_add(1);
-                        consecutive_holds = 0;
                         consecutive_empty_ticks = 0;
                         window_primary += 1;
                         telemetry
@@ -1107,7 +1163,6 @@ impl ClientEngine {
                     }
                     STATUS_HEALED_BY_FEC => {
                         next_play_seq = next_play_seq.wrapping_add(1);
-                        consecutive_holds = 0;
                         consecutive_empty_ticks = 0;
                         window_fec += 1;
                         // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 14.0 = 35.0ms)
@@ -1115,22 +1170,16 @@ impl ClientEngine {
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
+                        // `pop_next` has already synthesized one PLC subframe
+                        // for this playhead and rendered it into the decoupler.
+                        // Holding the playhead here would play a late primary
+                        // packet a second time (comb filtering plus permanent
+                        // +2.5 ms queue inflation), so advance exactly one
+                        // slot. The late packet then fails the
+                        // `s < next_play_seq` test and is dropped, which is the
+                        // right tradeoff once its slot has been concealed.
+                        next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
-                        // Bounded WebRTC NetEQ hold-playhead rule. The hard
-                        // invariant is that `next_play_seq` must never advance
-                        // past `latest_rx_seq + 1`: if it does, the delayed
-                        // packet is rejected as "past" when it arrives, which
-                        // creates the runaway packet-rejection domino.
-                        match decide_empty_playhead(latest_rx_seq, next_play_seq, consecutive_holds)
-                        {
-                            PlayheadDecision::Advance => {
-                                next_play_seq = next_play_seq.wrapping_add(1);
-                                consecutive_holds = 0;
-                            }
-                            PlayheadDecision::Hold => {
-                                consecutive_holds = consecutive_holds.saturating_add(1);
-                            }
-                        }
                         window_fec += 1;
                         // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(14.0);
@@ -1148,7 +1197,6 @@ impl ClientEngine {
                     }
                     _ => {
                         next_play_seq = next_play_seq.wrapping_add(1);
-                        consecutive_holds = 0;
                         consecutive_empty_ticks = 0;
                     }
                 }
@@ -1331,25 +1379,42 @@ mod tests {
     }
 
     #[test]
-    fn test_gaming_mode_has_real_plc_jitter_margin() {
+    fn test_gaming_target_respects_packet_size_and_jitter() {
         // Old gaming target (4 subframes) with the old 2-subframe PLC
         // watermark left zero margin for a 2-subframe Wi-Fi packet, so every
         // late packet triggered WSOLA PLC. Keep this regression explicit.
         let old_margin = fifo_target_subframes(4.0) as i32 - 2 - 2;
         assert_eq!(old_margin, 0);
 
-        // Wi-Fi: gaming caps the target at 6 subframes and the watermark is
-        // one subframe, leaving (6 - 1) - 2 = 3 subframes (7.5ms) of margin.
-        let wifi_target = fifo_target_subframes(gaming_base_target_subframes(6.0));
-        assert_eq!(wifi_target, 6);
-        assert_eq!(plc_jitter_margin_subframes(wifi_target, 2), 3);
-        // A larger configured/adaptive floor is still capped in gaming mode.
-        assert_eq!(gaming_base_target_subframes(14.0), 6.0);
-
-        // USB: one subframe per packet, (4 - 1) - 1 = 2 subframes (5ms).
-        let usb_target = fifo_target_subframes(gaming_base_target_subframes(4.0));
+        // One-subframe USB/desktop framing: 4 subframes (10 ms) leaves
+        // (4 - 1) - 1 = 2 subframes (5 ms) above the PLC watermark.
+        assert_eq!(gaming_base_target_subframes(1, 2500.0), 4.0);
+        let usb_target = fifo_target_subframes(gaming_base_target_subframes(1, 2500.0));
         assert_eq!(usb_target, 4);
         assert_eq!(plc_jitter_margin_subframes(usb_target, 1), 2);
+
+        // Two-subframe Wi-Fi framing: 6 subframes (15 ms) leaves
+        // (6 - 1) - 2 = 3 subframes (7.5 ms) of margin.
+        assert_eq!(gaming_base_target_subframes(2, 2500.0), 6.0);
+        let wifi_target = fifo_target_subframes(gaming_base_target_subframes(2, 2500.0));
+        assert_eq!(wifi_target, 6);
+        assert_eq!(plc_jitter_margin_subframes(wifi_target, 2), 3);
+
+        // Four-subframe 2.4 GHz framing must not be clamped below its own
+        // packet size. 7 subframes (17.5 ms) covers one 10 ms packet plus the
+        // PLC watermark and one subframe of scheduling margin.
+        assert_eq!(gaming_base_target_subframes(4, 2500.0), 7.0);
+        assert_eq!(
+            fifo_target_subframes(gaming_base_target_subframes(4, 2500.0)),
+            7
+        );
+
+        // Excess measured jitter adds cushion above the baseline packet
+        // interval, but the hard-lock target never exceeds four packets
+        // worth (8 subframes = 20 ms).
+        assert!((gaming_base_target_subframes(2, 5000.0) - 7.4).abs() < 1e-4);
+        assert_eq!(gaming_base_target_subframes(4, 60_000.0), 8.0);
+        assert_eq!(gaming_base_target_subframes(2, 0.0), 6.0);
     }
 
     #[test]
@@ -1409,28 +1474,42 @@ mod tests {
         let media = AtomicU8::new(0);
         let bitrate = AtomicU8::new(0);
         let codec = AtomicU8::new(0);
+        let gaming = AtomicU8::new(0);
 
         // Startup restores the quality profile (1..=5), the bitrate (30..=33)
         // and the codec backend (20/21) back-to-back. All must survive.
         media.store(4, Ordering::Relaxed);
         bitrate.store(33, Ordering::Relaxed);
         codec.store(21, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 4);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 33);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 21);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 0);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 4);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 33);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 21);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 0);
 
         // A bitrate-only change is sent immediately.
         bitrate.store(30, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 30);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 30);
 
         // A media key still takes priority over the other pending controls.
         media.store(11, Ordering::Relaxed);
         bitrate.store(31, Ordering::Relaxed);
         codec.store(20, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 11);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 31);
-        assert_eq!(take_pending_command(&media, &bitrate, &codec), 20);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 11);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 31);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 20);
+
+        // Gaming lock is last: a periodic refresh must not delay a one-shot
+        // user command, but it is still delivered when it is the only slot.
+        media.store(2, Ordering::Relaxed);
+        gaming.store(41, Ordering::Relaxed);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 2);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 41);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 0);
+
+        // The latest toggle wins when both states are pending.
+        gaming.store(40, Ordering::Relaxed);
+        gaming.store(41, Ordering::Relaxed);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec, &gaming), 41);
     }
 
     #[test]
@@ -1471,46 +1550,24 @@ mod tests {
     }
 
     #[test]
-    fn test_playhead_never_runs_ahead_of_latest_rx() {
-        // Packet 101 is still in flight (`latest_rx = 100`). Even after an
-        // arbitrarily long hold, the playhead must stay at 101 so the packet
-        // is not rejected as "past" when it arrives.
-        let latest_rx = 100u16;
-        let next_play = 101u16;
-        for holds in 0..=u8::MAX {
-            assert_eq!(
-                decide_empty_playhead(latest_rx, next_play, holds),
-                PlayheadDecision::Hold,
-                "playhead advanced past an in-flight packet after {} holds",
-                holds
-            );
-        }
+    fn test_plc_advance_drops_late_primary_instead_of_duplicating() {
+        // `pop_next` returned STATUS_EMPTY for slot 101, so the refill loop
+        // rendered 2.5 ms of PLC and advanced the playhead to 102. The late
+        // primary for 101 must now be rejected as "past"; playing it after its
+        // concealed slot would duplicate 2.5 ms and permanently inflate the
+        // queue.
+        let next_play_after_plc = 102u16;
+        let late_seq = 101u16;
+        assert!((late_seq.wrapping_sub(next_play_after_plc) as i16) < 0);
 
-        // A newer packet is already buffered: skipping the missing hole is safe.
-        assert_eq!(
-            decide_empty_playhead(104, 101, 0),
-            PlayheadDecision::Advance
-        );
-        // One newer packet arrived, but give FEC/PLC two ticks to heal it first.
-        assert_eq!(decide_empty_playhead(102, 101, 0), PlayheadDecision::Hold);
-        assert_eq!(decide_empty_playhead(102, 101, 1), PlayheadDecision::Hold);
-        assert_eq!(
-            decide_empty_playhead(102, 101, 2),
-            PlayheadDecision::Advance
-        );
-        // The latest received packet is the missing one (e.g. its payload
-        // failed to decode): after the 5ms grace period, skip it.
-        assert_eq!(decide_empty_playhead(101, 101, 1), PlayheadDecision::Hold);
-        assert_eq!(
-            decide_empty_playhead(101, 101, 2),
-            PlayheadDecision::Advance
-        );
-        // Sequence wrap-around must preserve the same invariant.
-        assert_eq!(decide_empty_playhead(0, 1, 0), PlayheadDecision::Hold);
-        assert_eq!(
-            decide_empty_playhead(3, 65535, 0),
-            PlayheadDecision::Advance
-        );
+        // The next genuinely new packet is still accepted.
+        let next_seq = 102u16;
+        assert_eq!(next_seq.wrapping_sub(next_play_after_plc) as i16, 0);
+
+        // Sequence wrap-around keeps the same classification.
+        let next_play_after_plc = 1u16;
+        assert_eq!(0u16.wrapping_sub(next_play_after_plc) as i16, -1);
+        assert_eq!(1u16.wrapping_sub(next_play_after_plc) as i16, 0);
     }
 
     #[test]

@@ -304,21 +304,25 @@ pub fn promote_thread_realtime() {
     }
 }
 
-/// Anti-burst gap for a capture-fed 2-subframe packet. OS callbacks often
-/// deliver 10-20 ms of audio at once; this spreads the catch-up packets
-/// without double-pacing the normal one-packet-per-callback case.
-const CAPTURE_MIN_GAP_MULTI_SUBFRAME_US: u64 = 1_500;
+/// Smooth pacing gap for capture-fed packets: 85% of the nominal 2.5 ms
+/// per-subframe interval. OS callbacks often deliver 10-20 ms of audio at
+/// once; spacing packets slightly faster than real time spreads the burst
+/// across the callback period while keeping the capture clock in charge.
+const CAPTURE_SMOOTH_GAP_PER_SUBFRAME_US: u64 = 2_125;
 
-/// Anti-burst gap for a 1-subframe packet (2.5 ms cadence). It must stay well
-/// below 2500 us so the capture clock remains the master.
-const CAPTURE_MIN_GAP_SINGLE_SUBFRAME_US: u64 = 800;
+/// Faster catch-up pacing when the capture ring holds more than 20 ms (8
+/// subframes). The added drain rate prevents a callback backlog from becoming
+/// permanent latency without dumping the whole burst in under 2 ms.
+const CAPTURE_CATCHUP_GAP_PER_SUBFRAME_US: u64 = 1_100;
+const CAPTURE_CATCHUP_BACKLOG_SUBFRAMES: usize = 8;
 
 #[inline]
-fn capture_min_gap_us(subframes_per_pkt: usize) -> u64 {
-    if subframes_per_pkt >= 2 {
-        CAPTURE_MIN_GAP_MULTI_SUBFRAME_US
+fn capture_min_gap_us(subframes_per_pkt: usize, remaining_subframes: usize) -> u64 {
+    let count = subframes_per_pkt.max(1) as u64;
+    if remaining_subframes > CAPTURE_CATCHUP_BACKLOG_SUBFRAMES {
+        count * CAPTURE_CATCHUP_GAP_PER_SUBFRAME_US
     } else {
-        CAPTURE_MIN_GAP_SINGLE_SUBFRAME_US
+        count * CAPTURE_SMOOTH_GAP_PER_SUBFRAME_US
     }
 }
 
@@ -458,6 +462,9 @@ pub struct ConnectedClient {
     /// Measured DAC/hardware presentation delay reported by the client.
     pub hardware_delay_ms: u16,
     pub client_volume: u8,
+    /// True when this client has engaged 5 ms Gaming Hard-Lock. At least one
+    /// such client makes the host tighten packetization for the session.
+    pub gaming_lock: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -489,6 +496,10 @@ pub struct HostTelemetry {
     /// pure-Rust VBR codec; `true` routes compressed profiles through the
     /// bundled pure-Rust Opus encoder. Lossless profiles ignore this flag.
     pub prefer_opus: AtomicBool,
+    /// True while any connected client has engaged 5 ms Gaming Hard-Lock.
+    /// The governor then drops to 1-subframe (2.5 ms) framing for normal
+    /// profiles (2 subframes for lossy 2.4 GHz stability profiles).
+    pub client_gaming_lock: AtomicBool,
     pub enable_group_sync: AtomicBool,
     pub manual_group_sync_trim_ms: AtomicU16,
     pub target_bitrate_kbps: AtomicU16,
@@ -560,6 +571,7 @@ impl HostEngine {
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
             prefer_opus: AtomicBool::new(false),
+            client_gaming_lock: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -592,6 +604,7 @@ impl HostEngine {
                     bluetooth_delay_ms: 0,
                     hardware_delay_ms: 0,
                     client_volume: 100,
+                    gaming_lock: false,
                 },
             );
         }
@@ -692,6 +705,24 @@ impl HostEngine {
             .store(max_downstream, Ordering::Relaxed);
     }
 
+    /// Recompute the session-wide 5 ms hard-lock flag. At least one unmuted
+    /// gaming client tightens packetization; when that client mutes, leaves,
+    /// or disables the lock, the session returns to the configured framing.
+    fn refresh_gaming_lock_telemetry(
+        map: &HashMap<SocketAddr, ConnectedClient>,
+        telemetry: &HostTelemetry,
+    ) {
+        telemetry
+            .client_gaming_lock
+            .store(Self::any_client_gaming_lock(map), Ordering::Relaxed);
+    }
+
+    /// Pure computation behind [`Self::refresh_gaming_lock_telemetry`].
+    /// Muted clients receive no audio, so they cannot request framing.
+    fn any_client_gaming_lock(map: &HashMap<SocketAddr, ConnectedClient>) -> bool {
+        map.values().any(|c| !c.muted && c.gaming_lock)
+    }
+
     /// Pure computation behind [`Self::refresh_client_delay_telemetry`].
     ///
     /// Returns `(max_bt, max_downstream)`. Muted clients are excluded from
@@ -718,6 +749,7 @@ impl HostEngine {
             client.muted = muted;
         }
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
+        Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
     }
 
     pub fn kick_client(&self, addr: SocketAddr) {
@@ -727,6 +759,7 @@ impl HostEngine {
             .active_clients_count
             .store(map.len() as u8, Ordering::Relaxed);
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
+        Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
     }
 
     pub fn stop(&mut self) {
@@ -1333,12 +1366,14 @@ impl HostEngine {
                             bluetooth_delay_ms: 0,
                             hardware_delay_ms: 0,
                             client_volume: 100,
+                            gaming_lock: false,
                         })
                         .last_seen = Instant::now();
                     telemetry
                         .active_clients_count
                         .store(map.len() as u8, Ordering::Relaxed);
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
+                    Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
                     for c in map.values() {
                         if !c.muted {
@@ -1355,13 +1390,19 @@ impl HostEngine {
                     if let Some(fb) =
                         ClientFeedbackPacket::decode_verified(&ctrl_buf[..len], active_key.as_ref())
                     {
+                        let mut gaming_lock_update: Option<bool> = None;
+
                         // Compressed-codec backend selection from the phone UI:
                         // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
                         // This is separate from the quality profile and only
                         // affects compressed modes.
+                        // 40/41 carry the client's 5 ms hard-lock state so the
+                        // host can tighten packetization for the session.
                         match fb.requested_mode {
                             20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
                             21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
+                            40 => gaming_lock_update = Some(false),
+                            41 => gaming_lock_update = Some(true),
                             _ => {}
                         }
 
@@ -1412,12 +1453,16 @@ impl HostEngine {
                             bluetooth_delay_ms: fb.bluetooth_delay_ms,
                             hardware_delay_ms: fb.hardware_delay_ms,
                             client_volume: fb.client_volume,
+                            gaming_lock: false,
                         });
                         entry.last_seen = Instant::now();
                         entry.fec_rate_permille = fb.fec_rate_permille;
                         entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
                         entry.hardware_delay_ms = fb.hardware_delay_ms;
                         entry.client_volume = fb.client_volume;
+                        if let Some(gaming_lock) = gaming_lock_update {
+                            entry.gaming_lock = gaming_lock;
+                        }
                         telemetry
                             .active_clients_count
                             .store(map.len() as u8, Ordering::Relaxed);
@@ -1440,6 +1485,7 @@ impl HostEngine {
                             &mut loss_hold_until,
                         );
                         Self::refresh_client_delay_telemetry(&map, &telemetry);
+                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
 
                         cached_targets.clear();
                         for c in map.values() {
@@ -1475,6 +1521,7 @@ impl HostEngine {
                         &mut loss_hold_until,
                     );
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
+                    Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
                     for c in map.values() {
                         if !c.muted {
@@ -1493,15 +1540,25 @@ impl HostEngine {
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
                 .clamp(96, 320);
+            // A connected 5 ms hard-lock client requests the tightest framing
+            // the profile can sustain. Normal profiles drop to one subframe
+            // (2.5 ms packets); lossy 2.4 GHz stability profiles stay at two
+            // subframes so the doubled packet rate does not worsen contention.
+            let gaming_lock = telemetry.client_gaming_lock.load(Ordering::Relaxed);
+            let base_subframes = if gaming_lock {
+                1
+            } else {
+                config.subframes_per_packet.clamp(1, 2) as usize
+            };
             match profile {
                 QualityProfile::StudioLossless => {
                     dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                    subframes_per_pkt = base_subframes;
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::LowLatencyCompressed => {
                     dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                    subframes_per_pkt = base_subframes;
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::MaxStability24Ghz => {
@@ -1509,8 +1566,10 @@ impl HostEngine {
                     // the profile name. Longer packets cut MAC contention and
                     // retransmit bursts on congested 2.4 GHz links; the client
                     // WSOLA PLC covers subframes not carried by [N-1]/[N-2].
+                    // Gaming lock halves that to 5 ms instead of doubling the
+                    // packet rate to 400 pps on an already lossy link.
                     dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = 4;
+                    subframes_per_pkt = if gaming_lock { 2 } else { 4 };
                     tx_bitrate_kbps = 160;
                 }
                 QualityProfile::StudioLossless24Bit => {
@@ -1519,21 +1578,21 @@ impl HostEngine {
                     // drops FEC first and splits into per-subframe datagrams
                     // only when the primary itself cannot fit the safe MTU.
                     dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                    subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                    subframes_per_pkt = base_subframes;
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::SmartAuto => {
                     if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = 4;
+                        subframes_per_pkt = if gaming_lock { 2 } else { 4 };
                         tx_bitrate_kbps = 160;
                     } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = 2;
+                        subframes_per_pkt = if gaming_lock { 1 } else { 2 };
                         tx_bitrate_kbps = selected_kbps;
                     } else {
                         dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                        subframes_per_pkt = config.subframes_per_packet.clamp(1, 2) as usize;
+                        subframes_per_pkt = base_subframes;
                         tx_bitrate_kbps = selected_kbps;
                     }
                 }
@@ -1919,10 +1978,15 @@ impl HostEngine {
                     <= 80;
             if capture_active {
                 if ring.available_samples() >= needed_samples {
-                    // 1-subframe mode (2.5 ms cadence) still needs a small
-                    // anti-burst gap, but 800 us keeps the capture clock in
-                    // charge; 2-subframe mode keeps its 1.5 ms gap.
-                    let min_gap = Duration::from_micros(capture_min_gap_us(subframes_per_pkt));
+                    // Spread a 10-20 ms OS capture callback across its
+                    // callback period instead of dumping every packet in a
+                    // 1.5 ms burst and then starving the network. A backlog
+                    // above 20 ms drains faster so it cannot become latency.
+                    let remaining_subframes = ring.available_samples() / SUBFRAME_STEREO_SAMPLES;
+                    let min_gap = Duration::from_micros(capture_min_gap_us(
+                        subframes_per_pkt,
+                        remaining_subframes,
+                    ));
                     let since_tx = now.saturating_duration_since(last_tx_instant);
                     if since_tx < min_gap {
                         std::thread::sleep(min_gap - since_tx);
@@ -2003,6 +2067,7 @@ mod tests {
                 bluetooth_delay_ms: 0,
                 hardware_delay_ms: 17,
                 client_volume: 100,
+                gaming_lock: false,
             },
         );
         map.insert(
@@ -2016,6 +2081,7 @@ mod tests {
                 bluetooth_delay_ms: 145,
                 hardware_delay_ms: 30,
                 client_volume: 100,
+                gaming_lock: false,
             },
         );
         map.insert(
@@ -2029,6 +2095,7 @@ mod tests {
                 bluetooth_delay_ms: 200,
                 hardware_delay_ms: 200,
                 client_volume: 100,
+                gaming_lock: false,
             },
         );
 
@@ -2252,13 +2319,57 @@ mod tests {
     }
 
     #[test]
-    fn test_capture_pacer_covers_single_subframe_mode() {
-        assert_eq!(capture_min_gap_us(1), 800);
-        assert_eq!(capture_min_gap_us(2), 1_500);
-        assert_eq!(capture_min_gap_us(4), 1_500);
-        // The anti-burst gap must stay below the 2.5 ms packet cadence so the
-        // capture clock remains the master in 1-subframe mode.
-        assert!(capture_min_gap_us(1) < 2_500);
+    fn test_capture_pacer_spreads_bursts_below_nominal_cadence() {
+        // Smooth pacing is 85% of the nominal 2.5 ms per-subframe interval.
+        assert_eq!(capture_min_gap_us(1, 0), 2_125);
+        assert_eq!(capture_min_gap_us(2, 0), 4_250);
+        assert_eq!(capture_min_gap_us(4, 0), 8_500);
+        assert!(capture_min_gap_us(1, 0) < 2_500);
+        assert!(capture_min_gap_us(2, 0) < 5_000);
+        assert!(capture_min_gap_us(4, 0) < 10_000);
+
+        // A normal 10-20 ms callback leaves at most 8 subframes queued and
+        // stays on smooth pacing; only a genuine backlog (>20 ms) accelerates.
+        assert_eq!(capture_min_gap_us(2, 8), 4_250);
+        assert_eq!(capture_min_gap_us(2, 9), 2_200);
+        assert_eq!(capture_min_gap_us(4, 9), 4_400);
+        assert_eq!(capture_min_gap_us(1, 9), 1_100);
+    }
+
+    #[test]
+    fn test_gaming_lock_requires_an_unmuted_client() {
+        fn client(addr: SocketAddr, muted: bool, gaming_lock: bool) -> ConnectedClient {
+            ConnectedClient {
+                addr,
+                last_seen: Instant::now(),
+                is_usb: false,
+                muted,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 0,
+                client_volume: 100,
+                gaming_lock,
+            }
+        }
+
+        let mut map = HashMap::new();
+        let a: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        map.insert(a, client(a, false, false));
+        map.insert(b, client(b, false, true));
+        assert!(HostEngine::any_client_gaming_lock(&map));
+
+        // Muting the only gaming client returns the session to normal framing.
+        map.get_mut(&b).unwrap().muted = true;
+        assert!(!HostEngine::any_client_gaming_lock(&map));
+
+        // A gaming lock on any unmuted client enables tight framing again.
+        map.get_mut(&b).unwrap().muted = false;
+        map.get_mut(&b).unwrap().gaming_lock = false;
+        map.get_mut(&a).unwrap().gaming_lock = true;
+        assert!(HostEngine::any_client_gaming_lock(&map));
+        map.get_mut(&a).unwrap().gaming_lock = false;
+        assert!(!HostEngine::any_client_gaming_lock(&map));
     }
 
     #[test]
@@ -2273,6 +2384,7 @@ mod tests {
                 bluetooth_delay_ms: 0,
                 hardware_delay_ms: 0,
                 client_volume: 100,
+                gaming_lock: false,
             }
         }
 
