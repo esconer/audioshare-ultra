@@ -23,7 +23,7 @@ const TAG_LPC_PCM24: u8 = 0x03;
 /// payload apart from a legacy 124-byte IMA-ADPCM FEC frame without guessing.
 pub const TAG_VBR_BFP: u8 = 0x7E;
 
-/// Maximum encoded size of a VBR subframe (the 320 kbps profile is 94 bytes,
+/// Maximum encoded size of a VBR subframe (the 320 kbps profile is 98 bytes,
 /// leaving headroom for future ladder rungs).
 pub const MAX_VBR_SUBFRAME_BYTES: usize = 102;
 
@@ -62,19 +62,30 @@ impl QualityProfile {
 /// `widths` is the repeating per-sample code width in bits.  Mixed patterns
 /// let the codec land close to the advertised 160/256 kbps targets without
 /// abandoning uniform quantization.  `block_len == 0` selects the 1-bit CVSD
-/// profile, which carries no side information at all.
+/// profile, which carries only a 4-byte exact sample-0 seed.
 #[derive(Clone, Copy)]
 struct VbrLadderEntry {
     widths: &'static [u8],
     block_len: usize,
 }
 
+/// Side-information bytes for the 1-bit CVSD profile: one exact `i16`
+/// sample-0 seed per channel. Starting each subframe from the real waveform
+/// instead of zero removes the 400 Hz boundary chop.
+const VBR_CVSD_SEED_BYTES: usize = 4;
+
+/// Side-information bytes per block and channel for the block-floating-point
+/// profiles: an exact little-endian `i16` sample-0 seed plus one initial-step
+/// index. The old 5-bit seed quantized sample 0 to a 2048-LSB bucket, which
+/// injected a 400 Hz buzz at every block boundary.
+const VBR_BLOCK_HEADER_BYTES: usize = 3;
+
 /// Payload sizes (including the 2-byte tag/profile header) per 2.5 ms subframe:
-/// 32 / 49 / 79 / 94 bytes, i.e. ~102 / 157 / 253 / 301 kbps of primary audio.
+/// 36 / 53 / 83 / 98 bytes, i.e. ~115 / 170 / 266 / 314 kbps of primary audio.
 /// These are *nominal* targets: packet headers and the [N-1]/[N-2] FEC backups
 /// add overhead on the wire, and the UI labels keep the familiar 96/160/256/320.
 const VBR_LADDER: [VbrLadderEntry; 4] = [
-    // 96 kbps: 1-bit CVSD, fully adaptive step, no side information.
+    // 96 kbps: 1-bit CVSD, fully adaptive step, 4-byte exact seed.
     VbrLadderEntry {
         widths: &[1],
         block_len: 0,
@@ -106,16 +117,26 @@ fn vbr_profile_index(bitrate_kbps: u16) -> usize {
     }
 }
 
-/// Exact encoded byte length produced for a given target bitrate setting.
-/// Useful for diagnostics, tests and receivers that pre-size buffers.
-pub fn vbr_encoded_len(bitrate_kbps: u16) -> usize {
-    let idx = vbr_profile_index(bitrate_kbps);
+/// Exact encoded byte length produced for a given profile index.
+#[inline(always)]
+fn vbr_encoded_len_for_profile(idx: usize) -> usize {
     let spec = VBR_LADDER[idx];
     let blocks_per_channel = SUBFRAME_FRAMES.checked_div(spec.block_len).unwrap_or(0);
     let payload_bits: usize = (0..SUBFRAME_STEREO_SAMPLES)
         .map(|i| spec.widths[i % spec.widths.len()] as usize)
         .sum();
-    2 + 2 * blocks_per_channel + payload_bits.div_ceil(8)
+    let side_info_bytes = if blocks_per_channel == 0 {
+        VBR_CVSD_SEED_BYTES
+    } else {
+        VBR_BLOCK_HEADER_BYTES * 2 * blocks_per_channel
+    };
+    2 + side_info_bytes + payload_bits.div_ceil(8)
+}
+
+/// Exact encoded byte length produced for a given target bitrate setting.
+/// Useful for diagnostics, tests and receivers that pre-size buffers.
+pub fn vbr_encoded_len(bitrate_kbps: u16) -> usize {
+    vbr_encoded_len_for_profile(vbr_profile_index(bitrate_kbps))
 }
 
 #[inline(always)]
@@ -152,8 +173,8 @@ fn read_bits(buf: &[u8], bit_pos: &mut usize, bits: u8) -> Option<u32> {
 /// 1-bit continuously variable slope delta (CVSD) state.
 ///
 /// Both encoder and decoder update the step from the transmitted bit history
-/// only, so no side information is required and the stream is exactly 1 bit
-/// per sample (96 kbps nominal at 48 kHz stereo).
+/// only, so the stream is exactly 1 bit per sample plus the per-subframe
+/// sample-0 seed (96 kbps nominal at 48 kHz stereo).
 struct CvsdState {
     step: i32,
     history: u8,
@@ -236,62 +257,27 @@ fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8) -> i32 {
 /// blocks, while index 7 leaves headroom for full-scale transients.
 const VBR_INIT_STEPS: [i32; 8] = [4, 16, 64, 160, 384, 896, 2048, 4096];
 
-/// Quantize the first sample of a block to the 5-bit seed carried in the
-/// block header. Rounding (instead of truncation) keeps the mid-range error
-/// within half a 2048-LSB bucket; only the positive full-scale clamp can use
-/// the full bucket.
+/// Pick the initial Jayant step index for a block from its measured slope.
+///
+/// The first sample itself is now transmitted exactly, so there is no
+/// seed-error term to compensate for; the step only has to track the waveform
+/// that follows.
 #[inline(always)]
-fn quantize_vbr_seed(first_sample: i16) -> i32 {
-    (((first_sample as i32 + 1024) >> 11).clamp(-16, 15)) << 11
-}
-
-/// Choose an initial step that covers both the block's measured slope and the
-/// unavoidable error between `first_sample` and its 5-bit seed. Without the
-/// seed-error term, a quiet block near a seed boundary would start at step 4
-/// and take most of the 2.5 ms block to converge.
-#[inline(always)]
-fn vbr_initial_step(first_sample: i16, max_slope: i32) -> i32 {
-    let seed_error = (first_sample as i32 - quantize_vbr_seed(first_sample)).abs();
-    let target = (max_slope.max(seed_error) >> 1).max(4);
+fn vbr_initial_step_index(max_slope: i32) -> u8 {
+    let target = (max_slope >> 1).max(VBR_MIN_STEP);
     VBR_INIT_STEPS
         .iter()
-        .copied()
-        .find(|&step| step >= target)
-        .unwrap_or(VBR_INIT_STEPS[7])
-}
-
-/// Pack a 5-bit first-sample seed and a 3-bit initial-step index into the
-/// single per-block header byte. The top bit of `first_sample` is not lost:
-/// the seed is a rounded 5-bit value, and the decoder reconstructs it at the
-/// same 2048-LSB granularity.
-#[inline(always)]
-fn pack_vbr_block_header(first_sample: i16, max_slope: i32) -> u8 {
-    let seed5 = (quantize_vbr_seed(first_sample) >> 11).clamp(-16, 15) as i8 as u8 & 0x1F;
-    let step = vbr_initial_step(first_sample, max_slope);
-    let step_idx = VBR_INIT_STEPS
-        .iter()
-        .position(|&candidate| candidate == step)
-        .unwrap_or(0) as u8;
-    (seed5 << 3) | (step_idx & 0x07)
-}
-
-/// Inverse of [`pack_vbr_block_header`].
-#[inline(always)]
-fn unpack_vbr_block_header(header: u8) -> (i32, i32) {
-    let seed = ((header as i8) >> 3) as i32;
-    (
-        (seed << 11).clamp(-32_768, 32_767),
-        VBR_INIT_STEPS[(header & 0x07) as usize],
-    )
+        .position(|&step| step >= target)
+        .unwrap_or(VBR_INIT_STEPS.len() - 1) as u8
 }
 
 /// Encode a 2.5 ms stereo subframe with the user-selected VBR profile.
 ///
 /// Layout: `[TAG_VBR_BFP][profile][block exponents...][packed q-bit codes...]`.
-/// The codec has zero lookahead. 96 kbps uses 1-bit CVSD with no side info;
-/// the higher rungs use per-block block-floating-point DPCM with mixed 1/2,
-/// 2/3 or 3-bit codes to land near the advertised target rates.  Returns the
-/// exact number of bytes written.
+/// The codec has zero lookahead. 96 kbps uses 1-bit CVSD with an exact 4-byte
+/// sample-0 seed; the higher rungs use per-block block-floating-point DPCM
+/// with mixed 1/2, 2/3 or 3-bit codes to land near the advertised target
+/// rates.  Returns the exact number of bytes written.
 pub fn encode_vbr_subframe(
     pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
     bitrate_kbps: u16,
@@ -305,18 +291,44 @@ pub fn encode_vbr_subframe(
     out[1] = idx as u8;
 
     if spec.block_len == 0 {
-        // ---- 1-bit CVSD: no exponent side information ----
-        let payload_start = 2usize;
+        // ---- 1-bit CVSD with exact per-channel i16 sample-0 seed ----
+        //
+        // Resetting the predictor to zero every 2.5 ms produced a 400 Hz
+        // waveform chopper: a -6 dBFS waveform needed ~25 samples to slew
+        // back from zero. The seed is only 4 bytes and makes sample 0 exact.
+        let seed_l = pcm_stereo[0].to_le_bytes();
+        let seed_r = pcm_stereo[1].to_le_bytes();
+        out[2] = seed_l[0];
+        out[3] = seed_l[1];
+        out[4] = seed_r[0];
+        out[5] = seed_r[1];
+        let payload_start = 2 + VBR_CVSD_SEED_BYTES;
         out[payload_start..encoded_len].fill(0);
         let mut bit_pos = payload_start * 8;
 
         for ch in 0..2 {
-            let mut prev1 = 0i32;
-            let mut prev2 = 0i32;
+            let seed = pcm_stereo[ch] as i32;
+            let mut prev1 = seed;
+            let mut prev2 = seed;
             let mut cvsd = CvsdState::new();
 
             for i in 0..SUBFRAME_FRAMES {
                 let s = pcm_stereo[i * 2 + ch] as i32;
+
+                if i == 0 {
+                    // Sample 0 is carried by the header. Still consume one
+                    // bit so encoder and decoder advance the step history
+                    // identically, but keep the reconstructed value exact.
+                    let bit = u8::from(s >= prev1);
+                    let _ = cvsd.update_and_get_step(bit);
+                    write_bits(out, &mut bit_pos, bit as u32, 1);
+                    prev2 = prev1;
+                    prev1 = seed;
+                    continue;
+                }
+
+                // 2nd-order integrator predictor, seeded with a flat slope at
+                // sample 0 so the first synthesized sample does not overshoot.
                 let pred = (prev1 << 1) - prev2;
                 let bit = u8::from(s >= pred);
                 let step = cvsd.update_and_get_step(bit);
@@ -324,7 +336,6 @@ pub fn encode_vbr_subframe(
                 let recon = (pred + dequant).clamp(-32_768, 32_767);
 
                 write_bits(out, &mut bit_pos, bit as u32, 1);
-
                 prev2 = prev1;
                 prev1 = recon;
             }
@@ -332,27 +343,31 @@ pub fn encode_vbr_subframe(
         return encoded_len;
     }
 
-    // ---- Block-floating-point DPCM ----
+    // ---- Block-floating-point DPCM with exact 16-bit sample-0 seeds ----
     let blocks_per_channel = SUBFRAME_FRAMES.checked_div(spec.block_len).unwrap_or(0);
     let exponent_start = 2usize;
-    let payload_start = exponent_start + 2 * blocks_per_channel;
+    let payload_start = exponent_start + VBR_BLOCK_HEADER_BYTES * 2 * blocks_per_channel;
 
-    // Pack a 5-bit initial sample seed and a 3-bit initial step scale into
-    // `out[2..4]` so quiet blocks start at step 4 (no idle hiss) while loud
-    // blocks start near the measured signal slope without overload.
+    // Store the exact first sample plus an initial Jayant step index for each
+    // block. The old 5-bit seed could be off by up to 1024 LSB, which was
+    // audible as a 400 Hz buzz at every block boundary.
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
             let first_idx = (block * spec.block_len) * 2 + ch;
             let first_s = pcm_stereo[first_idx];
             let mut max_slope = 0i32;
             let mut prev = first_s as i32;
-            for k in 1..spec.block_len.min(16) {
+            for k in 1..spec.block_len.min(32) {
                 let s = pcm_stereo[(block * spec.block_len + k) * 2 + ch] as i32;
                 max_slope = max_slope.max((s - prev).abs());
                 prev = s;
             }
-            out[exponent_start + ch * blocks_per_channel + block] =
-                pack_vbr_block_header(first_s, max_slope);
+            let hdr_off =
+                exponent_start + (ch * blocks_per_channel + block) * VBR_BLOCK_HEADER_BYTES;
+            let seed = first_s.to_le_bytes();
+            out[hdr_off] = seed[0];
+            out[hdr_off + 1] = seed[1];
+            out[hdr_off + 2] = vbr_initial_step_index(max_slope);
         }
     }
 
@@ -362,8 +377,10 @@ pub fn encode_vbr_subframe(
     // Closed-loop adaptive DPCM quantization using reconstructed predictor + Jayant step.
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
-            let header = out[exponent_start + ch * blocks_per_channel + block];
-            let (mut prev1, mut step) = unpack_vbr_block_header(header);
+            let hdr_off =
+                exponent_start + (ch * blocks_per_channel + block) * VBR_BLOCK_HEADER_BYTES;
+            let mut prev1 = i16::from_le_bytes([out[hdr_off], out[hdr_off + 1]]) as i32;
+            let mut step = VBR_INIT_STEPS[(out[hdr_off + 2] & 0x07) as usize];
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
@@ -377,8 +394,15 @@ pub fn encode_vbr_subframe(
                 let dequant = ((2 * code as i32 + 1 - (1i32 << width)) * step) >> 1;
 
                 write_bits(out, &mut bit_pos, code, width);
-                let recon = (prev1 + dequant).clamp(-32_768, 32_767);
-                prev1 = recon;
+                if k == 0 {
+                    // The exact seed is authoritative for the first sample.
+                    // Keep the code (and its step adaptation) on the wire so
+                    // both sides stay synchronized, but do not let the
+                    // mid-riser quantizer's half-step offset move sample 0.
+                    prev1 = s;
+                } else {
+                    prev1 = (prev1 + dequant).clamp(-32_768, 32_767);
+                }
                 step = adapt_vbr_step(step, code, width, &mut prev_bit);
             }
         }
@@ -404,29 +428,40 @@ pub fn decode_vbr_subframe_to_f32(
         return false;
     }
     let spec = VBR_LADDER[idx];
-    let expected_len = {
-        let blocks_per_channel = SUBFRAME_FRAMES.checked_div(spec.block_len).unwrap_or(0);
-        let payload_bits: usize = (0..SUBFRAME_STEREO_SAMPLES)
-            .map(|i| spec.widths[i % spec.widths.len()] as usize)
-            .sum();
-        2 + 2 * blocks_per_channel + payload_bits.div_ceil(8)
-    };
-    if encoded.len() != expected_len {
+    if encoded.len() != vbr_encoded_len_for_profile(idx) {
         return false;
     }
 
     if spec.block_len == 0 {
-        // ---- 1-bit CVSD ----
-        let mut bit_pos = 2usize * 8;
+        // ---- 1-bit CVSD with exact per-channel i16 sample-0 seed ----
+        if encoded.len() < 2 + VBR_CVSD_SEED_BYTES {
+            return false;
+        }
+        let seed_l = i16::from_le_bytes([encoded[2], encoded[3]]) as i32;
+        let seed_r = i16::from_le_bytes([encoded[4], encoded[5]]) as i32;
+        let mut bit_pos = (2 + VBR_CVSD_SEED_BYTES) * 8;
+
         for ch in 0..2 {
-            let mut prev1 = 0i32;
-            let mut prev2 = 0i32;
+            let seed = if ch == 0 { seed_l } else { seed_r };
+            let mut prev1 = seed;
+            let mut prev2 = seed;
             let mut cvsd = CvsdState::new();
 
             for i in 0..SUBFRAME_FRAMES {
                 let Some(bit) = read_bits(encoded, &mut bit_pos, 1) else {
                     return false;
                 };
+
+                if i == 0 {
+                    // Sample 0 comes from the header. The bit is consumed only
+                    // to keep the step history synchronized with the encoder.
+                    let _ = cvsd.update_and_get_step(bit as u8);
+                    out_f32[ch] = (seed as f32) * (1.0 / 32_768.0);
+                    prev2 = prev1;
+                    prev1 = seed;
+                    continue;
+                }
+
                 let step = cvsd.update_and_get_step(bit as u8);
                 let dequant = if bit == 1 { step } else { -step };
                 let pred = (prev1 << 1) - prev2;
@@ -442,12 +477,14 @@ pub fn decode_vbr_subframe_to_f32(
 
     let blocks_per_channel = SUBFRAME_FRAMES.checked_div(spec.block_len).unwrap_or(0);
     let exponent_start = 2usize;
-    let mut bit_pos = (exponent_start + 2 * blocks_per_channel) * 8;
+    let mut bit_pos = (exponent_start + VBR_BLOCK_HEADER_BYTES * 2 * blocks_per_channel) * 8;
 
     for ch in 0..2 {
         for block in 0..blocks_per_channel {
-            let header = encoded[exponent_start + ch * blocks_per_channel + block];
-            let (mut prev1, mut step) = unpack_vbr_block_header(header);
+            let hdr_off =
+                exponent_start + (ch * blocks_per_channel + block) * VBR_BLOCK_HEADER_BYTES;
+            let mut prev1 = i16::from_le_bytes([encoded[hdr_off], encoded[hdr_off + 1]]) as i32;
+            let mut step = VBR_INIT_STEPS[(encoded[hdr_off + 2] & 0x07) as usize];
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
@@ -458,9 +495,16 @@ pub fn decode_vbr_subframe_to_f32(
                 };
                 let dequant = ((2 * code as i32 + 1 - (1i32 << width)) * step) >> 1;
 
-                let recon = (prev1 + dequant).clamp(-32_768, 32_767);
-                out_f32[i * 2 + ch] = (recon as f32) * (1.0 / 32_768.0);
-                prev1 = recon;
+                if k == 0 {
+                    // `prev1` already holds the exact seed from the block
+                    // header. Consume the code only to keep the Jayant step
+                    // history in sync with the encoder.
+                    out_f32[i * 2 + ch] = (prev1 as f32) * (1.0 / 32_768.0);
+                } else {
+                    let recon = (prev1 + dequant).clamp(-32_768, 32_767);
+                    out_f32[i * 2 + ch] = (recon as f32) * (1.0 / 32_768.0);
+                    prev1 = recon;
+                }
                 step = adapt_vbr_step(step, code, width, &mut prev_bit);
             }
         }
@@ -787,16 +831,24 @@ pub fn encode_fec_subframe(
     pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
     out: &mut [u8; ADPCM_FEC_BYTES],
 ) {
-    let mut pred_l = pcm_stereo[0] as i32;
+    let mut pred_l;
     let mut pred_r = pcm_stereo[1] as i32;
 
-    // Estimate initial signal slope to prevent ADPCM slope-overload distortion on frame start
-    let diff_l = ((pcm_stereo[2] as i32) - pred_l).abs();
-    let diff_r = ((pcm_stereo[3] as i32) - pred_r).abs();
+    // Estimate the initial signal slope from the first ~0.33 ms instead of a
+    // single neighbouring sample. A waveform that starts at its peak has a
+    // near-zero first difference but a large slope a few samples later; the
+    // old one-sample estimate left the ADPCM step too small and the FEC
+    // backup distorted the first ~1 ms of every such subframe.
+    let mut max_slope = 60i32;
+    for i in 1..SUBFRAME_FRAMES.min(16) {
+        let d_l = (pcm_stereo[i * 2] as i32 - pcm_stereo[(i - 1) * 2] as i32).abs();
+        let d_r = (pcm_stereo[i * 2 + 1] as i32 - pcm_stereo[(i - 1) * 2 + 1] as i32).abs();
+        max_slope = max_slope.max(d_l).max(d_r);
+    }
     let init_idx = IMA_STEP_TABLE
         .iter()
-        .position(|&s| s >= diff_l.max(diff_r).max(60))
-        .unwrap_or(42) as i8;
+        .position(|&s| s >= max_slope)
+        .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8;
     let mut idx_l = init_idx;
     let mut idx_r = init_idx;
 
@@ -978,7 +1030,7 @@ mod tests {
         let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
         make_sine(&mut pcm);
 
-        for (kbps, expected_len) in [(96u16, 32usize), (160, 49), (256, 79), (320, 94)] {
+        for (kbps, expected_len) in [(96u16, 36usize), (160, 53), (256, 83), (320, 98)] {
             let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
             let len = encode_vbr_subframe(&pcm, kbps, &mut encoded);
             assert_eq!(len, expected_len, "unexpected size at {} kbps", kbps);
@@ -1038,30 +1090,51 @@ mod tests {
     }
 
     #[test]
-    fn test_vbr_block_header_packs_seed_and_step() {
-        // Silence must select the 4-LSB step, not the old fixed 256 LSB.
-        let silent = pack_vbr_block_header(0, 0);
-        assert_eq!(silent & 0x07, 0);
-        let (seed, step) = unpack_vbr_block_header(silent);
-        assert_eq!(seed, 0);
-        assert_eq!(step, 4);
+    fn test_vbr_initial_step_index_tracks_slope() {
+        // Silence must select the 4-LSB step, not a fixed 256 LSB.
+        assert_eq!(VBR_INIT_STEPS[vbr_initial_step_index(0) as usize], 4);
 
         // A full-scale-ish slope must select a large initial step.
-        let loud = pack_vbr_block_header(0, 30_000);
-        let (_, step) = unpack_vbr_block_header(loud);
-        assert!(step >= 2048, "loud block step {} too small", step);
+        let loud = vbr_initial_step_index(30_000);
+        assert!(
+            VBR_INIT_STEPS[loud as usize] >= 2048,
+            "loud block step {} too small",
+            VBR_INIT_STEPS[loud as usize]
+        );
+    }
 
-        // A 5-bit linear seed has a 2048-LSB bucket; clamp at the positive
-        // full-scale edge gives at most one bucket of error there.
-        for sample in [-32_768i16, -20_000, -1_025, -1, 0, 1, 1_025, 20_000, 32_767] {
-            let header = pack_vbr_block_header(sample, 0);
-            let (seed, _) = unpack_vbr_block_header(header);
-            assert!(
-                (sample as i32 - seed).abs() <= 2048,
-                "seed error for {} was {}",
-                sample,
-                (sample as i32 - seed).abs()
-            );
+    #[test]
+    fn test_vbr_sample_zero_is_bit_exact_at_all_profiles() {
+        // The old wire format quantized sample 0 to a 2048-LSB bucket, which
+        // produced a 400 Hz buzz at every block/subframe boundary. Sample 0
+        // must now round-trip exactly, including full-scale edges.
+        let edges = [-32_768i16, -20_000, -1_025, -1, 0, 1, 1_025, 20_000, 32_767];
+        for sample in edges {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            pcm[0] = sample;
+            pcm[1] = sample.wrapping_neg();
+
+            for kbps in [96u16, 160, 256, 320] {
+                let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                let len = encode_vbr_subframe(&pcm, kbps, &mut encoded);
+                let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                assert!(decode_vbr_subframe_to_f32(&encoded[..len], &mut decoded));
+
+                assert_eq!(
+                    (decoded[0] * 32_768.0).round() as i32,
+                    sample as i32,
+                    "{} kbps sample 0 mismatch for {}",
+                    kbps,
+                    sample
+                );
+                assert_eq!(
+                    (decoded[1] * 32_768.0).round() as i32,
+                    pcm[1] as i32,
+                    "{} kbps sample 1 mismatch for {}",
+                    kbps,
+                    sample
+                );
+            }
         }
     }
 
@@ -1243,12 +1316,12 @@ mod tests {
 
         // Nearest-target bucketing of the four advertised bitrates.
         for (kbps, expected) in [
-            (96u16, 32usize),
-            (160, 49),
-            (256, 79),
-            (320, 94),
-            (128, 49),
-            (300, 94),
+            (96u16, 36usize),
+            (160, 53),
+            (256, 83),
+            (320, 98),
+            (128, 53),
+            (300, 98),
         ] {
             assert_eq!(vbr_encoded_len(kbps), expected);
         }
