@@ -87,6 +87,15 @@ fun MainScreen() {
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
     // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
     var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
+    // Target for the compressed profiles. Persisted and restored on the next
+    // stream start; command codes 30..33 are 96/160/256/320 kbps.
+    var compressedBitrateKbps by remember {
+        mutableIntStateOf(
+            prefs.getInt("target_bitrate_kbps", 256).let {
+                if (it == 96 || it == 160 || it == 256 || it == 320) it else 256
+            }
+        )
+    }
     // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
     // Sent to the host as feedback code 20/21; only affects compressed modes.
     var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", false)) }
@@ -663,6 +672,31 @@ fun MainScreen() {
                                     },
                                     label = { Text(label) }
                                 )
+                            }
+                        }
+
+                        // Bitrate selector for the compressed profiles. The
+                        // host resolves the command to 96/160/256/320 kbps and
+                        // ignores it while a lossless profile is active.
+                        if (qualityMode == 0 || qualityMode == 2) {
+                            Text("Compressed Bitrate", style = MaterialTheme.typography.titleSmall)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                listOf(96, 160, 256, 320).forEachIndexed { idx, kbps ->
+                                    FilterChip(
+                                        selected = compressedBitrateKbps == kbps,
+                                        onClick = {
+                                            compressedBitrateKbps = kbps
+                                            prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
+                                            AudioEngineService.nativeSendMediaCommand(30 + idx)
+                                        },
+                                        label = { Text("$kbps kbps") }
+                                    )
+                                }
                             }
                         }
 

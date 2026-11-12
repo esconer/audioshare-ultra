@@ -201,6 +201,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // calls cannot overwrite each other before the RX thread sends them.
         val savedQuality = prefs.getInt("quality_mode", 0).coerceIn(0, 4)
         nativeSendMediaCommand(savedQuality + 1)
+        // Restore the compressed bitrate target (30..33 = 96/160/256/320 kbps)
+        // in its own slot as well.
+        val savedBitrateCmd = when (prefs.getInt("target_bitrate_kbps", 256)) {
+            96 -> 30
+            160 -> 31
+            320 -> 33
+            else -> 32
+        }
+        nativeSendMediaCommand(savedBitrateCmd)
         nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
         return START_STICKY
     }

@@ -56,8 +56,9 @@ pub struct ClientFeedbackPacket {
     /// Client requested quality profile (0 = no change, 1 = Smart Auto,
     /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms,
     /// 5 = Studio Master 24-bit), a media transport command (10 = play/pause,
-    /// 11 = next, 12 = previous), or a compressed-codec backend selection
-    /// (20 = pure-Rust VBR default, 21 = bundled Opus RLD).
+    /// 11 = next, 12 = previous), a compressed-codec backend selection
+    /// (20 = pure-Rust VBR default, 21 = bundled Opus RLD), or a compressed
+    /// bitrate target (30 = 96, 31 = 160, 32 = 256, 33 = 320 kbps).
     pub requested_mode: u8,
     /// Measured downstream hardware/DAC presentation latency in milliseconds.
     /// This is intentionally separate from `bluetooth_delay_ms`: the host uses

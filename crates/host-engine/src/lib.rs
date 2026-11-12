@@ -1379,12 +1379,24 @@ impl HostEngine {
                         // Remote quality-mode selection from the phone UI:
                         // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
                         // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                        // Values >= 10 are media transport or codec-backend
+                        // Bitrate selections are 30=96, 31=160, 32=256, 33=320 kbps.
+                        // Other values are media transport or codec-backend
                         // commands handled above.
                         if (1..=5).contains(&fb.requested_mode) {
                             telemetry
                                 .quality_profile
                                 .store(fb.requested_mode - 1, Ordering::Relaxed);
+                        } else {
+                            let kbps = match fb.requested_mode {
+                                30 => Some(96u16),
+                                31 => Some(160),
+                                32 => Some(256),
+                                33 => Some(320),
+                                _ => None,
+                            };
+                            if let Some(kbps) = kbps {
+                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                            }
                         }
 
                         let mut map = clients.lock().unwrap();
@@ -1491,10 +1503,12 @@ impl HostEngine {
                     tx_bitrate_kbps = selected_kbps;
                 }
                 QualityProfile::MaxStability24Ghz => {
-                    // Keep 2 subframes/pkt (5.0 ms) so [N-1] and [N-2] FEC cover 100%
-                    // of every packet on 2.4 GHz without unrecoverable 2-subframe holes!
+                    // 4 x 2.5 ms = 10.0 ms framing (100 pps) as advertised by
+                    // the profile name. Longer packets cut MAC contention and
+                    // retransmit bursts on congested 2.4 GHz links; the client
+                    // WSOLA PLC covers subframes not carried by [N-1]/[N-2].
                     dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = 2;
+                    subframes_per_pkt = 4;
                     tx_bitrate_kbps = 160;
                 }
                 QualityProfile::StudioLossless24Bit => {
@@ -1509,7 +1523,7 @@ impl HostEngine {
                 QualityProfile::SmartAuto => {
                     if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = 2;
+                        subframes_per_pkt = 4;
                         tx_bitrate_kbps = 160;
                     } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
@@ -2329,6 +2343,48 @@ mod tests {
         assert_eq!(
             observed, 2,
             "24-bit profile did not bundle two subframes per packet"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_max_stability_uses_four_subframe_10ms_frames() {
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 1,
+            enable_smart_dtx: false,
+        };
+        let mut engine = HostEngine::start(config, vec![]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::MaxStability24Ghz as u8, Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed = 0u8;
+        let mut interval_us = 0u32;
+        while Instant::now() < deadline {
+            observed = engine
+                .telemetry
+                .tx_subframes_per_packet
+                .load(Ordering::Relaxed);
+            interval_us = engine
+                .telemetry
+                .tx_packet_interval_us
+                .load(Ordering::Relaxed);
+            if observed == 4 && interval_us == 10_000 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            observed, 4,
+            "Max Stability must bundle 4 subframes (10 ms) per packet"
+        );
+        assert_eq!(
+            interval_us, 10_000,
+            "Max Stability packet cadence must be 100 pps"
         );
         engine.stop();
     }

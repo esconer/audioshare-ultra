@@ -141,17 +141,22 @@ fn trim_post_stall_backlog(
 
 /// Take at most one pending control command for this feedback packet.
 ///
-/// Quality/media commands win the current packet; a simultaneous
-/// codec-backend selection stays in its own slot and is sent on the next loop
-/// pass (the feedback send condition stays true while either slot is non-zero).
+/// Quality/media commands win the current packet, then the compressed bitrate,
+/// then the codec backend. Every command has its own slot, so a startup
+/// restore of all three is delivered over consecutive loop passes (the
+/// feedback send condition stays true while any slot is non-zero) instead of
+/// the later store overwriting the earlier one.
 #[inline]
-fn take_pending_command(media: &AtomicU8, codec: &AtomicU8) -> u8 {
+fn take_pending_command(media: &AtomicU8, bitrate: &AtomicU8, codec: &AtomicU8) -> u8 {
     let media_cmd = media.swap(0, Ordering::Relaxed);
     if media_cmd != 0 {
-        media_cmd
-    } else {
-        codec.swap(0, Ordering::Relaxed)
+        return media_cmd;
     }
+    let bitrate_cmd = bitrate.swap(0, Ordering::Relaxed);
+    if bitrate_cmd != 0 {
+        return bitrate_cmd;
+    }
+    codec.swap(0, Ordering::Relaxed)
 }
 
 /// A packet this far ahead of the playhead means the sequence tracker was
@@ -300,6 +305,10 @@ pub struct ClientTelemetry {
     /// Kept separate from [`Self::pending_media_command`] so restoring the
     /// quality profile and the backend back-to-back cannot overwrite either.
     pub pending_codec_backend_command: AtomicU8,
+    /// Compressed bitrate selection (30 = 96, 31 = 160, 32 = 256, 33 = 320
+    /// kbps). A third slot keeps a startup restore of quality + bitrate +
+    /// backend from collapsing into a single command.
+    pub pending_bitrate_command: AtomicU8,
     pub host_volume: AtomicU8,
     pub max_group_delay_ms: AtomicU16,
     pub seconds_since_last_packet: AtomicU16,
@@ -394,6 +403,7 @@ impl ClientEngine {
             downstream_hw_delay_ms: AtomicU16::new(0),
             pending_media_command: AtomicU8::new(0),
             pending_codec_backend_command: AtomicU8::new(0),
+            pending_bitrate_command: AtomicU8::new(0),
             host_volume: AtomicU8::new(100),
             max_group_delay_ms: AtomicU16::new(0),
             seconds_since_last_packet: AtomicU16::new(0),
@@ -683,6 +693,7 @@ impl ClientEngine {
                     .pending_codec_backend_command
                     .load(Ordering::Relaxed)
                     != 0
+                || telemetry.pending_bitrate_command.load(Ordering::Relaxed) != 0
             {
                 telemetry.seconds_since_last_packet.store(
                     last_packet_instant.elapsed().as_secs().min(65535) as u16,
@@ -705,6 +716,7 @@ impl ClientEngine {
                 // sent on the next loop pass, so neither command is lost.
                 let media_cmd = take_pending_command(
                     &telemetry.pending_media_command,
+                    &telemetry.pending_bitrate_command,
                     &telemetry.pending_codec_backend_command,
                 );
 
@@ -1353,25 +1365,30 @@ mod tests {
     #[test]
     fn test_pending_control_commands_do_not_clobber_each_other() {
         let media = AtomicU8::new(0);
+        let bitrate = AtomicU8::new(0);
         let codec = AtomicU8::new(0);
 
-        // Startup restores the quality profile (1..=5) and the codec backend
-        // (20/21) back-to-back. Both must survive.
+        // Startup restores the quality profile (1..=5), the bitrate (30..=33)
+        // and the codec backend (20/21) back-to-back. All must survive.
         media.store(4, Ordering::Relaxed);
+        bitrate.store(33, Ordering::Relaxed);
         codec.store(21, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &codec), 4);
-        assert_eq!(take_pending_command(&media, &codec), 21);
-        assert_eq!(take_pending_command(&media, &codec), 0);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 4);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 33);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 21);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 0);
 
-        // A codec-only change is sent immediately.
-        codec.store(20, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &codec), 20);
+        // A bitrate-only change is sent immediately.
+        bitrate.store(30, Ordering::Relaxed);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 30);
 
-        // A media key still takes priority over a pending backend switch.
+        // A media key still takes priority over the other pending controls.
         media.store(11, Ordering::Relaxed);
-        codec.store(21, Ordering::Relaxed);
-        assert_eq!(take_pending_command(&media, &codec), 11);
-        assert_eq!(take_pending_command(&media, &codec), 21);
+        bitrate.store(31, Ordering::Relaxed);
+        codec.store(20, Ordering::Relaxed);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 11);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 31);
+        assert_eq!(take_pending_command(&media, &bitrate, &codec), 20);
     }
 
     #[test]

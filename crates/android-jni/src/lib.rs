@@ -380,12 +380,18 @@ pub fn android_report_bt_delay_ms(delay_ms: u16) {
 
 pub fn android_send_media_command(cmd_code: u8) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
-        // Quality/media commands and the compressed-codec backend use
-        // separate slots so startup restoration cannot overwrite either one.
+        // Quality/media, compressed bitrate and codec-backend commands each
+        // have their own slot so a startup restore cannot overwrite a command
+        // that has not reached the host yet.
         if cmd_code == 20 || cmd_code == 21 {
             client
                 .telemetry
                 .pending_codec_backend_command
+                .store(cmd_code, Ordering::Relaxed);
+        } else if (30..=33).contains(&cmd_code) {
+            client
+                .telemetry
+                .pending_bitrate_command
                 .store(cmd_code, Ordering::Relaxed);
         } else {
             client
