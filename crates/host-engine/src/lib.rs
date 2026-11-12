@@ -38,6 +38,9 @@ const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
 const SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE: u16 = 45;
 /// Above this loss Smart Auto also drops to the fixed 160 kbps profile.
 const SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
+/// Above this loss even the 2.4 GHz stability framing steps down to the
+/// 96 kbps rung. 200 permille = 20% packet loss.
+const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
 /// Keep compressed mode for this long after the last high-loss report. Without
 /// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
 /// encoder every 500 ms.
@@ -56,6 +59,24 @@ fn governed_worst_loss(previous: u16, raw: u16, now: Instant, hold_until: &mut I
         previous.max(raw)
     } else {
         raw
+    }
+}
+
+/// Primary bitrate for the 2.4 GHz stability framing, used by both the
+/// explicit `MaxStability24Ghz` profile and Smart Auto's high-loss tier.
+///
+/// The profile exists for long-range links through walls, so the primary
+/// stream is capped at 160 kbps even when the user selected 256/320. A
+/// user-selected 96 kbps is honored rather than silently raised to 160.
+/// Above 20% loss the 96 kbps rung is the better tradeoff: its primary
+/// payload is 36 B/subframe instead of 53 B, leaving more airtime for the
+/// FEC backups that actually repair the loss.
+#[inline]
+fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
+    if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
+        96
+    } else {
+        selected_kbps.clamp(96, 160)
     }
 }
 
@@ -336,23 +357,62 @@ enum DatagramPlan {
     SplitPerSubframe,
 }
 
-/// True when `primary_len` plus `fec_frames` ADPCM backups and the wire
+/// True when `primary_len` plus the exact FEC payload bytes and the wire
 /// overhead fit inside the safe UDP payload budget.
 #[inline]
-fn datagram_fits(primary_len: usize, encrypted: bool, fec_frames: usize) -> bool {
-    let overhead =
-        HEADER_LEN + if encrypted { MAC_TAG_LEN } else { 0 } + fec_frames * ADPCM_FEC_BYTES;
+fn datagram_fits(primary_len: usize, encrypted: bool, fec_bytes: usize) -> bool {
+    let overhead = HEADER_LEN + if encrypted { MAC_TAG_LEN } else { 0 } + fec_bytes;
     overhead + primary_len <= MAX_SAFE_UDP_PAYLOAD
 }
 
-/// Choose how to fit a packet into one datagram.
+/// Choose how to fit a packet into one datagram using the exact FEC payload
+/// sizes.
 ///
-/// FEC N-2 is dropped first because it is older and less useful than N-1.
-/// If N-1 cannot fit either, the bundle is split into one-subframe datagrams
-/// whenever FEC was requested: a single 2.5 ms subframe is small enough that
-/// N-1 (and usually N-2) fits even for true 24-bit PCM. Silently keeping the
-/// multi-subframe packet and stripping all protection was the old behaviour,
-/// which left 24-bit Wi-Fi streams with no loss recovery at all.
+/// Normal framing carries one 124-byte ADPCM frame per field, while 10 ms
+/// 2.4 GHz framing carries a 248-byte pair per field. N-2 is dropped first
+/// because it is older and less useful than N-1. If N-1 cannot fit either,
+/// the bundle is split into one-subframe datagrams whenever FEC was requested:
+/// a single 2.5 ms subframe is small enough that N-1 (and usually N-2) fits
+/// even for true 24-bit PCM. Silently keeping the multi-subframe packet and
+/// stripping all protection was the old behaviour, which left 24-bit Wi-Fi
+/// streams with no loss recovery at all.
+#[inline]
+fn plan_datagram_with_fec(
+    primary_len: usize,
+    encrypted: bool,
+    n1_len: usize,
+    n2_len: usize,
+) -> DatagramPlan {
+    let want_n1 = n1_len > 0;
+    let want_n2 = n2_len > 0;
+    let first_fec = if want_n1 { n1_len } else { n2_len };
+    if !datagram_fits(primary_len, encrypted, first_fec) {
+        return DatagramPlan::SplitPerSubframe;
+    }
+    if want_n1 && want_n2 && datagram_fits(primary_len, encrypted, n1_len + n2_len) {
+        DatagramPlan::Single { n1: true, n2: true }
+    } else if want_n1 && datagram_fits(primary_len, encrypted, n1_len) {
+        DatagramPlan::Single {
+            n1: true,
+            n2: false,
+        }
+    } else if want_n2 && datagram_fits(primary_len, encrypted, n2_len) {
+        // Defensive: no current caller sends N-2 without N-1, but a planner
+        // should still carry the frame it was given instead of silently
+        // dropping protection.
+        DatagramPlan::Single {
+            n1: false,
+            n2: true,
+        }
+    } else {
+        DatagramPlan::Single {
+            n1: false,
+            n2: false,
+        }
+    }
+}
+
+/// Boolean convenience wrapper for callers that only track FEC presence.
 #[inline]
 fn plan_datagram(
     primary_len: usize,
@@ -360,21 +420,52 @@ fn plan_datagram(
     want_n1: bool,
     want_n2: bool,
 ) -> DatagramPlan {
-    if !datagram_fits(primary_len, encrypted, usize::from(want_n1 || want_n2)) {
-        return DatagramPlan::SplitPerSubframe;
-    }
-    if want_n1 && want_n2 && datagram_fits(primary_len, encrypted, 2) {
-        DatagramPlan::Single { n1: true, n2: true }
-    } else if want_n1 && datagram_fits(primary_len, encrypted, 1) {
-        DatagramPlan::Single {
-            n1: true,
-            n2: false,
+    plan_datagram_with_fec(
+        primary_len,
+        encrypted,
+        if want_n1 { ADPCM_FEC_BYTES } else { 0 },
+        if want_n2 { ADPCM_FEC_BYTES } else { 0 },
+    )
+}
+
+/// Build the two FEC fields for one outgoing packet from the sliding history.
+///
+/// `hist[0]` is N-1 (newest). Normal framing carries one frame per field.
+/// Four-subframe 10 ms framing interleaves two frames per field:
+/// `fec_n1 = [N-1, N-3]`, `fec_n2 = [N-2, N-4]`. Keeping N-1/N-2 as the
+/// *first* frame of each field is deliberate: older clients decode exactly
+/// those 124 bytes and stay bit-compatible, while newer clients read the
+/// second frame as the older half. A contiguous `[N-1,N-2]` + `[N-3,N-4]`
+/// layout would make an old client heal slot N-2 with N-3's audio.
+///
+/// Returns `(n1_len, n2_len)` into `pair_1`/`pair_2`.
+fn pack_fec_history(
+    pair_fec: bool,
+    hist: &[[u8; ADPCM_FEC_BYTES]; 4],
+    hist_len: usize,
+    pair_1: &mut [u8; ADPCM_FEC_BYTES * 2],
+    pair_2: &mut [u8; ADPCM_FEC_BYTES * 2],
+) -> (usize, usize) {
+    if pair_fec && hist_len >= 3 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        pair_1[ADPCM_FEC_BYTES..].copy_from_slice(&hist[2]);
+        pair_2[..ADPCM_FEC_BYTES].copy_from_slice(&hist[1]);
+        if hist_len >= 4 {
+            pair_2[ADPCM_FEC_BYTES..].copy_from_slice(&hist[3]);
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES * 2)
+        } else {
+            // Ramp-up: N-2 alone is still the legacy field for one packet.
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES)
         }
+    } else if hist_len >= 2 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        pair_2[..ADPCM_FEC_BYTES].copy_from_slice(&hist[1]);
+        (ADPCM_FEC_BYTES, ADPCM_FEC_BYTES)
+    } else if hist_len == 1 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        (ADPCM_FEC_BYTES, 0)
     } else {
-        DatagramPlan::Single {
-            n1: false,
-            n2: false,
-        }
+        (0, 0)
     }
 }
 
@@ -1297,10 +1388,12 @@ impl HostEngine {
         let mut last_tx_instant = start_instant;
 
         let mut seq: u16 = 0;
-        let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
-        let mut fec_n2 = [0u8; ADPCM_FEC_BYTES];
-        let mut has_fec_n1 = false;
-        let mut has_fec_n2 = false;
+        // Sliding FEC history, newest first. Normal framing sends history[0]
+        // as N-1 and history[1] as N-2. Four-subframe 10 ms framing packs
+        // [N-1, N-2] into the first FEC field and [N-3, N-4] into the second
+        // so one lost 10 ms packet is fully healed by the next packet.
+        let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
+        let mut fec_hist_len: usize = 0;
 
         let mut silent_subframes: u32 = 0;
         let mut tone_phase: f32 = 0.0;
@@ -1570,7 +1663,7 @@ impl HostEngine {
                     // packet rate to 400 pps on an already lossy link.
                     dynamic_codec_mode = CodecMode::CompressedLowDelay;
                     subframes_per_pkt = if gaming_lock { 2 } else { 4 };
-                    tx_bitrate_kbps = 160;
+                    tx_bitrate_kbps = stability_bitrate_kbps(selected_kbps, worst_loss_permille);
                 }
                 QualityProfile::StudioLossless24Bit => {
                     // Two subframes halve MAC contention (200 packets/s).
@@ -1585,7 +1678,8 @@ impl HostEngine {
                     if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
                         subframes_per_pkt = if gaming_lock { 2 } else { 4 };
-                        tx_bitrate_kbps = 160;
+                        tx_bitrate_kbps =
+                            stability_bitrate_kbps(selected_kbps, worst_loss_permille);
                     } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                         dynamic_codec_mode = CodecMode::CompressedLowDelay;
                         subframes_per_pkt = if gaming_lock { 1 } else { 2 };
@@ -1672,10 +1766,10 @@ impl HostEngine {
             // per-subframe split path uses [i-1] and [i-2] as its N-1/N-2.
             let mut packet_fec = [[0u8; ADPCM_FEC_BYTES]; 4];
             let base_seq = seq;
-            let prev_n1_copy = fec_n1;
-            let prev_n2_copy = fec_n2;
-            let send_n1 = has_fec_n1;
-            let send_n2 = has_fec_n2;
+            let prev_hist = fec_hist;
+            let prev_hist_len = fec_hist_len;
+            let send_n1 = prev_hist_len >= 1;
+            let send_n2 = prev_hist_len >= 2;
             let mut packet_is_silent = true;
 
             for sub_idx in 0..subframes_per_pkt {
@@ -1722,11 +1816,10 @@ impl HostEngine {
                     silent_subframes = silent_subframes.saturating_add(1);
                 }
 
-                fec_n2 = fec_n1;
-                has_fec_n2 = has_fec_n1;
-                encode_fec_subframe(&i16_subframe, &mut fec_n1);
-                has_fec_n1 = true;
-                packet_fec[sub_idx] = fec_n1;
+                fec_hist.copy_within(0..3, 1);
+                encode_fec_subframe(&i16_subframe, &mut fec_hist[0]);
+                fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
+                packet_fec[sub_idx] = fec_hist[0];
 
                 let entry_start = primary_cursor;
                 if matches!(
@@ -1890,10 +1983,34 @@ impl HostEngine {
                     },
                     header_crc16: 0,
                 };
-                match plan_datagram(primary_cursor, active_key.is_some(), send_n1, send_n2) {
+                // 2.4 GHz 10 ms framing carries the previous four subframes
+                // across the two FEC fields: [N-1,N-3] and [N-2,N-4]. Each
+                // field stays <= 255 bytes, so the wire header is unchanged;
+                // old clients decode the first 124-byte frame of each field
+                // (N-1/N-2) and ignore the rest. Opus skips ADPCM FEC on the
+                // client, so the pair is only packed for the pure-Rust VBR
+                // backend.
+                let pair_fec = subframes_per_pkt == 4 && dynamic_codec_mode != CodecMode::OpusRld;
+                let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
+                let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
+                let (n1_len, n2_len) = pack_fec_history(
+                    pair_fec,
+                    &prev_hist,
+                    prev_hist_len,
+                    &mut fec_pair_1,
+                    &mut fec_pair_2,
+                );
+                let full_n1 = &fec_pair_1[..n1_len];
+                let full_n2 = &fec_pair_2[..n2_len];
+                match plan_datagram_with_fec(
+                    primary_cursor,
+                    active_key.is_some(),
+                    full_n1.len(),
+                    full_n2.len(),
+                ) {
                     DatagramPlan::Single { n1, n2 } => {
-                        let f1_slice = if n1 { &prev_n1_copy[..] } else { &[] };
-                        let f2_slice = if n2 { &prev_n2_copy[..] } else { &[] };
+                        let f1_slice = if n1 { full_n1 } else { &[] };
+                        let f2_slice = if n2 { full_n2 } else { &[] };
                         sent_any = pack_and_send(
                             &socket,
                             &mut datagram,
@@ -1921,8 +2038,8 @@ impl HostEngine {
                                 split_idx,
                                 send_n1,
                                 send_n2,
-                                &prev_n1_copy,
-                                &prev_n2_copy,
+                                &prev_hist[0],
+                                &prev_hist[1],
                                 &packet_fec,
                             );
                             let (n1, n2) = match plan_datagram(
@@ -2316,6 +2433,131 @@ mod tests {
         let f1_start = split_packet_fec(1, false, false, &prev_n1, &prev_n2, &packet_fec);
         assert!(f1_start.want_n1);
         assert!(!f1_start.want_n2);
+    }
+
+    #[test]
+    fn test_plan_datagram_with_paired_fec_fields() {
+        let pair = ADPCM_FEC_BYTES * 2;
+
+        // 10 ms 2.4 GHz framing: one paired field per FEC slot.
+        let both_pairs = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - 2 * pair;
+        assert_eq!(
+            plan_datagram_with_fec(both_pairs, true, pair, pair),
+            DatagramPlan::Single { n1: true, n2: true }
+        );
+        // One byte over: drop the older N-3/N-4 pair first.
+        assert_eq!(
+            plan_datagram_with_fec(both_pairs + 1, true, pair, pair),
+            DatagramPlan::Single {
+                n1: true,
+                n2: false
+            }
+        );
+
+        // A paired N-1 field plus a single N-2 frame (history ramp-up).
+        let pair_plus_one =
+            MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - pair - ADPCM_FEC_BYTES;
+        assert_eq!(
+            plan_datagram_with_fec(pair_plus_one, true, pair, ADPCM_FEC_BYTES),
+            DatagramPlan::Single { n1: true, n2: true }
+        );
+        assert_eq!(
+            plan_datagram_with_fec(pair_plus_one + 1, true, pair, ADPCM_FEC_BYTES),
+            DatagramPlan::Single {
+                n1: true,
+                n2: false
+            }
+        );
+
+        // Two paired fields no longer fit: split so both survive per subframe.
+        let pair_only = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - pair;
+        assert_eq!(
+            plan_datagram_with_fec(pair_only + 1, true, pair, pair),
+            DatagramPlan::SplitPerSubframe
+        );
+        assert_eq!(
+            plan_datagram_with_fec(pair_only + 1, true, pair, 0),
+            DatagramPlan::SplitPerSubframe
+        );
+
+        // The boolean wrapper keeps the legacy 124-byte accounting.
+        let legacy_both = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - 2 * ADPCM_FEC_BYTES;
+        assert_eq!(
+            plan_datagram(legacy_both, true, true, true),
+            DatagramPlan::Single { n1: true, n2: true }
+        );
+        assert_eq!(
+            plan_datagram(legacy_both + 1, true, true, true),
+            DatagramPlan::Single {
+                n1: true,
+                n2: false
+            }
+        );
+
+        // A lone N-2 field is carried rather than silently dropped.
+        assert_eq!(
+            plan_datagram_with_fec(pair_only, true, 0, ADPCM_FEC_BYTES),
+            DatagramPlan::Single {
+                n1: false,
+                n2: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_pack_fec_history_keeps_legacy_slots_stable() {
+        let mut hist = [[0u8; ADPCM_FEC_BYTES]; 4];
+        for (i, frame) in hist.iter_mut().enumerate() {
+            frame.fill(0x10 + i as u8);
+        }
+        let mut p1 = [0u8; ADPCM_FEC_BYTES * 2];
+        let mut p2 = [0u8; ADPCM_FEC_BYTES * 2];
+
+        // Legacy 1/2-subframe framing keeps one frame per field.
+        let (n1, n2) = pack_fec_history(false, &hist, 4, &mut p1, &mut p2);
+        assert_eq!((n1, n2), (ADPCM_FEC_BYTES, ADPCM_FEC_BYTES));
+        assert_eq!(&p1[..ADPCM_FEC_BYTES], &hist[0][..]);
+        assert_eq!(&p2[..ADPCM_FEC_BYTES], &hist[1][..]);
+
+        // 10 ms paired framing interleaves the older half into the second
+        // frame so the first frame of each field stays N-1/N-2.
+        let (n1, n2) = pack_fec_history(true, &hist, 4, &mut p1, &mut p2);
+        assert_eq!((n1, n2), (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES * 2));
+        assert_eq!(&p1[..ADPCM_FEC_BYTES], &hist[0][..]);
+        assert_eq!(&p1[ADPCM_FEC_BYTES..], &hist[2][..]);
+        assert_eq!(&p2[..ADPCM_FEC_BYTES], &hist[1][..]);
+        assert_eq!(&p2[ADPCM_FEC_BYTES..], &hist[3][..]);
+
+        // Ramp-up at length 3: paired N-1 plus the legacy single N-2.
+        let (n1, n2) = pack_fec_history(true, &hist, 3, &mut p1, &mut p2);
+        assert_eq!((n1, n2), (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES));
+        assert_eq!(&p1[ADPCM_FEC_BYTES..], &hist[2][..]);
+        assert_eq!(&p2[..ADPCM_FEC_BYTES], &hist[1][..]);
+
+        // Short histories (mode switch / stream start) stay legacy.
+        assert_eq!(
+            pack_fec_history(true, &hist, 2, &mut p1, &mut p2),
+            (ADPCM_FEC_BYTES, ADPCM_FEC_BYTES)
+        );
+        assert_eq!(
+            pack_fec_history(true, &hist, 1, &mut p1, &mut p2),
+            (ADPCM_FEC_BYTES, 0)
+        );
+        assert_eq!(pack_fec_history(true, &hist, 0, &mut p1, &mut p2), (0, 0));
+    }
+
+    #[test]
+    fn test_stability_bitrate_stepdown_at_critical_loss() {
+        // The 2.4 GHz profile caps at 160 kbps without raising a user's
+        // explicit 96 kbps choice.
+        assert_eq!(stability_bitrate_kbps(96, 0), 96);
+        assert_eq!(stability_bitrate_kbps(128, 0), 128);
+        assert_eq!(stability_bitrate_kbps(160, 0), 160);
+        assert_eq!(stability_bitrate_kbps(320, 0), 160);
+        // Exactly 20% loss keeps the normal stability rung; above it, 96.
+        assert_eq!(stability_bitrate_kbps(320, 200), 160);
+        assert_eq!(stability_bitrate_kbps(320, 201), 96);
+        assert_eq!(stability_bitrate_kbps(96, 900), 96);
     }
 
     #[test]
