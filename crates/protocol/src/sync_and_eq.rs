@@ -296,55 +296,100 @@ impl StudioEqualizer {
 }
 
 /// 6. Zero-Latency "Night Mode" Upward Whisper Compressor & Explosion Tamer (0.00ms Lookahead)
-/// - Boosts quiet movie dialogue & game footsteps (-50 dBFS .. -16 dBFS) by up to +11.5 dB
-/// - Tames sudden loud explosions/gunshots above -12 dBFS with a 4:1 ratio
-/// - Noise-gates signals below -55 dBFS so background hiss is never amplified
+/// - Boosts quiet movie dialogue & game footsteps (-49 dBFS .. -18 dBFS) by up to +10.9 dB
+/// - Tames sudden loud explosions/gunshots above -11 dBFS with a 4:1 ratio
+/// - Noise-gates signals below -64 dBFS so background hiss is never amplified
+///
+/// The transfer curve is strictly monotonic: every zone's output level
+/// `level * gain(level)` rises with the input level, so louder dialogue never
+/// becomes quieter. The old curve fell from 0.2955 to 0.250 between -16 and
+/// -12 dBFS, folding speech peaks inward.
+const NIGHT_GATE_START: f32 = 0.0006; // -64.4 dBFS: unity below this floor
+const NIGHT_NOISE_FLOOR: f32 = 0.0035; // -49.1 dBFS: full whisper boost
+const NIGHT_WHISPER_ZONE: f32 = 0.12; // -18.4 dBFS
+const NIGHT_LOUD_THRESH: f32 = 0.28; // -11.1 dBFS
+const NIGHT_MAX_BOOST: f32 = 3.50; // +10.9 dB
+const NIGHT_WHISPER_GAIN: f32 = 2.00;
+/// Gain at the downward-compression knee. 1.35 (not 1.15) keeps
+/// `d(level * gain)/d(level)` positive all the way to the knee.
+const NIGHT_LOUD_GAIN: f32 = 1.35;
+
+/// Target night-mode gain for a peak envelope level.
+///
+/// Below the gate the signal passes at unity. A smoothstep ramps the gain up
+/// to `NIGHT_MAX_BOOST`, then two linear segments hand over to the 4:1
+/// downward compressor. The control points are chosen so the output level is
+/// monotonic at every boundary; the report's 2.00 -> 1.15 segment still had a
+/// negative output slope near 0.25 and was corrected to 1.35.
+#[inline(always)]
+fn night_mode_target_gain(level: f32) -> f32 {
+    if level <= NIGHT_GATE_START {
+        1.0
+    } else if level < NIGHT_NOISE_FLOOR {
+        let t = (level - NIGHT_GATE_START) / (NIGHT_NOISE_FLOOR - NIGHT_GATE_START);
+        let smooth = t * t * (3.0 - 2.0 * t);
+        1.0 + (NIGHT_MAX_BOOST - 1.0) * smooth
+    } else if level < NIGHT_WHISPER_ZONE {
+        let t = (level - NIGHT_NOISE_FLOOR) / (NIGHT_WHISPER_ZONE - NIGHT_NOISE_FLOOR);
+        NIGHT_MAX_BOOST - (NIGHT_MAX_BOOST - NIGHT_WHISPER_GAIN) * t
+    } else if level <= NIGHT_LOUD_THRESH {
+        let t = (level - NIGHT_WHISPER_ZONE) / (NIGHT_LOUD_THRESH - NIGHT_WHISPER_ZONE);
+        NIGHT_WHISPER_GAIN - (NIGHT_WHISPER_GAIN - NIGHT_LOUD_GAIN) * t
+    } else {
+        let target = NIGHT_LOUD_THRESH * NIGHT_LOUD_GAIN + (level - NIGHT_LOUD_THRESH) * 0.25;
+        target / level
+    }
+}
+
 pub struct NightModeCompressor {
     env: f32,
+    /// Smoothed gain actually applied to the samples. Reductions move quickly
+    /// so a transient cannot overshoot; recovery is slow to avoid pumping.
+    gain_env: f32,
 }
 
 impl NightModeCompressor {
     pub const fn new() -> Self {
-        Self { env: 0.0 }
+        Self {
+            env: 0.0,
+            gain_env: 1.0,
+        }
     }
 
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
-        const NOISE_FLOOR: f32 = 0.0018; // -55 dBFS gate threshold
-        const WHISPER_ZONE: f32 = 0.16; // -16 dBFS upward boost target
-        const LOUD_THRESH: f32 = 0.25; // -12 dBFS downward 4:1 compression start
-        const MAX_BOOST: f32 = 3.75; // +11.5 dB max whisper/footstep boost
-
         for frame in stereo.chunks_exact_mut(2) {
             let l = frame[0];
             let r = frame[1];
             let peak = l.abs().max(r.abs()) + 1.0e-25;
 
-            // Fast attack (0.2), smooth release (0.0008) to prevent pumping
+            // 1.5 ms attack, 100 ms release. The old 93 us attack / 26 ms
+            // release tracked 60-200 Hz waveform cycles and modulated their
+            // gain, adding harmonics.
             if peak > self.env {
-                self.env += 0.20 * (peak - self.env);
+                self.env += 0.014 * (peak - self.env);
             } else {
-                self.env += 0.0008 * (peak - self.env);
+                self.env += 0.0002 * (peak - self.env);
             }
 
-            let gain = if self.env < NOISE_FLOOR {
-                1.0
-            } else if self.env < WHISPER_ZONE {
-                // Smooth upward compression for quiet voices & footsteps
-                let norm = (self.env - NOISE_FLOOR) / (WHISPER_ZONE - NOISE_FLOOR);
-                1.0 + (MAX_BOOST - 1.0) * (1.0 - norm * 0.7)
-            } else if self.env > LOUD_THRESH {
-                // 4:1 downward compression for sudden explosions
-                let target = LOUD_THRESH + (self.env - LOUD_THRESH) * 0.25;
-                (target / self.env).min(1.0)
-            } else {
-                1.0 + (MAX_BOOST - 1.0)
-                    * 0.3
-                    * ((LOUD_THRESH - self.env) / (LOUD_THRESH - WHISPER_ZONE))
-            };
+            // Feed-forward peak: a transient on top of a quiet envelope must
+            // be compressed immediately instead of receiving whisper boost
+            // on its leading edge.
+            let level = self.env.max(peak);
+            let target_gain = night_mode_target_gain(level);
 
-            frame[0] = (l * gain).clamp(-0.89, 0.89);
-            frame[1] = (r * gain).clamp(-0.89, 0.89);
+            // Reach 75% of a downward target in two samples, but recover
+            // slowly enough not to pump. This also smooths the residual
+            // envelope ripple that used to distort bass.
+            let coeff = if target_gain < self.gain_env {
+                0.5
+            } else {
+                0.001
+            };
+            self.gain_env += coeff * (target_gain - self.gain_env);
+
+            frame[0] = (l * self.gain_env).clamp(-0.84, 0.84);
+            frame[1] = (r * self.gain_env).clamp(-0.84, 0.84);
         }
     }
 }
@@ -606,6 +651,140 @@ mod tests {
         let mut loud_block = [0.95f32; 240];
         comp.process_in_place(&mut loud_block);
         assert!(loud_block[238].abs() < 0.90);
+    }
+
+    #[test]
+    fn test_night_mode_gate_has_no_step_discontinuity() {
+        // Evaluate the gain one LSB either side of the old -55 dBFS gate
+        // boundary. The old curve jumped from 1.0x to 3.75x (+11.5 dB).
+        let low = 0.001799f32;
+        let high = 0.001801f32;
+
+        let mut below = NightModeCompressor::new();
+        below.env = low;
+        let mut a = [low, low];
+        below.process_in_place(&mut a);
+        let gain_below = a[0] / low;
+
+        let mut above = NightModeCompressor::new();
+        above.env = high;
+        let mut b = [high, high];
+        above.process_in_place(&mut b);
+        let gain_above = b[0] / high;
+
+        println!(
+            "night gate gain across boundary: {:.4} -> {:.4}",
+            gain_below, gain_above
+        );
+        assert!(
+            (gain_above - gain_below).abs() < 0.25,
+            "gain steps from {:.4} to {:.4} across the gate boundary",
+            gain_below,
+            gain_above
+        );
+    }
+
+    fn settled_night_output(level: f32) -> f32 {
+        let mut comp = NightModeCompressor::new();
+        let mut out = 0.0f32;
+        // 125 ms is long enough for both the 1.5 ms level envelope and the
+        // slow gain-recovery smoother to settle on a constant input.
+        for _ in 0..6000 {
+            let mut frame = [level, level];
+            comp.process_in_place(&mut frame);
+            out = frame[0];
+        }
+        out
+    }
+
+    #[test]
+    fn test_night_mode_transfer_is_monotonic() {
+        // Normal speech sits between about -16 dBFS and -12 dBFS. The old
+        // curve reduced gain faster than the level grew, so 0.19 input
+        // produced less output than 0.18 (dynamic inversion / wavefolding).
+        let levels = [
+            0.16f32, 0.17, 0.18, 0.19, 0.20, 0.22, 0.24, 0.25, 0.27, 0.28,
+        ];
+        let outputs: Vec<f32> = levels.iter().map(|&l| settled_night_output(l)).collect();
+        println!("night-mode transfer outputs: {:?}", outputs);
+
+        for (pair, levels) in outputs.windows(2).zip(levels.windows(2)) {
+            assert!(
+                pair[1] > pair[0],
+                "louder input {} -> {:.4} did not exceed {} -> {:.4}",
+                levels[1],
+                pair[1],
+                levels[0],
+                pair[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_night_mode_transient_does_not_overshoot() {
+        // A 0.85 transient on top of a 0.01 envelope must not receive whisper
+        // boost on its leading edge. The old gain was computed from the
+        // partially updated envelope (0.178) and amplified it to 1.41 before
+        // hard-clipping at 0.89.
+        let mut comp = NightModeCompressor::new();
+        comp.env = 0.01;
+        let mut frame = [0.85f32, 0.85];
+        comp.process_in_place(&mut frame);
+        let peak = frame[0].abs();
+        println!("night-mode transient output peak: {:.4}", peak);
+        assert!(
+            peak <= 0.84 + 1.0e-6,
+            "transient overshot to {} instead of staying under the clamp",
+            peak
+        );
+        assert!(peak > 0.2, "transient was over-attenuated to {}", peak);
+    }
+
+    fn tone_amplitude(samples: &[f32], freq_hz: f32) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * freq_hz as f64 / 48_000.0;
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for (n, &sample) in samples.iter().enumerate() {
+            let phase = w * n as f64;
+            re += sample as f64 * phase.cos();
+            im += sample as f64 * phase.sin();
+        }
+        2.0 * (re * re + im * im).sqrt() / samples.len() as f64
+    }
+
+    #[test]
+    fn test_night_mode_low_frequency_distortion() {
+        // A steady 100 Hz bass tone at 0.2 sits in the old transition zone.
+        // Its envelope ripples between peaks, so the gain modulation shows up
+        // as harmonics. 0.9 s after a 0.1 s settle is an integer number of
+        // cycles at 100 Hz and each measured harmonic, avoiding leakage.
+        let mut comp = NightModeCompressor::new();
+        let mut processed = Vec::with_capacity(48_000);
+        for n in 0..48_000 {
+            let v = ((n as f32) * 2.0 * std::f32::consts::PI * 100.0 / 48_000.0).sin() * 0.2;
+            let mut frame = [v, v];
+            comp.process_in_place(&mut frame);
+            processed.push(frame[0]);
+        }
+        let settled = &processed[4_800..];
+        let h1 = tone_amplitude(settled, 100.0);
+        let h2 = tone_amplitude(settled, 200.0);
+        let h3 = tone_amplitude(settled, 300.0);
+        let h4 = tone_amplitude(settled, 400.0);
+        let thd = (h2 * h2 + h3 * h3 + h4 * h4).sqrt() / h1;
+        println!(
+            "night-mode 100 Hz THD: {:.3}% (H1 {:.5}, H2 {:.5}, H3 {:.5}, H4 {:.5})",
+            thd * 100.0,
+            h1,
+            h2,
+            h3,
+            h4
+        );
+        assert!(
+            thd < 0.02,
+            "100 Hz bass THD is {:.2}%, above the 2% ceiling",
+            thd * 100.0
+        );
     }
 
     #[test]

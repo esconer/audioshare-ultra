@@ -1680,7 +1680,7 @@ impl AudioShareApp {
                 dsp_changed |= ui
                     .checkbox(
                         &mut self.night_mode_drc,
-                        "🌙 Night Mode (Boost Whispers/Footsteps +11.5dB, Tame Explosions)",
+                        "🌙 Night Mode (Boost Whispers/Footsteps +10.9dB, Tame Explosions)",
                     )
                     .changed();
             });
