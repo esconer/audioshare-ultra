@@ -112,7 +112,13 @@ impl OpusStreamEncoder {
 
     /// Encode one 2.5 ms subframe into `[TAG_OPUS_RLD][opus packet...]`.
     ///
-    /// `out` must have room for at least [`MAX_OPUS_SUBFRAME_BYTES`] bytes.
+    /// `out` must have room for at least [`MAX_OPUS_SUBFRAME_BYTES`] bytes;
+    /// any extra capacity is never exposed to the encoder. `opus-rs` treats the
+    /// output slice length as its `max_data_bytes`, so passing the host's full
+    /// 481-byte buffer (480 bytes after the tag) would let a CELT VBR transient
+    /// write past the wire budget. Only the capped packet region is passed, and
+    /// the post-encode length check remains as defense in depth.
+    ///
     /// Returns the tagged length, or `None` if the encoder rejected the frame
     /// or the packet exceeded the wire budget.
     pub fn encode_subframe(
@@ -126,9 +132,16 @@ impl OpusStreamEncoder {
         }
         self.set_bitrate_kbps(kbps);
         out[0] = TAG_OPUS_RLD;
+        // `opus-rs` uses the slice length as `max_data_bytes`. Expose exactly
+        // the wire budget, not whatever spare capacity the caller's buffer has
+        // (the host passes a 481-byte primary-subframe buffer).
         let written = self
             .inner
-            .encode_i16(pcm_stereo, SUBFRAME_FRAMES, &mut out[1..])
+            .encode_i16(
+                pcm_stereo,
+                SUBFRAME_FRAMES,
+                &mut out[1..1 + MAX_OPUS_PACKET_BYTES],
+            )
             .ok()?;
         if written == 0 || written > MAX_OPUS_PACKET_BYTES {
             return None;
@@ -338,6 +351,65 @@ mod tests {
             assert!(
                 len <= MAX_OPUS_SUBFRAME_BYTES,
                 "packet {len} exceeds wire budget"
+            );
+        }
+    }
+
+    /// Regression test for the host's 481-byte primary-subframe buffer.
+    ///
+    /// `opus-rs` treats the output slice length as `max_data_bytes`, so handing
+    /// it all 480 bytes after the tag lets a VBR transient fill far more than
+    /// the 240-byte Opus wire budget. `encode_subframe` must pass the capped
+    /// slice instead of relying on a post-hoc length check.
+    #[test]
+    fn test_opus_encoder_respects_packet_cap_with_host_sized_buffer() {
+        const HOST_SUBFRAME_BYTES: usize = 481;
+        const SENTINEL: u8 = 0xA5;
+        let mut encoder = OpusStreamEncoder::new(320).expect("create Opus encoder");
+        let mut payload = [SENTINEL; HOST_SUBFRAME_BYTES];
+        let mut rng = 0x1234_5678u32;
+        let mut max_len = 0usize;
+
+        for frame_index in 0..256usize {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            // Alternate full-scale square bursts and full-scale noise so the
+            // CELT VBR reservoir sees loud transients and dense spectra.
+            let burst = (frame_index / 8).is_multiple_of(2);
+            for i in 0..SUBFRAME_FRAMES {
+                rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (rng >> 16) as i16;
+                let square = if (i / 8).is_multiple_of(2) {
+                    32_000
+                } else {
+                    -32_000
+                };
+                let left = if burst { square } else { noise };
+                // Invert the right channel on burst frames to stress stereo
+                // coding without cancelling the mid signal.
+                let right = if burst { -square } else { noise.wrapping_neg() };
+                pcm[i * 2] = left;
+                pcm[i * 2 + 1] = right;
+            }
+
+            // The host does not zero this buffer; prove the encoder does not
+            // write past the capped packet region.
+            payload[MAX_OPUS_SUBFRAME_BYTES..].fill(SENTINEL);
+
+            let len = encoder
+                .encode_subframe(&pcm, 320, &mut payload)
+                .unwrap_or_else(|| panic!("frame {frame_index} exceeded the packet cap"));
+            assert_eq!(payload[0], TAG_OPUS_RLD);
+            max_len = max_len.max(len);
+            assert!(
+                len <= MAX_OPUS_SUBFRAME_BYTES,
+                "frame {frame_index} packet {len} exceeds wire budget"
+            );
+            assert!(
+                payload[MAX_OPUS_SUBFRAME_BYTES..]
+                    .iter()
+                    .all(|byte| *byte == SENTINEL),
+                "frame {frame_index} wrote past the {MAX_OPUS_PACKET_BYTES}-byte packet cap \
+                 (max tagged length so far: {max_len})"
             );
         }
     }

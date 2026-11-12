@@ -59,9 +59,12 @@ impl QualityProfile {
 
 /// One rung of the compressed VBR ladder.
 ///
-/// `widths` is the repeating per-sample code width in bits.  Mixed patterns
-/// let the codec land close to the advertised 160/256 kbps targets without
-/// abandoning uniform quantization.  `block_len == 0` selects the 1-bit CVSD
+/// `widths` is the code width in bits for each equal part of a block.  Mixed
+/// patterns let the codec land close to the advertised 160/256 kbps targets
+/// while keeping the quantizer uniform across a sub-block: the `0x80` layout
+/// flag splits a 120-sample block into the first 60 samples at `widths[0]`
+/// and the last 60 at `widths[1]`.  Legacy payloads (no flag) alternate the
+/// widths per sample instead.  `block_len == 0` selects the 1-bit CVSD
 /// profile, which carries only a 4-byte exact sample-0 seed.
 #[derive(Clone, Copy)]
 struct VbrLadderEntry {
@@ -90,12 +93,12 @@ const VBR_LADDER: [VbrLadderEntry; 4] = [
         widths: &[1],
         block_len: 0,
     },
-    // 160 kbps: alternating 1/2-bit codes (1.5 bits/sample average).
+    // 160 kbps: 1-bit first half, 2-bit second half (1.5 bits/sample average).
     VbrLadderEntry {
         widths: &[1, 2],
         block_len: SUBFRAME_FRAMES,
     },
-    // 256 kbps: alternating 2/3-bit codes (2.5 bits/sample average).
+    // 256 kbps: 2-bit first half, 3-bit second half (2.5 bits/sample average).
     VbrLadderEntry {
         widths: &[2, 3],
         block_len: SUBFRAME_FRAMES,
@@ -125,6 +128,10 @@ fn vbr_encoded_len_for_profile(idx: usize) -> usize {
     let payload_bits: usize = (0..SUBFRAME_STEREO_SAMPLES)
         .map(|i| spec.widths[i % spec.widths.len()] as usize)
         .sum();
+    // Block-uniform widths split each block into equal sub-blocks but keep
+    // the same total bit count as the legacy per-sample alternation
+    // (60x1 + 60x2 == 120x1.5, 60x2 + 60x3 == 120x2.5), so the encoded size
+    // never depends on the layout flag.
     let side_info_bytes = if blocks_per_channel == 0 {
         VBR_CVSD_SEED_BYTES
     } else {
@@ -137,6 +144,28 @@ fn vbr_encoded_len_for_profile(idx: usize) -> usize {
 /// Useful for diagnostics, tests and receivers that pre-size buffers.
 pub fn vbr_encoded_len(bitrate_kbps: u16) -> usize {
     vbr_encoded_len_for_profile(vbr_profile_index(bitrate_kbps))
+}
+
+/// Code width for sample `k` of `block` under the selected wire layout.
+///
+/// The encoder and decoder must call this with identical arguments so the
+/// width sequence cannot silently drift.
+#[inline(always)]
+fn vbr_width(spec: &VbrLadderEntry, block: usize, k: usize, block_layout: bool) -> u8 {
+    let n = spec.widths.len();
+    if block_layout && spec.block_len > 0 {
+        // Block-uniform codes: split the block into `n` equal sub-blocks.
+        // For the 160/256 kbps rungs this is 60 samples at the first width
+        // and 60 samples at the second, instead of toggling the quantizer
+        // resolution every sample at fs/2.
+        let subblock = (k * n) / spec.block_len;
+        spec.widths[subblock.min(n - 1)]
+    } else {
+        // Legacy layout: per-sample alternation. Kept bit-exact so payloads
+        // produced before the 0x80 flag existed still decode correctly.
+        let i = block * spec.block_len + k;
+        spec.widths[i % n]
+    }
 }
 
 #[inline(always)]
@@ -273,22 +302,51 @@ fn vbr_initial_step_index(max_slope: i32) -> u8 {
 
 /// Encode a 2.5 ms stereo subframe with the user-selected VBR profile.
 ///
-/// Layout: `[TAG_VBR_BFP][profile][block exponents...][packed q-bit codes...]`.
+/// Layout: `[TAG_VBR_BFP][profile][block headers...][packed q-bit codes...]`.
 /// The codec has zero lookahead. 96 kbps uses 1-bit CVSD with an exact 4-byte
-/// sample-0 seed; the higher rungs use per-block block-floating-point DPCM
-/// with mixed 1/2, 2/3 or 3-bit codes to land near the advertised target
-/// rates.  Returns the exact number of bytes written.
+/// sample-0 seed; the higher rungs use per-block block-floating-point DPCM.
+/// The mixed 160/256 kbps rungs split each block into a first half at the
+/// lower code width and a second half at the higher width, keeping the
+/// quantizer uniform across 60 samples instead of toggling it every sample.
+/// Their profile byte carries bit 7 (`0x80`) to mark that layout; single-width
+/// rungs (CVSD and 320 kbps) keep the plain index.  Returns the exact number
+/// of bytes written.
 pub fn encode_vbr_subframe(
     pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
     bitrate_kbps: u16,
     out: &mut [u8; MAX_LOSSLESS_SUBFRAME_BYTES],
 ) -> usize {
+    encode_vbr_subframe_layout(pcm_stereo, bitrate_kbps, out, true)
+}
+
+/// Encoder core with an explicit width layout.
+///
+/// `block_layout == false` emits the legacy per-sample alternation without the
+/// `0x80` flag.  Only tests use that path today; it exists to prove old
+/// payloads still decode unchanged through the public decoder.
+fn encode_vbr_subframe_layout(
+    pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
+    bitrate_kbps: u16,
+    out: &mut [u8; MAX_LOSSLESS_SUBFRAME_BYTES],
+    block_layout: bool,
+) -> usize {
     let idx = vbr_profile_index(bitrate_kbps);
     let spec = VBR_LADDER[idx];
     let encoded_len = vbr_encoded_len(bitrate_kbps);
 
+    // Single-width rungs have nothing to make uniform, so they always carry
+    // the plain profile index.  Mixed-width rungs set bit 7 to advertise the
+    // block-uniform layout; old decoders then see an out-of-range profile
+    // index (0x81/0x82) and reject the frame instead of mis-decoding it with
+    // alternating widths.
+    let block_layout = block_layout && spec.widths.len() > 1;
+
     out[0] = TAG_VBR_BFP;
-    out[1] = idx as u8;
+    out[1] = if block_layout {
+        idx as u8 | 0x80
+    } else {
+        idx as u8
+    };
 
     if spec.block_len == 0 {
         // ---- 1-bit CVSD with exact per-channel i16 sample-0 seed ----
@@ -385,7 +443,7 @@ pub fn encode_vbr_subframe(
 
             for k in 0..spec.block_len {
                 let i = block * spec.block_len + k;
-                let width = spec.widths[i % spec.widths.len()];
+                let width = vbr_width(&spec, block, k, block_layout);
                 let s = pcm_stereo[i * 2 + ch] as i32;
                 let residual = s - prev1;
 
@@ -413,9 +471,13 @@ pub fn encode_vbr_subframe(
 
 /// Decode a VBR compressed subframe (96 / 160 / 256 / 320 kbps targets).
 ///
-/// Returns `false` for a foreign tag, an unknown profile or a payload whose
-/// length does not exactly match the profile (which also prevents a legacy
-/// ADPCM FEC frame from being mistaken for a VBR frame).
+/// Accepts both wire layouts: legacy payloads with a plain profile byte
+/// (per-sample alternating widths) and current payloads whose profile byte
+/// has bit 7 set (block-uniform first-half/second-half widths).  Returns
+/// `false` for a foreign tag, an unknown profile, a layout flag that is
+/// impossible for the profile, or a payload whose length does not exactly
+/// match the profile (which also prevents a legacy ADPCM FEC frame from being
+/// mistaken for a VBR frame).
 pub fn decode_vbr_subframe_to_f32(
     encoded: &[u8],
     out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
@@ -423,11 +485,21 @@ pub fn decode_vbr_subframe_to_f32(
     if encoded.len() < 2 || encoded[0] != TAG_VBR_BFP {
         return false;
     }
-    let idx = encoded[1] as usize;
+    // Bit 7 is the block-layout flag.  Legacy payloads (flag clear) keep the
+    // original per-sample alternation and must decode exactly as before.
+    // Payloads from this encoder set the flag and use block-uniform widths.
+    // Old decoders treat 0x81/0x82 as out-of-range profile indices, so mixed
+    // versions fail cleanly instead of decoding with the wrong widths.
+    let raw_profile = encoded[1];
+    let block_layout = raw_profile & 0x80 != 0;
+    let idx = (raw_profile & 0x7F) as usize;
     if idx >= VBR_LADDER.len() {
         return false;
     }
     let spec = VBR_LADDER[idx];
+    if block_layout && spec.block_len == 0 {
+        return false;
+    }
     if encoded.len() != vbr_encoded_len_for_profile(idx) {
         return false;
     }
@@ -489,7 +561,7 @@ pub fn decode_vbr_subframe_to_f32(
 
             for k in 0..spec.block_len {
                 let i = block * spec.block_len + k;
-                let width = spec.widths[i % spec.widths.len()];
+                let width = vbr_width(&spec, block, k, block_layout);
                 let Some(code) = read_bits(encoded, &mut bit_pos, width) else {
                     return false;
                 };
@@ -1055,6 +1127,118 @@ mod tests {
             assert_eq!(vbr_encoded_len(kbps), expected_len);
             assert_eq!(encoded[0], TAG_VBR_BFP);
         }
+    }
+
+    #[test]
+    fn test_vbr_block_layout_halves_and_legacy_alternation() {
+        // Profile 1: 60 samples at 1 bit, then 60 at 2 bits. Profile 2: 60
+        // samples at 2 bits, then 60 at 3 bits. The averages match the legacy
+        // per-sample alternation, so payload sizes stay identical.
+        for (idx, low, high) in [(1usize, 1u8, 2u8), (2, 2, 3)] {
+            let spec = VBR_LADDER[idx];
+            assert_eq!(spec.block_len, SUBFRAME_FRAMES);
+            for k in 0..spec.block_len {
+                let block_width = vbr_width(&spec, 0, k, true);
+                let legacy_width = vbr_width(&spec, 0, k, false);
+                let expected_block = if k < spec.block_len / 2 { low } else { high };
+                assert_eq!(
+                    block_width, expected_block,
+                    "profile {} block width at sample {}",
+                    idx, k
+                );
+                assert_eq!(
+                    legacy_width,
+                    if k % 2 == 0 { low } else { high },
+                    "profile {} legacy width at sample {}",
+                    idx,
+                    k
+                );
+            }
+        }
+
+        // Single-width rungs are identical under either layout.
+        for idx in [0usize, 3] {
+            let spec = VBR_LADDER[idx];
+            for k in 0..SUBFRAME_FRAMES {
+                assert_eq!(vbr_width(&spec, 0, k, true), spec.widths[0]);
+                assert_eq!(vbr_width(&spec, 0, k, false), spec.widths[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_vbr_legacy_layout_payload_still_decodes() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        make_sine(&mut pcm);
+
+        for (kbps, idx) in [(160u16, 1u8), (256, 2)] {
+            // Old-format payload: plain profile byte, per-sample alternation.
+            let mut legacy = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let legacy_len = encode_vbr_subframe_layout(&pcm, kbps, &mut legacy, false);
+            assert_eq!(legacy_len, vbr_encoded_len(kbps));
+            assert_eq!(legacy[1] & 0x80, 0, "legacy payload must not set 0x80");
+
+            let mut legacy_decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(
+                &legacy[..legacy_len],
+                &mut legacy_decoded
+            ));
+            let legacy_snr = signal_to_noise_db(&pcm, &legacy_decoded);
+            assert!(
+                legacy_snr > 3.0,
+                "legacy {} kbps SNR {:.1} dB",
+                kbps,
+                legacy_snr
+            );
+
+            // Current payload: flagged profile byte and block-uniform widths.
+            let mut current = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let current_len = encode_vbr_subframe(&pcm, kbps, &mut current);
+            assert_eq!(current_len, legacy_len);
+            assert_eq!(
+                current[1] & 0x80,
+                0x80,
+                "profile {} must carry the 0x80 layout flag",
+                idx
+            );
+            assert_eq!((current[1] & 0x7F) as usize, idx as usize);
+            assert_ne!(
+                &current[..current_len],
+                &legacy[..legacy_len],
+                "block-uniform layout must change the {} kbps payload",
+                kbps
+            );
+
+            let mut current_decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(
+                &current[..current_len],
+                &mut current_decoded
+            ));
+        }
+
+        // Single-width rungs keep the plain, unflagged profile index.
+        for (kbps, idx) in [(96u16, 0u8), (320, 3)] {
+            let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encode_vbr_subframe(&pcm, kbps, &mut encoded);
+            assert_eq!(encoded[1], idx, "{} kbps must stay unflagged", kbps);
+            let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(&encoded[..len], &mut decoded));
+        }
+    }
+
+    #[test]
+    fn test_vbr_rejects_block_layout_flag_on_cvsd_profile() {
+        let silence = [0i16; SUBFRAME_STEREO_SAMPLES];
+        let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let len = encode_vbr_subframe(&silence, 96, &mut encoded);
+        assert_eq!(encoded[1], 0);
+
+        // Profile 0 is 1-bit CVSD with block_len == 0, so a block layout is
+        // impossible and must be rejected rather than ignored.
+        let mut flagged = encoded;
+        flagged[1] = 0x80;
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(!decode_vbr_subframe_to_f32(&flagged[..len], &mut decoded));
     }
 
     #[test]

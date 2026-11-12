@@ -678,7 +678,18 @@ fun MainScreen() {
                         // Bitrate selector for the compressed profiles. The
                         // host resolves the command to 96/160/256/320 kbps and
                         // ignores it while a lossless profile is active.
-                        if (qualityMode == 0 || qualityMode == 2) {
+                        // 10ms 2.4G stability caps the target at 160 kbps (and
+                        // drops to 96 kbps above 200‰ loss), so only show the
+                        // values that actually take effect there. The saved
+                        // 256/320 preference is preserved for the other modes.
+                        if (qualityMode == 0 || qualityMode == 2 || qualityMode == 3) {
+                            val stabilityMode = qualityMode == 3
+                            val bitrateChoices =
+                                if (stabilityMode) listOf(96, 160)
+                                else listOf(96, 160, 256, 320)
+                            val effectiveBitrate =
+                                if (stabilityMode) compressedBitrateKbps.coerceIn(96, 160)
+                                else compressedBitrateKbps
                             Text("Compressed Bitrate", style = MaterialTheme.typography.titleSmall)
                             Row(
                                 modifier = Modifier
@@ -686,9 +697,9 @@ fun MainScreen() {
                                     .horizontalScroll(rememberScrollState()),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                listOf(96, 160, 256, 320).forEachIndexed { idx, kbps ->
+                                bitrateChoices.forEachIndexed { idx, kbps ->
                                     FilterChip(
-                                        selected = compressedBitrateKbps == kbps,
+                                        selected = effectiveBitrate == kbps,
                                         onClick = {
                                             compressedBitrateKbps = kbps
                                             prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
@@ -697,6 +708,12 @@ fun MainScreen() {
                                         label = { Text("$kbps kbps") }
                                     )
                                 }
+                            }
+                            if (stabilityMode) {
+                                Text(
+                                    "🛡️ 2.4G stability caps the target at 160 kbps and uses 96 kbps above 200‰ loss.",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
                             }
                         }
 

@@ -590,6 +590,14 @@ impl eframe::App for AudioShareApp {
             self.quality_profile =
                 QualityProfile::from_u8(host.telemetry.quality_profile.load(Ordering::Relaxed));
             self.prefer_opus = host.telemetry.prefer_opus.load(Ordering::Relaxed);
+            // Reflect bitrate changes requested from a connected phone. The
+            // host stores the raw 96/160/256/320 target; the active profile
+            // decides whether 256/320 are used or clamped to 160.
+            self.target_bitrate_kbps = host
+                .telemetry
+                .target_bitrate_kbps
+                .load(Ordering::Relaxed)
+                .clamp(96, 320);
             if let Some(ref mut guard) = self.os_guard {
                 if client_count > 0 {
                     guard.activate();
@@ -868,20 +876,35 @@ impl AudioShareApp {
                 .color(egui::Color32::GRAY),
             );
 
-            if self.quality_profile == QualityProfile::LowLatencyCompressed
-                || self.quality_profile == QualityProfile::SmartAuto
-            {
+            if matches!(
+                self.quality_profile,
+                QualityProfile::LowLatencyCompressed
+                    | QualityProfile::SmartAuto
+                    | QualityProfile::MaxStability24Ghz
+            ) {
+                // Max Stability deliberately caps the target at 160 kbps and
+                // steps down to 96 kbps above 200 permille loss, so only
+                // offer the values that take effect there. The saved
+                // 256/320 preference is preserved for the other profiles.
+                let stability = self.quality_profile == QualityProfile::MaxStability24Ghz;
+                let choices: &[u16] = if stability {
+                    &[96, 160]
+                } else {
+                    &[96, 160, 256, 320]
+                };
+                let mut effective = if stability {
+                    self.target_bitrate_kbps.clamp(96, 160)
+                } else {
+                    self.target_bitrate_kbps
+                };
                 ui.horizontal_wrapped(|ui| {
                     ui.label("📶 Compressed bitrate:");
-                    for kbps in [96u16, 160, 256, 320] {
+                    for &kbps in choices {
                         if ui
-                            .selectable_value(
-                                &mut self.target_bitrate_kbps,
-                                kbps,
-                                format!("{} kbps", kbps),
-                            )
+                            .selectable_value(&mut effective, kbps, format!("{} kbps", kbps))
                             .changed()
                         {
+                            self.target_bitrate_kbps = effective;
                             if let Some(ref host) = self.host_engine {
                                 host.telemetry
                                     .target_bitrate_kbps
@@ -890,6 +913,16 @@ impl AudioShareApp {
                         }
                     }
                 });
+                if stability {
+                    ui.label(
+                        egui::RichText::new(
+                            "🛡️ 2.4G stability caps the target at 160 kbps and steps down to \
+                             96 kbps above 200‰ loss. 256/320 stay saved for other profiles.",
+                        )
+                        .small()
+                        .color(egui::Color32::GRAY),
+                    );
+                }
             }
 
             let note = match self.quality_profile {
@@ -906,7 +939,8 @@ impl AudioShareApp {
                     "VBR DPCM primary payload at the selected target; ADPCM FEC stays active."
                 }
                 QualityProfile::MaxStability24Ghz => {
-                    "Fixed 10ms (4-subframe) framing at 160 kbps for long-range 2.4GHz."
+                    "Fixed 10ms (4-subframe) framing; bitrate is capped at 160 kbps \
+                     (96 kbps above 200‰ loss) for long-range 2.4GHz."
                 }
             };
             ui.label(egui::RichText::new(note).color(egui::Color32::GRAY));
