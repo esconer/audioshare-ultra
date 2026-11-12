@@ -14,6 +14,10 @@ const STATUS_BUSY: u32 = 3;
 const HISTORY_FRAMES: usize = 360; // 7.5ms pitch search window (down to 133Hz fundamental)
 const HISTORY_STEREO_SAMPLES: usize = HISTORY_FRAMES * 2;
 const CROSSFADE_FRAMES: usize = 32; // 0.66ms raised-cosine overlap-add crossfade
+/// Linear correction applied when a lossy FEC reconstruction is followed by a
+/// bit-exact primary frame. 8 frames = 0.17 ms at 48 kHz: long enough to hide
+/// the accumulated ADPCM error, short enough to leave the transient intact.
+const FEC_DECLICK_FRAMES: usize = 8;
 
 #[repr(align(64))]
 pub struct SequencerSlot {
@@ -30,6 +34,10 @@ pub struct ZeroJitterSequencer {
     /// Continuation tail for smooth overlap-add when real packets resume after PLC
     plc_recovery_tail: [f32; CROSSFADE_FRAMES * 2],
     consecutive_plc_count: u32,
+    /// True when the most recently popped subframe was an IMA-ADPCM FEC
+    /// reconstruction. The next bit-exact primary frame is joined to it with
+    /// a short linear correction so the codec switch cannot click.
+    last_pop_was_fec: bool,
 }
 
 impl ZeroJitterSequencer {
@@ -42,6 +50,7 @@ impl ZeroJitterSequencer {
             history: [0.0; HISTORY_STEREO_SAMPLES],
             plc_recovery_tail: [0.0; CROSSFADE_FRAMES * 2],
             consecutive_plc_count: 0,
+            last_pop_was_fec: false,
         }
     }
 
@@ -59,6 +68,7 @@ impl ZeroJitterSequencer {
         self.history.fill(0.0);
         self.plc_recovery_tail.fill(0.0);
         self.consecutive_plc_count = 0;
+        self.last_pop_was_fec = false;
     }
 
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing
@@ -222,8 +232,25 @@ impl ZeroJitterSequencer {
                             out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
                     }
                     self.consecutive_plc_count = 0;
+                } else if self.last_pop_was_fec && cur_status != STATUS_HEALED_BY_FEC {
+                    // The previous subframe was an IMA-ADPCM FEC reconstruction.
+                    // Its timbre is close, but its accumulated quantization error
+                    // leaves the final sample offset from the bit-exact primary
+                    // frame that follows. Splice from that exact last sample for
+                    // 0.17 ms instead of applying the old unconditional codec
+                    // step, then let the primary frame take over unchanged.
+                    let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
+                    let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+                    let delta_l = last_l - out[0];
+                    let delta_r = last_r - out[1];
+                    for i in 0..FEC_DECLICK_FRAMES {
+                        let w = 1.0 - (i as f32) / (FEC_DECLICK_FRAMES as f32);
+                        out[i * 2] += delta_l * w;
+                        out[i * 2 + 1] += delta_r * w;
+                    }
                 }
 
+                self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;
                 self.append_to_history(out);
                 return cur_status;
             }
@@ -273,6 +300,9 @@ impl ZeroJitterSequencer {
                 self.history[src_frame * 2 + 1] * target_attenuation;
         }
 
+        // WSOLA concealment already has its own recovery crossfade above. Do
+        // not additionally apply the FEC splice ramp to the next frame.
+        self.last_pop_was_fec = false;
         self.append_to_history(out);
         STATUS_EMPTY
     }
@@ -412,5 +442,68 @@ mod tests {
         let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
         assert_eq!(out[0], 0.25);
+    }
+
+    #[test]
+    fn test_fec_to_primary_splice_is_declicked() {
+        use crate::lpc_lossless::{
+            decode_fec_subframe_to_f32, encode_fec_subframe, ADPCM_FEC_BYTES,
+        };
+
+        fn sine_frame(subframe_index: u16) -> [f32; SUBFRAME_STEREO_SAMPLES] {
+            let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let n = subframe_index as usize * SUBFRAME_FRAMES + i;
+                let v = ((n as f32) * 2.0 * std::f32::consts::PI * 300.0 / 48_000.0).sin() * 0.5;
+                frame[i * 2] = v;
+                frame[i * 2 + 1] = v;
+            }
+            frame
+        }
+
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let first = sine_frame(0);
+        assert!(seq.push_primary(0, &first));
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Reconstruct subframe 1 through the real IMA-ADPCM FEC codec. Its
+        // accumulated error is what used to produce the codec-switch click.
+        let second = sine_frame(1);
+        let mut second_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for (dst, &s) in second_i16.iter_mut().zip(second.iter()) {
+            *dst = (s * 32767.0) as i16;
+        }
+        let mut fec_bytes = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&second_i16, &mut fec_bytes);
+        let mut fec_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec_bytes, &mut fec_f32));
+        assert!(seq.try_heal_with_fec(1, &fec_f32));
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_HEALED_BY_FEC);
+        let last_fec_l = out[SUBFRAME_STEREO_SAMPLES - 2];
+        let last_fec_r = out[SUBFRAME_STEREO_SAMPLES - 1];
+
+        // The following primary frame must start at the exact sample the
+        // listener just heard, then converge to the bit-exact waveform.
+        let third = sine_frame(2);
+        assert!(seq.push_primary(2, &third));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(
+            (out[0] - last_fec_l).abs() < 1e-6 && (out[1] - last_fec_r).abs() < 1e-6,
+            "FEC->primary splice stepped from ({last_fec_l}, {last_fec_r}) to ({}, {})",
+            out[0],
+            out[1]
+        );
+        for i in FEC_DECLICK_FRAMES..SUBFRAME_FRAMES {
+            assert_eq!(out[i * 2], third[i * 2], "ramp leaked past frame {}", i);
+            assert_eq!(out[i * 2 + 1], third[i * 2 + 1]);
+        }
+
+        // The correction is one-shot: the next primary frame is untouched.
+        let fourth = sine_frame(3);
+        assert!(seq.push_primary(3, &fourth));
+        assert_eq!(seq.pop_next(3, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert_eq!(out[0], fourth[0]);
+        assert_eq!(out[1], fourth[1]);
     }
 }

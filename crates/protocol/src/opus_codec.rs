@@ -204,6 +204,30 @@ impl OpusStreamDecoder {
         encoded: &[u8],
         out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
     ) -> bool {
+        self.decode_subframe_with_plc(seq, encoded, out_f32, |_, _| {})
+    }
+
+    /// Decode `seq` while handing any intermediate CELT PLC frames to
+    /// `on_plc_frame`.
+    ///
+    /// `restricted-low-delay` Opus carries a 120-sample (2.5 ms) lookahead, so
+    /// a decoded packet `N` contains the waveform that belongs in slot
+    /// `N - 1`. The empty-packet PLC path advances the same MDCT overlap state
+    /// and therefore produces the exact 2.5 ms that the missing packet would
+    /// have produced. Delivering those frames to the sequencer keeps a lost
+    /// packet phase-aligned; splicing the zero-lookahead IMA-ADPCM FEC backup
+    /// into an Opus stream instead would jump the waveform by one subframe.
+    ///
+    /// At most four PLC frames (10 ms) are generated, matching the codec's
+    /// useful concealment window. `on_plc_frame` receives each frame with the
+    /// sequence number of the slot it belongs to, in order.
+    pub fn decode_subframe_with_plc(
+        &mut self,
+        seq: u16,
+        encoded: &[u8],
+        out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
+        mut on_plc_frame: impl FnMut(u16, &[f32; SUBFRAME_STEREO_SAMPLES]),
+    ) -> bool {
         if let Some(previous) = self.last_seq {
             let delta = seq.wrapping_sub(previous) as i16;
             if delta <= 0 {
@@ -211,11 +235,19 @@ impl OpusStreamDecoder {
             }
             if delta > 1 {
                 let missed = ((delta - 1) as usize).min(4);
+                let start_miss_seq = seq.wrapping_sub(missed as u16);
                 let mut concealment = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                for _ in 0..missed {
+                for i in 0..missed {
                     // An empty packet is libopus's packet-loss concealment
                     // entry point; it advances the MDCT overlap state.
-                    let _ = self.inner.decode(&[], SUBFRAME_FRAMES, &mut concealment);
+                    let decoded = self
+                        .inner
+                        .decode(&[], SUBFRAME_FRAMES, &mut concealment)
+                        .map(|frames| frames == SUBFRAME_FRAMES)
+                        .unwrap_or(false);
+                    if decoded {
+                        on_plc_frame(start_miss_seq.wrapping_add(i as u16), &concealment);
+                    }
                 }
             }
         }
@@ -353,6 +385,85 @@ mod tests {
         assert!(wrap_decoder.decode_subframe_at_seq(65534, &payload[..fourth_len], &mut out));
         assert!(wrap_decoder.decode_subframe_at_seq(65535, &payload[..fourth_len], &mut out));
         assert!(wrap_decoder.decode_subframe_at_seq(0, &payload[..fourth_len], &mut out));
+    }
+
+    #[test]
+    fn test_decode_subframe_with_plc_delivers_missing_slots() {
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        let first = tone_frame(0);
+        let len = encoder.encode_subframe(&first, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(100, &payload[..len], &mut out));
+
+        // Jump from 100 to 103: the decoder must hand slots 101 and 102 to
+        // the callback before decoding the packet that belongs in 103.
+        let second = tone_frame(1);
+        let second_len = encoder.encode_subframe(&second, 128, &mut payload).unwrap();
+        let mut plc = Vec::new();
+        assert!(decoder.decode_subframe_with_plc(
+            103,
+            &payload[..second_len],
+            &mut out,
+            |missed_seq, concealment| plc.push((missed_seq, *concealment)),
+        ));
+        assert_eq!(plc.len(), 2);
+        assert_eq!(plc[0].0, 101);
+        assert_eq!(plc[1].0, 102);
+        assert!(plc
+            .iter()
+            .flat_map(|(_, frame)| frame.iter())
+            .all(|sample| sample.is_finite()));
+        let concealed_energy: f32 = plc[0].1.iter().map(|sample| sample * sample).sum();
+        assert!(
+            concealed_energy > 1e-6,
+            "CELT PLC returned silence instead of concealing the tone"
+        );
+
+        // Duplicate and late sequences are rejected without generating PLC.
+        let mut late_calls = 0u32;
+        let mut on_late = |_: u16, _: &[f32; SUBFRAME_STEREO_SAMPLES]| late_calls += 1;
+        assert!(!decoder.decode_subframe_with_plc(
+            102,
+            &payload[..second_len],
+            &mut out,
+            &mut on_late
+        ));
+        assert!(!decoder.decode_subframe_with_plc(
+            100,
+            &payload[..second_len],
+            &mut out,
+            &mut on_late
+        ));
+        assert_eq!(late_calls, 0);
+    }
+
+    #[test]
+    fn test_decode_subframe_with_plc_caps_concealment_window() {
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        let first = tone_frame(0);
+        let len = encoder.encode_subframe(&first, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(10, &payload[..len], &mut out));
+
+        // A 9-frame jump generates at most 4 PLC frames (10 ms), matching
+        // the useful CELT concealment window. The reported sequence numbers
+        // must be the four slots immediately before the decoded packet.
+        let second = tone_frame(1);
+        let second_len = encoder.encode_subframe(&second, 128, &mut payload).unwrap();
+        let mut plc_seqs = Vec::new();
+        assert!(decoder.decode_subframe_with_plc(
+            19,
+            &payload[..second_len],
+            &mut out,
+            |missed_seq, _| plc_seqs.push(missed_seq),
+        ));
+        assert_eq!(plc_seqs, vec![15, 16, 17, 18]);
     }
 
     #[test]

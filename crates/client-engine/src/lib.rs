@@ -198,6 +198,18 @@ fn decode_raw_pcm16_payload(payload: &[u8], out: &mut [f32; SUBFRAME_STEREO_SAMP
     false
 }
 
+/// True when a compressed packet's primary payload is Opus RLD.
+///
+/// The header mode is authoritative for current hosts. The payload tag check
+/// also covers a packet whose header was switched to `CompressedLowDelay`
+/// after an Opus encode failure mid-bundle: its first subframe may still be
+/// Opus, and splicing zero-lookahead ADPCM FEC into that stream would jump
+/// the waveform by one subframe.
+#[inline]
+fn primary_is_opus(mode: CodecMode, primary_payload: &[u8]) -> bool {
+    mode == CodecMode::OpusRld || primary_payload.get(2) == Some(&TAG_OPUS_RLD)
+}
+
 /// Decode a compressed-mode primary payload by its self-identifying tag.
 ///
 /// The host can switch between the pure-Rust VBR codec and Opus live, so the
@@ -205,10 +217,18 @@ fn decode_raw_pcm16_payload(payload: &[u8], out: &mut [f32; SUBFRAME_STEREO_SAMP
 /// `CompressedLowDelay` or `OpusRld`. Dropping the Opus decoder when a
 /// non-Opus payload arrives prevents stale codec history from leaking across
 /// a backend switch or a stream resync.
+///
+/// When the payload is Opus, any sequence gap is concealed by the codec's own
+/// CELT PLC and delivered straight into the sequencer. Opus RLD carries a
+/// 2.5 ms lookahead, so those PLC frames are phase-aligned with the primary
+/// stream; the zero-lookahead IMA-ADPCM FEC backup is not (it would jump the
+/// waveform by one subframe), so the caller skips that backup for Opus.
 fn decode_compressed_payload(
     payload: &[u8],
     seq: u16,
     opus_decoder: &mut Option<OpusStreamDecoder>,
+    sequencer: &ZeroJitterSequencer,
+    next_play_seq: u16,
     out: &mut [f32; SUBFRAME_STEREO_SAMPLES],
 ) -> bool {
     if payload.first() == Some(&TAG_OPUS_RLD) {
@@ -217,7 +237,18 @@ fn decode_compressed_payload(
         }
         return opus_decoder
             .as_mut()
-            .map(|decoder| decoder.decode_subframe_at_seq(seq, payload, out))
+            .map(|decoder| {
+                decoder.decode_subframe_with_plc(seq, payload, out, |missed_seq, plc_pcm| {
+                    // Only fill slots that are still ahead of the playhead and
+                    // genuinely empty. A late primary copy may arrive later and
+                    // is allowed to replace this concealment.
+                    if (missed_seq.wrapping_sub(next_play_seq) as i16) >= 0
+                        && sequencer.is_slot_missing(missed_seq)
+                    {
+                        sequencer.try_heal_with_fec(missed_seq, plc_pcm);
+                    }
+                })
+            })
             .unwrap_or(false);
     }
 
@@ -861,7 +892,16 @@ impl ClientEngine {
 
                         // Lazy FEC Decoding: Only decode FEC [N-1] / [N-2] if that slot is ACTUALLY missing
                         // and still ahead of the DAC playhead (saves 99.5% of FEC CPU work!).
-                        if !parsed.fec_n1_payload.is_empty() {
+                        //
+                        // Opus RLD has a 2.5 ms codec lookahead, while the
+                        // IMA-ADPCM FEC backup has zero lookahead. Splicing
+                        // that FEC into an Opus stream would advance the
+                        // waveform by one subframe, so Opus gaps are healed by
+                        // phase-aligned CELT PLC in `decode_compressed_payload`
+                        // instead.
+                        let opus_primary =
+                            primary_is_opus(parsed.header.mode, parsed.primary_payload);
+                        if !opus_primary && !parsed.fec_n1_payload.is_empty() {
                             let s1 = base_seq.wrapping_sub(1);
                             if (s1.wrapping_sub(next_play_seq) as i16) >= 0
                                 && sequencer.is_slot_missing(s1)
@@ -873,7 +913,7 @@ impl ClientEngine {
                                 }
                             }
                         }
-                        if !parsed.fec_n2_payload.is_empty() {
+                        if !opus_primary && !parsed.fec_n2_payload.is_empty() {
                             let s2 = base_seq.wrapping_sub(2);
                             if (s2.wrapping_sub(next_play_seq) as i16) >= 0
                                 && sequencer.is_slot_missing(s2)
@@ -922,6 +962,8 @@ impl ClientEngine {
                                     payload,
                                     s,
                                     &mut opus_decoder,
+                                    &sequencer,
+                                    next_play_seq,
                                     &mut pcm_f32,
                                 )
                             } else if parsed.header.mode == CodecMode::RawPcm16 {
@@ -1558,11 +1600,14 @@ mod tests {
         assert_eq!(opus_payload[0], TAG_OPUS_RLD);
 
         let mut decoder = None;
+        let sequencer = ZeroJitterSequencer::new();
         let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_compressed_payload(
             &opus_payload[..opus_len],
             10,
             &mut decoder,
+            &sequencer,
+            10,
             &mut out
         ));
         assert!(decoder.is_some(), "Opus tag must create the decoder");
@@ -1575,6 +1620,8 @@ mod tests {
             &vbr_payload[..vbr_len],
             11,
             &mut decoder,
+            &sequencer,
+            11,
             &mut vbr_out
         ));
         assert!(
@@ -1588,9 +1635,70 @@ mod tests {
             &opus_payload[..opus_len],
             12,
             &mut decoder,
+            &sequencer,
+            12,
             &mut opus_out
         ));
         assert!(decoder.is_some());
+    }
+
+    #[test]
+    fn test_opus_gap_is_healed_with_phase_aligned_plc() {
+        use audioshare_protocol::lpc_lossless::MAX_LOSSLESS_SUBFRAME_BYTES;
+        use audioshare_protocol::opus_codec::OpusStreamEncoder;
+
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut payload = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let mut decoder = None;
+        let mut sequencer = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        let len = encoder.encode_subframe(&pcm, 128, &mut payload).unwrap();
+        assert!(decode_compressed_payload(
+            &payload[..len],
+            100,
+            &mut decoder,
+            &sequencer,
+            100,
+            &mut out
+        ));
+
+        // Packet 103 arrives without 101/102. The decoder's CELT PLC must
+        // populate both holes so the playhead never falls back to WSOLA or
+        // to the zero-lookahead ADPCM backup.
+        let len = encoder.encode_subframe(&pcm, 128, &mut payload).unwrap();
+        assert!(decode_compressed_payload(
+            &payload[..len],
+            103,
+            &mut decoder,
+            &sequencer,
+            100,
+            &mut out
+        ));
+        assert!(!sequencer.is_slot_missing(101));
+        assert!(!sequencer.is_slot_missing(102));
+
+        let mut healed = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(sequencer.pop_next(101, &mut healed), STATUS_HEALED_BY_FEC);
+        assert!(healed.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn test_primary_is_opus_detects_header_and_payload_tag() {
+        let tagged = [0u8, 2, TAG_OPUS_RLD, 0xAA];
+        let vbr = [0u8, 2, TAG_VBR_BFP, 0xAA];
+
+        assert!(primary_is_opus(CodecMode::OpusRld, &[]));
+        assert!(primary_is_opus(CodecMode::CompressedLowDelay, &tagged));
+        assert!(!primary_is_opus(CodecMode::CompressedLowDelay, &vbr));
+        assert!(!primary_is_opus(CodecMode::CompressedLowDelay, &[]));
     }
 
     #[test]

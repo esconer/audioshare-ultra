@@ -344,9 +344,11 @@ fn datagram_fits(primary_len: usize, encrypted: bool, fec_frames: usize) -> bool
 /// Choose how to fit a packet into one datagram.
 ///
 /// FEC N-2 is dropped first because it is older and less useful than N-1.
-/// If N-1 cannot fit either, both are dropped; if even the primary alone
-/// cannot fit (only possible for two incompressible 24-bit subframes), the
-/// caller must split the bundle rather than lose audio.
+/// If N-1 cannot fit either, the bundle is split into one-subframe datagrams
+/// whenever FEC was requested: a single 2.5 ms subframe is small enough that
+/// N-1 (and usually N-2) fits even for true 24-bit PCM. Silently keeping the
+/// multi-subframe packet and stripping all protection was the old behaviour,
+/// which left 24-bit Wi-Fi streams with no loss recovery at all.
 #[inline]
 fn plan_datagram(
     primary_len: usize,
@@ -354,7 +356,7 @@ fn plan_datagram(
     want_n1: bool,
     want_n2: bool,
 ) -> DatagramPlan {
-    if !datagram_fits(primary_len, encrypted, 0) {
+    if !datagram_fits(primary_len, encrypted, usize::from(want_n1 || want_n2)) {
         return DatagramPlan::SplitPerSubframe;
     }
     if want_n1 && want_n2 && datagram_fits(primary_len, encrypted, 2) {
@@ -2125,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn test_datagram_plan_drops_fec_before_splitting() {
+    fn test_datagram_plan_splits_bundles_to_preserve_fec() {
         // Worst-case two 24-bit subframes = 2 * (2-byte length + 722 bytes).
         let worst_two = 2 * (2 + MAX_LOSSLESS_PCM24_BYTES);
         assert_eq!(worst_two, 1448);
@@ -2145,6 +2147,24 @@ mod tests {
             DatagramPlan::Single { n1: true, n2: true }
         );
 
+        // This is the regression from report 1.5: a typical two-subframe
+        // 24-bit bundle fits the MTU without FEC but not with N-1. It must
+        // split so each 724-byte subframe carries both FEC backups, rather
+        // than silently disabling FEC for the whole stream.
+        let typical_24bit_two = 1280;
+        assert_eq!(
+            plan_datagram(typical_24bit_two, true, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+        // With no FEC requested (stream start) there is nothing to preserve.
+        assert_eq!(
+            plan_datagram(typical_24bit_two, true, false, false),
+            DatagramPlan::Single {
+                n1: false,
+                n2: false
+            }
+        );
+
         let two_fec_budget = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN - 2 * ADPCM_FEC_BYTES;
         assert_eq!(
             plan_datagram(two_fec_budget, true, true, true),
@@ -2158,10 +2178,15 @@ mod tests {
                 n2: false
             }
         );
-        // One byte over the one-FEC budget: no FEC can fit.
+        // One byte over the one-FEC budget: split to preserve N-1.
         let one_fec_budget = two_fec_budget + ADPCM_FEC_BYTES;
         assert_eq!(
             plan_datagram(one_fec_budget + 1, true, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+        // The same packet is fine when the caller does not want FEC.
+        assert_eq!(
+            plan_datagram(one_fec_budget + 1, true, false, false),
             DatagramPlan::Single {
                 n1: false,
                 n2: false
@@ -2171,6 +2196,10 @@ mod tests {
         let primary_only = MAX_SAFE_UDP_PAYLOAD - HEADER_LEN - MAC_TAG_LEN;
         assert_eq!(
             plan_datagram(primary_only, true, true, true),
+            DatagramPlan::SplitPerSubframe
+        );
+        assert_eq!(
+            plan_datagram(primary_only, true, false, false),
             DatagramPlan::Single {
                 n1: false,
                 n2: false
@@ -2182,10 +2211,7 @@ mod tests {
         );
         assert_eq!(
             plan_datagram(primary_only + 1, false, true, true),
-            DatagramPlan::Single {
-                n1: false,
-                n2: false
-            }
+            DatagramPlan::SplitPerSubframe
         );
         assert_eq!(
             plan_datagram(primary_only + 1 + MAC_TAG_LEN, false, true, true),
