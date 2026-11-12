@@ -576,6 +576,18 @@ fn split_packet_fec<'a>(
     }
 }
 
+/// RFC 3550 timestamp for one subframe of a split bundle.
+///
+/// A split datagram carries exactly one 2.5 ms subframe, while the bundle's
+/// base timestamp describes its first subframe. Reusing that timestamp for
+/// every split datagram makes each later subframe look late by a multiple of
+/// 2.5 ms to the receiver's interarrival-jitter estimator, inflating the
+/// reported network jitter. Advance it by the real audio time instead.
+#[inline]
+fn split_tx_timestamp_us(base_timestamp_us: u32, split_idx: usize) -> u32 {
+    base_timestamp_us.wrapping_add((split_idx as u32).wrapping_mul(2_500))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pack_and_send(
     socket: &UdpSocket,
@@ -2101,6 +2113,8 @@ impl HostEngine {
                             let mut split_hdr = hdr;
                             split_hdr.subframe_count = 1;
                             split_hdr.sequence = base_seq.wrapping_add(split_idx as u16);
+                            split_hdr.tx_timestamp_us =
+                                split_tx_timestamp_us(tx_timestamp_us, split_idx);
 
                             let fec = split_packet_fec(
                                 split_idx,
@@ -2469,6 +2483,19 @@ mod tests {
             plan_datagram(primary_only + 1 + MAC_TAG_LEN, false, true, true),
             DatagramPlan::SplitPerSubframe
         );
+    }
+
+    #[test]
+    fn test_split_datagrams_advance_timestamp_per_subframe() {
+        // Each split datagram is one 2.5 ms subframe, so the RFC 3550
+        // timestamp must advance by 2,500 us per datagram. A shared
+        // timestamp makes later subframes look late to the jitter estimator.
+        assert_eq!(split_tx_timestamp_us(1_000, 0), 1_000);
+        assert_eq!(split_tx_timestamp_us(1_000, 1), 3_500);
+        assert_eq!(split_tx_timestamp_us(1_000, 3), 8_500);
+        // Wrapping is intentional: the wire field is a 32-bit microsecond
+        // clock that wraps roughly every 71 minutes.
+        assert_eq!(split_tx_timestamp_us(u32::MAX - 1_000, 1), 1_499);
     }
 
     #[test]

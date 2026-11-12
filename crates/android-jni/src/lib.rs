@@ -239,7 +239,11 @@ impl PhoneMicTransmitter {
 
                             let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
                             for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
-                                *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                // Round rather than truncate toward zero: the
+                                // latter doubles the zero-crossing quantization
+                                // bin and adds odd-harmonic distortion to the
+                                // phone-mic capture.
+                                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                             }
 
                             let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];

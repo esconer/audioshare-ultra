@@ -351,7 +351,16 @@ impl TruePeakLimiter {
                 self.envelope += RELEASE * (peak - self.envelope);
             }
 
-            if self.envelope > THRESHOLD {
+            // At unity gain the limiter must be bit-transparent below the
+            // ceiling. The soft knee exists to absorb pre-amp boost, not to
+            // re-compress material that already fits; applying it at 0 dB
+            // audibly squashes peaks between -1.4 dBFS and -0.1 dBFS. Keep
+            // the envelope updated above so later gain changes start from the
+            // real signal level, and still engage the knee for any sample
+            // that would actually exceed the ceiling.
+            let unity_gain = (self.current_gain_linear - 1.0).abs() <= 1e-4
+                && (self.target_gain_linear - 1.0).abs() <= 1e-4;
+            if (!unity_gain || peak > CEILING) && self.envelope > THRESHOLD {
                 let over = self.envelope - THRESHOLD;
                 let compressed =
                     THRESHOLD + (CEILING - THRESHOLD) * (over / (over + (CEILING - THRESHOLD)));
@@ -474,6 +483,44 @@ mod tests {
         for &s in &loud_signal {
             assert!(s.abs() <= 0.989, "Sample clipped: {}", s);
         }
+    }
+
+    #[test]
+    fn test_true_peak_limiter_unity_gain_is_transparent_below_ceiling() {
+        let mut limiter = TruePeakLimiter::new(0.0);
+        let mut signal = [0.0f32; 480];
+        for (i, s) in signal.iter_mut().enumerate() {
+            *s = if i % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        limiter.process_in_place(&mut signal);
+
+        // 0.9 is below the -0.1 dBFS ceiling, so a 0 dB pre-amp must not
+        // touch it. The old soft knee compressed anything above 0.85.
+        for &s in &signal {
+            assert_eq!(s.abs(), 0.9, "unity gain must be bit-transparent: {}", s);
+        }
+    }
+
+    #[test]
+    fn test_true_peak_limiter_unity_gain_still_catches_samples_above_ceiling() {
+        let mut limiter = TruePeakLimiter::new(0.0);
+        let mut signal = [1.0f32; 480];
+        limiter.process_in_place(&mut signal);
+
+        for &s in &signal {
+            assert!(
+                s.abs() <= 0.989,
+                "unity gain must still honour ceiling: {}",
+                s
+            );
+        }
+        // After the envelope tracks the full-scale input the soft knee must
+        // pull it below the hard clamp, so this is not just clipping.
+        assert!(
+            signal[signal.len() - 1].abs() < 0.96,
+            "soft knee should engage for overs: {}",
+            signal[signal.len() - 1]
+        );
     }
 
     #[test]

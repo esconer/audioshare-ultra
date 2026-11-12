@@ -721,7 +721,11 @@ impl ClientEngine {
                 .iter_mut()
                 .zip(tmp[..chunk].iter())
             {
-                *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                // Round instead of truncating. `as i16` truncates toward
+                // zero, which doubles the width of the zero-crossing
+                // quantization bin and adds signal-dependent DC offset and
+                // odd-harmonic distortion on quiet passages.
+                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             }
             offset += chunk;
         }
@@ -1862,12 +1866,14 @@ mod tests {
         let f32_samples: [f32; 4] = [1.5, -1.5, 0.0, 0.5];
         let mut i16_samples = [0i16; 4];
         for (dst, &s) in i16_samples.iter_mut().zip(f32_samples.iter()) {
-            *dst = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
         }
         assert_eq!(i16_samples[0], 32767);
         assert_eq!(i16_samples[1], -32767);
         assert_eq!(i16_samples[2], 0);
-        assert_eq!(i16_samples[3], 16383);
+        // 0.5 * 32767 = 16383.5 rounds to 16384; truncation used to produce
+        // 16383 and bias the zero crossing.
+        assert_eq!(i16_samples[3], 16384);
     }
 
     #[test]
@@ -2148,7 +2154,7 @@ mod tests {
         ClientEngine::fill_i16_output(&ring, &mut out, &mut rng);
 
         for (i, &sample) in input.iter().enumerate() {
-            let expected = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+            let expected = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             assert_eq!(out[i], expected, "unfilled sample at {}", i);
         }
     }

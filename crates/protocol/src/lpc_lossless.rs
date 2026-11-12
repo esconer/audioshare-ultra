@@ -520,6 +520,12 @@ pub fn decode_vbr_subframe_to_f32(
 /// The upper plane reuses the zero-lookahead LPC packer (including its raw
 /// fallback for incompressible blocks); the lower byte plane is stored
 /// verbatim, so the codec remains exactly reversible at 24-bit resolution.
+///
+/// When every LSB is zero — the common case for native 16-bit sources
+/// shifted into the 24-bit domain — the inner tagged 16-bit frame is emitted
+/// alone. The 24-bit decoder rejects its tag and the client's 16-bit
+/// fallback reconstructs the identical samples, while the packet stays
+/// small enough to avoid needless per-subframe MTU splitting.
 pub fn encode_lossless_pcm24_subframe(
     pcm_f32: &[f32; SUBFRAME_STEREO_SAMPLES],
     out: &mut [u8; MAX_LOSSLESS_PCM24_BYTES],
@@ -540,6 +546,18 @@ pub fn encode_lossless_pcm24_subframe(
 
     let mut enc16 = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
     let len16 = encode_lossless_subframe(&upper16, &mut enc16);
+
+    // Native 16-bit sources leave the entire LSB plane at zero. Carrying
+    // 240 zero bytes would inflate every subframe and force the host to
+    // split an otherwise tiny bundle across datagrams, so emit the inner
+    // 16-bit frame directly. Its own tag makes the client's 24-bit decoder
+    // reject it and fall through to the 16-bit decoder, which reconstructs
+    // `upper16` exactly; with a zero LSB plane that is also the exact
+    // 24-bit value.
+    if lower8.iter().all(|&b| b == 0) {
+        out[..len16].copy_from_slice(&enc16[..len16]);
+        return len16;
+    }
 
     out[0] = TAG_LPC_PCM24;
     out[1..1 + len16].copy_from_slice(&enc16[..len16]);
@@ -1305,6 +1323,68 @@ mod tests {
 
         let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_lossless_pcm24_to_f32(&encoded[..len], &mut decoded));
+    }
+
+    #[test]
+    fn test_pcm24_16bit_source_emits_compact_16bit_frame() {
+        // Native 16-bit samples shifted into the 24-bit domain have a zero
+        // LSB plane. The encoder must omit that 240-byte plane entirely and
+        // the client's 16-bit fallback must reconstruct the samples exactly.
+        let mut original = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut expected = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let phase = (i as f32) * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0;
+            let l = (phase.sin() * 24_000.0) as i16;
+            let r = ((phase + 0.3).sin() * 24_000.0) as i16;
+            expected[i * 2] = l;
+            expected[i * 2 + 1] = r;
+            original[i * 2] = l as f32 * (1.0 / 32_768.0);
+            original[i * 2 + 1] = r as f32 * (1.0 / 32_768.0);
+        }
+
+        let mut encoded = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let len = encode_lossless_pcm24_subframe(&original, &mut encoded);
+        assert!(
+            len < 1 + SUBFRAME_STEREO_SAMPLES,
+            "zero LSB plane must not be carried: {} bytes",
+            len
+        );
+        assert_ne!(encoded[0], TAG_LPC_PCM24);
+
+        // The 24-bit decoder rejects the inner tag, and the 16-bit fallback
+        // used by the client decodes it bit-exactly.
+        let mut decoded_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(!decode_lossless_pcm24_to_f32(
+            &encoded[..len],
+            &mut decoded_f32
+        ));
+        let mut decoded_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+        decode_lossless_subframe(&encoded[..len], &mut decoded_i16).unwrap();
+        assert_eq!(decoded_i16, expected);
+    }
+
+    #[test]
+    fn test_pcm24_16bit_raw_fallback_stays_compact() {
+        // Alternating full-scale 16-bit values force the inner LPC packer
+        // into its 481-byte raw fallback. Even then the zero LSB plane must
+        // not add 240 bytes: 481 is still below the 722-byte 24-bit max.
+        let mut original = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for (i, s) in original.iter_mut().enumerate() {
+            let v = if i % 2 == 0 { 32_767i16 } else { -32_768i16 };
+            *s = v as f32 * (1.0 / 32_768.0);
+        }
+
+        let mut encoded = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let len = encode_lossless_pcm24_subframe(&original, &mut encoded);
+        assert_eq!(len, MAX_LOSSLESS_SUBFRAME_BYTES);
+        assert_eq!(encoded[0], TAG_RAW_PCM16);
+
+        let mut decoded = [0i16; SUBFRAME_STEREO_SAMPLES];
+        decode_lossless_subframe(&encoded[..len], &mut decoded).unwrap();
+        for (i, s) in decoded.iter().enumerate() {
+            let expected = if i % 2 == 0 { 32_767i16 } else { -32_768i16 };
+            assert_eq!(*s, expected, "raw fallback mismatch at {}", i);
+        }
     }
 
     #[test]
