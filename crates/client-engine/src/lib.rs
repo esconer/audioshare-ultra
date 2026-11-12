@@ -46,10 +46,53 @@ pub struct ClientConfig {
 /// WSOLA while the DAC still has audio it can play.
 const PLC_EMERGENCY_WATERMARK_SUBFRAMES: usize = 1;
 
-/// A post-stall fast-forward keeps the combined sequencer + decoupler backlog
-/// within `target_buf + 6` subframes (15 ms). The old `+16` allowance let one
-/// Wi-Fi stall leave up to 40 ms of permanent playback latency behind.
-const MAX_BACKLOG_OVER_TARGET_SUBFRAMES: f32 = 6.0;
+/// Minimum post-stall fast-forward headroom above `target_buf`, in 2.5 ms
+/// subframes. The old fixed `+16` allowance let one Wi-Fi stall leave up to
+/// 40 ms of permanent playback latency behind; the +6 floor keeps the
+/// historical bound for 1-2 subframe framing.
+const MIN_BACKLOG_OVER_TARGET_SUBFRAMES: f32 = 6.0;
+
+/// Post-stall headroom for the sender's current framing.
+///
+/// A 20 ms OS capture callback can hand the host two 10 ms packets at once,
+/// and Wi-Fi can aggregate them into one 8-subframe arrival. With a fixed +6
+/// cap that normal burst was mistaken for a post-stall backlog and
+/// `trim_post_stall_backlog` skipped the playhead by 2 subframes (5 ms). Two
+/// packets plus one subframe of FIFO rounding/scheduling margin keeps the
+/// fast-forward for genuine stalls only.
+#[inline]
+fn max_backlog_over_target_subframes(pkt_subframes: u8) -> f32 {
+    let pkt = pkt_subframes.max(1) as f32;
+    (pkt * 2.0 + 2.0).max(MIN_BACKLOG_OVER_TARGET_SUBFRAMES)
+}
+
+/// Configured minimum network cushion before the sender's framing is known.
+#[inline]
+fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
+    if target_buffer_subframes <= 2.5 {
+        4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
+    } else {
+        target_buffer_subframes.max(6.0)
+    }
+}
+
+/// Floor that covers one sender packet plus one subframe of margin.
+///
+/// Tracking the current framing instead of ratcheting upward lets the client
+/// return to 2.5/5 ms framing after a SmartAuto excursion into 10 ms mode.
+#[inline]
+fn wifi_floor_for_packet(configured_floor: f32, subframe_count: u8) -> f32 {
+    configured_floor.max((subframe_count.max(1) as f32) * 2.5 + 1.0)
+}
+
+/// How far the playhead may trail the newest received subframe while the
+/// decoupler still holds real audio. Reordering a single 10 ms packet puts the
+/// playhead 4 subframes behind the newer packet, so a fixed `< 3` legitimate
+/// wait window synthesized PLC while 20+ ms of audio was still queued.
+#[inline]
+fn in_flight_wait_subframes(pkt_subframes: u8) -> i16 {
+    ((pkt_subframes.max(1) as i16) * 2).max(3)
+}
 
 /// Gaming hard-lock never adds group-sync delay. The target must stay above
 /// the sender's packet size plus the one-subframe PLC watermark, otherwise
@@ -123,7 +166,7 @@ fn plc_jitter_margin_subframes(target_fifo: usize, packet_subframes: usize) -> i
 }
 
 /// Fast-forward a post-stall backlog so `sequencer + decoupler` stays within
-/// `target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES`.
+/// `target_buf + max_backlog_over_target_subframes(pkt_subframes)`.
 ///
 /// Only the sequencer portion can be shortened (the decoupler is already
 /// feeding the DAC), so `keep` is computed from the space left under the cap.
@@ -136,13 +179,15 @@ fn trim_post_stall_backlog(
     net_subframes: &mut f32,
     fifo_subframes: f32,
     target_buf: f32,
+    pkt_subframes: u8,
 ) {
+    let max_over = max_backlog_over_target_subframes(pkt_subframes);
     let combined = *net_subframes + fifo_subframes;
-    if combined <= target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES {
+    if combined <= target_buf + max_over {
         return;
     }
 
-    let max_net = (target_buf + MAX_BACKLOG_OVER_TARGET_SUBFRAMES - fifo_subframes)
+    let max_net = (target_buf + max_over - fifo_subframes)
         .max(0.0)
         .min(*net_subframes);
     let keep = max_net.floor() as u16;
@@ -441,11 +486,7 @@ impl ClientEngine {
         let running = Arc::new(AtomicBool::new(true));
         // Mirror the RX loop's initial cushion so the debug view has sensible
         // values before the first packet arrives.
-        let initial_floor_subframes = if config.target_buffer_subframes <= 2.5 {
-            4.0
-        } else {
-            config.target_buffer_subframes.max(6.0)
-        };
+        let initial_floor_subframes = configured_wifi_floor(config.target_buffer_subframes);
         let initial_target_subframes = (initial_floor_subframes.ceil() as u32).clamp(4, 12);
         let telemetry = Arc::new(ClientTelemetry {
             packets_received: AtomicU64::new(0),
@@ -680,11 +721,8 @@ impl ClientEngine {
         let mut window_primary = 0u32;
         let mut window_fec = 0u32;
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
-        let mut initial_wifi_floor = if config.target_buffer_subframes <= 2.5 {
-            4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
-        } else {
-            config.target_buffer_subframes.max(6.0)
-        };
+        let configured_floor = configured_wifi_floor(config.target_buffer_subframes);
+        let mut initial_wifi_floor = configured_floor;
         let mut adaptive_wifi_subframes = initial_wifi_floor;
         let mut last_pkt_subframe_count: u8 = 1;
         // The refill loop targets this watermark. Keeping the last value lets
@@ -935,12 +973,14 @@ impl ClientEngine {
                             .store(jitter_estimate_us.max(0.0) as u32, Ordering::Relaxed);
                         prev_rx_us = Some(rx_now_us);
                         prev_tx_us = tx_now_us;
-                        // Ensure floor is always at least 2.5 packets for the sender's bundling mode
-                        let pkt_subframes =
-                            (parsed.header.subframe_count.max(1) as f32) * 2.5 + 1.0;
-                        if pkt_subframes > initial_wifi_floor {
-                            initial_wifi_floor = pkt_subframes;
-                        }
+                        // Track the sender's current bundling mode instead of
+                        // ratcheting the floor upward. A single 10 ms packet
+                        // (4 subframes) used to raise the floor to 11
+                        // subframes (27.5 ms) for the rest of the session,
+                        // even after the host returned to 5 ms or 2.5 ms
+                        // framing.
+                        initial_wifi_floor =
+                            wifi_floor_for_packet(configured_floor, parsed.header.subframe_count);
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
                         let proactive_floor =
                             ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
@@ -1176,13 +1216,14 @@ impl ClientEngine {
             {
                 // If the missing slot is still within the in-flight/FEC
                 // recovery window, wait while the FIFO has at least 2.5ms of
-                // real audio. Once a newer packet is already buffered
-                // (`missing_delta >= 3`), waiting can no longer heal the hole:
-                // skip it immediately instead of draining the FIFO first.
+                // real audio. The window scales with the sender's framing: a
+                // single reordered 10 ms packet puts the playhead 4 subframes
+                // behind the newest packet, so the old fixed `< 3` check
+                // synthesized PLC even with 20+ ms of audio still queued.
                 let missing_delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
                 if sequencer.is_slot_missing(next_play_seq)
                     && burst_fifo.available_samples() >= plc_emergency_watermark
-                    && missing_delta < 3
+                    && missing_delta < in_flight_wait_subframes(last_pkt_subframe_count)
                 {
                     // Wait for in-flight packet or [N-1]/[N-2] FEC before triggering WSOLA PLC!
                     break;
@@ -1304,6 +1345,7 @@ impl ClientEngine {
                     &mut net_subframes,
                     fifo_subframes,
                     target_buf,
+                    last_pkt_subframe_count,
                 );
 
                 // Never synthesize more than one PLC subframe per loop pass
@@ -1421,6 +1463,7 @@ mod tests {
             &mut net_subframes,
             fifo_subframes,
             target_buf,
+            1,
         );
 
         // The combined sequencer + decoupler backlog is capped at
@@ -1475,7 +1518,7 @@ mod tests {
         // Gaming Wi-Fi: 6-subframe target with a full 6-subframe decoupler.
         let mut next_play = 70u16;
         let mut net_subframes = 20.0f32;
-        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0, 2);
         assert_eq!(net_subframes, 6.0);
         assert_eq!(next_play, 95);
         assert_eq!(net_subframes + 6.0, 12.0); // target_buf + 6
@@ -1485,7 +1528,7 @@ mod tests {
         // sequencer to the target (which would retain 26 subframes).
         let mut next_play = 50u16;
         let mut net_subframes = 30.0f32;
-        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 12.0, 14.0);
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 12.0, 14.0, 2);
         assert_eq!(net_subframes, 8.0);
         assert_eq!(next_play, 93);
         assert_eq!(net_subframes + 12.0, 20.0); // target_buf + 6
@@ -1493,7 +1536,7 @@ mod tests {
         // At or below the cap the playhead and queue are untouched.
         let mut next_play = 90u16;
         let mut net_subframes = 6.0f32;
-        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0, 2);
         assert_eq!(next_play, 90);
         assert_eq!(net_subframes, 6.0);
 
@@ -1502,7 +1545,7 @@ mod tests {
         // absorbed by the resampler, not skipped as a post-stall backlog.
         let mut next_play = 97u16;
         let mut net_subframes = 4.0f32;
-        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 6.0, 6.0, 2);
         assert_eq!(next_play, 97);
         assert_eq!(net_subframes, 4.0);
         assert_eq!(net_subframes + 6.0, 10.0); // <= target_buf + 6
@@ -1510,16 +1553,79 @@ mod tests {
         // Never rewind, even if the FIFO estimate alone exceeds the cap.
         let mut next_play = 99u16;
         let mut net_subframes = 2.0f32;
-        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 20.0, 6.0);
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 20.0, 6.0, 2);
         assert_eq!(next_play, 101);
         assert_eq!(net_subframes, 0.0);
 
         // Sequence wrap-around keeps the same forward-only invariant.
         let mut next_play = 65533u16;
         let mut net_subframes = 7.0f32;
-        trim_post_stall_backlog(3, &mut next_play, &mut net_subframes, 6.0, 6.0);
+        trim_post_stall_backlog(3, &mut next_play, &mut net_subframes, 6.0, 6.0, 2);
         assert_eq!(net_subframes, 6.0);
         assert_eq!(next_play, 65534);
+    }
+
+    #[test]
+    fn test_backlog_cap_scales_with_ten_ms_packets() {
+        // 10 ms framing uses 4-subframe packets. A normal 20 ms capture
+        // callback or Wi-Fi A-MPDU burst delivers two packets (8 subframes);
+        // the old fixed +6 cap mistook that for a stall and skipped 5 ms.
+        assert_eq!(max_backlog_over_target_subframes(1), 6.0);
+        assert_eq!(max_backlog_over_target_subframes(2), 6.0);
+        assert_eq!(max_backlog_over_target_subframes(4), 10.0);
+
+        // Full 11-subframe decoupler + two-packet burst = 19 subframes.
+        // target 11 + scaled cap 10 leaves it untouched.
+        let mut next_play = 88u16;
+        let mut net_subframes = 8.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 11.0, 11.0, 4);
+        assert_eq!(next_play, 88);
+        assert_eq!(net_subframes, 8.0);
+
+        // A genuine post-stall backlog still fast-forwards to the new cap.
+        let mut next_play = 70u16;
+        let mut net_subframes = 30.0f32;
+        trim_post_stall_backlog(100, &mut next_play, &mut net_subframes, 11.0, 11.0, 4);
+        assert_eq!(net_subframes, 10.0);
+        assert_eq!(next_play, 91);
+        assert_eq!(net_subframes + 11.0, 21.0); // target + 10
+    }
+
+    #[test]
+    fn test_wifi_floor_tracks_current_packet_framing() {
+        // USB/desktop configure a 4-subframe (10 ms) minimum so a 20 ms
+        // capture callback cannot underrun.
+        let configured = configured_wifi_floor(0.0);
+        assert_eq!(configured, 4.0);
+        assert_eq!(wifi_floor_for_packet(configured, 1), 4.0);
+        assert_eq!(wifi_floor_for_packet(configured, 2), 6.0);
+        assert_eq!(wifi_floor_for_packet(configured, 4), 11.0);
+        // Returning to 5 ms or 2.5 ms framing lowers the floor immediately
+        // instead of leaving it ratcheted at 27.5 ms for the session.
+        assert_eq!(wifi_floor_for_packet(configured, 2), 6.0);
+        assert_eq!(wifi_floor_for_packet(configured, 1), 4.0);
+
+        // A 2.4 GHz profile keeps its configured floor for small packets but
+        // still raises it for 10 ms framing.
+        let configured = configured_wifi_floor(8.0);
+        assert_eq!(configured, 8.0);
+        assert_eq!(wifi_floor_for_packet(configured, 1), 8.0);
+        assert_eq!(wifi_floor_for_packet(configured, 2), 8.0);
+        assert_eq!(wifi_floor_for_packet(configured, 4), 11.0);
+    }
+
+    #[test]
+    fn test_in_flight_wait_scales_with_packet_size() {
+        assert_eq!(in_flight_wait_subframes(1), 3);
+        assert_eq!(in_flight_wait_subframes(2), 4);
+        assert_eq!(in_flight_wait_subframes(4), 8);
+
+        // One reordered 4-subframe packet leaves a 7-subframe shortfall.
+        // The old fixed `< 3` threshold classified it as unrecoverable and
+        // synthesized PLC while the decoupler still held 20+ ms.
+        let reordered = 7i16;
+        assert!(reordered < in_flight_wait_subframes(4));
+        assert!(!(reordered < 3));
     }
 
     #[test]
