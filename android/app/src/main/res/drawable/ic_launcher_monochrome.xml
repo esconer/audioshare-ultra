@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Single-colour silhouette for Android 13+ themed icons. The system
+         replaces the white fill with the wallpaper-derived tint. -->
+    <path
+        android:pathData="M47.747,29.684 C34.318,29.684 23.432,40.571 23.432,54 C23.432,67.429 34.318,78.316 47.747,78.316"
+        android:strokeWidth="4.863"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M60.253,29.684 C73.682,29.684 84.568,40.571 84.568,54 C84.568,67.429 73.682,78.316 60.253,78.316"
+        android:strokeWidth="4.863"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M42.895,47.768 a2.084,2.084 0,0 1 4.168,0 v12.505 a2.084,2.084 0,0 1 -4.168,0 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M51.916,40.105 a2.084,2.084 0,0 1 4.168,0 v27.789 a2.084,2.084 0,0 1 -4.168,0 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M60.947,47.768 a2.084,2.084 0,0 1 4.168,0 v12.505 a2.084,2.084 0,0 1 -4.168,0 z" />
+</vector>

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#060911"/>
+    </linearGradient>
+    <linearGradient id="ring_grad" x1="96" y1="96" x2="416" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg2)" stroke="#1E293B" stroke-width="6"/>
+
+  <!-- Concentric Clock-Lock Sonar Rings -->
+  <circle cx="256" cy="256" r="176" stroke="url(#ring_grad)" stroke-width="14" stroke-opacity="0.30" stroke-dasharray="28 18"/>
+  <circle cx="256" cy="256" r="136" stroke="url(#ring_grad)" stroke-width="18"/>
+
+  <!-- High-Precision Zero-Jitter Waveform Pulse -->
+  <path d="M96 256H164L198 184L236 344L276 148L314 316L344 256H416" stroke="#38BDF8" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="276" cy="148" r="14" fill="#34D399"/>
+</svg>

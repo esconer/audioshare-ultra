@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- Option C "Bidirectional Studio Bridge" monochrome tile/notification
+         icon. No ?attr/ tint is used: the system tints the alpha channel for
+         Quick Settings and notification small icons. -->
+    <path
+        android:pathData="M10.105,4.632 C6.036,4.632 2.737,7.931 2.737,12 C2.737,16.069 6.036,19.368 10.105,19.368"
+        android:strokeWidth="1.474"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M13.895,4.632 C17.964,4.632 21.263,7.931 21.263,12 C21.263,16.069 17.964,19.368 13.895,19.368"
+        android:strokeWidth="1.474"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8.632,10.105 a0.632,0.632 0,0 1 1.263,0 v3.789 a0.632,0.632 0,0 1 -1.263,0 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M11.368,7.789 a0.632,0.632 0,0 1 1.263,0 v8.421 a0.632,0.632 0,0 1 -1.263,0 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M14.105,10.105 a0.632,0.632 0,0 1 1.263,0 v3.789 a0.632,0.632 0,0 1 -1.263,0 z" />
+</vector>

@@ -31,6 +31,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 740.0])
             .with_min_inner_size([760.0, 560.0])
+            .with_icon(build_studio_window_icon())
             .with_title("AudioShare Ultra — Studio Audio Routing Mesh"),
         ..Default::default()
     };
@@ -44,6 +45,157 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Window / taskbar icon: "Bidirectional Studio Bridge" (Option C)
+// ---------------------------------------------------------------------------
+
+/// Brand palette shared by the master artwork, Android adaptive icon, and the
+/// zero-dependency desktop window icon.
+const ICON_BG_TOP: (u8, u8, u8) = (0x11, 0x18, 0x27);
+const ICON_BG_BOTTOM: (u8, u8, u8) = (0x09, 0x0D, 0x16);
+const ICON_BORDER: (u8, u8, u8) = (0x24, 0x30, 0x47);
+const ICON_CYAN: (u8, u8, u8) = (0x38, 0xBD, 0xF8);
+const ICON_BLUE: (u8, u8, u8) = (0x25, 0x63, 0xEB);
+const ICON_EMERALD: (u8, u8, u8) = (0x34, 0xD3, 0x99);
+const ICON_GREEN: (u8, u8, u8) = (0x05, 0x96, 0x69);
+const ICON_WHITE: (u8, u8, u8) = (0xFF, 0xFF, 0xFF);
+
+/// Supersampling factor for the 64x64 window icon.
+const ICON_SUPERSAMPLE: usize = 4;
+
+/// Rasterizes the primary "Bidirectional Studio Bridge" mark (PC <-> Phone) as
+/// RGBA data for the window and taskbar icon. The 512-unit master artwork is
+/// sampled at 4x and box-filtered down, so the arcs and stereo bars stay smooth
+/// at 64 px without adding an image or SVG dependency.
+fn build_studio_window_icon() -> egui::IconData {
+    const SIZE: usize = 64;
+    const MASTER: f32 = 512.0;
+    const STEP: f32 = MASTER / (SIZE * ICON_SUPERSAMPLE) as f32;
+
+    let mut rgba = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (mut sum_r, mut sum_g, mut sum_b, mut covered) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..ICON_SUPERSAMPLE {
+                for sx in 0..ICON_SUPERSAMPLE {
+                    let mx = (x * ICON_SUPERSAMPLE + sx) as f32 * STEP + STEP * 0.5;
+                    let my = (y * ICON_SUPERSAMPLE + sy) as f32 * STEP + STEP * 0.5;
+                    if let Some((r, g, b)) = studio_bridge_pixel(mx, my) {
+                        sum_r += u32::from(r);
+                        sum_g += u32::from(g);
+                        sum_b += u32::from(b);
+                        covered += 1;
+                    }
+                }
+            }
+
+            if let (Some(r), Some(g), Some(b)) = (
+                sum_r.checked_div(covered),
+                sum_g.checked_div(covered),
+                sum_b.checked_div(covered),
+            ) {
+                let idx = (y * SIZE + x) * 4;
+                rgba[idx] = r as u8;
+                rgba[idx + 1] = g as u8;
+                rgba[idx + 2] = b as u8;
+                rgba[idx + 3] =
+                    ((covered * 255) / (ICON_SUPERSAMPLE * ICON_SUPERSAMPLE) as u32) as u8;
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
+/// Samples one point of the 512-unit master artwork. Returns `None` outside the
+/// squircle so the icon keeps transparent corners on every desktop.
+fn studio_bridge_pixel(x: f32, y: f32) -> Option<(u8, u8, u8)> {
+    // Rounded-rect squircle: 16..496 with a 112-unit corner radius.
+    let dx = x - 256.0;
+    let dy = y - 256.0;
+    let qx = dx.abs() - 128.0;
+    let qy = dy.abs() - 128.0;
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let edge = qx.max(qy).min(0.0) + outside - 112.0;
+    if edge > 0.0 {
+        return None;
+    }
+
+    // Obsidian diagonal gradient plus a 6-unit inner rim.
+    let t = ((x + y) / 1024.0).clamp(0.0, 1.0);
+    let mut color = lerp_rgb(ICON_BG_TOP, ICON_BG_BOTTOM, t);
+    if edge > -6.0 {
+        color = ICON_BORDER;
+    }
+
+    // Left transmission arc: center (220, 256), radius 140, 28-unit stroke,
+    // open to the right. Round caps extend beyond both endpoints.
+    let left_dx = x - 220.0;
+    let left_dist = (left_dx * left_dx + (y - 256.0).powi(2)).sqrt();
+    let left_ring = (left_dist - 140.0).abs() <= 14.0 && left_dx <= 0.0;
+    let left_cap = (x - 220.0).powi(2) + (y - 116.0).powi(2) <= 14.0 * 14.0
+        || (x - 220.0).powi(2) + (y - 396.0).powi(2) <= 14.0 * 14.0;
+    if left_ring || left_cap {
+        let g = gradient_t(x, y, 96.0, 128.0, 320.0, 384.0);
+        color = lerp_rgb(ICON_CYAN, ICON_BLUE, g);
+    }
+
+    // Right receiver arc: center (292, 256), mirror of the left one.
+    let right_dx = x - 292.0;
+    let right_dist = (right_dx * right_dx + (y - 256.0).powi(2)).sqrt();
+    let right_ring = (right_dist - 140.0).abs() <= 14.0 && right_dx >= 0.0;
+    let right_cap = (x - 292.0).powi(2) + (y - 116.0).powi(2) <= 14.0 * 14.0
+        || (x - 292.0).powi(2) + (y - 396.0).powi(2) <= 14.0 * 14.0;
+    if right_ring || right_cap {
+        let g = gradient_t(x, y, 192.0, 128.0, 416.0, 384.0);
+        color = lerp_rgb(ICON_EMERALD, ICON_GREEN, g);
+    }
+
+    // Three stereo lock bars; the middle one is the white lossless reference.
+    if inside_rounded_rect(x, y, 192.0, 208.0, 24.0, 96.0, 12.0) {
+        color = ICON_CYAN;
+    }
+    if inside_rounded_rect(x, y, 244.0, 164.0, 24.0, 184.0, 12.0) {
+        color = ICON_WHITE;
+    }
+    if inside_rounded_rect(x, y, 296.0, 208.0, 24.0, 96.0, 12.0) {
+        color = ICON_EMERALD;
+    }
+
+    Some(color)
+}
+
+fn gradient_t(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    (((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0)
+}
+
+fn lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let mix =
+        |from: u8, to: u8| (f32::from(from) + (f32::from(to) - f32::from(from)) * t).round() as u8;
+    (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+fn inside_rounded_rect(
+    px: f32,
+    py: f32,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+) -> bool {
+    let qx = (px - (x + width * 0.5)).abs() - (width * 0.5 - radius);
+    let qy = (py - (y + height * 0.5)).abs() - (height * 0.5 - radius);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    qx.max(qy).min(0.0) + outside - radius <= 0.0
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -3076,5 +3228,86 @@ phone_rx_mode=1
         assert!(app.latency_debug);
         assert!(app.gaming_hard_lock);
         assert_eq!(app.phone_rx_mode, PhoneRxRoutingMode::PlayOnPcSpeakers);
+    }
+
+    fn icon_pixel(icon: &egui::IconData, x: usize, y: usize) -> [u8; 4] {
+        let idx = (y * icon.width as usize + x) * 4;
+        [
+            icon.rgba[idx],
+            icon.rgba[idx + 1],
+            icon.rgba[idx + 2],
+            icon.rgba[idx + 3],
+        ]
+    }
+
+    #[test]
+    fn test_window_icon_dimensions_and_corners() {
+        let icon = build_studio_window_icon();
+        assert_eq!(icon.width, 64);
+        assert_eq!(icon.height, 64);
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        for (x, y) in [(0, 0), (63, 0), (0, 63), (63, 63)] {
+            assert_eq!(
+                icon_pixel(&icon, x, y)[3],
+                0,
+                "corner ({x},{y}) must be transparent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_window_icon_center_bar_is_white() {
+        let icon = build_studio_window_icon();
+        let p = icon_pixel(&icon, 32, 32);
+        assert_eq!(p[3], 255);
+        assert!(
+            p[0] > 240 && p[1] > 240 && p[2] > 240,
+            "center lossless bar must be white, got {p:?}"
+        );
+    }
+
+    #[test]
+    fn test_window_icon_arcs_use_cyan_and_emerald_brand_colors() {
+        let icon = build_studio_window_icon();
+        let left = icon_pixel(&icon, 10, 32);
+        assert_eq!(left[3], 255);
+        assert!(
+            left[2] > 220 && left[1] > 130,
+            "left transmission arc must stay cyan/blue, got {left:?}"
+        );
+        let right = icon_pixel(&icon, 54, 32);
+        assert_eq!(right[3], 255);
+        assert!(
+            right[1] > 130 && right[1] > right[2],
+            "right receiver arc must stay emerald, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn test_window_icon_stereo_bars_use_brand_colors() {
+        let icon = build_studio_window_icon();
+        let left = icon_pixel(&icon, 26, 32);
+        assert!(
+            left[2] > 220 && left[1] > 150,
+            "left bar must be cyan, got {left:?}"
+        );
+        let right = icon_pixel(&icon, 38, 32);
+        assert!(
+            right[1] > 180 && right[2] < 190,
+            "right bar must be emerald, got {right:?}"
+        );
+    }
+
+    #[test]
+    fn test_window_icon_opaque_pixels_are_never_black() {
+        let icon = build_studio_window_icon();
+        for (i, chunk) in icon.rgba.chunks_exact(4).enumerate() {
+            if chunk[3] > 0 {
+                assert!(
+                    chunk[0] > 0 || chunk[1] > 0 || chunk[2] > 0,
+                    "opaque black pixel at index {i}"
+                );
+            }
+        }
     }
 }

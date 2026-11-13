@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- "Bidirectional Studio Bridge" (Option C), scaled from the 512-unit
+         master into the 66x66 adaptive-icon safe zone (x/y 21..87). -->
+
+    <!-- Left transmission arc (PC host). -->
+    <path
+        android:pathData="M47.747,29.684 C34.318,29.684 23.432,40.571 23.432,54 C23.432,67.429 34.318,78.316 47.747,78.316"
+        android:strokeWidth="4.863"
+        android:strokeLineCap="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="26.211"
+                android:startY="31.769"
+                android:endX="65.116"
+                android:endY="76.231">
+                <item android:offset="0.0" android:color="#FF38BDF8" />
+                <item android:offset="1.0" android:color="#FF2563EB" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Right receiver arc (Android client). -->
+    <path
+        android:pathData="M60.253,29.684 C73.682,29.684 84.568,40.571 84.568,54 C84.568,67.429 73.682,78.316 60.253,78.316"
+        android:strokeWidth="4.863"
+        android:strokeLineCap="round">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:type="linear"
+                android:startX="42.884"
+                android:startY="31.769"
+                android:endX="81.789"
+                android:endY="76.231">
+                <item android:offset="0.0" android:color="#FF34D399" />
+                <item android:offset="1.0" android:color="#FF059669" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Center stereo lock bars. -->
+    <path
+        android:fillColor="#FF38BDF8"
+        android:pathData="M42.895,47.768 a2.084,2.084 0,0 1 4.168,0 v12.505 a2.084,2.084 0,0 1 -4.168,0 z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M51.916,40.105 a2.084,2.084 0,0 1 4.168,0 v27.789 a2.084,2.084 0,0 1 -4.168,0 z" />
+    <path
+        android:fillColor="#FF34D399"
+        android:pathData="M60.947,47.768 a2.084,2.084 0,0 1 4.168,0 v12.505 a2.084,2.084 0,0 1 -4.168,0 z" />
+</vector>

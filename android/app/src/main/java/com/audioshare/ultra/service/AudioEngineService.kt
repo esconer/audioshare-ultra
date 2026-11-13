@@ -24,6 +24,7 @@ import android.os.PerformanceHintManager
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.audioshare.ultra.R
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
@@ -659,7 +660,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("AudioShare Ultra • $badge")
             .setContentText(statusText)
-            .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+            .setSmallIcon(R.drawable.ic_qs_tile_audio)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
             .addAction(android.R.drawable.ic_media_pause, "Disconnect", stopPending)
