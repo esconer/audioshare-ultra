@@ -1622,34 +1622,36 @@ impl AudioShareApp {
             });
             ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Pre-Amp Gain   :");
-                dsp_changed |= ui
-                    .add(egui::Slider::new(&mut self.preamp_gain_db, -12.0..=24.0).suffix(" dB"))
-                    .changed();
-                ui.label("Bass (90 Hz)   :");
-                dsp_changed |= ui
-                    .add(egui::Slider::new(&mut self.eq_bass_db, -12.0..=12.0).suffix(" dB"))
-                    .changed();
-            });
+            // egui's default slider track is only 100 px wide, which makes a
+            // 24-36 dB EQ range jump by roughly a quarter dB per pixel. Put
+            // each slider on its own row and stretch the track to the card so
+            // fine adjustments stay possible at the 700 px minimum width.
+            egui::Grid::new("client_dsp_slider_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    for (label, value, range) in [
+                        ("Pre-Amp Gain", &mut self.preamp_gain_db, -12.0..=24.0),
+                        ("Bass (90 Hz)", &mut self.eq_bass_db, -12.0..=12.0),
+                        ("Vocal (2.5 kHz)", &mut self.eq_presence_db, -12.0..=12.0),
+                        ("Air (10 kHz)", &mut self.eq_treble_db, -12.0..=12.0),
+                    ] {
+                        ui.label(label);
+                        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(120.0);
+                        dsp_changed |= ui
+                            .add(egui::Slider::new(value, range).suffix(" dB"))
+                            .changed();
+                        ui.end_row();
+                    }
+                });
 
-            ui.horizontal(|ui| {
-                ui.label("Vocal (2.5 kHz):");
-                dsp_changed |= ui
-                    .add(egui::Slider::new(&mut self.eq_presence_db, -12.0..=12.0).suffix(" dB"))
-                    .changed();
-                ui.label("Air (10 kHz)   :");
-                dsp_changed |= ui
-                    .add(egui::Slider::new(&mut self.eq_treble_db, -12.0..=12.0).suffix(" dB"))
-                    .changed();
-                if ui.button("Flat Reset").clicked() {
-                    self.preamp_gain_db = 0.0;
-                    self.eq_bass_db = 0.0;
-                    self.eq_presence_db = 0.0;
-                    self.eq_treble_db = 0.0;
-                    dsp_changed = true;
-                }
-            });
+            if ui.button("Flat Reset").clicked() {
+                self.preamp_gain_db = 0.0;
+                self.eq_bass_db = 0.0;
+                self.eq_presence_db = 0.0;
+                self.eq_treble_db = 0.0;
+                dsp_changed = true;
+            }
 
             ui.separator();
             ui.horizontal_wrapped(|ui| {
