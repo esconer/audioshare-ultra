@@ -29,9 +29,9 @@ use qrcode::{Color as QrColor, QrCode};
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([860.0, 720.0])
-            .with_min_inner_size([700.0, 560.0])
-            .with_title("AudioShare Ultra — Zero-Jitter Lossless Audio Mesh"),
+            .with_inner_size([920.0, 740.0])
+            .with_min_inner_size([760.0, 560.0])
+            .with_title("AudioShare Ultra — Studio Audio Routing Mesh"),
         ..Default::default()
     };
 
@@ -40,11 +40,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let app = AudioShareApp::new();
-            cc.egui_ctx.set_visuals(if app.dark_mode {
-                egui::Visuals::dark()
-            } else {
-                egui::Visuals::light()
-            });
+            AudioShareApp::apply_studio_theme(&cc.egui_ctx, app.dark_mode);
             Ok(Box::new(app))
         }),
     )
@@ -64,11 +60,19 @@ struct AudioShareApp {
     /// `list_valid_host_interfaces()` sorts first.
     selected_qr_iface_idx: usize,
     show_qr_modal: bool,
+    show_settings_modal: bool,
     dark_mode: bool,
     minimize_on_close: bool,
     autostart_stream_on_launch: bool,
     os_boot_autostart: bool,
     force_quit: bool,
+
+    // Progressive Disclosure Drawer States ("Simple First, Complex When Needed")
+    host_pro_codec_open: bool,
+    host_routing_mic_open: bool,
+    client_manual_ip_open: bool,
+    client_eq_drawer_open: bool,
+    client_telemetry_drawer_open: bool,
 
     // Host State
     host_engine: Option<HostEngine>,
@@ -173,11 +177,17 @@ impl AudioShareApp {
             interfaces,
             selected_qr_iface_idx,
             show_qr_modal: false,
+            show_settings_modal: false,
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
             os_boot_autostart: false,
             force_quit: false,
+            host_pro_codec_open: false,
+            host_routing_mic_open: false,
+            client_manual_ip_open: false,
+            client_eq_drawer_open: false,
+            client_telemetry_drawer_open: false,
             host_engine: None,
             beacon: None,
             adb_watcher: None,
@@ -194,7 +204,7 @@ impl AudioShareApp {
             last_applied_bt_delay: 0,
             host_master_volume: 100,
             use_test_tone: false,
-            host_status_msg: "Stopped. Click 'Start Host Server' to broadcast.".into(),
+            host_status_msg: "Ready to broadcast 48 kHz studio audio.".into(),
             last_rate_calc: Instant::now(),
             prev_bytes_sent: 0,
             prev_pkts_sent: 0,
@@ -426,7 +436,6 @@ impl AudioShareApp {
                 enable_smart_dtx: self.enable_smart_dtx,
             };
 
-            // 1. Create Virtual Speaker & suppress 60s Wi-Fi scan BEFORE opening audio capture!
             let guard = VirtualSpeakerAndRadioGuard::acquire(self.enable_virtual_speaker);
 
             match HostEngine::start(cfg, vec![]) {
@@ -462,8 +471,7 @@ impl AudioShareApp {
                     self.adb_watcher = Some(AdbUsbWatcher::start(DEFAULT_PORT));
                     self.host_engine = Some(engine);
                     self.host_status_msg =
-                        "Broadcasting 48kHz Studio Lossless + [N-1]/[N-2] FEC (802.11e AC_VI)"
-                            .into();
+                        "Broadcasting 48 kHz Studio Audio + [N-1]/[N-2] FEC".into();
                 }
                 Err(e) => {
                     self.host_status_msg = format!("Error: {}", e);
@@ -530,6 +538,486 @@ impl AudioShareApp {
             .store(self.gaming_hard_lock, Ordering::Relaxed);
     }
 
+    // =========================================================================
+    // STUDIO DESIGN SYSTEM & CUSTOM VECTOR WIDGETS (Zero Broken Tofu Glyphs)
+    // =========================================================================
+
+    fn apply_studio_theme(ctx: &egui::Context, dark_mode: bool) {
+        let mut style = (*ctx.style()).clone();
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.window_margin = egui::Margin::same(16.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.visuals = if dark_mode {
+            let mut v = egui::Visuals::dark();
+            v.panel_fill = egui::Color32::from_rgb(10, 13, 19);
+            v.window_fill = egui::Color32::from_rgb(16, 20, 29);
+            v.faint_bg_color = egui::Color32::from_rgb(20, 25, 36);
+            v.extreme_bg_color = egui::Color32::from_rgb(7, 9, 14);
+            v.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+            v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(147, 197, 253));
+            v.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(32, 40, 56));
+            v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(24, 30, 43);
+            v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(22, 28, 40);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 52, 70));
+            v.widgets.inactive.rounding = egui::Rounding::same(7.0);
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 43, 62);
+            v.widgets.hovered.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 165, 250));
+            v.widgets.hovered.rounding = egui::Rounding::same(7.0);
+            v.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+            v.widgets.active.rounding = egui::Rounding::same(7.0);
+            v
+        } else {
+            let mut v = egui::Visuals::light();
+            v.panel_fill = egui::Color32::from_rgb(241, 245, 249);
+            v.window_fill = egui::Color32::from_rgb(255, 255, 255);
+            v.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+            v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+            v.widgets.inactive.rounding = egui::Rounding::same(7.0);
+            v.widgets.hovered.rounding = egui::Rounding::same(7.0);
+            v.widgets.active.rounding = egui::Rounding::same(7.0);
+            v
+        };
+        ctx.set_style(style);
+    }
+
+    fn studio_card<R>(
+        ui: &mut egui::Ui,
+        dark_mode: bool,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> egui::InnerResponse<R> {
+        let fill = if dark_mode {
+            egui::Color32::from_rgb(17, 22, 32)
+        } else {
+            egui::Color32::from_rgb(255, 255, 255)
+        };
+        let stroke = if dark_mode {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 42, 59))
+        } else {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 222, 234))
+        };
+        egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(12.0))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                add_contents(ui)
+            })
+    }
+
+    fn status_pill(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32) {
+        egui::Frame::none()
+            .fill(bg)
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(text).color(fg).size(11.5).strong());
+            });
+    }
+
+    fn metric_tile(ui: &mut egui::Ui, dark_mode: bool, label: &str, value: &str) {
+        let fill = if dark_mode {
+            egui::Color32::from_rgb(12, 16, 24)
+        } else {
+            egui::Color32::from_rgb(244, 247, 251)
+        };
+        let stroke = if dark_mode {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(28, 36, 52))
+        } else {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 226, 236))
+        };
+        egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(11.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                    );
+                    ui.monospace(egui::RichText::new(value).size(13.0).strong());
+                });
+            });
+    }
+
+    /// Custom-painted iOS / Sonar style animated pill switch
+    fn pill_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+        let desired_size = egui::vec2(38.0, 20.0);
+        let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        if response.clicked() {
+            *on = !*on;
+            response.mark_changed();
+        }
+        if ui.is_rect_visible(rect) {
+            let how_on = ui.ctx().animate_bool(response.id, *on);
+            let bg_off = egui::Color32::from_rgb(45, 55, 72);
+            let bg_on = egui::Color32::from_rgb(37, 99, 235);
+            let bg = egui::Color32::from_rgb(
+                (bg_off.r() as f32 + (bg_on.r() as f32 - bg_off.r() as f32) * how_on) as u8,
+                (bg_off.g() as f32 + (bg_on.g() as f32 - bg_off.g() as f32) * how_on) as u8,
+                (bg_off.b() as f32 + (bg_on.b() as f32 - bg_off.b() as f32) * how_on) as u8,
+            );
+            let radius = 0.5 * rect.height();
+            ui.painter().rect_filled(rect, radius, bg);
+            let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+            let center = egui::pos2(circle_x, rect.center().y);
+            ui.painter()
+                .circle_filled(center, radius - 2.5, egui::Color32::WHITE);
+        }
+        response
+    }
+
+    /// Clean two-line setting row with title + subtitle on the left and a pill switch on the right
+    fn setting_switch_row(
+        ui: &mut egui::Ui,
+        dark_mode: bool,
+        title: &str,
+        subtitle: &str,
+        value: &mut bool,
+    ) -> bool {
+        let mut changed = false;
+        let row_bg = if dark_mode {
+            egui::Color32::from_rgb(13, 17, 25)
+        } else {
+            egui::Color32::from_rgb(246, 248, 252)
+        };
+        let row_stroke = if dark_mode {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(28, 35, 50))
+        } else {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(226, 232, 240))
+        };
+        egui::Frame::none()
+            .fill(row_bg)
+            .stroke(row_stroke)
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.5;
+                        ui.label(egui::RichText::new(title).size(13.0).strong());
+                        ui.label(
+                            egui::RichText::new(subtitle)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(130, 144, 168)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::pill_switch(ui, value).changed() {
+                            changed = true;
+                        }
+                    });
+                });
+            });
+        changed
+    }
+
+    /// Segmented capsule button with clear active/inactive borders and fills
+    fn pill_choice(ui: &mut egui::Ui, dark_mode: bool, selected: bool, label: &str) -> bool {
+        let (fill, stroke, text_col) = if selected {
+            (
+                egui::Color32::from_rgb(37, 99, 235),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 165, 250)),
+                egui::Color32::WHITE,
+            )
+        } else if dark_mode {
+            (
+                egui::Color32::from_rgb(24, 30, 43),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 54, 74)),
+                egui::Color32::from_rgb(203, 213, 225),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(238, 242, 248),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(203, 213, 225)),
+                egui::Color32::from_rgb(30, 41, 59),
+            )
+        };
+        let btn = egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .strong()
+                .color(text_col),
+        )
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(egui::Rounding::same(7.0));
+        ui.add(btn).clicked()
+    }
+
+    /// Tactile Mode Card for the 4 "Simple First" hero presets
+    fn mode_preset_card(
+        ui: &mut egui::Ui,
+        dark_mode: bool,
+        selected: bool,
+        title: &str,
+        subtitle: &str,
+        badge: &str,
+    ) -> bool {
+        let (fill, stroke, title_col) = if selected {
+            (
+                if dark_mode {
+                    egui::Color32::from_rgb(23, 37, 68)
+                } else {
+                    egui::Color32::from_rgb(219, 234, 254)
+                },
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(59, 130, 246)),
+                if dark_mode {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_rgb(30, 58, 138)
+                },
+            )
+        } else if dark_mode {
+            (
+                egui::Color32::from_rgb(14, 18, 27),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(34, 43, 60)),
+                egui::Color32::from_rgb(226, 232, 240),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(248, 250, 252),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(203, 213, 225)),
+                egui::Color32::from_rgb(15, 23, 42),
+            )
+        };
+
+        let resp = egui::Frame::none()
+            .fill(fill)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.horizontal(|ui| {
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        let dot_col = if selected {
+                            egui::Color32::from_rgb(59, 130, 246)
+                        } else {
+                            egui::Color32::from_rgb(100, 116, 139)
+                        };
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(13.5)
+                                .strong()
+                                .color(title_col),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            Self::status_pill(
+                                ui,
+                                badge,
+                                if selected {
+                                    egui::Color32::from_rgb(37, 99, 235)
+                                } else {
+                                    egui::Color32::from_rgb(26, 33, 48)
+                                },
+                                if selected {
+                                    egui::Color32::WHITE
+                                } else {
+                                    egui::Color32::from_rgb(148, 163, 184)
+                                },
+                            );
+                        });
+                    });
+                    ui.label(
+                        egui::RichText::new(subtitle)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(135, 149, 173)),
+                    );
+                });
+            })
+            .response;
+
+        ui.interact(resp.rect, resp.id.with("mode_click"), egui::Sense::click())
+            .clicked()
+    }
+
+    /// Clickable Progressive Disclosure Drawer Header with live summary pills on the right
+    fn drawer_header(
+        ui: &mut egui::Ui,
+        dark_mode: bool,
+        open: &mut bool,
+        title: &str,
+        summary_pills: &[&str],
+    ) {
+        let bg = if *open {
+            if dark_mode {
+                egui::Color32::from_rgb(22, 29, 44)
+            } else {
+                egui::Color32::from_rgb(235, 241, 250)
+            }
+        } else if dark_mode {
+            egui::Color32::from_rgb(16, 21, 31)
+        } else {
+            egui::Color32::from_rgb(248, 250, 252)
+        };
+        let stroke = if *open {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(59, 130, 246))
+        } else if dark_mode {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 42, 59))
+        } else {
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 222, 234))
+        };
+
+        let resp = egui::Frame::none()
+            .fill(bg)
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(10.0))
+            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let arrow = if *open { "⏷" } else { "⏵" };
+                    ui.label(
+                        egui::RichText::new(format!("{}  {}", arrow, title))
+                            .size(13.5)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for &pill in summary_pills.iter().rev() {
+                            Self::status_pill(
+                                ui,
+                                pill,
+                                egui::Color32::from_rgb(26, 34, 49),
+                                egui::Color32::from_rgb(147, 197, 253),
+                            );
+                        }
+                    });
+                });
+            })
+            .response;
+
+        if ui
+            .interact(
+                resp.rect,
+                resp.id.with("drawer_toggle"),
+                egui::Sense::click(),
+            )
+            .clicked()
+        {
+            *open = !*open;
+        }
+    }
+
+    /// Custom 24-Segment Studio LED VU Peak Meter
+    fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8) {
+        let segments = 24usize;
+        let desired = egui::vec2(210.0, 16.0);
+        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 13, 20));
+
+        let gap = 2.0f32;
+        let seg_w = (rect.width() - gap * (segments as f32 + 1.0)) / (segments as f32);
+        let active_segs = ((vu_pct as usize) * segments).div_ceil(100);
+
+        for i in 0..segments {
+            let x = rect.left() + gap + (i as f32) * (seg_w + gap);
+            let seg_rect = egui::Rect::from_min_size(
+                egui::pos2(x, rect.top() + 2.5),
+                egui::vec2(seg_w, rect.height() - 5.0),
+            );
+            let color = if i < active_segs {
+                if i >= 21 {
+                    egui::Color32::from_rgb(239, 68, 68) // Red clip zone
+                } else if i >= 16 {
+                    egui::Color32::from_rgb(245, 158, 11) // Amber headroom zone
+                } else {
+                    egui::Color32::from_rgb(16, 185, 129) // Emerald nominal zone
+                }
+            } else {
+                egui::Color32::from_rgb(26, 33, 46)
+            };
+            painter.rect_filled(seg_rect, 1.5, color);
+        }
+    }
+
+    /// Studio Fader Row: Band title + frequency badge on left, clickable dB reset pill on right
+    fn studio_fader_row(
+        ui: &mut egui::Ui,
+        dark_mode: bool,
+        title: &str,
+        freq_badge: &str,
+        value: &mut f32,
+        range: std::ops::RangeInclusive<f32>,
+    ) -> bool {
+        let mut changed = false;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(title).size(12.5).strong());
+                if !freq_badge.is_empty() {
+                    Self::status_pill(
+                        ui,
+                        freq_badge,
+                        if dark_mode {
+                            egui::Color32::from_rgb(24, 31, 46)
+                        } else {
+                            egui::Color32::from_rgb(230, 236, 245)
+                        },
+                        egui::Color32::from_rgb(130, 144, 168),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_boosted = value.abs() >= 0.05;
+                    let (bg, fg) = if is_boosted {
+                        (
+                            egui::Color32::from_rgb(30, 58, 138),
+                            egui::Color32::from_rgb(147, 197, 253),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(24, 30, 43),
+                            egui::Color32::from_rgb(148, 163, 184),
+                        )
+                    };
+                    let db_btn = egui::Button::new(
+                        egui::RichText::new(format!("{:+.1} dB", *value))
+                            .monospace()
+                            .size(11.5)
+                            .strong()
+                            .color(fg),
+                    )
+                    .fill(bg)
+                    .rounding(egui::Rounding::same(6.0));
+                    if ui
+                        .add(db_btn)
+                        .on_hover_text("Click to reset band to 0.0 dB")
+                        .clicked()
+                    {
+                        *value = 0.0;
+                        changed = true;
+                    }
+                });
+            });
+
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(140.0);
+            let slider = egui::Slider::new(value, range)
+                .show_value(false)
+                .trailing_fill(true);
+            if ui.add(slider).changed() {
+                changed = true;
+            }
+        });
+        ui.add_space(2.0);
+        changed
+    }
+
     /// Render a crisp, scannable ISO-18004 QR Code directly onto the egui canvas
     fn draw_qr_code(ui: &mut egui::Ui, uri: &str) {
         let Ok(code) = QrCode::new(uri.as_bytes()) else {
@@ -543,7 +1031,7 @@ impl AudioShareApp {
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(size_px, size_px), egui::Sense::hover());
         let painter = ui.painter();
-        painter.rect_filled(rect, 6.0, egui::Color32::WHITE);
+        painter.rect_filled(rect, 8.0, egui::Color32::WHITE);
 
         for y in 0..width {
             for x in 0..width {
@@ -563,8 +1051,6 @@ impl AudioShareApp {
 
 impl eframe::App for AudioShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Close-to-Background Protection: If streaming is active and user clicks window 'X',
-        // minimize to taskbar (0.0% CPU) instead of killing the live audio stream!
         if ctx.input(|i| i.viewport().close_requested())
             && !self.force_quit
             && self.minimize_on_close
@@ -574,30 +1060,47 @@ impl eframe::App for AudioShareApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
-        // Drop GUI CPU usage to ~0% while minimized: audio/network threads keep
-        // running, and winit asks for a repaint as soon as the window returns.
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if !is_minimized {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // Auto-switch to the virtual speaker only while phones are connected,
-        // then restore the physical speakers when the last client leaves.
         if let Some(ref host) = self.host_engine {
             let client_count = host.telemetry.active_clients_count.load(Ordering::Relaxed);
             self.host_master_volume = host.telemetry.host_volume.load(Ordering::Relaxed);
-            // Reflect profile changes requested from a connected phone.
             self.quality_profile =
                 QualityProfile::from_u8(host.telemetry.quality_profile.load(Ordering::Relaxed));
             self.prefer_opus = host.telemetry.prefer_opus.load(Ordering::Relaxed);
-            // Reflect bitrate changes requested from a connected phone. The
-            // host stores the raw 96/160/256/320 target; the active profile
-            // decides whether 256/320 are used or clamped to 160.
             self.target_bitrate_kbps = host
                 .telemetry
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
                 .clamp(96, 320);
+
+            let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
+            let bytes_now = host.telemetry.bytes_sent.load(Ordering::Relaxed);
+            let bt_delay = host
+                .telemetry
+                .max_client_bt_delay_ms
+                .load(Ordering::Relaxed);
+
+            if self.last_rate_calc.elapsed() >= Duration::from_secs(1) {
+                let dt = self.last_rate_calc.elapsed().as_secs_f32().max(0.1);
+                self.live_kbps = (((bytes_now.saturating_sub(self.prev_bytes_sent)) as f32 * 8.0)
+                    / (dt * 1000.0)) as u32;
+                self.live_pps = ((pkts.saturating_sub(self.prev_pkts_sent)) as f32 / dt) as u32;
+                self.prev_bytes_sent = bytes_now;
+                self.prev_pkts_sent = pkts;
+                self.last_rate_calc = Instant::now();
+            }
+
+            if self.auto_bt_video_lipsync
+                && should_apply_lipsync(bt_delay, self.last_applied_bt_delay)
+            {
+                apply_automatic_video_lipsync_offset_ms(bt_delay);
+                self.last_applied_bt_delay = bt_delay;
+            }
+
             if let Some(ref mut guard) = self.os_guard {
                 if client_count > 0 {
                     guard.activate();
@@ -607,122 +1110,210 @@ impl eframe::App for AudioShareApp {
             }
         }
 
-        egui::TopBottomPanel::top("top_nav").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading("🎧 AudioShare Ultra");
-                ui.separator();
-                ui.selectable_value(
-                    &mut self.tab,
-                    AppTab::HostSender,
-                    "📡 Host Server (Send Audio)",
-                );
-                ui.selectable_value(
-                    &mut self.tab,
-                    AppTab::ClientReceiver,
-                    "🔊 Client Receiver & Studio DSP",
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🚪 Quit").clicked() {
-                        self.force_quit = true;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    let debug_lbl = if self.latency_debug {
-                        "📊 Latency Debug: ON"
+        let dark = self.dark_mode;
+
+        // =========================================================================
+        // 1. TOP NAVIGATION BAR (Minimalist & Intent-Driven)
+        // =========================================================================
+        egui::TopBottomPanel::top("top_nav")
+            .frame(
+                egui::Frame::none()
+                    .fill(if dark {
+                        egui::Color32::from_rgb(14, 18, 27)
                     } else {
-                        "📊 Latency Debug"
-                    };
-                    if ui.button(debug_lbl).clicked() {
-                        self.latency_debug = !self.latency_debug;
-                    }
-                    let theme_lbl = if self.dark_mode {
-                        "☀️ Light"
-                    } else {
-                        "🌙 Dark"
-                    };
-                    if ui.button(theme_lbl).clicked() {
-                        self.dark_mode = !self.dark_mode;
-                        ctx.set_visuals(if self.dark_mode {
-                            egui::Visuals::dark()
+                        egui::Color32::from_rgb(255, 255, 255)
+                    })
+                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if dark {
+                            egui::Color32::from_rgb(28, 36, 52)
                         } else {
-                            egui::Visuals::light()
-                        });
-                    }
-                    if ui.button("📱 Scan QR to Connect Phone").clicked() {
-                        self.interfaces = list_valid_host_interfaces();
-                        self.selected_qr_iface_idx =
-                            refreshed_qr_iface_index(&self.interfaces, self.selected_qr_iface_idx);
-                        self.show_qr_modal = !self.show_qr_modal;
-                    }
-                });
-            });
-            ui.add_space(4.0);
-        });
-
-        // QR Code Pairing Modal
-        if self.show_qr_modal {
-            egui::Window::new("📱 1-Scan Phone QR Pairing")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    let pin_opt = if self.enable_pin_encryption {
-                        Some(self.pairing_pin.as_str())
+                            egui::Color32::from_rgb(220, 226, 236)
+                        },
+                    )),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let (dot_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let dot_col = if self.host_engine.is_some() {
+                        egui::Color32::from_rgb(16, 185, 129)
+                    } else if self.client_engine.is_some() {
+                        egui::Color32::from_rgb(59, 130, 246)
                     } else {
-                        None
+                        egui::Color32::from_rgb(100, 116, 139)
                     };
+                    ui.painter().circle_filled(dot_rect.center(), 4.5, dot_col);
 
-                    ui.vertical_centered(|ui| {
-                        if self.interfaces.len() > 1 {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Adapter:");
-                                for (idx, iface) in self.interfaces.iter().enumerate() {
-                                    ui.selectable_value(
-                                        &mut self.selected_qr_iface_idx,
-                                        idx,
-                                        format!("{} ({})", iface.name, iface.ip),
-                                    );
-                                }
-                            });
-                            ui.add_space(4.0);
+                    ui.label(egui::RichText::new("AudioShare Ultra").size(17.0).strong());
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    if Self::pill_choice(ui, dark, self.tab == AppTab::HostSender, "Send PC Audio")
+                    {
+                        self.tab = AppTab::HostSender;
+                    }
+                    if Self::pill_choice(
+                        ui,
+                        dark,
+                        self.tab == AppTab::ClientReceiver,
+                        "Receive & EQ",
+                    ) {
+                        self.tab = AppTab::ClientReceiver;
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Quit").clicked() {
+                            self.force_quit = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        let primary_ip = self
-                            .interfaces
-                            .get(self.selected_qr_iface_idx)
-                            .or_else(|| self.interfaces.first())
-                            .map(|i| i.ip.to_string())
-                            .unwrap_or_else(|| "192.168.1.100".into());
-                        let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
-                        ui.label("Scan with your Android Camera or AudioShare Ultra app:");
-                        ui.add_space(6.0);
-                        Self::draw_qr_code(ui, &uri);
-                        ui.add_space(6.0);
-                        ui.monospace(&uri);
-                        ui.add_space(6.0);
-                        if ui.button("📋 Copy Connection URI").clicked() {
-                            ui.ctx().copy_text(uri.clone());
+                        if Self::pill_choice(ui, dark, self.show_settings_modal, "Settings") {
+                            self.interfaces = list_valid_host_interfaces();
+                            self.show_settings_modal = !self.show_settings_modal;
                         }
-                        ui.add_space(6.0);
-                        if ui.button("Close QR Window").clicked() {
-                            self.show_qr_modal = false;
+                        if Self::pill_choice(ui, dark, self.show_qr_modal, "Pair Phone QR") {
+                            self.interfaces = list_valid_host_interfaces();
+                            self.selected_qr_iface_idx = refreshed_qr_iface_index(
+                                &self.interfaces,
+                                self.selected_qr_iface_idx,
+                            );
+                            self.show_qr_modal = !self.show_qr_modal;
                         }
                     });
                 });
+            });
+
+        // =========================================================================
+        // 2. BOTTOM STATUS & TELEMETRY BAR (Quiet 1-Line Summary + HUD Trigger)
+        // =========================================================================
+        egui::TopBottomPanel::bottom("bottom_status")
+            .frame(
+                egui::Frame::none()
+                    .fill(if dark {
+                        egui::Color32::from_rgb(13, 17, 25)
+                    } else {
+                        egui::Color32::from_rgb(248, 250, 252)
+                    })
+                    .inner_margin(egui::Margin::symmetric(18.0, 7.0))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if dark {
+                            egui::Color32::from_rgb(28, 36, 52)
+                        } else {
+                            egui::Color32::from_rgb(220, 226, 236)
+                        },
+                    )),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(ref host) = self.host_engine {
+                        let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
+                        let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
+                        let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
+                        let kb = host.telemetry.bytes_sent.load(Ordering::Relaxed) / 1024;
+                        let codec_label = if dtx {
+                            "Smart DTX Sleep (0.6 kbps)".to_string()
+                        } else if mode_id == 4 {
+                            format!("Opus RLD ({} kbps)", self.target_bitrate_kbps)
+                        } else if mode_id == 2 {
+                            format!("Rust VBR ({} kbps)", self.target_bitrate_kbps)
+                        } else if self.quality_profile == QualityProfile::StudioLossless24Bit {
+                            "24-Bit Studio Master".to_string()
+                        } else {
+                            "16-Bit Lossless LPC".to_string()
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "• Broadcasting: {}   •   {} kbps ({} pps)   •   Sent: {} KB   •   Receivers: {}",
+                                codec_label, self.live_kbps, self.live_pps, kb, clients
+                            ))
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(134, 239, 172)),
+                        );
+                    } else if let Some(ref client) = self.client_engine {
+                        let prim = client.telemetry.primary_frames_played.load(Ordering::Relaxed);
+                        let fec = client.telemetry.fec_healed_frames.load(Ordering::Relaxed);
+                        let plc = client.telemetry.plc_extrapolated_frames.load(Ordering::Relaxed);
+                        let drift = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
+                        let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "• Receiving: {}   •   Est. Latency: {:.1} ms   •   Lossless: {}   •   FEC/PLC: {}/{}   •   Clock Lock: {:+} ppm",
+                                snap.codec_name(),
+                                snap.estimated_one_way_ms(),
+                                prim,
+                                fec,
+                                plc,
+                                drift
+                            ))
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                        );
+                    } else {
+                        let primary_ip = self
+                            .interfaces
+                            .get(default_qr_iface_index(&self.interfaces))
+                            .map(|i| format!("{}:{}", i.ip, DEFAULT_PORT))
+                            .unwrap_or_else(|| format!("0.0.0.0:{}", DEFAULT_PORT));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "○ Standby   •   Host Endpoint: {}   •   Plug in USB or click Start Broadcast",
+                                primary_ip
+                            ))
+                            .size(11.5)
+                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                        );
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::pill_choice(
+                            ui,
+                            dark,
+                            self.latency_debug,
+                            if self.latency_debug {
+                                "Latency & Telemetry HUD: ON"
+                            } else {
+                                "Latency & Telemetry HUD"
+                            },
+                        ) {
+                            self.latency_debug = !self.latency_debug;
+                        }
+                    });
+                });
+            });
+
+        // =========================================================================
+        // 3. MODAL WINDOWS: QR Pairing, System/Network Settings, and Latency HUD
+        // =========================================================================
+        if self.show_qr_modal {
+            self.render_qr_modal(ctx);
+        }
+
+        if self.show_settings_modal {
+            self.render_settings_modal(ctx);
         }
 
         if self.latency_debug {
-            egui::Window::new("📊 Live Latency Debug")
-                .default_width(560.0)
+            egui::Window::new("Live Stage-by-Stage Latency Breakdown")
+                .default_width(600.0)
                 .default_height(460.0)
                 .resizable(true)
                 .show(ctx, |ui| self.render_latency_debug(ui));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                AppTab::HostSender => self.render_host_tab(ui),
-                AppTab::ClientReceiver => self.render_client_tab(ui),
-            });
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    match self.tab {
+                        AppTab::HostSender => self.render_host_tab(ui),
+                        AppTab::ClientReceiver => self.render_client_tab(ui),
+                    }
+                    ui.add_space(12.0);
+                });
         });
     }
 
@@ -739,382 +1330,742 @@ impl eframe::App for AudioShareApp {
         }
         self.beacon = None;
         self.adb_watcher = None;
-        // Explicitly drop VirtualSpeakerAndRadioGuard to restore physical PC speakers on window close!
         self.os_guard = None;
     }
 }
 
 impl AudioShareApp {
+    fn render_qr_modal(&mut self, ctx: &egui::Context) {
+        let dark = self.dark_mode;
+        egui::Window::new("Pair Android Phone via QR Code")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                Self::studio_card(ui, dark, |ui| {
+                    let pin_opt = if self.enable_pin_encryption {
+                        Some(self.pairing_pin.as_str())
+                    } else {
+                        None
+                    };
+
+                    ui.vertical_centered(|ui| {
+                        if self.interfaces.len() > 1 {
+                            ui.label(
+                                egui::RichText::new("Select Network Adapter")
+                                    .size(12.0)
+                                    .strong(),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                for (idx, iface) in self.interfaces.iter().enumerate() {
+                                    let tag = if iface.is_usb_tethering {
+                                        "[USB]"
+                                    } else {
+                                        "[LAN]"
+                                    };
+                                    if Self::pill_choice(
+                                        ui,
+                                        dark,
+                                        self.selected_qr_iface_idx == idx,
+                                        &format!("{} {} ({})", tag, iface.name, iface.ip),
+                                    ) {
+                                        self.selected_qr_iface_idx = idx;
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        let primary_ip = self
+                            .interfaces
+                            .get(self.selected_qr_iface_idx)
+                            .or_else(|| self.interfaces.first())
+                            .map(|i| i.ip.to_string())
+                            .unwrap_or_else(|| "192.168.1.100".into());
+                        let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
+                        ui.label("Scan with your Android Camera or the AudioShare Ultra app:");
+                        ui.add_space(8.0);
+                        Self::draw_qr_code(ui, &uri);
+                        ui.add_space(8.0);
+                        Self::status_pill(
+                            ui,
+                            &uri,
+                            egui::Color32::from_rgb(15, 23, 42),
+                            egui::Color32::from_rgb(147, 197, 253),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy Connection URI").clicked() {
+                                ui.ctx().copy_text(uri.clone());
+                            }
+                            if ui.button("Close").clicked() {
+                                self.show_qr_modal = false;
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    fn render_settings_modal(&mut self, ctx: &egui::Context) {
+        let dark = self.dark_mode;
+        egui::Window::new("System, Network, Hotspot & Security Settings")
+            .collapsible(false)
+            .resizable(true)
+            .vscroll(true)
+            .default_width(540.0)
+            .max_height((ctx.screen_rect().height() - 48.0).max(240.0))
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                Self::studio_card(ui, dark, |ui| {
+                    ui.label(
+                        egui::RichText::new("Active Network & USB Endpoints")
+                            .size(13.5)
+                            .strong(),
+                    );
+                    if self.interfaces.is_empty() {
+                        ui.label("Listening on 0.0.0.0:65530");
+                    } else {
+                        for iface in &self.interfaces {
+                            let badge = if iface.is_usb_tethering {
+                                "USB RNDIS"
+                            } else {
+                                "Wi-Fi / LAN"
+                            };
+                            ui.horizontal(|ui| {
+                                Self::status_pill(
+                                    ui,
+                                    badge,
+                                    egui::Color32::from_rgb(30, 41, 59),
+                                    egui::Color32::from_rgb(147, 197, 253),
+                                );
+                                let ep = format!("{}:{}", iface.ip, DEFAULT_PORT);
+                                ui.monospace(format!("{} ({})", ep, iface.name));
+                                if ui.small_button("Copy IP").clicked() {
+                                    ui.ctx().copy_text(ep);
+                                }
+                            });
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("1-Hop 5 GHz Direct Hotspot & Firewall")
+                            .size(13.5)
+                            .strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("SSID:");
+                        ui.add_sized(
+                            [120.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.hotspot_ssid),
+                        );
+                        ui.label("Password:");
+                        ui.add_sized(
+                            [110.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.hotspot_pass),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let hs_btn = if self.direct_hotspot_active {
+                            "Stop 1-Hop Direct Hotspot"
+                        } else {
+                            "Start 1-Hop 5GHz Link"
+                        };
+                        if ui.button(hs_btn).clicked() {
+                            if self.direct_hotspot_active {
+                                DirectHotspotController::stop_direct_hotspot();
+                                self.direct_hotspot_active = false;
+                                self.hotspot_status = "Router LAN Mode".into();
+                            } else {
+                                match DirectHotspotController::start_direct_5ghz_hotspot(
+                                    &self.hotspot_ssid,
+                                    &self.hotspot_pass,
+                                ) {
+                                    Ok(msg) => {
+                                        self.direct_hotspot_active = true;
+                                        self.hotspot_status = msg;
+                                    }
+                                    Err(e) => {
+                                        self.hotspot_status = format!("Hotspot notice: {}", e)
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
+                            self.hotspot_status = open_os_firewall_ports();
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(&self.hotspot_status)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                    );
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Stream Security (ChaCha20 + MAC32)")
+                            .size(13.5)
+                            .strong(),
+                    );
+                    if Self::setting_switch_row(
+                        ui,
+                        dark,
+                        "Require Pairing PIN Encryption",
+                        "Encrypts all audio and control packets with RFC 8439 ChaCha20",
+                        &mut self.enable_pin_encryption,
+                    ) {
+                        if let Some(ref host) = self.host_engine {
+                            let pin = if self.enable_pin_encryption {
+                                Some(self.pairing_pin.as_str())
+                            } else {
+                                None
+                            };
+                            host.set_encryption_pin(pin);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Pairing PIN:");
+                        ui.add_sized(
+                            [90.0, 22.0],
+                            egui::TextEdit::singleline(&mut self.pairing_pin),
+                        );
+                        if ui.button("Apply PIN").clicked() {
+                            if let Some(ref host) = self.host_engine {
+                                let pin = if self.enable_pin_encryption {
+                                    Some(self.pairing_pin.as_str())
+                                } else {
+                                    None
+                                };
+                                host.set_encryption_pin(pin);
+                            }
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Application & OS Preferences")
+                            .size(13.5)
+                            .strong(),
+                    );
+                    Self::setting_switch_row(
+                        ui,
+                        dark,
+                        "Auto-Start Broadcast on App Launch",
+                        "Immediately start Host Server when AudioShare Ultra opens",
+                        &mut self.autostart_stream_on_launch,
+                    );
+                    if Self::setting_switch_row(
+                        ui,
+                        dark,
+                        "Start App on OS Login",
+                        "Register AudioShare Ultra in desktop session startup",
+                        &mut self.os_boot_autostart,
+                    ) {
+                        self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
+                    }
+                    Self::setting_switch_row(
+                        ui,
+                        dark,
+                        "Minimize on Window Close",
+                        "Keep active audio stream running in background when closing window",
+                        &mut self.minimize_on_close,
+                    );
+                    if Self::setting_switch_row(
+                        ui,
+                        dark,
+                        "Dark Studio Theme",
+                        "Use high-contrast obsidian slate palette",
+                        &mut self.dark_mode,
+                    ) {
+                        Self::apply_studio_theme(ctx, self.dark_mode);
+                    }
+
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if ui.button("Close Settings").clicked() {
+                            self.show_settings_modal = false;
+                        }
+                    });
+                });
+            });
+    }
+
     fn render_host_tab(&mut self, ui: &mut egui::Ui) {
         let is_running = self.host_engine.is_some();
+        let dark = self.dark_mode;
 
-        ui.group(|ui| {
+        // =========================================================================
+        // 1. SIMPLE HERO CONSOLE: Start/Stop CTA, Peak LED Meter & Master Volume
+        // =========================================================================
+        Self::studio_card(ui, dark, |ui| {
             ui.horizontal(|ui| {
-                let btn_text = if is_running {
-                    "⏹ Stop Host Server"
+                let (btn_text, btn_fill) = if is_running {
+                    ("■  Stop Broadcast", egui::Color32::from_rgb(185, 28, 28))
                 } else {
-                    "▶ Start Host Server"
+                    ("▶  Start Broadcast", egui::Color32::from_rgb(22, 163, 74))
                 };
-                let btn = egui::Button::new(egui::RichText::new(btn_text).size(16.0).strong());
-                if ui.add_sized([200.0, 38.0], btn).clicked() {
+                let btn = egui::Button::new(
+                    egui::RichText::new(btn_text)
+                        .size(15.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(btn_fill)
+                .rounding(egui::Rounding::same(8.0));
+
+                if ui.add_sized([195.0, 42.0], btn).clicked() {
                     self.toggle_host();
                 }
-                ui.label(
-                    egui::RichText::new(&self.host_status_msg).color(if is_running {
-                        egui::Color32::LIGHT_GREEN
-                    } else {
-                        egui::Color32::GRAY
-                    }),
-                );
+
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(
+                        egui::RichText::new(&self.host_status_msg)
+                            .size(13.5)
+                            .strong()
+                            .color(if is_running {
+                                egui::Color32::from_rgb(134, 239, 172)
+                            } else {
+                                egui::Color32::from_rgb(148, 163, 184)
+                            }),
+                    );
+                    let usb_connected = self
+                        .adb_watcher
+                        .as_ref()
+                        .map(|a| a.usb_device_connected.load(Ordering::Relaxed))
+                        .unwrap_or(false);
+                    ui.label(
+                        egui::RichText::new(if usb_connected {
+                            "USB ADB Tunnel Active (<11 ms Wired Path Ready)"
+                        } else {
+                            "Wireless LAN Ready • Plug in USB cable anytime for instant wired failover"
+                        })
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(130, 144, 168)),
+                    );
+                });
             });
 
             ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(
-                    &mut self.usb_low_latency_pacing,
-                    "⚡ 2.5ms USB Pacing (Uncheck for 5.0ms Bundled Wi-Fi Pacing)",
-                );
-                ui.checkbox(&mut self.enable_smart_dtx, "🔋 Smart DTX Silence Saver");
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(
-                    &mut self.enable_virtual_speaker,
-                    "🔇 Auto Virtual Speaker + Win32 60s Scan Blocker",
-                );
-                ui.checkbox(
-                    &mut self.auto_bt_video_lipsync,
-                    "🎬 Auto Video Lip-Sync for Phone Bluetooth Earbuds",
-                );
-                ui.checkbox(&mut self.use_test_tone, "🎵 440Hz/554Hz Test Chord");
-            });
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(
-                    &mut self.autostart_stream_on_launch,
-                    "🚀 Auto-Start Broadcast on App Launch",
-                );
-                if ui
-                    .checkbox(&mut self.os_boot_autostart, "🖥️ Start App on OS Login")
-                    .changed()
-                {
-                    self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
-                }
-                ui.checkbox(
-                    &mut self.minimize_on_close,
-                    "📌 Minimize on Window Close (Keep Stream Alive)",
-                );
-            });
-        });
-
-        ui.add_space(8.0);
-
-        ui.group(|ui| {
-            ui.heading("Quality Mode & Compressed Bitrate");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("🎚️ Mode:");
-                for (profile, label) in [
-                    (QualityProfile::SmartAuto, "🤖 Smart Auto"),
-                    (QualityProfile::StudioLossless, "💎 Studio Lossless 16-Bit (0ms)"),
-                    (
-                        QualityProfile::StudioLossless24Bit,
-                        "👑 Studio Master 24-Bit (0ms)",
-                    ),
-                    (
-                        QualityProfile::LowLatencyCompressed,
-                        "⚡ Low-Latency Compressed",
-                    ),
-                    (
-                        QualityProfile::MaxStability24Ghz,
-                        "🛡️ Max Stability (10ms 2.4GHz)",
-                    ),
-                ] {
-                    if ui
-                        .selectable_value(&mut self.quality_profile, profile, label)
-                        .changed()
-                    {
-                        if let Some(ref host) = self.host_engine {
-                            host.telemetry
-                                .quality_profile
-                                .store(self.quality_profile as u8, Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("🧩 Compressed codec:");
-                if ui
-                    .selectable_value(&mut self.prefer_opus, false, "🦀 Pure-Rust VBR (Default)")
-                    .changed()
-                {
-                    if let Some(ref host) = self.host_engine {
-                        host.telemetry
-                            .prefer_opus
-                            .store(false, Ordering::Relaxed);
-                    }
-                }
-                if ui
-                    .selectable_value(
-                        &mut self.prefer_opus,
-                        true,
-                        "🎵 Opus RLD (Pure Rust, 2.5ms lookahead)",
-                    )
-                    .changed()
-                {
-                    if let Some(ref host) = self.host_engine {
-                        host.telemetry
-                            .prefer_opus
-                            .store(true, Ordering::Relaxed);
-                    }
-                }
-            });
-            ui.label(
-                egui::RichText::new(
-                    "Applies to compressed profiles only; lossless and 24-bit modes are unchanged. \
-                     Switching is live and auto-detected per packet.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-
-            if matches!(
-                self.quality_profile,
-                QualityProfile::LowLatencyCompressed
-                    | QualityProfile::SmartAuto
-                    | QualityProfile::MaxStability24Ghz
-            ) {
-                // Max Stability deliberately caps the target at 160 kbps and
-                // steps down to 96 kbps above 200 permille loss, so only
-                // offer the values that take effect there. The saved
-                // 256/320 preference is preserved for the other profiles.
-                let stability = self.quality_profile == QualityProfile::MaxStability24Ghz;
-                let choices: &[u16] = if stability {
-                    &[96, 160]
-                } else {
-                    &[96, 160, 256, 320]
-                };
-                let mut effective = if stability {
-                    self.target_bitrate_kbps.clamp(96, 160)
-                } else {
-                    self.target_bitrate_kbps
-                };
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("📶 Compressed bitrate:");
-                    for &kbps in choices {
-                        if ui
-                            .selectable_value(&mut effective, kbps, format!("{} kbps", kbps))
-                            .changed()
-                        {
-                            self.target_bitrate_kbps = effective;
-                            if let Some(ref host) = self.host_engine {
-                                host.telemetry
-                                    .target_bitrate_kbps
-                                    .store(self.target_bitrate_kbps, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                });
-                if stability {
-                    ui.label(
-                        egui::RichText::new(
-                            "🛡️ 2.4G stability caps the target at 160 kbps and steps down to \
-                             96 kbps above 200‰ loss. 256/320 stay saved for other profiles.",
-                        )
-                        .small()
-                        .color(egui::Color32::GRAY),
-                    );
-                }
-            }
-
-            let note = match self.quality_profile {
-                QualityProfile::SmartAuto => {
-                    "Adapts: lossless at <4.5% loss, compressed at >4.5%, 10ms/160k at >12%."
-                }
-                QualityProfile::StudioLossless => {
-                    "100% bit-perfect 16-bit LPC-Delta, 2.5/5.0ms framing, zero codec lookahead."
-                }
-                QualityProfile::StudioLossless24Bit => {
-                    "True 24-bit: upper-16-bit LPC + exact LSB plane, 2.5ms single-subframe packets."
-                }
-                QualityProfile::LowLatencyCompressed => {
-                    "VBR DPCM primary payload at the selected target; ADPCM FEC stays active."
-                }
-                QualityProfile::MaxStability24Ghz => {
-                    "Fixed 10ms (4-subframe) framing; bitrate is capped at 160 kbps \
-                     (96 kbps above 200‰ loss) for long-range 2.4GHz."
-                }
-            };
-            ui.label(egui::RichText::new(note).color(egui::Color32::GRAY));
-        });
-
-        ui.add_space(8.0);
-
-        ui.group(|ui| {
-            ui.heading("Active Network, USB & 1-Hop Direct Wireless Endpoints");
-            if let Some(ref adb) = self.adb_watcher {
-                let usb_ok = adb.usb_device_connected.load(Ordering::Relaxed);
-                ui.label(if usb_ok {
-                    "🔌 ADB USB Device Detected — Zero-Touch Wired Tunnel Active!"
-                } else {
-                    "🔌 ADB USB Watcher: Waiting for USB cable connection..."
-                });
-            }
-            for iface in &self.interfaces {
-                let tag = if iface.is_usb_tethering {
-                    "⚡ [USB RNDIS Priority]"
-                } else {
-                    "📶 [Wi-Fi / Ethernet]"
-                };
-                ui.horizontal(|ui| {
-                    let ep = format!("{}:{}", iface.ip, DEFAULT_PORT);
-                    ui.monospace(format!("{} {} ({})", tag, ep, iface.name));
-                    if ui.small_button("📋 Copy IP").clicked() {
-                        ui.ctx().copy_text(ep);
-                    }
-                });
-            }
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("SSID:");
-                ui.add_sized(
-                    [110.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.hotspot_ssid),
-                );
-                ui.label("Pass:");
-                ui.add_sized(
-                    [100.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.hotspot_pass),
-                );
-                let hs_btn = if self.direct_hotspot_active {
-                    "Stop 1-Hop Direct Hotspot"
-                } else {
-                    "📡 Start 1-Hop 5GHz Link"
-                };
-                if ui.button(hs_btn).clicked() {
-                    if self.direct_hotspot_active {
-                        DirectHotspotController::stop_direct_hotspot();
-                        self.direct_hotspot_active = false;
-                        self.hotspot_status = "Router LAN Mode".into();
-                    } else {
-                        match DirectHotspotController::start_direct_5ghz_hotspot(
-                            &self.hotspot_ssid,
-                            &self.hotspot_pass,
-                        ) {
-                            Ok(msg) => {
-                                self.direct_hotspot_active = true;
-                                self.hotspot_status = msg;
-                            }
-                            Err(e) => self.hotspot_status = format!("Hotspot notice: {}", e),
-                        }
-                    }
-                }
-                if ui
-                    .button("🛡️ 1-Click Open Firewall (65530-65532)")
-                    .clicked()
-                {
-                    self.hotspot_status = open_os_firewall_ports();
-                }
-                ui.monospace(&self.hotspot_status);
-            });
-        });
 
-        ui.add_space(8.0);
+            let vu_pct = self
+                .host_engine
+                .as_ref()
+                .map(|h| h.telemetry.host_vu_peak_pct.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let bt_delay = self
+                .host_engine
+                .as_ref()
+                .map(|h| h.telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed))
+                .unwrap_or(0);
 
-        ui.group(|ui| {
-            ui.heading("Connected Clients & Dynamic Link Governor");
-            if let Some(ref host) = self.host_engine {
-                let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
-                let kb = host.telemetry.bytes_sent.load(Ordering::Relaxed) / 1024;
-                let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
-                let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
-                let bt_delay = host.telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed);
-                let rebinds = host.telemetry.hotplug_rebinds.load(Ordering::Relaxed);
-                let bytes_now = host.telemetry.bytes_sent.load(Ordering::Relaxed);
-
-                if self.last_rate_calc.elapsed() >= Duration::from_secs(1) {
-                    let dt = self.last_rate_calc.elapsed().as_secs_f32().max(0.1);
-                    self.live_kbps = (((bytes_now.saturating_sub(self.prev_bytes_sent)) as f32 * 8.0)
-                        / (dt * 1000.0)) as u32;
-                    self.live_pps =
-                        ((pkts.saturating_sub(self.prev_pkts_sent)) as f32 / dt) as u32;
-                    self.prev_bytes_sent = bytes_now;
-                    self.prev_pkts_sent = pkts;
-                    self.last_rate_calc = Instant::now();
-                }
-
-                // Automatically adjust PipeWire sink latency offset when phone Bluetooth delay changes!
-                if self.auto_bt_video_lipsync
-                    && should_apply_lipsync(bt_delay, self.last_applied_bt_delay)
-                {
-                    apply_automatic_video_lipsync_offset_ms(bt_delay);
-                    self.last_applied_bt_delay = bt_delay;
-                }
-
-                let mode_str = if dtx {
-                    "SMART-DTX SILENCE (0.6 kbps)".to_string()
-                } else if mode_id == 4 {
-                    format!(
-                        "GOVERNOR: COMPRESSED [OPUS RLD] {} kbps (Weak Wi-Fi Protection)",
-                        self.target_bitrate_kbps
-                    )
-                } else if mode_id == 2 {
-                    format!(
-                        "GOVERNOR: COMPRESSED [RUST VBR] {} kbps (Weak Wi-Fi Protection)",
-                        self.target_bitrate_kbps
-                    )
-                } else if self.quality_profile == QualityProfile::StudioLossless24Bit {
-                    "GOVERNOR: STUDIO MASTER 24-BIT LOSSLESS + FEC".to_string()
-                } else {
-                    "GOVERNOR: STUDIO LOSSLESS LPC + [N-1]/[N-2] FEC".to_string()
-                };
-
-                ui.monospace(format!(
-                    "Live Speed: {} kbps ({} pkt/s) | Total: {} KB | Rebinds: {} | {}",
-                    self.live_kbps, self.live_pps, kb, rebinds, mode_str
-                ));
-
-                // Live 60 FPS Audio Capture VU Peak Bar
-                let vu_pct = host.telemetry.host_vu_peak_pct.load(Ordering::Relaxed);
-                ui.horizontal(|ui| {
-                    ui.label("Live Audio Peak:");
-                    let bar_color = if vu_pct > 92 {
-                        egui::Color32::RED
-                    } else if vu_pct > 70 {
-                        egui::Color32::GOLD
-                    } else {
-                        egui::Color32::LIGHT_GREEN
-                    };
-                    ui.add(
-                        egui::ProgressBar::new((vu_pct as f32) / 100.0)
-                            .fill(bar_color)
-                            .text(format!("{}% Peak", vu_pct)),
-                    );
-                    ui.separator();
-                    ui.label("Master Vol:");
+            ui.columns(2, |cols| {
+                cols[0].horizontal(|ui| {
+                    ui.label(egui::RichText::new("Audio Peak").size(12.5).strong());
+                    Self::draw_led_vu_meter(ui, vu_pct);
+                    ui.monospace(format!("{:>3}%", vu_pct));
+                });
+                cols[1].horizontal(|ui| {
+                    ui.label(egui::RichText::new("Master Volume").size(12.5).strong());
+                    ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(100.0);
                     if ui
                         .add(egui::Slider::new(&mut self.host_master_volume, 0..=100).suffix("%"))
                         .changed()
                     {
-                        host.telemetry
-                            .host_volume
-                            .store(self.host_master_volume, Ordering::Relaxed);
+                        if let Some(ref host) = self.host_engine {
+                            host.telemetry
+                                .host_volume
+                                .store(self.host_master_volume, Ordering::Relaxed);
+                        }
+                    }
+                });
+            });
+
+            if bt_delay > 40 {
+                ui.add_space(2.0);
+                Self::status_pill(
+                    ui,
+                    &format!(
+                        "Phone Bluetooth Earbuds Active (+{} ms A2DP) — Auto Video Lip-Sync Applied",
+                        bt_delay
+                    ),
+                    egui::Color32::from_rgb(66, 32, 6),
+                    egui::Color32::from_rgb(253, 224, 71),
+                );
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // =========================================================================
+        // 2. 4 SIMPLE MODE CARDS (Zero Jargon, 1-Click Priority Selection)
+        // =========================================================================
+        ui.columns(4, |cols| {
+            let is_auto = self.quality_profile == QualityProfile::SmartAuto;
+            let is_lossless = matches!(
+                self.quality_profile,
+                QualityProfile::StudioLossless | QualityProfile::StudioLossless24Bit
+            );
+            let is_low_lat = self.quality_profile == QualityProfile::LowLatencyCompressed;
+            let is_max_range = self.quality_profile == QualityProfile::MaxStability24Ghz;
+
+            if Self::mode_preset_card(
+                &mut cols[0],
+                dark,
+                is_auto,
+                "Smart Auto",
+                "Adapts to Wi-Fi quality",
+                "Default",
+            ) {
+                self.quality_profile = QualityProfile::SmartAuto;
+                if let Some(ref host) = self.host_engine {
+                    host.telemetry
+                        .quality_profile
+                        .store(self.quality_profile as u8, Ordering::Relaxed);
+                }
+            }
+
+            let lossless_badge = if self.quality_profile == QualityProfile::StudioLossless24Bit {
+                "24-Bit"
+            } else {
+                "16-Bit"
+            };
+            if Self::mode_preset_card(
+                &mut cols[1],
+                dark,
+                is_lossless,
+                "Lossless HD",
+                "100% bit-exact studio audio",
+                lossless_badge,
+            ) {
+                if !is_lossless {
+                    self.quality_profile = QualityProfile::StudioLossless;
+                }
+                if let Some(ref host) = self.host_engine {
+                    host.telemetry
+                        .quality_profile
+                        .store(self.quality_profile as u8, Ordering::Relaxed);
+                }
+            }
+
+            if Self::mode_preset_card(
+                &mut cols[2],
+                dark,
+                is_low_lat,
+                "Low-Latency VBR",
+                "Compact fast wireless stream",
+                &format!("{}k", self.target_bitrate_kbps),
+            ) {
+                self.quality_profile = QualityProfile::LowLatencyCompressed;
+                if let Some(ref host) = self.host_engine {
+                    host.telemetry
+                        .quality_profile
+                        .store(self.quality_profile as u8, Ordering::Relaxed);
+                }
+            }
+
+            if Self::mode_preset_card(
+                &mut cols[3],
+                dark,
+                is_max_range,
+                "Max Range 2.4G",
+                "10 ms framing through walls",
+                "10 ms",
+            ) {
+                self.quality_profile = QualityProfile::MaxStability24Ghz;
+                if let Some(ref host) = self.host_engine {
+                    host.telemetry
+                        .quality_profile
+                        .store(self.quality_profile as u8, Ordering::Relaxed);
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // =========================================================================
+        // 3. CONNECTED DEVICES CARD (Always Visible, Clean Empty State)
+        // =========================================================================
+        Self::studio_card(ui, dark, |ui| {
+            let clients = self
+                .host_engine
+                .as_ref()
+                .map(|h| h.connected_clients())
+                .unwrap_or_default();
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Connected Receivers ({})", clients.len()))
+                        .size(13.5)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Pair New Phone (QR)").clicked() {
+                        self.interfaces = list_valid_host_interfaces();
+                        self.selected_qr_iface_idx =
+                            refreshed_qr_iface_index(&self.interfaces, self.selected_qr_iface_idx);
+                        self.show_qr_modal = true;
+                    }
+                });
+            });
+
+            if clients.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No receivers connected — tap this PC in the Android app or click 'Pair New Phone (QR)'.",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                );
+            } else if let Some(ref host) = self.host_engine {
+                ui.separator();
+                for client in clients {
+                    ui.horizontal(|ui| {
+                        let badge = if client.is_usb { "USB" } else { "Wi-Fi" };
+                        Self::status_pill(
+                            ui,
+                            badge,
+                            egui::Color32::from_rgb(30, 58, 138),
+                            egui::Color32::WHITE,
+                        );
+                        ui.monospace(format!(
+                            "{}   •   Vol: {}%   •   Loss: {:.1}%   •   BT: {} ms",
+                            client.addr,
+                            client.client_volume,
+                            (client.fec_rate_permille as f32) / 10.0,
+                            client.bluetooth_delay_ms
+                        ));
+                        let mute_label = if client.muted { "Unmute" } else { "Mute" };
+                        if ui.small_button(mute_label).clicked() {
+                            host.set_client_muted(client.addr, !client.muted);
+                        }
+                        if ui.small_button("Kick").clicked() {
+                            host.kick_client(client.addr);
+                        }
+                    });
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+
+        // =========================================================================
+        // 4. PRO DRAWER 1: Codec, Bitrate, Frame Pacing & Multi-Device Sync
+        // =========================================================================
+        let profile_badge = match self.quality_profile {
+            QualityProfile::SmartAuto => "Smart Auto",
+            QualityProfile::StudioLossless => "16-Bit Lossless",
+            QualityProfile::StudioLossless24Bit => "24-Bit Master",
+            QualityProfile::LowLatencyCompressed => "Compressed VBR",
+            QualityProfile::MaxStability24Ghz => "10ms 2.4G",
+        };
+        let engine_badge = if self.prefer_opus {
+            "Opus RLD"
+        } else {
+            "Rust VBR"
+        };
+        let pacing_badge = if self.usb_low_latency_pacing {
+            "2.5ms USB"
+        } else {
+            "5.0ms Wi-Fi"
+        };
+        Self::drawer_header(
+            ui,
+            dark,
+            &mut self.host_pro_codec_open,
+            "Pro Codec, Bitrate & Sync Tuning",
+            &[profile_badge, engine_badge, pacing_badge],
+        );
+
+        if self.host_pro_codec_open {
+            ui.add_space(4.0);
+            Self::studio_card(ui, dark, |ui| {
+                ui.label(
+                    egui::RichText::new("Exact Quality Profile & Bit Depth")
+                        .size(12.0)
+                        .strong(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for (profile, label) in [
+                        (QualityProfile::SmartAuto, "Smart Auto"),
+                        (
+                            QualityProfile::StudioLossless,
+                            "Studio Lossless 16-Bit (0ms)",
+                        ),
+                        (
+                            QualityProfile::StudioLossless24Bit,
+                            "Studio Master 24-Bit (0ms)",
+                        ),
+                        (
+                            QualityProfile::LowLatencyCompressed,
+                            "Low-Latency Compressed",
+                        ),
+                        (
+                            QualityProfile::MaxStability24Ghz,
+                            "Max Stability (10ms 2.4GHz)",
+                        ),
+                    ] {
+                        if Self::pill_choice(ui, dark, self.quality_profile == profile, label) {
+                            self.quality_profile = profile;
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .quality_profile
+                                    .store(self.quality_profile as u8, Ordering::Relaxed);
+                            }
+                        }
                     }
                 });
 
-                // Multi-Device Acoustic Group Sync Controls
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Compressed Codec Module")
+                        .size(12.0)
+                        .strong(),
+                );
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .checkbox(
-                            &mut self.enable_group_sync,
-                            "🔗 Multi-Device Acoustic Sync (Lock All Phones/Speakers in Phase)",
-                        )
-                        .changed()
-                    {
-                        host.telemetry
-                            .enable_group_sync
-                            .store(self.enable_group_sync, Ordering::Relaxed);
+                    if Self::pill_choice(
+                        ui,
+                        dark,
+                        !self.prefer_opus,
+                        "Pure-Rust VBR (Default, 0ms)",
+                    ) {
+                        self.prefer_opus = false;
+                        if let Some(ref host) = self.host_engine {
+                            host.telemetry.prefer_opus.store(false, Ordering::Relaxed);
+                        }
                     }
-                    if self.enable_group_sync {
-                        ui.label("Room Trim:");
+                    if Self::pill_choice(
+                        ui,
+                        dark,
+                        self.prefer_opus,
+                        "Opus RLD (Pure Rust, 2.5ms lookahead)",
+                    ) {
+                        self.prefer_opus = true;
+                        if let Some(ref host) = self.host_engine {
+                            host.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+
+                if matches!(
+                    self.quality_profile,
+                    QualityProfile::LowLatencyCompressed
+                        | QualityProfile::SmartAuto
+                        | QualityProfile::MaxStability24Ghz
+                ) {
+                    let stability = self.quality_profile == QualityProfile::MaxStability24Ghz;
+                    let choices: &[u16] = if stability {
+                        &[96, 160]
+                    } else {
+                        &[96, 160, 256, 320]
+                    };
+                    let effective = if stability {
+                        self.target_bitrate_kbps.clamp(96, 160)
+                    } else {
+                        self.target_bitrate_kbps
+                    };
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Target Compressed Bitrate")
+                            .size(12.0)
+                            .strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for &kbps in choices {
+                            if Self::pill_choice(
+                                ui,
+                                dark,
+                                effective == kbps,
+                                &format!("{} kbps", kbps),
+                            ) {
+                                self.target_bitrate_kbps = kbps;
+                                if let Some(ref host) = self.host_engine {
+                                    host.telemetry
+                                        .target_bitrate_kbps
+                                        .store(self.target_bitrate_kbps, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    });
+                    if stability {
+                        ui.label(
+                            egui::RichText::new(
+                                "2.4G stability caps the target at 160 kbps and steps down to 96 kbps above 200‰ loss.",
+                            )
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                        );
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.separator();
+
+                ui.columns(2, |cols| {
+                    cols[0].vertical(|ui| {
+                        Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "2.5 ms USB Frame Pacing",
+                            "Single-subframe packets (OFF = 5.0 ms bundled Wi-Fi)",
+                            &mut self.usb_low_latency_pacing,
+                        );
+                        Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "Smart DTX Silence Saver",
+                            "Halts audio packets during silence (0.6 kbps heartbeat)",
+                            &mut self.enable_smart_dtx,
+                        );
+                        Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "Auto Virtual Speaker & Scan Lock",
+                            "Switches PC output on connect & suppresses 60s Wi-Fi scans",
+                            &mut self.enable_virtual_speaker,
+                        );
+                    });
+                    cols[1].vertical(|ui| {
+                        Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "Auto Bluetooth Video Lip-Sync",
+                            "Applies PipeWire offset matching phone Bluetooth delay",
+                            &mut self.auto_bt_video_lipsync,
+                        );
+                        if Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "Multi-Device Acoustic Group Sync",
+                            "Locks all connected phones and speakers in phase",
+                            &mut self.enable_group_sync,
+                        ) {
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .enable_group_sync
+                                    .store(self.enable_group_sync, Ordering::Relaxed);
+                            }
+                        }
+                        Self::setting_switch_row(
+                            ui,
+                            dark,
+                            "440 Hz / 554 Hz Test Chord",
+                            "Synthesizes reference tone instead of system capture",
+                            &mut self.use_test_tone,
+                        );
+                    });
+                });
+
+                if self.enable_group_sync {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Room Alignment Trim:")
+                                .size(12.0)
+                                .strong(),
+                        );
                         if ui
                             .add(
                                 egui::Slider::new(&mut self.group_sync_trim_ms, 0..=120)
@@ -1122,656 +2073,584 @@ impl AudioShareApp {
                             )
                             .changed()
                         {
-                            host.telemetry
-                                .manual_group_sync_trim_ms
-                                .store(self.group_sync_trim_ms, Ordering::Relaxed);
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .manual_group_sync_trim_ms
+                                    .store(self.group_sync_trim_ms, Ordering::Relaxed);
+                            }
                         }
-                    }
-                });
-
-                if bt_delay > 40 {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!(
-                            "🎧 Phone Bluetooth Earbuds Active (+{} ms A2DP delay) — Auto Video Lip-Sync Applied!",
-                            bt_delay
-                        ),
-                    );
+                    });
                 }
-
-                ui.separator();
-                let clients = host.connected_clients();
-                if clients.is_empty() {
-                    ui.label("Waiting for clients (Click '📱 Scan QR to Connect Phone' in top-right or use mDNS)...");
-                } else {
-                    for client in clients {
-                        ui.horizontal(|ui| {
-                            let badge = if client.is_usb { "[USB]" } else { "[Wi-Fi]" };
-                            ui.monospace(format!(
-                                "{} {} (Vol: {}% | Loss: {:.1}% | BT Delay: {}ms)",
-                                badge,
-                                client.addr,
-                                client.client_volume,
-                                (client.fec_rate_permille as f32) / 10.0,
-                                client.bluetooth_delay_ms
-                            ));
-                            let mute_label = if client.muted { "Unmute" } else { "Mute" };
-                            if ui.button(mute_label).clicked() {
-                                host.set_client_muted(client.addr, !client.muted);
-                            }
-                            if ui.button("Kick").clicked() {
-                                host.kick_client(client.addr);
-                            }
-                        });
-                    }
-                }
-            } else {
-                ui.label("Start the Host Server to view connected clients and telemetry.");
-            }
-        });
+            });
+        }
 
         ui.add_space(8.0);
 
-        ui.group(|ui| {
-            ui.heading("🛡️ Security, Per-App Audio Routing & Bidirectional Phone Mic");
-
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(
-                        &mut self.enable_pin_encryption,
-                        "🔒 ChaCha20 + MAC32 Encryption — PIN:",
-                    )
-                    .changed()
-                {
-                    if let Some(ref host) = self.host_engine {
-                        let pin = if self.enable_pin_encryption {
-                            Some(self.pairing_pin.as_str())
-                        } else {
-                            None
-                        };
-                        host.set_encryption_pin(pin);
-                    }
-                }
-                ui.add_sized(
-                    [80.0, 22.0],
-                    egui::TextEdit::singleline(&mut self.pairing_pin),
-                );
-                if ui.button("Apply PIN").clicked() {
-                    if let Some(ref host) = self.host_engine {
-                        let pin = if self.enable_pin_encryption {
-                            Some(self.pairing_pin.as_str())
-                        } else {
-                            None
-                        };
-                        host.set_encryption_pin(pin);
-                    }
-                }
-            });
-
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("🎯 Per-App Capture:");
-                if ui
-                    .selectable_label(self.selected_app_idx.is_none(), "🌐 All System Audio")
-                    .clicked()
-                {
-                    self.selected_app_idx = None;
-                    self.app_route_status = restore_all_apps_to_default_sink();
-                }
-                if ui.button("🔄 Refresh Apps").clicked() {
-                    self.audio_apps = list_active_audio_apps();
-                }
-                for (idx, app) in self.audio_apps.iter().enumerate() {
-                    let selected = self.selected_app_idx == Some(idx);
-                    if ui
-                        .selectable_label(selected, format!("{} ({})", app.name, app.pid))
-                        .clicked()
-                    {
-                        self.selected_app_idx = Some(idx);
-                        match route_single_app_to_audioshare(app) {
-                            Ok(msg) => self.app_route_status = msg,
-                            Err(err) => self.app_route_status = err,
-                        }
-                    }
-                }
-            });
-            ui.monospace(&self.app_route_status);
-
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("📲 Phone -> PC Mode:");
-                let mut mode_changed = false;
-                mode_changed |= ui
-                    .selectable_value(
-                        &mut self.phone_rx_mode,
-                        PhoneRxRoutingMode::VirtualMicForCalls,
-                        "🎙️ Virtual Mic (Zoom / Discord / Meet)",
-                    )
-                    .changed();
-                mode_changed |= ui
-                    .selectable_value(
-                        &mut self.phone_rx_mode,
-                        PhoneRxRoutingMode::PlayOnPcSpeakers,
-                        "🔊 Play Phone Audio on PC Speakers",
-                    )
-                    .changed();
-
-                // Hot-swap routing mode immediately if receiver is already active!
-                if mode_changed && self.phone_mic_receiver.is_some() {
-                    if let Some(mut m) = self.phone_mic_receiver.take() {
-                        m.stop();
-                    }
-                    self.phone_mic_receiver =
-                        PhoneMicReceiver::start_with_mode(PHONE_MIC_PORT, self.phone_rx_mode).ok();
-                }
-
-                let mic_active = self.phone_mic_receiver.is_some();
-                let btn_label = if mic_active {
-                    "⏹ Stop Phone Receiver"
-                } else {
-                    "▶ Start Phone Receiver (Port 65532)"
-                };
-                if ui.button(btn_label).clicked() {
-                    if let Some(mut m) = self.phone_mic_receiver.take() {
-                        m.stop();
-                    } else if let Ok(rx) =
-                        PhoneMicReceiver::start_with_mode(PHONE_MIC_PORT, self.phone_rx_mode)
-                    {
-                        self.phone_mic_receiver = Some(rx);
-                    }
-                }
-
-                if let Some(ref mic) = self.phone_mic_receiver {
-                    let pkts = mic.mic_packets_received.load(Ordering::Relaxed);
-                    let peak = mic.mic_peak_level_pct.load(Ordering::Relaxed);
-                    ui.monospace(format!("RX Phone Pkts: {} | Level: {}%", pkts, peak));
-
-                    if let Some(ref host) = self.host_engine {
-                        if ui.button("📡 Ping True Acoustic Latency (Sonar)").clicked() {
-                            host.telemetry
-                                .trigger_sonar_ping
-                                .store(true, Ordering::Relaxed);
-                        }
-                        let tx_us = host.telemetry.sonar_tx_timestamp_us.load(Ordering::Relaxed);
-                        let rx_us = mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
-                        if rx_us > tx_us && (rx_us - tx_us) < 500_000 {
-                            self.measured_sonar_ms = Some(((rx_us - tx_us) as f32) / 2000.0);
-                            self.measured_sonar_at = Some(Instant::now());
-                        }
-                    }
-                }
-                if let Some(ms) = self.measured_sonar_ms {
-                    let age_s = self
-                        .measured_sonar_at
-                        .map(|t| t.elapsed().as_secs())
-                        .unwrap_or(0);
-                    ui.colored_label(
-                        egui::Color32::LIGHT_GREEN,
-                        format!("⚡ Measured One-Way Latency: {:.1} ms ({}s ago)", ms, age_s),
-                    );
-                }
-            });
-        });
-    }
-
-    fn render_latency_debug(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new(
-                "Live values are published by the audio threads. The estimate is not an acoustic measurement.",
-            )
-            .small()
-            .color(egui::Color32::GRAY),
+        // =========================================================================
+        // 5. PRO DRAWER 2: Per-App Audio Capture & Bidirectional Phone Receiver
+        // =========================================================================
+        let source_summary = if self.selected_app_idx.is_none() {
+            "All System Audio"
+        } else {
+            "Single App Routed"
+        };
+        let mic_summary = if self.phone_mic_receiver.is_some() {
+            "Phone RX: LIVE"
+        } else {
+            "Phone RX: Off"
+        };
+        Self::drawer_header(
+            ui,
+            dark,
+            &mut self.host_routing_mic_open,
+            "App Audio Picker & Phone Microphone (Port 65532)",
+            &[source_summary, mic_summary],
         );
-        ui.separator();
 
-        let sonar_ms = self.measured_sonar_ms;
-        let sonar_age_s = self.measured_sonar_at.map(|t| t.elapsed().as_secs_f32());
-        let mut any_engine = false;
-
-        if let Some(ref host) = self.host_engine {
-            any_engine = true;
-            ui.heading("Host: capture → wire");
-            let pacing_ms =
-                host.telemetry.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0;
-            let capture_ms =
-                host.telemetry.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0;
-            let subframes = host
-                .telemetry
-                .tx_subframes_per_packet
-                .load(Ordering::Relaxed);
-            let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
-            let clients = host.connected_clients();
-            let bt_max = host
-                .telemetry
-                .max_client_bt_delay_ms
-                .load(Ordering::Relaxed);
-            let downstream_max = host
-                .telemetry
-                .max_client_downstream_delay_ms
-                .load(Ordering::Relaxed);
-            let room_trim = host
-                .telemetry
-                .manual_group_sync_trim_ms
-                .load(Ordering::Relaxed);
-
-            egui::Grid::new("host_latency_grid")
-                .num_columns(2)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("Packetization");
-                    ui.monospace(format!(
-                        "{:.1} ms ({} × {:.1} ms, {})",
-                        pacing_ms, subframes, SUBFRAME_MS, codec
-                    ));
-                    ui.end_row();
-
-                    ui.label("Capture backlog");
-                    ui.monospace(format!("{:.1} ms", capture_ms));
-                    ui.end_row();
-
-                    ui.label("Host pipeline");
-                    ui.monospace(format!("{:.1} ms", capture_ms + pacing_ms));
-                    ui.end_row();
-
-                    ui.label("Connected clients");
-                    ui.monospace(format!("{}", clients.len()));
-                    ui.end_row();
-
-                    ui.label("Downstream max");
-                    ui.monospace(format!("{} ms (BT max {} ms)", downstream_max, bt_max));
-                    ui.end_row();
-
-                    ui.label("Room trim");
-                    ui.monospace(format!("+{} ms", room_trim));
-                    ui.end_row();
-
-                    ui.label("Acoustic sonar");
-                    match (sonar_ms, sonar_age_s) {
-                        (Some(ms), Some(age)) => {
-                            ui.monospace(format!("{:.1} ms ({:.0}s ago)", ms, age));
-                        }
-                        (Some(ms), None) => {
-                            ui.monospace(format!("{:.1} ms", ms));
-                        }
-                        _ => {
-                            ui.label("not measured");
-                        }
-                    }
-                    ui.end_row();
-                });
-
-            if clients.is_empty() {
-                ui.label("No clients connected.");
-            } else {
-                for c in &clients {
-                    let badge = if c.is_usb { "⚡ USB" } else { "📶 Wi-Fi" };
-                    ui.monospace(format!(
-                        "{} {} | Loss {:.1}% | BT {} ms | DAC {} ms | Vol {}%{}",
-                        badge,
-                        c.addr,
-                        (c.fec_rate_permille as f32) / 10.0,
-                        c.bluetooth_delay_ms,
-                        c.hardware_delay_ms,
-                        c.client_volume,
-                        if c.muted { " | MUTED" } else { "" }
-                    ));
-                }
-            }
-        }
-
-        if any_engine {
-            ui.separator();
-        }
-
-        if let Some(ref client) = self.client_engine {
-            any_engine = true;
-            let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
-
-            ui.heading("Client: ingress → speaker");
-            ui.monospace(
-                egui::RichText::new(format!(
-                    "Estimated one-way: {:.1} ms",
-                    snap.estimated_one_way_ms()
-                ))
-                .strong()
-                .color(egui::Color32::LIGHT_GREEN),
-            );
-
-            egui::Grid::new("client_latency_grid")
-                .num_columns(2)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label("Sender packetization");
-                    ui.monospace(format!("{:.1} ms", snap.packet_interval_ms));
-                    ui.end_row();
-
-                    ui.label("Network jitter");
-                    ui.monospace(format!("{:.1} ms (sizes the FIFO)", snap.network_jitter_ms));
-                    ui.end_row();
-
-                    ui.label("Adaptive cushion");
-                    ui.monospace(format!("{:.1} ms", snap.adaptive_buffer_ms));
-                    ui.end_row();
-
-                    ui.label("Target FIFO");
-                    ui.monospace(format!("{:.1} ms", snap.target_buffer_ms));
-                    ui.end_row();
-
-                    ui.label("Group sync addition");
-                    ui.monospace(format!("+{:.1} ms", snap.group_sync_extra_ms));
-                    ui.end_row();
-
-                    ui.label("Buffered right now");
-                    ui.monospace(format!("{:.1} ms", snap.buffered_audio_ms));
-                    ui.end_row();
-
-                    ui.label("Downstream stage");
-                    ui.monospace(format!("{:.1} ms", snap.downstream_stage_ms()));
-                    ui.end_row();
-
-                    ui.label("DAC queue");
-                    if snap.hardware_delay_ms > 0 {
-                        ui.monospace(format!("{} ms (measured)", snap.hardware_delay_ms));
-                    } else {
-                        ui.label("not measured on this platform");
-                    }
-                    ui.end_row();
-
-                    ui.label("Bluetooth estimate");
-                    if snap.bluetooth_delay_ms > 0 {
-                        ui.monospace(format!(
-                            "{} ms (fixed A2DP estimate)",
-                            snap.bluetooth_delay_ms
-                        ));
-                    } else {
-                        ui.label("not routed");
-                    }
-                    ui.end_row();
-
-                    ui.label("Desktop output buffer");
-                    ui.monospace(format!("{:.1} ms (configured)", snap.output_buffer_ms));
-                    ui.end_row();
-
-                    ui.label("Codec lookahead");
-                    if snap.codec_lookahead_ms > 0.0 {
-                        ui.monospace(format!("{:.1} ms (Opus RLD)", snap.codec_lookahead_ms));
-                    } else {
-                        ui.monospace("0.0 ms (lossless/VBR)");
-                    }
-                    ui.end_row();
-
-                    ui.label("Prebuffer");
-                    ui.monospace(if snap.prebuffer_ready {
-                        "READY"
-                    } else {
-                        "FILLING"
-                    });
-                    ui.end_row();
-
-                    ui.label("Codec");
-                    ui.monospace(snap.codec_name());
-                    ui.end_row();
-                });
-
-            let fill = if snap.target_buffer_ms > 0.0 {
-                (snap.buffered_audio_ms / snap.target_buffer_ms).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            ui.add(egui::ProgressBar::new(fill).text(format!(
-                "FIFO fill: {:.1} / {:.1} ms",
-                snap.buffered_audio_ms, snap.target_buffer_ms
-            )));
-
+        if self.host_routing_mic_open {
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(
-                    "Estimate = packetization + target FIFO + max(DAC, BT, desktop output) + codec \
-                     lookahead. Group sync is already inside the target FIFO. Excludes one-way \
-                     network transit and the acoustic air path; use the sonar for end-to-end.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-        }
+            Self::studio_card(ui, dark, |ui| {
+                ui.columns(2, |cols| {
+                    // Left: Per-App Capture
+                    cols[0].vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Per-Application Audio Capture")
+                                .size(13.0)
+                                .strong(),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if Self::pill_choice(
+                                ui,
+                                dark,
+                                self.selected_app_idx.is_none(),
+                                "All System Audio",
+                            ) {
+                                self.selected_app_idx = None;
+                                self.app_route_status = restore_all_apps_to_default_sink();
+                            }
+                            if ui.button("Refresh Apps").clicked() {
+                                self.audio_apps = list_active_audio_apps();
+                            }
+                        });
+                        if !self.audio_apps.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                for (idx, app) in self.audio_apps.iter().enumerate() {
+                                    let selected = self.selected_app_idx == Some(idx);
+                                    if Self::pill_choice(
+                                        ui,
+                                        dark,
+                                        selected,
+                                        &format!("{} ({})", app.name, app.pid),
+                                    ) {
+                                        self.selected_app_idx = Some(idx);
+                                        match route_single_app_to_audioshare(app) {
+                                            Ok(msg) => self.app_route_status = msg,
+                                            Err(err) => self.app_route_status = err,
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new(&self.app_route_status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(130, 144, 168)),
+                        );
+                    });
 
-        if !any_engine {
-            ui.label("Start the Host Server or connect to a Client to see live latency.");
+                    // Right: Phone -> PC Receiver
+                    cols[1].vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Phone-to-PC Receiver (Port 65532)")
+                                .size(13.0)
+                                .strong(),
+                        );
+                        let mut mode_changed = false;
+                        ui.horizontal_wrapped(|ui| {
+                            if Self::pill_choice(
+                                ui,
+                                dark,
+                                self.phone_rx_mode == PhoneRxRoutingMode::VirtualMicForCalls,
+                                "Virtual Mic (Zoom / Discord)",
+                            ) && self.phone_rx_mode != PhoneRxRoutingMode::VirtualMicForCalls
+                            {
+                                self.phone_rx_mode = PhoneRxRoutingMode::VirtualMicForCalls;
+                                mode_changed = true;
+                            }
+                            if Self::pill_choice(
+                                ui,
+                                dark,
+                                self.phone_rx_mode == PhoneRxRoutingMode::PlayOnPcSpeakers,
+                                "Play on PC Speakers",
+                            ) && self.phone_rx_mode != PhoneRxRoutingMode::PlayOnPcSpeakers
+                            {
+                                self.phone_rx_mode = PhoneRxRoutingMode::PlayOnPcSpeakers;
+                                mode_changed = true;
+                            }
+                        });
+
+                        if mode_changed && self.phone_mic_receiver.is_some() {
+                            if let Some(mut m) = self.phone_mic_receiver.take() {
+                                m.stop();
+                            }
+                            self.phone_mic_receiver = PhoneMicReceiver::start_with_mode(
+                                PHONE_MIC_PORT,
+                                self.phone_rx_mode,
+                            )
+                            .ok();
+                        }
+
+                        ui.horizontal_wrapped(|ui| {
+                            let mic_active = self.phone_mic_receiver.is_some();
+                            let (btn_label, btn_col) = if mic_active {
+                                (
+                                    "■  Stop Phone Receiver",
+                                    egui::Color32::from_rgb(185, 28, 28),
+                                )
+                            } else {
+                                (
+                                    "▶  Start Phone Receiver",
+                                    egui::Color32::from_rgb(37, 99, 235),
+                                )
+                            };
+                            let btn = egui::Button::new(
+                                egui::RichText::new(btn_label)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(btn_col);
+                            if ui.add(btn).clicked() {
+                                if let Some(mut m) = self.phone_mic_receiver.take() {
+                                    m.stop();
+                                } else if let Ok(rx) = PhoneMicReceiver::start_with_mode(
+                                    PHONE_MIC_PORT,
+                                    self.phone_rx_mode,
+                                ) {
+                                    self.phone_mic_receiver = Some(rx);
+                                }
+                            }
+
+                            if let Some(ref mic) = self.phone_mic_receiver {
+                                let pkts = mic.mic_packets_received.load(Ordering::Relaxed);
+                                let peak = mic.mic_peak_level_pct.load(Ordering::Relaxed);
+                                Self::status_pill(
+                                    ui,
+                                    &format!("RX: {} pkts • Peak: {}%", pkts, peak),
+                                    egui::Color32::from_rgb(20, 83, 45),
+                                    egui::Color32::from_rgb(134, 239, 172),
+                                );
+
+                                if let Some(ref host) = self.host_engine {
+                                    if ui.button("Ping Acoustic Latency (Sonar)").clicked() {
+                                        host.telemetry
+                                            .trigger_sonar_ping
+                                            .store(true, Ordering::Relaxed);
+                                    }
+                                    let tx_us = host
+                                        .telemetry
+                                        .sonar_tx_timestamp_us
+                                        .load(Ordering::Relaxed);
+                                    let rx_us =
+                                        mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
+                                    if rx_us > tx_us && (rx_us - tx_us) < 500_000 {
+                                        self.measured_sonar_ms =
+                                            Some(((rx_us - tx_us) as f32) / 2000.0);
+                                        self.measured_sonar_at = Some(Instant::now());
+                                    }
+                                }
+                            }
+                            if let Some(ms) = self.measured_sonar_ms {
+                                let age_s = self
+                                    .measured_sonar_at
+                                    .map(|t| t.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                Self::status_pill(
+                                    ui,
+                                    &format!("Measured One-Way: {:.1} ms ({}s ago)", ms, age_s),
+                                    egui::Color32::from_rgb(20, 83, 45),
+                                    egui::Color32::from_rgb(134, 239, 172),
+                                );
+                            }
+                        });
+                    });
+                });
+            });
         }
     }
 
     fn render_client_tab(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.heading("1-Tap Auto-Discovered Hosts (LAN & USB)");
+        let dark = self.dark_mode;
+
+        // =========================================================================
+        // 1. SIMPLE CONNECTION CONSOLE (Auto-Discovered Hosts + 1-Click Connect)
+        // =========================================================================
+        Self::studio_card(ui, dark, |ui| {
             let discovered = self.scanner.discovered_hosts();
-            if discovered.is_empty() {
-                ui.label("Scanning LAN & USB for AudioShare Ultra beacons...");
-            } else {
-                for host in discovered {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Available AudioShare Hosts")
+                        .size(14.5)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.client_engine.is_some() {
+                        let disc_btn = egui::Button::new(
+                            egui::RichText::new("■  Disconnect")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(185, 28, 28));
+                        if ui.add(disc_btn).clicked() {
+                            if let Some(mut c) = self.client_engine.take() {
+                                c.stop();
+                            }
+                            self.client_status_msg = "Disconnected.".into();
+                        }
+                    }
+                    let manual_lbl = if self.client_manual_ip_open {
+                        "Hide Manual IP"
+                    } else {
+                        "Manual IP / USB"
+                    };
+                    if Self::pill_choice(ui, dark, self.client_manual_ip_open, manual_lbl) {
+                        self.client_manual_ip_open = !self.client_manual_ip_open;
+                    }
+                });
+            });
+
+            ui.label(
+                egui::RichText::new(&self.client_status_msg)
+                    .size(12.0)
+                    .color(if self.client_engine.is_some() {
+                        egui::Color32::from_rgb(134, 239, 172)
+                    } else {
+                        egui::Color32::from_rgb(130, 144, 168)
+                    }),
+            );
+
+            if !discovered.is_empty() {
+                ui.separator();
+                for host in &discovered {
                     ui.horizontal(|ui| {
-                        let badge = if host.is_usb { "⚡ USB" } else { "📶 Wi-Fi" };
-                        ui.monospace(format!("{} {} ({})", badge, host.hostname, host.addr));
-                        if ui.button("Connect Now").clicked() {
+                        let badge = if host.is_usb { "USB" } else { "Wi-Fi" };
+                        Self::status_pill(
+                            ui,
+                            badge,
+                            egui::Color32::from_rgb(30, 58, 138),
+                            egui::Color32::WHITE,
+                        );
+                        ui.monospace(format!("{} ({})", host.hostname, host.addr));
+                        if ui.button("▶  Connect Now").clicked() {
                             self.usb_buffer_mode = host.is_usb;
                             self.connect_client(host.addr);
                         }
                     });
                 }
+            } else if !self.client_manual_ip_open {
+                ui.label(
+                    egui::RichText::new(
+                        "Scanning LAN & USB for beacons... Click 'Manual IP / USB' to enter an address directly.",
+                    )
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                );
             }
 
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Manual Host IP:Port:");
-                ui.text_edit_singleline(&mut self.manual_server_ip);
-                if ui
-                    .checkbox(&mut self.gaming_hard_lock, "🎮 Gaming 5ms Hard-Lock")
-                    .changed()
-                {
-                    if let Some(ref c) = self.client_engine {
-                        self.sync_client_dsp_atomics(c);
+            if self.client_manual_ip_open || discovered.is_empty() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Host IP:Port:").size(12.5).strong());
+                    ui.add_sized(
+                        [210.0, 26.0],
+                        egui::TextEdit::singleline(&mut self.manual_server_ip),
+                    );
+                    let connect_btn = egui::Button::new(
+                        egui::RichText::new("▶  Connect")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(22, 163, 74));
+                    if ui.add(connect_btn).clicked() {
+                        if let Ok(addr) = self.manual_server_ip.parse::<SocketAddr>() {
+                            self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
+                            self.connect_client(addr);
+                        } else if let Ok(addr) =
+                            format!("{}:{}", self.manual_server_ip, DEFAULT_PORT)
+                                .parse::<SocketAddr>()
+                        {
+                            self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
+                            self.connect_client(addr);
+                        }
                     }
-                }
-                if ui.button("Connect").clicked() {
-                    if let Ok(addr) = self.manual_server_ip.parse::<SocketAddr>() {
-                        // The scanner sets this for discovered hosts. Manual
-                        // entry, QR URIs and saved addresses bypass that path,
-                        // so detect USB tethering from the destination address.
-                        self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                        self.connect_client(addr);
-                    } else if let Ok(addr) =
-                        format!("{}:{}", self.manual_server_ip, DEFAULT_PORT).parse::<SocketAddr>()
-                    {
-                        self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                        self.connect_client(addr);
+                    if ui.button("USB Localhost").clicked() {
+                        self.manual_server_ip = format!("127.0.0.1:{}", DEFAULT_PORT);
                     }
-                }
-                if self.client_engine.is_some() && ui.button("Disconnect").clicked() {
-                    if let Some(mut c) = self.client_engine.take() {
-                        c.stop();
-                    }
-                    self.client_status_msg = "Disconnected.".into();
-                }
-            });
-            ui.label(&self.client_status_msg);
+                });
+            }
         });
 
         ui.add_space(8.0);
 
-        // Studio Pre-Amp, 3-Band Biquad EQ, Spatial Role & Binaural Crossfeed (0.00ms Delay!)
-        ui.group(|ui| {
-            ui.heading("🎛️ Zero-Latency Studio DSP (3-Band EQ, Spatial Role & Binaural Crossfeed)");
-
-            let mut dsp_changed = false;
-            // 1-Click Studio EQ Presets
+        // =========================================================================
+        // 2. SIMPLE SOUND PROFILE & 3 ENHANCEMENT CARDS (Always Visible)
+        // =========================================================================
+        let mut dsp_changed = false;
+        Self::studio_card(ui, dark, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("✨ 1-Click EQ Presets:");
+                ui.label(egui::RichText::new("Sound Profile:").size(13.0).strong());
                 for (name, b, p, t) in [
                     ("Flat (Studio)", 0.0, 0.0, 0.0),
-                    ("🔥 Bass Boost", 6.5, 0.0, 1.5),
-                    ("🎙️ Vocal / Podcast", -2.0, 5.5, 2.0),
-                    ("🎮 FPS Footsteps", -3.0, 6.0, 4.5),
-                    ("🎧 Harman Target", 4.5, 1.5, 3.0),
+                    ("Bass Boost", 6.5, 0.0, 1.5),
+                    ("Vocal / Podcast", -2.0, 5.5, 2.0),
+                    ("FPS Footsteps", -3.0, 6.0, 4.5),
+                    ("Harman Target", 4.5, 1.5, 3.0),
                 ] {
-                    if ui.button(name).clicked() {
+                    let is_preset = (self.eq_bass_db - b).abs() < 0.05
+                        && (self.eq_presence_db - p).abs() < 0.05
+                        && (self.eq_treble_db - t).abs() < 0.05;
+                    if Self::pill_choice(ui, dark, is_preset, name) {
                         self.eq_bass_db = b;
                         self.eq_presence_db = p;
                         self.eq_treble_db = t;
                         dsp_changed = true;
                     }
                 }
-            });
-            ui.separator();
-
-            // egui's default slider track is only 100 px wide, which makes a
-            // 24-36 dB EQ range jump by roughly a quarter dB per pixel. Put
-            // each slider on its own row and stretch the track to the card so
-            // fine adjustments stay possible at the 700 px minimum width.
-            egui::Grid::new("client_dsp_slider_grid")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    for (label, value, range) in [
-                        ("Pre-Amp Gain", &mut self.preamp_gain_db, -12.0..=24.0),
-                        ("Bass (90 Hz)", &mut self.eq_bass_db, -12.0..=12.0),
-                        ("Vocal (2.5 kHz)", &mut self.eq_presence_db, -12.0..=12.0),
-                        ("Air (10 kHz)", &mut self.eq_treble_db, -12.0..=12.0),
-                    ] {
-                        ui.label(label);
-                        ui.spacing_mut().slider_width = (ui.available_width() - 70.0).max(120.0);
-                        dsp_changed |= ui
-                            .add(egui::Slider::new(value, range).suffix(" dB"))
-                            .changed();
-                        ui.end_row();
-                    }
-                });
-
-            if ui.button("Flat Reset").clicked() {
-                self.preamp_gain_db = 0.0;
-                self.eq_bass_db = 0.0;
-                self.eq_presence_db = 0.0;
-                self.eq_treble_db = 0.0;
-                dsp_changed = true;
-            }
-
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                ui.label("🔊 Spatial Channel Role:");
-                for (role, label) in [
-                    (ChannelRole::Stereo, "Stereo"),
-                    (ChannelRole::LeftMono, "Left Speaker"),
-                    (ChannelRole::RightMono, "Right Speaker"),
-                    (ChannelRole::CenterDialogue, "Center Dialogue"),
-                    (ChannelRole::SurroundAmbient, "Rear Surround"),
-                ] {
-                    if ui
-                        .selectable_value(&mut self.channel_role, role, label)
-                        .changed()
-                    {
-                        dsp_changed = true;
-                    }
+                if ui.small_button("Reset All").clicked() {
+                    self.preamp_gain_db = 0.0;
+                    self.eq_bass_db = 0.0;
+                    self.eq_presence_db = 0.0;
+                    self.eq_treble_db = 0.0;
+                    dsp_changed = true;
                 }
             });
 
-            ui.horizontal(|ui| {
-                dsp_changed |= ui
-                    .checkbox(
-                        &mut self.binaural_crossfeed,
-                        "🎧 Audiophile Bauer Binaural Headphone Crossfeed (0.00ms delay, 270µs ITD)",
-                    )
-                    .changed();
-                dsp_changed |= ui
-                    .checkbox(
-                        &mut self.night_mode_drc,
-                        "🌙 Night Mode (Boost Whispers/Footsteps +10.9dB, Tame Explosions)",
-                    )
-                    .changed();
+            ui.separator();
+            ui.columns(3, |cols| {
+                dsp_changed |= Self::setting_switch_row(
+                    &mut cols[0],
+                    dark,
+                    "3D Headphone Stage",
+                    "Binaural studio monitor crossfeed",
+                    &mut self.binaural_crossfeed,
+                );
+                dsp_changed |= Self::setting_switch_row(
+                    &mut cols[1],
+                    dark,
+                    "Night Mode DRC",
+                    "Boost whispers & tame explosions",
+                    &mut self.night_mode_drc,
+                );
+                dsp_changed |= Self::setting_switch_row(
+                    &mut cols[2],
+                    dark,
+                    "5 ms Gaming Lock",
+                    "Locks jitter target to lowest floor",
+                    &mut self.gaming_hard_lock,
+                );
             });
-
-            if dsp_changed {
-                if let Some(ref c) = self.client_engine {
-                    self.sync_client_dsp_atomics(c);
-                }
-            }
         });
 
         ui.add_space(8.0);
 
-        ui.group(|ui| {
-            ui.heading("Real-Time WSOLA Sequencer & Clock Drift Telemetry");
+        // =========================================================================
+        // 3. PRO DRAWER 1: Custom 3-Band Parametric EQ, Pre-Amp & Speaker Role
+        // =========================================================================
+        let preamp_pill = format!("Pre-Amp {:+.1} dB", self.preamp_gain_db);
+        let role_pill = match self.channel_role {
+            ChannelRole::Stereo => "Role: Stereo",
+            ChannelRole::LeftMono => "Role: Left",
+            ChannelRole::RightMono => "Role: Right",
+            ChannelRole::CenterDialogue => "Role: Vocal",
+            ChannelRole::SurroundAmbient => "Role: Surround",
+        };
+        Self::drawer_header(
+            ui,
+            dark,
+            &mut self.client_eq_drawer_open,
+            "Custom 3-Band Parametric EQ, Pre-Amp & Speaker Role",
+            &[&preamp_pill, role_pill],
+        );
+
+        if self.client_eq_drawer_open {
+            ui.add_space(4.0);
+            Self::studio_card(ui, dark, |ui| {
+                ui.columns(2, |cols| {
+                    dsp_changed |= Self::studio_fader_row(
+                        &mut cols[0],
+                        dark,
+                        "Pre-Amp Gain",
+                        "True-Peak Limited",
+                        &mut self.preamp_gain_db,
+                        -12.0..=24.0,
+                    );
+                    dsp_changed |= Self::studio_fader_row(
+                        &mut cols[0],
+                        dark,
+                        "Sub-Bass",
+                        "90 Hz",
+                        &mut self.eq_bass_db,
+                        -12.0..=12.0,
+                    );
+                    dsp_changed |= Self::studio_fader_row(
+                        &mut cols[1],
+                        dark,
+                        "Vocal Presence",
+                        "2.5 kHz",
+                        &mut self.eq_presence_db,
+                        -12.0..=12.0,
+                    );
+                    dsp_changed |= Self::studio_fader_row(
+                        &mut cols[1],
+                        dark,
+                        "Treble Air",
+                        "10 kHz",
+                        &mut self.eq_treble_db,
+                        -12.0..=12.0,
+                    );
+                });
+
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Spatial Speaker Role:")
+                            .size(12.0)
+                            .strong(),
+                    );
+                    for (role, label) in [
+                        (ChannelRole::Stereo, "Stereo"),
+                        (ChannelRole::LeftMono, "Left Speaker"),
+                        (ChannelRole::RightMono, "Right Speaker"),
+                        (ChannelRole::CenterDialogue, "Center Dialogue"),
+                        (ChannelRole::SurroundAmbient, "Rear Surround"),
+                    ] {
+                        if Self::pill_choice(ui, dark, self.channel_role == role, label) {
+                            self.channel_role = role;
+                            dsp_changed = true;
+                        }
+                    }
+                });
+            });
+        }
+
+        if dsp_changed {
+            if let Some(ref c) = self.client_engine {
+                self.sync_client_dsp_atomics(c);
+            }
+        }
+
+        ui.add_space(8.0);
+
+        // =========================================================================
+        // 4. PRO DRAWER 2: Real-Time WSOLA Sequencer & Clock-Drift Oscilloscope
+        // =========================================================================
+        let (pkts, prim, fec, plc, auth_err, drift, dtx, host_vol, group_ms, idle_secs) =
             if let Some(ref client) = self.client_engine {
-                let pkts = client.telemetry.packets_received.load(Ordering::Relaxed);
-                let prim = client
-                    .telemetry
-                    .primary_frames_played
-                    .load(Ordering::Relaxed);
-                let fec = client.telemetry.fec_healed_frames.load(Ordering::Relaxed);
-                let plc = client
-                    .telemetry
-                    .plc_extrapolated_frames
-                    .load(Ordering::Relaxed);
-                let auth_err = client.telemetry.auth_failures.load(Ordering::Relaxed);
-                let drift = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
-                let dtx = client.telemetry.server_dtx_silent.load(Ordering::Relaxed);
-
+                let drift_now = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
                 self.drift_history.pop_front();
-                self.drift_history.push_back(drift as f32);
+                self.drift_history.push_back(drift_now as f32);
+                (
+                    client.telemetry.packets_received.load(Ordering::Relaxed),
+                    client
+                        .telemetry
+                        .primary_frames_played
+                        .load(Ordering::Relaxed),
+                    client.telemetry.fec_healed_frames.load(Ordering::Relaxed),
+                    client
+                        .telemetry
+                        .plc_extrapolated_frames
+                        .load(Ordering::Relaxed),
+                    client.telemetry.auth_failures.load(Ordering::Relaxed),
+                    drift_now,
+                    client.telemetry.server_dtx_silent.load(Ordering::Relaxed),
+                    client.telemetry.host_volume.load(Ordering::Relaxed),
+                    client.telemetry.max_group_delay_ms.load(Ordering::Relaxed),
+                    client
+                        .telemetry
+                        .seconds_since_last_packet
+                        .load(Ordering::Relaxed),
+                )
+            } else {
+                (0, 0, 0, 0, 0, 0, false, 100, 0, 0)
+            };
 
-                let host_vol = client.telemetry.host_volume.load(Ordering::Relaxed);
-                let group_ms = client.telemetry.max_group_delay_ms.load(Ordering::Relaxed);
-                let idle_secs = client
-                    .telemetry
-                    .seconds_since_last_packet
-                    .load(Ordering::Relaxed);
+        let drift_pill = format!("Drift: {:+} ppm", drift);
+        let fec_pill = format!("FEC/PLC: {}/{}", fec, plc);
+        Self::drawer_header(
+            ui,
+            dark,
+            &mut self.client_telemetry_drawer_open,
+            "Real-Time WSOLA Sequencer & Clock-Drift Oscilloscope",
+            &[&fec_pill, &drift_pill],
+        );
 
-                if idle_secs >= 3 {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        format!(
-                            "⚠️ No packets from Host for {}s — Waiting for automatic reconnect...",
+        if self.client_telemetry_drawer_open {
+            ui.add_space(4.0);
+            Self::studio_card(ui, dark, |ui| {
+                if self.client_engine.is_some() && idle_secs >= 3 {
+                    Self::status_pill(
+                        ui,
+                        &format!(
+                            "No packets from Host for {}s — Waiting for automatic reconnect...",
                             idle_secs
                         ),
+                        egui::Color32::from_rgb(66, 32, 6),
+                        egui::Color32::from_rgb(253, 224, 71),
                     );
                 }
-                ui.monospace(format!(
-                    "Host Master Vol: {:<9}% | Multi-Phone Group Sync Delay: +{} ms",
-                    host_vol, group_ms
-                ));
 
-                ui.monospace(format!(
-                    "RX Packets     : {:<10} | Lossless Subframes : {}",
-                    pkts, prim
-                ));
-                ui.monospace(format!(
-                    "FEC Healed     : {:<10} | WSOLA PLC Frames   : {}",
-                    fec, plc
-                ));
-                ui.monospace(format!(
-                    "Clock Lock PPM : {:+4} ppm   | Auth Rejections    : {}",
-                    drift, auth_err
-                ));
-                ui.monospace(format!(
-                    "Bluetooth KeepAliveState   : {}",
-                    if dtx {
-                        "ACTIVE (-90 dBFS Dither)"
+                ui.columns(4, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "RX Packets / Lossless",
+                        &format!("{} / {}", pkts, prim),
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "FEC Healed / WSOLA PLC",
+                        &format!("{} / {}", fec, plc),
+                    );
+                    Self::metric_tile(
+                        &mut cols[2],
+                        dark,
+                        "Clock Lock / Auth Err",
+                        &format!("{:+4} ppm / {}", drift, auth_err),
+                    );
+                    let state_str = if self.client_engine.is_none() {
+                        "STANDBY"
+                    } else if dtx {
+                        "DTX SLEEP"
                     } else {
-                        "STREAMING LIVE AUDIO"
-                    }
-                ));
+                        "LIVE"
+                    };
+                    Self::metric_tile(
+                        &mut cols[3],
+                        dark,
+                        "Host Vol / Group Sync",
+                        &format!("{}% / +{} ms ({})", host_vol, group_ms, state_str),
+                    );
+                });
 
-                // Render 60 FPS Real-Time Clock-Drift Sparkline Graph (-500 ppm .. +500 ppm)
+                ui.add_space(4.0);
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 44.0),
+                    egui::vec2(ui.available_width(), 52.0),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter();
-                painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
+                painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(10, 13, 20));
+                painter.rect_stroke(
+                    rect,
+                    8.0,
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 38, 54)),
+                );
                 let mid_y = rect.center().y;
                 painter.line_segment(
                     [
                         egui::pos2(rect.left(), mid_y),
                         egui::pos2(rect.right(), mid_y),
                     ],
-                    egui::Stroke::new(1.0f32, egui::Color32::DARK_GRAY),
+                    egui::Stroke::new(1.0f32, egui::Color32::from_rgb(38, 48, 66)),
                 );
                 let step_x = rect.width() / (self.drift_history.len().max(2) as f32 - 1.0);
                 let points: Vec<egui::Pos2> = self
@@ -1786,12 +2665,293 @@ impl AudioShareApp {
                     .collect();
                 painter.add(egui::Shape::line(
                     points,
-                    egui::Stroke::new(1.5f32, egui::Color32::LIGHT_GREEN),
+                    egui::Stroke::new(1.75f32, egui::Color32::from_rgb(56, 189, 248)),
                 ));
-            } else {
-                ui.label("Connect to a Host to view real-time jitter & clock recovery telemetry.");
-            }
-        });
+            });
+        }
+    }
+
+    fn render_latency_debug(&mut self, ui: &mut egui::Ui) {
+        let dark = self.dark_mode;
+        ui.label(
+            egui::RichText::new(
+                "Live values are published by the audio threads. The estimate is not an acoustic measurement.",
+            )
+            .size(11.5)
+            .color(egui::Color32::from_rgb(130, 144, 168)),
+        );
+        ui.add_space(4.0);
+
+        let sonar_ms = self.measured_sonar_ms;
+        let sonar_age_s = self.measured_sonar_at.map(|t| t.elapsed().as_secs_f32());
+        let mut any_engine = false;
+
+        if let Some(ref host) = self.host_engine {
+            any_engine = true;
+            Self::studio_card(ui, dark, |ui| {
+                ui.label(
+                    egui::RichText::new("Host Pipeline: Capture -> Wire")
+                        .size(14.5)
+                        .strong(),
+                );
+                ui.separator();
+
+                let pacing_ms =
+                    host.telemetry.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                let capture_ms =
+                    host.telemetry.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0;
+                let subframes = host
+                    .telemetry
+                    .tx_subframes_per_packet
+                    .load(Ordering::Relaxed);
+                let codec =
+                    codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
+                let clients = host.connected_clients();
+                let bt_max = host
+                    .telemetry
+                    .max_client_bt_delay_ms
+                    .load(Ordering::Relaxed);
+                let downstream_max = host
+                    .telemetry
+                    .max_client_downstream_delay_ms
+                    .load(Ordering::Relaxed);
+                let room_trim = host
+                    .telemetry
+                    .manual_group_sync_trim_ms
+                    .load(Ordering::Relaxed);
+                let rebinds = host.telemetry.hotplug_rebinds.load(Ordering::Relaxed);
+
+                ui.columns(3, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "Packetization",
+                        &format!(
+                            "{:.1} ms ({} x {:.1} ms)",
+                            pacing_ms, subframes, SUBFRAME_MS
+                        ),
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "Capture Backlog",
+                        &format!("{:.1} ms", capture_ms),
+                    );
+                    Self::metric_tile(
+                        &mut cols[2],
+                        dark,
+                        "Host Pipeline Total",
+                        &format!("{:.1} ms ({})", capture_ms + pacing_ms, codec),
+                    );
+                });
+
+                ui.columns(4, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "Downstream Max",
+                        &format!("{} ms (BT max {} ms)", downstream_max, bt_max),
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "Room Trim",
+                        &format!("+{} ms", room_trim),
+                    );
+                    let sonar_label = match (sonar_ms, sonar_age_s) {
+                        (Some(ms), Some(age)) => format!("{:.1} ms ({:.0}s ago)", ms, age),
+                        (Some(ms), None) => format!("{:.1} ms", ms),
+                        _ => "not measured".to_string(),
+                    };
+                    Self::metric_tile(&mut cols[2], dark, "Acoustic Sonar", &sonar_label);
+                    Self::metric_tile(
+                        &mut cols[3],
+                        dark,
+                        "Hotplug Rebinds",
+                        &format!("{}", rebinds),
+                    );
+                });
+
+                if clients.is_empty() {
+                    ui.label("No clients connected.");
+                } else {
+                    ui.separator();
+                    for c in &clients {
+                        let badge = if c.is_usb { "[USB]" } else { "[Wi-Fi]" };
+                        ui.monospace(format!(
+                            "{} {} | Loss {:.1}% | BT {} ms | DAC {} ms | Vol {}%{}",
+                            badge,
+                            c.addr,
+                            (c.fec_rate_permille as f32) / 10.0,
+                            c.bluetooth_delay_ms,
+                            c.hardware_delay_ms,
+                            c.client_volume,
+                            if c.muted { " | MUTED" } else { "" }
+                        ));
+                    }
+                }
+            });
+        }
+
+        if any_engine {
+            ui.add_space(6.0);
+        }
+
+        if let Some(ref client) = self.client_engine {
+            any_engine = true;
+            let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
+
+            Self::studio_card(ui, dark, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Client Pipeline: Ingress -> Speaker")
+                            .size(14.5)
+                            .strong(),
+                    );
+                    Self::status_pill(
+                        ui,
+                        &format!("Estimated One-Way: {:.1} ms", snap.estimated_one_way_ms()),
+                        egui::Color32::from_rgb(20, 83, 45),
+                        egui::Color32::from_rgb(134, 239, 172),
+                    );
+                    Self::status_pill(
+                        ui,
+                        if snap.prebuffer_ready {
+                            "READY"
+                        } else {
+                            "FILLING"
+                        },
+                        egui::Color32::from_rgb(30, 41, 59),
+                        egui::Color32::WHITE,
+                    );
+                });
+                ui.separator();
+
+                ui.columns(3, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "Sender Packetization",
+                        &format!("{:.1} ms ({})", snap.packet_interval_ms, snap.codec_name()),
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "Network Jitter",
+                        &format!("{:.1} ms", snap.network_jitter_ms),
+                    );
+                    Self::metric_tile(
+                        &mut cols[2],
+                        dark,
+                        "Adaptive Cushion",
+                        &format!("{:.1} ms", snap.adaptive_buffer_ms),
+                    );
+                });
+
+                ui.columns(3, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "Target FIFO",
+                        &format!(
+                            "{:.1} ms (Group +{:.1} ms)",
+                            snap.target_buffer_ms, snap.group_sync_extra_ms
+                        ),
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "Buffered Now",
+                        &format!("{:.1} ms", snap.buffered_audio_ms),
+                    );
+                    Self::metric_tile(
+                        &mut cols[2],
+                        dark,
+                        "Downstream + Lookahead",
+                        &format!(
+                            "{:.1} ms + {:.1} ms",
+                            snap.downstream_stage_ms(),
+                            snap.codec_lookahead_ms
+                        ),
+                    );
+                });
+
+                ui.columns(4, |cols| {
+                    Self::metric_tile(
+                        &mut cols[0],
+                        dark,
+                        "DAC Queue",
+                        &if snap.hardware_delay_ms > 0 {
+                            format!("{} ms (measured)", snap.hardware_delay_ms)
+                        } else {
+                            "not measured".to_string()
+                        },
+                    );
+                    Self::metric_tile(
+                        &mut cols[1],
+                        dark,
+                        "Bluetooth Estimate",
+                        &if snap.bluetooth_delay_ms > 0 {
+                            format!("{} ms (A2DP)", snap.bluetooth_delay_ms)
+                        } else {
+                            "not routed".to_string()
+                        },
+                    );
+                    Self::metric_tile(
+                        &mut cols[2],
+                        dark,
+                        "Desktop Output Buffer",
+                        &format!("{:.1} ms", snap.output_buffer_ms),
+                    );
+                    Self::metric_tile(
+                        &mut cols[3],
+                        dark,
+                        "Prebuffer / Codec",
+                        &format!(
+                            "{} • {}",
+                            if snap.prebuffer_ready {
+                                "READY"
+                            } else {
+                                "FILLING"
+                            },
+                            snap.codec_name()
+                        ),
+                    );
+                });
+
+                let fill = if snap.target_buffer_ms > 0.0 {
+                    (snap.buffered_audio_ms / snap.target_buffer_ms).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(fill)
+                        .fill(egui::Color32::from_rgb(37, 99, 235))
+                        .text(format!(
+                            "FIFO Fill: {:.1} / {:.1} ms ({:.0}%)",
+                            snap.buffered_audio_ms,
+                            snap.target_buffer_ms,
+                            fill * 100.0
+                        )),
+                );
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Estimate = packetization + target FIFO + max(DAC, BT, desktop output) + codec lookahead. \
+                         Group sync is already inside the target FIFO. Excludes one-way network transit and the acoustic air path; use the sonar for end-to-end.",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                );
+            });
+        }
+
+        if !any_engine {
+            Self::studio_card(ui, dark, |ui| {
+                ui.label("Start the Host Server or connect to a Client to see live latency.");
+            });
+        }
     }
 }
 
