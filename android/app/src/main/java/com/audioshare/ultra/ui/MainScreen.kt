@@ -111,6 +111,11 @@ fun MainScreen() {
     // 0..10 legacy counters, 11..21 live latency breakdown.
     var telemetry by remember { mutableStateOf(LongArray(24)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
+    // Manual host/PIN entry is the advanced path: auto-discovery normally
+    // supplies the target. Collapse the editors once a host is visible, but
+    // keep them one tap away and keep the PIN editor visible while no PIN is
+    // saved so encrypted hosts do not fail on a hidden credential.
+    var showManualConnect by remember { mutableStateOf(false) }
 
     fun syncAndSaveDsp() {
         prefs.edit()
@@ -461,14 +466,44 @@ fun MainScreen() {
                         modifier = Modifier.padding(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text("PC Host Endpoint (USB RNDIS or 5GHz Wi-Fi)", style = MaterialTheme.typography.titleMedium)
-                        OutlinedTextField(
-                            value = hostAddress,
-                            onValueChange = { hostAddress = it },
-                            label = { Text("Host IP:Port") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "PC Host Endpoint (USB RNDIS or 5GHz Wi-Fi)",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (discoveredHosts.isNotEmpty()) {
+                                TextButton(onClick = { showManualConnect = !showManualConnect }) {
+                                    Text(if (showManualConnect) "Hide" else "⚙️ IP / PIN")
+                                }
+                            }
+                        }
+
+                        if (showManualConnect || discoveredHosts.isEmpty()) {
+                            OutlinedTextField(
+                                value = hostAddress,
+                                onValueChange = {
+                                    hostAddress = it
+                                    showManualConnect = true
+                                },
+                                label = { Text("Host IP:Port") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        } else {
+                            // Keep the active target visible while the editor is
+                            // collapsed; Connect and USB ADB still act on it.
+                            Text(
+                                hostAddress,
+                                fontFamily = FontFamily.Monospace,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
 
                         if (discoveredHosts.isNotEmpty()) {
                             Text(
@@ -509,16 +544,19 @@ fun MainScreen() {
                             }
                         }
 
-                        OutlinedTextField(
-                            value = pinCode,
-                            onValueChange = {
-                                pinCode = it
-                                prefs.edit().putString("pin_code", it).apply()
-                            },
-                            label = { Text("PIN (optional, ChaCha20 + MAC32)") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                        if (showManualConnect || discoveredHosts.isEmpty() || pinCode.isBlank()) {
+                            OutlinedTextField(
+                                value = pinCode,
+                                onValueChange = {
+                                    pinCode = it
+                                    showManualConnect = true
+                                    prefs.edit().putString("pin_code", it).apply()
+                                },
+                                label = { Text("PIN (optional, ChaCha20 + MAC32)") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
 
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(
