@@ -9,8 +9,27 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.ui.graphics.Color
 import com.audioshare.ultra.service.AudioEngineService
 import com.audioshare.ultra.ui.MainScreen
+
+private val StudioDarkColors = darkColorScheme(
+    primary = Color(0xFF3B82F6),
+    onPrimary = Color(0xFFFFFFFF),
+    primaryContainer = Color(0xFF1D4ED8),
+    onPrimaryContainer = Color(0xFFFFFFFF),
+    secondary = Color(0xFF38BDF8),
+    secondaryContainer = Color(0xFF1E3A5F),
+    onSecondaryContainer = Color(0xFFE0F2FE),
+    tertiary = Color(0xFF34D399),
+    background = Color(0xFF0A0D13),
+    onBackground = Color(0xFFF1F5F9),
+    surface = Color(0xFF111622),
+    onSurface = Color(0xFFF1F5F9),
+    surfaceVariant = Color(0xFF171E2E),
+    onSurfaceVariant = Color(0xFF94A3B8),
+    error = Color(0xFFF87171)
+)
 
 class MainActivity : ComponentActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
@@ -51,7 +70,7 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            MaterialTheme(colorScheme = StudioDarkColors) {
                 MainScreen()
             }
         }
