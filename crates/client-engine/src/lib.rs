@@ -151,10 +151,34 @@ fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
     net_subframes.max(0.0) + target_buf.max(0.0)
 }
 
-/// Output decoupler watermark in 2.5 ms subframes (4..=12).
+/// Lower the packet framing count only after a sustained run of smaller
+/// packets. `SplitPerSubframe` sends one subframe per datagram when a loud
+/// 24-bit frame exceeds the wire budget, so adopting the split size
+/// immediately collapsed the client's Wi-Fi floor for a single transient.
+#[inline]
+fn update_pkt_subframe_count(current: &mut u8, smaller_run: &mut u8, incoming: u8) {
+    if incoming >= *current {
+        *current = incoming;
+        *smaller_run = 0;
+    } else {
+        *smaller_run = smaller_run.saturating_add(1);
+        if *smaller_run >= 8 {
+            *current = incoming;
+            *smaller_run = 0;
+        }
+    }
+}
+
+/// Output decoupler watermark in 2.5 ms subframes (4..=32).
+///
+/// The upper bound used to be 12 (30 ms), which silently capped group-sync
+/// alignment: a wired client could never add enough cushion to match an
+/// 80 ms Bluetooth peer. 32 subframes (80 ms) still leaves two subframes of
+/// headroom in the 8192-sample decoupler, which the playhead fills one
+/// subframe at a time.
 #[inline]
 fn fifo_target_subframes(target_buf: f32) -> usize {
-    (target_buf.ceil() as usize).clamp(4, 12)
+    (target_buf.ceil() as usize).clamp(4, 32)
 }
 
 /// Number of subframes of real audio left after the current decoupler
@@ -847,6 +871,7 @@ impl ClientEngine {
         let mut initial_wifi_floor = configured_floor;
         let mut adaptive_wifi_subframes = initial_wifi_floor;
         let mut last_pkt_subframe_count: u8 = 1;
+        let mut smaller_pkt_run: u8 = 0;
         // The refill loop targets this watermark. Keeping the last value lets
         // the socket poll below decide whether the decoupler needs audio
         // before the new target is recomputed for this pass.
@@ -1065,7 +1090,13 @@ impl ClientEngine {
                             (parsed.header.subframe_count.max(1) as u32) * 2500,
                             Ordering::Relaxed,
                         );
-                        last_pkt_subframe_count = parsed.header.subframe_count.max(1);
+                        if parsed.header.mode != CodecMode::SilenceHeartbeat {
+                            update_pkt_subframe_count(
+                                &mut last_pkt_subframe_count,
+                                &mut smaller_pkt_run,
+                                parsed.header.subframe_count.max(1),
+                            );
+                        }
                         telemetry
                             .codec_mode
                             .store(parsed.header.mode as u8, Ordering::Relaxed);
@@ -1112,9 +1143,11 @@ impl ClientEngine {
                         // (4 subframes) used to raise the floor to 11
                         // subframes (27.5 ms) for the rest of the session,
                         // even after the host returned to 5 ms or 2.5 ms
-                        // framing.
+                        // framing. Use the smoothed count so a transient
+                        // `SplitPerSubframe` datagram cannot drop the floor
+                        // from 15 ms to 10 ms for one packet.
                         initial_wifi_floor =
-                            wifi_floor_for_packet(configured_floor, parsed.header.subframe_count);
+                            wifi_floor_for_packet(configured_floor, last_pkt_subframe_count);
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
                         let proactive_floor =
                             ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
@@ -1636,6 +1669,65 @@ mod tests {
         assert!((gaming_base_target_subframes(2, 5000.0) - 7.4).abs() < 1e-4);
         assert_eq!(gaming_base_target_subframes(4, 60_000.0), 8.0);
         assert_eq!(gaming_base_target_subframes(2, 0.0), 6.0);
+    }
+
+    #[test]
+    fn test_group_sync_target_is_not_capped_at_30ms() {
+        // Group sync adds up to 40 subframes to match a Bluetooth peer's
+        // output delay. The old 12-subframe clamp silently capped it at
+        // 30 ms, so a wired client could never align with an 80 ms peer.
+        assert_eq!(fifo_target_subframes(26.0), 26);
+        assert_eq!(fifo_target_subframes(32.0), 32);
+        assert_eq!(fifo_target_subframes(40.0), 32);
+        assert!(
+            (32 + 1) * SUBFRAME_STEREO_SAMPLES <= BurstDecouplerRing::new().capacity_samples(),
+            "80 ms target plus one pushed subframe must fit the decoupler"
+        );
+    }
+
+    #[test]
+    fn test_split_packet_count_does_not_collapse_wifi_floor() {
+        let mut count = 2u8;
+        let mut run = 0u8;
+
+        // One split datagram (subframe_count = 1) between normal packets.
+        update_pkt_subframe_count(&mut count, &mut run, 1);
+        assert_eq!(count, 2, "a single split packet must not change framing");
+
+        update_pkt_subframe_count(&mut count, &mut run, 2);
+        assert_eq!(count, 2);
+        assert_eq!(run, 0, "a normal packet resets the smaller-packet run");
+
+        // A sustained switch to 1-subframe framing is still adopted.
+        for _ in 0..8 {
+            update_pkt_subframe_count(&mut count, &mut run, 1);
+        }
+        assert_eq!(count, 1);
+
+        // Returning to larger framing applies immediately.
+        update_pkt_subframe_count(&mut count, &mut run, 2);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_split_packet_does_not_drop_wifi_floor() {
+        // USB/gaming framing starts from a 4-subframe configured floor.
+        let configured = configured_wifi_floor(2.5);
+        let normal = wifi_floor_for_packet(configured, 2);
+        let split = wifi_floor_for_packet(configured, 1);
+        assert!(
+            split < normal,
+            "raw split framing would lower the floor: {split} vs {normal}"
+        );
+
+        let mut count = 2u8;
+        let mut run = 0u8;
+        update_pkt_subframe_count(&mut count, &mut run, 1);
+        assert_eq!(
+            wifi_floor_for_packet(configured, count),
+            normal,
+            "a transient split datagram must not collapse the Wi-Fi floor"
+        );
     }
 
     #[test]

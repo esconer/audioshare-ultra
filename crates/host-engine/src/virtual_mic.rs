@@ -19,10 +19,12 @@ use crate::{configure_realtime_udp_socket, promote_thread_realtime};
 
 pub const PHONE_MIC_PORT: u16 = 65532;
 
-/// Keep roughly 5 ms queued in the output decoupler. The writer drains whole
-/// 2.5 ms subframes, so a two-subframe cushion absorbs the poll interval
-/// without adding audible call latency.
-const MIC_FIFO_TARGET_SUBFRAMES: f32 = 2.0;
+/// Keep roughly 15 ms queued in the output decoupler. `ClientPreviewSink`
+/// asks for a 5 ms (240-frame) callback, but desktop backends may still pull
+/// 10-21 ms in one callback; two subframes could never cover that and
+/// underran on every pull. Six subframes absorb a full default-callback burst
+/// while keeping phone-call latency moderate.
+const MIC_FIFO_TARGET_SUBFRAMES: f32 = 6.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhoneRxRoutingMode {
@@ -629,8 +631,15 @@ mod tests {
         let resampler = ClockDriftResampler::new();
         let one = resampler.samples_to_subframes(SUBFRAME_STEREO_SAMPLES);
         assert!((one - 1.0).abs() < 1e-6);
-        let target = resampler.samples_to_subframes(SUBFRAME_STEREO_SAMPLES * 2);
+        let target_samples = SUBFRAME_STEREO_SAMPLES * MIC_FIFO_TARGET_SUBFRAMES as usize;
+        let target = resampler.samples_to_subframes(target_samples);
         assert!((target - MIC_FIFO_TARGET_SUBFRAMES).abs() < 1e-6);
+        // A 10 ms default desktop callback drains four subframes in one pull;
+        // the cushion must cover at least that plus the poll interval.
+        assert!(
+            MIC_FIFO_TARGET_SUBFRAMES >= 6.0,
+            "mic FIFO target must absorb a 10-15 ms callback burst"
+        );
     }
 
     #[test]

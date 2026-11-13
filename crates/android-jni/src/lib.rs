@@ -86,9 +86,6 @@ fn trim_phone_mic_backlog(
 /// that would otherwise receive 400 packets per second on Wi-Fi.
 const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 
-/// Peer phones register on the well-known Party port, while PC receivers use
-/// `PHONE_MIC_PORT` (65532).
-const PARTY_PHONE_PORT: u16 = 65530;
 const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const PARTY_VBR_LOSS_THRESHOLD_PERMILLE: u16 = 45;
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
@@ -153,7 +150,6 @@ pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
 
 fn initial_party_peers(
     static_targets: &[SocketAddr],
-    add_phone_peers: bool,
     now: Instant,
 ) -> HashMap<SocketAddr, PartyPeerState> {
     let fresh = PartyPeerState {
@@ -164,12 +160,12 @@ fn initial_party_peers(
     let mut peers = HashMap::new();
     for &addr in static_targets {
         peers.insert(addr, fresh);
-        if add_phone_peers {
-            peers
-                .entry(SocketAddr::new(addr.ip(), PARTY_PHONE_PORT))
-                .or_insert(fresh);
-        }
     }
+    // Peer phones and PC clients register themselves on their real source
+    // port through HELLO/feedback. Blindly adding `IP:65530` for every
+    // configured PC receiver counted one listener twice, forced the phone
+    // into lossy VBR (`peer_count >= 2`) even for a single-PC call, and sent
+    // a second unicast copy to a port that often had nobody listening.
     peers
 }
 
@@ -293,7 +289,7 @@ impl PhoneMicTransmitter {
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
-        let initial_peers = initial_party_peers(&static_targets, !use_hardware_mic, Instant::now());
+        let initial_peers = initial_party_peers(&static_targets, Instant::now());
 
         // Party peers discover this phone through the beacon on the port the
         // transmitter actually bound. Advertising a hardcoded 65530 after a
@@ -327,6 +323,8 @@ impl PhoneMicTransmitter {
                 let mut has_fec_n1 = false;
                 let mut has_fec_n2 = false;
                 let mut dither_rng = 1u32;
+                let mut noise_shaper =
+                    audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
                 let mut last_sweep = Instant::now();
@@ -418,16 +416,14 @@ impl PhoneMicTransmitter {
                             ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
 
                             let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
-                            let mut max_abs = 0i16;
-                            for (dst, &s) in i16_buf.iter_mut().zip(f32_buf.iter()) {
-                                // Round rather than truncate toward zero: the
-                                // latter doubles the zero-crossing quantization
-                                // bin and adds odd-harmonic distortion to the
-                                // phone-mic capture.
-                                let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                                *dst = v;
-                                max_abs = max_abs.max(v.saturating_abs());
-                            }
+                            // Quantize with high-pass TPDF dither and 0.85
+                            // error feedback instead of plain rounding. The
+                            // shaped noise sits below the microphone's own
+                            // noise floor, while the old rounding correlated
+                            // the error with the signal and added odd-harmonic
+                            // distortion to quiet captures.
+                            let max_abs =
+                                noise_shaper.quantize_stereo_subframe(&f32_buf, &mut i16_buf);
                             if max_abs > 3 {
                                 packet_is_silent = false;
                                 silent_subframes = 0;
@@ -916,9 +912,19 @@ mod tests {
         let now = Instant::now();
         let pc: SocketAddr = "192.168.1.60:65532".parse().unwrap();
         let static_targets = vec![pc];
-        let mut peers = initial_party_peers(&static_targets, true, now);
+        let mut peers = initial_party_peers(&static_targets, now);
         assert!(peers.contains_key(&pc));
-        assert!(peers.contains_key(&"192.168.1.60:65530".parse().unwrap()));
+        assert_eq!(
+            peers.len(),
+            1,
+            "one configured PC receiver must count as one peer, not two ports"
+        );
+
+        // A PC client on the same IP registers dynamically on port 65530.
+        let pc_client: SocketAddr = "192.168.1.60:65530".parse().unwrap();
+        register_party_peer(&mut peers, pc_client, &static_targets, now);
+        assert!(peers.contains_key(&pc_client));
+        assert_eq!(peers.len(), 2);
 
         let phone_old: SocketAddr = "192.168.1.70:40000".parse().unwrap();
         let phone_new: SocketAddr = "192.168.1.70:40002".parse().unwrap();

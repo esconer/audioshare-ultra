@@ -152,6 +152,23 @@ impl ClientPreviewSink {
         Self::spawn_preferred(fifo, None)
     }
 
+    fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
+        // CPAL callbacks can be larger than 4096 samples on PulseAudio/ALSA.
+        let mut tmp = [0.0f32; 4096];
+        let mut offset = 0usize;
+        while offset < out.len() {
+            let chunk = (out.len() - offset).min(tmp.len());
+            fifo.pop_exact_or_dither(&mut tmp[..chunk], dither_rng);
+            for (dst, &s) in out[offset..offset + chunk]
+                .iter_mut()
+                .zip(tmp[..chunk].iter())
+            {
+                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+            }
+            offset += chunk;
+        }
+    }
+
     /// Spawn playback on the first output device whose name contains
     /// `preferred_name` (e.g. "CABLE Input"), falling back to the default.
     pub fn spawn_preferred(
@@ -172,21 +189,49 @@ impl ClientPreviewSink {
         let dev = preferred
             .or_else(|| host.default_output_device())
             .ok_or("No output device")?;
-        let cfg = cpal::StreamConfig {
+        let default_cfg = dev.default_output_config().map_err(|e| e.to_string())?;
+        let sample_format = default_cfg.sample_format();
+
+        // A 240-frame (5 ms) callback matches the 2.5 ms network subframe and
+        // stops the OS from draining 10-21 ms in one pull. Some backends
+        // reject a fixed period, so fall back to the device default instead of
+        // failing the preview entirely.
+        let low_lat_cfg = cpal::StreamConfig {
+            channels: 2,
+            sample_rate: cpal::SampleRate(SAMPLE_RATE),
+            buffer_size: cpal::BufferSize::Fixed(240),
+        };
+        let default_stream_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
-        let mut rng = 12345u32;
-        let stream = dev
-            .build_output_stream(
-                &cfg,
-                move |out: &mut [f32], _| {
-                    fifo.pop_exact_or_dither(out, &mut rng);
-                },
-                |_| {},
-                None,
-            )
+
+        let build_for_cfg = |cfg: &cpal::StreamConfig| {
+            let fifo = Arc::clone(&fifo);
+            let mut dither_rng = 12345u32;
+            match sample_format {
+                cpal::SampleFormat::I16 => dev.build_output_stream(
+                    cfg,
+                    move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        Self::fill_i16_output(&fifo, out, &mut dither_rng);
+                    },
+                    |_| {},
+                    None,
+                ),
+                _ => dev.build_output_stream(
+                    cfg,
+                    move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        fifo.pop_exact_or_dither(out, &mut dither_rng);
+                    },
+                    |_| {},
+                    None,
+                ),
+            }
+        };
+
+        let stream = build_for_cfg(&low_lat_cfg)
+            .or_else(|_| build_for_cfg(&default_stream_cfg))
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(stream)
@@ -289,9 +334,13 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     let sock_ref = socket2::SockRef::from(socket);
     // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
     let _ = sock_ref.set_tos(0xA0);
-    // Asymmetric buffers: Tight 16KB SO_SNDBUF prevents kernel TX bufferbloat on 2.4GHz stalls;
-    // 128KB SO_RCVBUF ensures receiver never drops incoming Wi-Fi aggregation bursts.
-    let _ = sock_ref.set_send_buffer_size(16_384);
+    // Asymmetric buffers: the send buffer must absorb a burst of split 24-bit
+    // datagrams while the Wi-Fi driver waits for a TXOP. The old tight 16 KB
+    // also overflowed after only a few large fast-scene allocations, and
+    // `send_to` runs on a non-blocking socket, so those drops were silent.
+    // 128 KB SO_RCVBUF ensures the receiver never drops Wi-Fi aggregation
+    // bursts.
+    let _ = sock_ref.set_send_buffer_size(65_536);
     let _ = sock_ref.set_recv_buffer_size(131_072);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
