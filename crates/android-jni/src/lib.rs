@@ -17,6 +17,7 @@ use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
+use audioshare_protocol::opus_codec::OpusStreamEncoder;
 use audioshare_protocol::wire::{
     pack_datagram, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
 };
@@ -350,6 +351,18 @@ impl PhoneMicTransmitter {
                 let mut dither_rng = 1u32;
                 let mut noise_shaper =
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
+                // Party mode upgrades its compressed fallback to Opus RLD when
+                // the encoder is available. Hardware-mic mode never compresses,
+                // so skip the encoder allocation there. `opus_available` goes
+                // false permanently if creation or encoding fails.
+                let mut opus_available = false;
+                let mut opus_encoder = if use_hardware_mic {
+                    None
+                } else {
+                    let encoder = OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS);
+                    opus_available = encoder.is_some();
+                    encoder
+                };
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
                 let mut last_sweep = Instant::now();
@@ -434,52 +447,117 @@ impl PhoneMicTransmitter {
                         let listener_ips = unique_peer_ip_count(&peers);
                         // A Party host feeding several phones cannot afford a
                         // lossless unicast copy per listener on 2.4 GHz. Step
-                        // down to 256 kbps VBR when a second listener joins or
-                        // when any listener reports more than 4.5% loss.
-                        let codec_mode = party_codec_mode(listener_ips, worst_loss_permille);
+                        // down to 256 kbps compressed when a second listener
+                        // joins or when any listener reports more than 4.5%
+                        // loss. Opus RLD replaces VBR when the encoder is
+                        // available; VBR remains the fallback.
+                        let packet_codec = party_codec_mode(listener_ips, worst_loss_permille);
                         let use_compressed =
-                            !use_hardware_mic && codec_mode == CodecMode::CompressedLowDelay;
+                            !use_hardware_mic && packet_codec == CodecMode::CompressedLowDelay;
 
-                        for _ in 0..subframes_per_pkt {
+                        // Opus is stateful and the receiver drops its decoder
+                        // on every non-Opus frame. Mirror that here: drop the
+                        // encoder when leaving compressed mode so a later
+                        // return starts from clean history, and recreate it
+                        // only if creation has not already failed.
+                        if !use_compressed {
+                            opus_encoder = None;
+                        } else if opus_encoder.is_none() && opus_available {
+                            opus_encoder = OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS);
+                            opus_available = opus_encoder.is_some();
+                        }
+
+                        // Collect the whole packet before choosing a codec. If
+                        // Opus fails on the second subframe, rebuilding the
+                        // first one as VBR keeps every datagram single-codec;
+                        // the receiver never has to guess per subframe.
+                        let mut pcm_frames = [[0i16; SUBFRAME_STEREO_SAMPLES]; 2];
+                        for frame in pcm_frames.iter_mut().take(subframes_per_pkt) {
                             let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
 
-                            let mut i16_buf = [0i16; SUBFRAME_STEREO_SAMPLES];
                             // Quantize with high-pass TPDF dither and 0.85
                             // error feedback instead of plain rounding. The
                             // shaped noise sits below the microphone's own
                             // noise floor, while the old rounding correlated
                             // the error with the signal and added odd-harmonic
                             // distortion to quiet captures.
-                            let max_abs =
-                                noise_shaper.quantize_stereo_subframe(&f32_buf, &mut i16_buf);
+                            let max_abs = noise_shaper.quantize_stereo_subframe(&f32_buf, frame);
                             if max_abs > 3 {
                                 packet_is_silent = false;
                                 silent_subframes = 0;
                             } else {
                                 silent_subframes = silent_subframes.saturating_add(1);
                             }
-
-                            let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                            let enc_len = if use_compressed {
-                                encode_vbr_subframe(&i16_buf, PARTY_VBR_BITRATE_KBPS, &mut enc)
-                            } else {
-                                encode_lossless_subframe(&i16_buf, &mut enc)
-                            };
-                            let len_be = (enc_len as u16).to_be_bytes();
-                            primary_bundle[cursor] = len_be[0];
-                            primary_bundle[cursor + 1] = len_be[1];
-                            cursor += 2;
-                            primary_bundle[cursor..cursor + enc_len]
-                                .copy_from_slice(&enc[..enc_len]);
-                            cursor += enc_len;
-
-                            fec_n2 = fec_n1;
-                            has_fec_n2 = has_fec_n1;
-                            encode_fec_subframe(&i16_buf, &mut fec_n1);
-                            has_fec_n1 = true;
-                            seq = seq.wrapping_add(1);
                         }
+
+                        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                        let mut opus_primary = use_compressed && opus_encoder.is_some();
+                        if opus_primary {
+                            for frame in pcm_frames.iter().take(subframes_per_pkt) {
+                                let encoded = opus_encoder.as_mut().and_then(|enc_opus| {
+                                    enc_opus.encode_subframe(
+                                        frame,
+                                        PARTY_VBR_BITRATE_KBPS,
+                                        &mut enc,
+                                    )
+                                });
+                                let Some(enc_len) = encoded else {
+                                    // Opus failed: drop it for the rest of the
+                                    // stream and rebuild this packet as VBR.
+                                    opus_encoder = None;
+                                    opus_available = false;
+                                    opus_primary = false;
+                                    break;
+                                };
+                                let len_be = (enc_len as u16).to_be_bytes();
+                                primary_bundle[cursor] = len_be[0];
+                                primary_bundle[cursor + 1] = len_be[1];
+                                cursor += 2;
+                                primary_bundle[cursor..cursor + enc_len]
+                                    .copy_from_slice(&enc[..enc_len]);
+                                cursor += enc_len;
+                            }
+                        }
+                        if !opus_primary {
+                            cursor = 0;
+                            for frame in pcm_frames.iter().take(subframes_per_pkt) {
+                                let enc_len = if use_compressed {
+                                    encode_vbr_subframe(frame, PARTY_VBR_BITRATE_KBPS, &mut enc)
+                                } else {
+                                    encode_lossless_subframe(frame, &mut enc)
+                                };
+                                let len_be = (enc_len as u16).to_be_bytes();
+                                primary_bundle[cursor] = len_be[0];
+                                primary_bundle[cursor + 1] = len_be[1];
+                                cursor += 2;
+                                primary_bundle[cursor..cursor + enc_len]
+                                    .copy_from_slice(&enc[..enc_len]);
+                                cursor += enc_len;
+                            }
+                        }
+                        let codec_mode = if opus_primary {
+                            CodecMode::OpusRld
+                        } else {
+                            packet_codec
+                        };
+
+                        if opus_primary {
+                            // Receivers heal Opus gaps with the codec's own
+                            // phase-aligned CELT PLC. A zero-lookahead ADPCM
+                            // backup would jump the waveform by one subframe,
+                            // so suppress it and save 248 bytes per packet.
+                            has_fec_n1 = false;
+                            has_fec_n2 = false;
+                        } else {
+                            for frame in pcm_frames.iter().take(subframes_per_pkt) {
+                                fec_n2 = fec_n1;
+                                has_fec_n2 = has_fec_n1;
+                                encode_fec_subframe(frame, &mut fec_n1);
+                                has_fec_n1 = true;
+                            }
+                        }
+                        seq = seq.wrapping_add(subframes_per_pkt as u16);
 
                         // After 500 ms of silence, keep only a 200 ms
                         // heartbeat. Every heartbeat advances the sequence and
@@ -1175,6 +1253,102 @@ mod tests {
     }
 
     #[test]
+    fn test_party_opus_packet_suppresses_adpcm_fec_airtime() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / 48_000.0;
+            pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut encoder =
+            OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS).expect("create Opus encoder");
+        let mut opus_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
+        let mut cursor = 0usize;
+        for _ in 0..2 {
+            let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encoder
+                .encode_subframe(&pcm, PARTY_VBR_BITRATE_KBPS, &mut enc)
+                .expect("encode Opus subframe");
+            assert_eq!(enc[0], audioshare_protocol::opus_codec::TAG_OPUS_RLD);
+            opus_bundle[cursor..cursor + 2].copy_from_slice(&(len as u16).to_be_bytes());
+            cursor += 2;
+            opus_bundle[cursor..cursor + len].copy_from_slice(&enc[..len]);
+            cursor += len;
+        }
+
+        let mut vbr_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
+        let mut vbr_cursor = 0usize;
+        for _ in 0..2 {
+            let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encode_vbr_subframe(&pcm, PARTY_VBR_BITRATE_KBPS, &mut enc);
+            vbr_bundle[vbr_cursor..vbr_cursor + 2].copy_from_slice(&(len as u16).to_be_bytes());
+            vbr_cursor += 2;
+            vbr_bundle[vbr_cursor..vbr_cursor + len].copy_from_slice(&enc[..len]);
+            vbr_cursor += len;
+        }
+
+        let hdr = |mode| WireHeader {
+            mode,
+            subframe_count: 2,
+            encrypted: false,
+            sequence: 0,
+            tx_timestamp_us: 0,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+        let mut dgram = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let opus_len = pack_datagram(
+            hdr(CodecMode::OpusRld),
+            &opus_bundle[..cursor],
+            &[],
+            &[],
+            &mut dgram,
+        )
+        .expect("pack Opus packet");
+        let vbr_no_fec = pack_datagram(
+            hdr(CodecMode::CompressedLowDelay),
+            &vbr_bundle[..vbr_cursor],
+            &[],
+            &[],
+            &mut dgram,
+        )
+        .expect("pack VBR packet");
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+        let vbr_with_fec = pack_datagram(
+            hdr(CodecMode::CompressedLowDelay),
+            &vbr_bundle[..vbr_cursor],
+            &fec,
+            &fec,
+            &mut dgram,
+        )
+        .expect("pack VBR+FEC packet");
+
+        assert_eq!(
+            vbr_with_fec - vbr_no_fec,
+            2 * ADPCM_FEC_BYTES,
+            "each packet carries two 124-byte ADPCM backups"
+        );
+        // Suppressing FEC on Opus removes both backups (248 B), but Opus's
+        // own framing costs ~60 B more than the fixed 256 kbps VBR rung here.
+        // The net saving is still ~188 B per datagram, or ~300 kbps at the
+        // 200 packets/s Party cadence.
+        let net_saving = vbr_with_fec - opus_len;
+        println!(
+            "party packet: Opus {opus_len} B vs VBR+FEC {vbr_with_fec} B (net {net_saving} B)"
+        );
+        assert!(
+            net_saving > 160,
+            "Opus + FEC suppression must save >160 B/packet, got {net_saving}"
+        );
+    }
+
+    #[test]
     fn test_client_volume_feedback_roundtrip() {
         use audioshare_protocol::wire::{ClientFeedbackPacket, CONTROL_FEEDBACK_LEN};
         let fb = ClientFeedbackPacket {
@@ -1247,9 +1421,15 @@ mod tests {
 
     #[test]
     fn test_party_transmitter_starts_with_zero_static_targets() {
-        // The Kotlin fallback TARGET_HOSTS is the broadcast address, which the
-        // parser rejects. Party mode must still start with no static targets:
-        // peers register themselves through HELLO/feedback after discovery.
+        // The Kotlin service now passes an empty TARGET_HOSTS when the user
+        // has not selected a PC. Party mode must still start: peers register
+        // themselves through HELLO/feedback after discovery.
+        let tx = PhoneMicTransmitter::start("", false);
+        assert!(tx.is_ok());
+        let mut tx = tx.unwrap();
+        tx.stop();
+
+        // The old broadcast fallback must stay harmless for older callers.
         let tx = PhoneMicTransmitter::start("255.255.255.255:65530", false);
         assert!(tx.is_ok());
         let mut tx = tx.unwrap();

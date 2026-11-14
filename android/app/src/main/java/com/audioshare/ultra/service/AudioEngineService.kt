@@ -494,13 +494,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         projectionActive = false
         previous?.stopCasting()
 
-        val rawTargets = intent.getStringExtra("TARGET_HOSTS")
-            ?: "255.255.255.255:65530"
+        // Empty is a valid Party target list: the transmitter advertises a
+        // beacon and peer phones register themselves by HELLO/feedback. The
+        // old 255.255.255.255 fallback was filtered out by the native parser
+        // anyway (broadcast destinations burn Wi-Fi airtime), so it only hid
+        // the discovery-only case.
+        val rawTargets = intent.getStringExtra("TARGET_HOSTS").orEmpty()
         val targets = rawTargets
             .split(',', ';', ' ')
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-            .ifEmpty { listOf("255.255.255.255:65530") }
 
         if (!isStreaming) {
             currentHostAddr = "Party Audio Broadcast"

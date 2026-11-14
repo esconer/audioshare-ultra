@@ -241,9 +241,25 @@ impl CvsdState {
 /// by only +/-2 LSB, i.e. roughly -84 dBFS instead of the old -48 dBFS floor.
 const VBR_MIN_STEP: i32 = 4;
 
+/// Slope threshold above which a sample is considered active rather than
+/// silent lead-in when locating a late transient onset. Shared by the VBR and
+/// IMA-FEC encoders so both pick the same lead-in boundary.
+const ONSET_SLOPE_THRESHOLD: i32 = 32;
+
+/// A transient that starts this early has no meaningful silent lead-in; the
+/// legacy codec already handles it because the initial step is seeded from the
+/// first samples themselves.
+const ONSET_MIN_LATE_SAMPLE: usize = 4;
+
+/// Largest pre-onset peak that still counts as a silent lead-in. Above this
+/// the ordinary first-window step estimate is representative and the deadzone
+/// would only distort real audio.
+const SILENT_LEAD_IN_PEAK_LSB: i32 = 512;
+
 /// Adaptive Jayant step update shared identically by encoder and decoder.
 #[inline(always)]
-fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8) -> i32 {
+fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8, min_step: i32) -> i32 {
+    let floor = min_step.max(VBR_MIN_STEP);
     match width {
         1 => {
             let b = (code & 1) as u8;
@@ -255,28 +271,28 @@ fn adapt_vbr_step(step: i32, code: u32, width: u8, prev_bit: &mut u8) -> i32 {
                 (step * 3) >> 2
             };
             *prev_bit = b;
-            next.clamp(VBR_MIN_STEP, 8192)
+            next.clamp(floor, 8192)
         }
         2 => {
             *prev_bit = (code >> 1) as u8;
             if code == 0 || code == 3 {
-                ((step * 5) >> 2).clamp(VBR_MIN_STEP, 8192)
+                ((step * 5) >> 2).clamp(floor, 8192)
             } else {
                 // Codes 1/2 are the codes a zero residual oscillates between.
                 // Decaying them is essential: keeping `step` unchanged here
                 // made the old quantizer hiss forever at its initial 256 LSB.
-                ((step * 13) >> 4).clamp(VBR_MIN_STEP, 8192)
+                ((step * 13) >> 4).clamp(floor, 8192)
             }
         }
         _ => {
             *prev_bit = (code >> (width - 1)) as u8;
             let max_c = (1u32 << width) - 1;
             if code <= 1 || code >= max_c - 1 {
-                ((step * 5) >> 2).clamp(VBR_MIN_STEP, 8192)
+                ((step * 5) >> 2).clamp(floor, 8192)
             } else if code == 2 || code == max_c - 2 {
                 step
             } else {
-                ((step * 13) >> 4).clamp(VBR_MIN_STEP, 8192)
+                ((step * 13) >> 4).clamp(floor, 8192)
             }
         }
     }
@@ -413,11 +429,23 @@ fn encode_vbr_subframe_layout(
         for block in 0..blocks_per_channel {
             let first_idx = (block * spec.block_len) * 2 + ch;
             let first_s = pcm_stereo[first_idx];
-            let mut max_slope = 0i32;
+            // Keep the legacy first-0.33 ms estimate separate so ordinary
+            // frames stay byte-identical to the pre-nb17 encoder. The full
+            // block maximum is only used once a late transient opts in.
+            let mut early_slope = 0i32;
+            let mut full_slope = 0i32;
+            let mut first_active_k: Option<usize> = None;
             let mut prev = first_s as i32;
-            for k in 1..spec.block_len.min(32) {
+            for k in 1..spec.block_len {
                 let s = pcm_stereo[(block * spec.block_len + k) * 2 + ch] as i32;
-                max_slope = max_slope.max((s - prev).abs());
+                let diff = (s - prev).abs();
+                if first_active_k.is_none() && diff > ONSET_SLOPE_THRESHOLD {
+                    first_active_k = Some(k);
+                }
+                if k < spec.block_len.min(32) {
+                    early_slope = early_slope.max(diff);
+                }
+                full_slope = full_slope.max(diff);
                 prev = s;
             }
             let hdr_off =
@@ -425,7 +453,26 @@ fn encode_vbr_subframe_layout(
             let seed = first_s.to_le_bytes();
             out[hdr_off] = seed[0];
             out[hdr_off + 1] = seed[1];
-            out[hdr_off + 2] = vbr_initial_step_index(max_slope);
+            let lead_in_is_silent = first_active_k.is_some_and(|onset_k| {
+                let block_start = block * spec.block_len;
+                (block_start..block_start + onset_k).all(|i| {
+                    pcm_stereo[i * 2].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
+                        && pcm_stereo[i * 2 + 1].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
+                })
+            });
+            // Slot 0 is the legacy layout and also means "no late onset".
+            // Round down so the seeded step arrives at or just before the
+            // attack instead of crushing the first samples of the transient.
+            let transient_onset =
+                first_active_k.filter(|&k| k >= ONSET_MIN_LATE_SAMPLE && lead_in_is_silent);
+            let onset_slot = transient_onset.map_or(0u8, |k| (k / 4).min(30) as u8);
+            let seed_slope = if transient_onset.is_some() {
+                full_slope
+            } else {
+                early_slope
+            };
+            let step_idx = vbr_initial_step_index(seed_slope) & 0x07;
+            out[hdr_off + 2] = step_idx | (onset_slot << 3);
         }
     }
 
@@ -438,10 +485,25 @@ fn encode_vbr_subframe_layout(
             let hdr_off =
                 exponent_start + (ch * blocks_per_channel + block) * VBR_BLOCK_HEADER_BYTES;
             let mut prev1 = i16::from_le_bytes([out[hdr_off], out[hdr_off + 1]]) as i32;
-            let mut step = VBR_INIT_STEPS[(out[hdr_off + 2] & 0x07) as usize];
+            let hdr_byte = out[hdr_off + 2];
+            let target_step = VBR_INIT_STEPS[(hdr_byte & 0x07) as usize];
+            let onset_k = ((hdr_byte >> 3) as usize) * 4;
+            let mut step = if onset_k == 0 {
+                target_step
+            } else {
+                VBR_MIN_STEP
+            };
+            // Slot 0 is also what legacy encoders wrote. Keep the old adaptive
+            // floor so a new decoder reproduces old payloads exactly; only an
+            // explicit onset slot opts into the transient-seeded step floor.
+            let mut min_step = VBR_MIN_STEP;
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
+                if onset_k > 0 && k == onset_k {
+                    step = target_step;
+                    min_step = (target_step >> 1).max(VBR_MIN_STEP);
+                }
                 let i = block * spec.block_len + k;
                 let width = vbr_width(&spec, block, k, block_layout);
                 let s = pcm_stereo[i * 2 + ch] as i32;
@@ -461,7 +523,7 @@ fn encode_vbr_subframe_layout(
                 } else {
                     prev1 = (prev1 + dequant).clamp(-32_768, 32_767);
                 }
-                step = adapt_vbr_step(step, code, width, &mut prev_bit);
+                step = adapt_vbr_step(step, code, width, &mut prev_bit, min_step);
             }
         }
     }
@@ -556,10 +618,24 @@ pub fn decode_vbr_subframe_to_f32(
             let hdr_off =
                 exponent_start + (ch * blocks_per_channel + block) * VBR_BLOCK_HEADER_BYTES;
             let mut prev1 = i16::from_le_bytes([encoded[hdr_off], encoded[hdr_off + 1]]) as i32;
-            let mut step = VBR_INIT_STEPS[(encoded[hdr_off + 2] & 0x07) as usize];
+            let hdr_byte = encoded[hdr_off + 2];
+            let target_step = VBR_INIT_STEPS[(hdr_byte & 0x07) as usize];
+            let onset_k = ((hdr_byte >> 3) as usize) * 4;
+            let mut step = if onset_k == 0 {
+                target_step
+            } else {
+                VBR_MIN_STEP
+            };
+            // Slot 0 is the legacy layout. Keep the old floor so payloads
+            // produced before the onset extension decode bit-exactly.
+            let mut min_step = VBR_MIN_STEP;
             let mut prev_bit = 1u8;
 
             for k in 0..spec.block_len {
+                if onset_k > 0 && k == onset_k {
+                    step = target_step;
+                    min_step = (target_step >> 1).max(VBR_MIN_STEP);
+                }
                 let i = block * spec.block_len + k;
                 let width = vbr_width(&spec, block, k, block_layout);
                 let Some(code) = read_bits(encoded, &mut bit_pos, width) else {
@@ -577,7 +653,7 @@ pub fn decode_vbr_subframe_to_f32(
                     out_f32[i * 2 + ch] = (recon as f32) * (1.0 / 32_768.0);
                     prev1 = recon;
                 }
-                step = adapt_vbr_step(step, code, width, &mut prev_bit);
+                step = adapt_vbr_step(step, code, width, &mut prev_bit, min_step);
             }
         }
     }
@@ -861,8 +937,41 @@ const IMA_STEP_TABLE: [i32; 89] = [
     10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
 ];
 
+/// Byte 4 marker ranges for FEC frames.
+///
+/// - `0x00`: pre-nb16 layout. Right channel shares the left initial index.
+/// - `0x80..=0xD8`: nb16 layout. Bits 0..6 carry the right initial index.
+/// - `0xD9..=0xFE`: late-transient layout. The low bits encode an onset
+///   bucket; both channels share one transient-sized initial index and the
+///   zero deadzone holds the predictor still through the silent lead-in.
+/// - `0xFF`: reserved.
+///
+/// Choosing values old encoders never wrote keeps new decoders bit-exact on
+/// every legacy payload while giving late-transient frames their own mode.
+const FEC_RIGHT_INDEX_MARKER_MAX: u8 = 0xD8;
+const FEC_TRANSIENT_MARKER_BASE: u8 = 0xD9;
+const FEC_TRANSIENT_BUCKETS: usize = 38;
+
+/// Map an onset sample to the bucket stored in the byte-4 marker.
+#[inline]
+fn fec_onset_bucket(onset_k: usize) -> usize {
+    ((onset_k * FEC_TRANSIENT_BUCKETS) / SUBFRAME_FRAMES).min(FEC_TRANSIENT_BUCKETS - 1)
+}
+
+/// Recover the onset sample both encoder and decoder use for the deadzone.
+#[inline]
+fn fec_bucket_onset(bucket: usize) -> usize {
+    (bucket * SUBFRAME_FRAMES + FEC_TRANSIENT_BUCKETS / 2) / FEC_TRANSIENT_BUCKETS
+}
+
 #[inline(always)]
-fn encode_adpcm_sample(sample: i16, pred: &mut i32, idx: &mut i8) -> u8 {
+fn encode_adpcm_sample(
+    sample: i16,
+    pred: &mut i32,
+    idx: &mut i8,
+    min_idx: i8,
+    zero_deadzone: bool,
+) -> u8 {
     let step = IMA_STEP_TABLE[*idx as usize];
     let mut diff = (sample as i32) - *pred;
     let mut nibble = 0u8;
@@ -885,17 +994,29 @@ fn encode_adpcm_sample(sample: i16, pred: &mut i32, idx: &mut i8) -> u8 {
         nibble |= 1;
         vpdiff += step >> 2;
     }
+    // Mid-tread zero deadzone: when magnitude nibble is 0 (`|diff| < step / 4`),
+    // keep the predictor stationary so a large transient-sized `step` does not
+    // inject a `step / 8` (up to 4,095 LSB) jump during a silent lead-in.
+    if zero_deadzone && (nibble & 7) == 0 {
+        vpdiff = 0;
+    }
     if (nibble & 8) != 0 {
         *pred = (*pred - vpdiff).clamp(-32768, 32767);
     } else {
         *pred = (*pred + vpdiff).clamp(-32768, 32767);
     }
-    *idx = (*idx + IMA_INDEX_TABLE[nibble as usize]).clamp(0, 88);
+    *idx = (*idx + IMA_INDEX_TABLE[nibble as usize]).clamp(min_idx, 88);
     nibble
 }
 
 #[inline(always)]
-fn decode_adpcm_sample(nibble: u8, pred: &mut i32, idx: &mut i8) -> i16 {
+fn decode_adpcm_sample(
+    nibble: u8,
+    pred: &mut i32,
+    idx: &mut i8,
+    min_idx: i8,
+    zero_deadzone: bool,
+) -> i16 {
     let step = IMA_STEP_TABLE[*idx as usize];
     let mut vpdiff = step >> 3;
     if (nibble & 4) != 0 {
@@ -907,12 +1028,15 @@ fn decode_adpcm_sample(nibble: u8, pred: &mut i32, idx: &mut i8) -> i16 {
     if (nibble & 1) != 0 {
         vpdiff += step >> 2;
     }
+    if zero_deadzone && (nibble & 7) == 0 {
+        vpdiff = 0;
+    }
     if (nibble & 8) != 0 {
         *pred = (*pred - vpdiff).clamp(-32768, 32767);
     } else {
         *pred = (*pred + vpdiff).clamp(-32768, 32767);
     }
-    *idx = (*idx + IMA_INDEX_TABLE[(nibble & 0x0F) as usize]).clamp(0, 88);
+    *idx = (*idx + IMA_INDEX_TABLE[(nibble & 0x0F) as usize]).clamp(min_idx, 88);
     *pred as i16
 }
 
@@ -933,22 +1057,64 @@ pub fn encode_fec_subframe(
     // Track the channels independently. A shared maximum let a loud transient
     // in one ear select the step for both, so a hard-panned hit drove the
     // silent opposite channel by thousands of LSB for the first milliseconds.
-    let mut max_slope_l = 60i32;
-    let mut max_slope_r = 60i32;
-    for i in 1..SUBFRAME_FRAMES.min(16) {
+    // Scan the whole subframe for a late onset and the largest slope, but keep
+    // the first-0.33 ms maximum separate: ordinary frames must stay
+    // bit-identical to the nb16 encoder.
+    let mut early_slope_l = 60i32;
+    let mut early_slope_r = 60i32;
+    let mut full_slope_l = 60i32;
+    let mut full_slope_r = 60i32;
+    let mut first_active_k: Option<usize> = None;
+    for i in 1..SUBFRAME_FRAMES {
         let d_l = (pcm_stereo[i * 2] as i32 - pcm_stereo[(i - 1) * 2] as i32).abs();
         let d_r = (pcm_stereo[i * 2 + 1] as i32 - pcm_stereo[(i - 1) * 2 + 1] as i32).abs();
-        max_slope_l = max_slope_l.max(d_l);
-        max_slope_r = max_slope_r.max(d_r);
+        if i < SUBFRAME_FRAMES.min(16) {
+            early_slope_l = early_slope_l.max(d_l);
+            early_slope_r = early_slope_r.max(d_r);
+        }
+        if first_active_k.is_none() && d_l.max(d_r) > ONSET_SLOPE_THRESHOLD {
+            first_active_k = Some(i);
+        }
+        full_slope_l = full_slope_l.max(d_l);
+        full_slope_r = full_slope_r.max(d_r);
     }
-    let init_idx_l = IMA_STEP_TABLE
-        .iter()
-        .position(|&s| s >= max_slope_l)
-        .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8;
-    let init_idx_r = IMA_STEP_TABLE
-        .iter()
-        .position(|&s| s >= max_slope_r)
-        .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8;
+    let lookup_idx = |slope: i32| -> i8 {
+        IMA_STEP_TABLE
+            .iter()
+            .position(|&s| s >= slope)
+            .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8
+    };
+    // A late transient gets the full-frame maximum slope and a shared initial
+    // index. Sharing is safe because the zero deadzone holds both predictors
+    // still through the lead-in, and it frees byte 4 for the mode marker.
+    // Only a genuinely quiet lead-in benefits; a steady or DC-offset start
+    // already has a representative first-window step.
+    let lead_in_is_silent = first_active_k.is_some_and(|onset_k| {
+        (0..onset_k).all(|i| {
+            pcm_stereo[i * 2].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
+                && pcm_stereo[i * 2 + 1].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
+        })
+    });
+    let transient_onset =
+        first_active_k.filter(|&k| k >= ONSET_MIN_LATE_SAMPLE && lead_in_is_silent);
+    let (init_idx_l, init_idx_r, min_idx_l, min_idx_r, marker, deadzone_until) =
+        if let Some(onset_k) = transient_onset {
+            let shared = lookup_idx(full_slope_l.max(full_slope_r));
+            let floor = (shared - 8).max(0);
+            let bucket = fec_onset_bucket(onset_k);
+            (
+                shared,
+                shared,
+                floor,
+                floor,
+                FEC_TRANSIENT_MARKER_BASE + bucket as u8,
+                fec_bucket_onset(bucket),
+            )
+        } else {
+            let init_l = lookup_idx(early_slope_l);
+            let init_r = lookup_idx(early_slope_r);
+            (init_l, init_r, 0, 0, 0x80 | (init_r as u8 & 0x7F), 0)
+        };
     let mut idx_l = init_idx_l;
     let mut idx_r = init_idx_r;
 
@@ -961,14 +1127,24 @@ pub fn encode_fec_subframe(
     // 7-bit index tag, R is exact). Re-encoding it with the initial step would
     // apply an ADPCM step of up to step/8 to a near-zero residual, biasing the
     // predictor before sample 1. Keep the first nibble for wire compatibility
-    // and use its byte for the right channel's independent initial step:
-    // bit 7 marks its presence, bits 0..6 hold the index. Frames from older
-    // encoders leave this byte zero, so the decoder falls back to the left
-    // index exactly as before.
-    out[4] = 0x80 | (init_idx_r as u8 & 0x7F);
+    // and use its byte for the channel/mode marker.
+    out[4] = marker;
     for i in 1..SUBFRAME_FRAMES {
-        let nib_l = encode_adpcm_sample(pcm_stereo[i * 2], &mut pred_l, &mut idx_l);
-        let nib_r = encode_adpcm_sample(pcm_stereo[i * 2 + 1], &mut pred_r, &mut idx_r);
+        let zero_deadzone = i < deadzone_until;
+        let nib_l = encode_adpcm_sample(
+            pcm_stereo[i * 2],
+            &mut pred_l,
+            &mut idx_l,
+            min_idx_l,
+            zero_deadzone,
+        );
+        let nib_r = encode_adpcm_sample(
+            pcm_stereo[i * 2 + 1],
+            &mut pred_r,
+            &mut idx_r,
+            min_idx_r,
+            zero_deadzone,
+        );
         out[4 + i] = (nib_l & 0x0F) | ((nib_r & 0x0F) << 4);
     }
 }
@@ -983,12 +1159,27 @@ pub fn decode_fec_subframe_to_f32(
     }
     let l_tagged = i16::from_le_bytes([fec_bytes[0], fec_bytes[1]]);
     let init_idx_l = ((l_tagged & 0x007F) as i8).clamp(0, 88);
-    // Byte 4 carries the right channel's independent step index when bit 7 is
-    // set. Legacy frames wrote zero there and shared the left index.
-    let init_idx_r = if (fec_bytes[4] & 0x80) != 0 {
-        ((fec_bytes[4] & 0x7F) as i8).clamp(0, 88)
+    let marker = fec_bytes[4];
+    let transient = (FEC_TRANSIENT_MARKER_BASE..=0xFE).contains(&marker);
+    let (init_idx_r, min_idx_l, min_idx_r, deadzone_until) = if transient {
+        // One shared transient-sized index; the mode marker occupies the byte
+        // that otherwise carries the independent right index.
+        let floor = (init_idx_l - 8).max(0);
+        (
+            init_idx_l,
+            floor,
+            floor,
+            fec_bucket_onset((marker - FEC_TRANSIENT_MARKER_BASE) as usize),
+        )
+    } else if marker > FEC_RIGHT_INDEX_MARKER_MAX {
+        // 0xFF is reserved; decode it as a plain nb16 frame.
+        (init_idx_l, 0, 0, 0)
+    } else if (marker & 0x80) != 0 {
+        let init_idx_r = ((marker & 0x7F) as i8).clamp(0, 88);
+        (init_idx_r, 0, 0, 0)
     } else {
-        init_idx_l
+        // Pre-nb16 frames leave byte 4 zero and share the left index.
+        (init_idx_l, 0, 0, 0)
     };
     let mut pred_l = l_tagged as i32;
     let mut pred_r = i16::from_le_bytes([fec_bytes[2], fec_bytes[3]]) as i32;
@@ -1003,8 +1194,21 @@ pub fn decode_fec_subframe_to_f32(
 
     for i in 1..SUBFRAME_FRAMES {
         let packed = fec_bytes[4 + i];
-        let s_l = decode_adpcm_sample(packed & 0x0F, &mut pred_l, &mut idx_l);
-        let s_r = decode_adpcm_sample(packed >> 4, &mut pred_r, &mut idx_r);
+        let zero_deadzone = i < deadzone_until;
+        let s_l = decode_adpcm_sample(
+            packed & 0x0F,
+            &mut pred_l,
+            &mut idx_l,
+            min_idx_l,
+            zero_deadzone,
+        );
+        let s_r = decode_adpcm_sample(
+            packed >> 4,
+            &mut pred_r,
+            &mut idx_r,
+            min_idx_r,
+            zero_deadzone,
+        );
         out_f32[i * 2] = (s_l as f32) * (1.0 / 32768.0);
         out_f32[i * 2 + 1] = (s_r as f32) * (1.0 / 32768.0);
     }
@@ -1163,6 +1367,155 @@ mod tests {
         legacy[4] = 0;
         let mut legacy_decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decode_fec_subframe_to_f32(&legacy, &mut legacy_decoded));
+    }
+
+    // Fixtures produced by the pre-nb17 codec at commit 4557b6b. They pin the
+    // exact legacy decode path: any change to how old payloads reconstruct
+    // samples breaks these hashes.
+    const LEGACY_VBR_256_HEX: &str = "7e82000007000007eeaeae55000065665aa6a5599a99651cc7711cc7711cc7711cc7711cc7711cc7711cc7711ce7eeea5a05005066a6655a9aa59959c6711cc7711cc7711cc7711cc7711cc7711cc7711cc771";
+    const LEGACY_VBR_256_HASH: u64 = 0x8248_99db_475d_43a9;
+    const LEGACY_FEC_HEX: &str = "42000000c23344333333333333222210019999bbddccccccffee8800880088008800008888000088088080088800008888000088088080080880800888000088880000888008088080080880800808808008088080080880800808800880088008808008800880089000000000000000000000000000000000000000";
+    const LEGACY_FEC_HASH: u64 = 0x527b_411e_9c7b_44b9;
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0);
+        hex.as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
+                let lo = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
+                (hi << 4) | lo
+            })
+            .collect()
+    }
+
+    fn decoded_fnv1a(samples: &[f32; SUBFRAME_STEREO_SAMPLES]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &sample in samples {
+            let value = (sample * 32_768.0).round() as i32 as u32;
+            for byte in value.to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn encoded_fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    #[test]
+    fn test_non_transient_encoding_stays_bit_identical() {
+        // Head hashes captured from commit 4557b6b with the pre-nb17 codec.
+        // The onset extension must not change a single byte unless a genuine
+        // near-silent lead-in precedes the attack. The `loud_late` case has a
+        // 2,000 LSB pre-roll and a much louder attack at sample 50; scanning
+        // the whole block for the initial step would have changed it.
+        let mut sine = [0i16; SUBFRAME_STEREO_SAMPLES];
+        make_sine(&mut sine);
+
+        let mut loud_late = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let phase = (i as f32) * std::f32::consts::TAU * 220.0 / 48_000.0;
+            let base = (phase.sin() * 2_000.0) as i16;
+            loud_late[i * 2] = base;
+            loud_late[i * 2 + 1] = base;
+        }
+        for i in 50..SUBFRAME_FRAMES {
+            let v = (30_000.0 * (-((i - 50) as f32) / 12.0).exp()).round() as i16;
+            loud_late[i * 2] = v;
+            loud_late[i * 2 + 1] = v;
+        }
+
+        let mut square12k = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let v = if (i / 2) % 2 == 0 { 24_000i16 } else { -24_000 };
+            square12k[i * 2] = v;
+            square12k[i * 2 + 1] = v;
+        }
+
+        let cases: [(&str, [i16; SUBFRAME_STEREO_SAMPLES], [u64; 4]); 3] = [
+            (
+                "sine",
+                sine,
+                [
+                    0x2e02_e5b4_5bf1_0734,
+                    0x4d39_2bdc_64f4_e533,
+                    0x6603_7c6e_ae38_6e46,
+                    0xde56_a090_9b8e_f71c,
+                ],
+            ),
+            (
+                "loud_late",
+                loud_late,
+                [
+                    0xb3a0_606a_27ed_ff79,
+                    0x9d8d_2e9a_b605_3b85,
+                    0x179e_a841_d1a9_28b2,
+                    0x5b83_c66a_74d2_5b87,
+                ],
+            ),
+            (
+                "square12k",
+                square12k,
+                [
+                    0xb241_7133_1aa0_7d71,
+                    0xf1f3_acd5_333b_226d,
+                    0x3ea1_da96_a78f_86ba,
+                    0x838b_4905_7d56_f418,
+                ],
+            ),
+        ];
+
+        for (name, pcm, expected) in cases {
+            for (slot, kbps) in [160u16, 256, 320].into_iter().enumerate() {
+                let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                let len = encode_vbr_subframe(&pcm, kbps, &mut enc);
+                assert_eq!(
+                    encoded_fnv1a(&enc[..len]),
+                    expected[slot],
+                    "{name} VBR {kbps}k changed"
+                );
+            }
+            let mut fec = [0u8; ADPCM_FEC_BYTES];
+            encode_fec_subframe(&pcm, &mut fec);
+            assert_eq!(encoded_fnv1a(&fec), expected[3], "{name} FEC changed");
+        }
+    }
+
+    #[test]
+    fn test_legacy_vbr_and_fec_payloads_decode_bit_exactly() {
+        let vbr = hex_bytes(LEGACY_VBR_256_HEX);
+        assert_eq!(vbr[0], TAG_VBR_BFP);
+        // Old encoders left the onset-slot bits clear in every block header.
+        assert_eq!(vbr[4] >> 3, 0, "legacy left block must use slot 0");
+        assert_eq!(vbr[7] >> 3, 0, "legacy right block must use slot 0");
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_vbr_subframe_to_f32(&vbr, &mut decoded));
+        assert_eq!(decoded_fnv1a(&decoded), LEGACY_VBR_256_HASH);
+
+        let fec = hex_bytes(LEGACY_FEC_HEX);
+        assert_eq!(fec.len(), ADPCM_FEC_BYTES);
+        assert!(
+            (0x80..=FEC_RIGHT_INDEX_MARKER_MAX).contains(&fec[4]),
+            "fixture must use the nb16 right-index marker"
+        );
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut decoded));
+        assert_eq!(decoded_fnv1a(&decoded), LEGACY_FEC_HASH);
+
+        // Pre-nb16 frames leave byte 4 zero and must use the shared-index path,
+        // never the transient marker range.
+        let mut pre_nb16 = fec;
+        pre_nb16[4] = 0;
+        assert!(decode_fec_subframe_to_f32(&pre_nb16, &mut decoded));
+        assert_eq!(decoded_fnv1a(&decoded), LEGACY_FEC_HASH);
     }
 
     fn make_sine(samples: &mut [i16; SUBFRAME_STEREO_SAMPLES]) {
@@ -1422,9 +1775,77 @@ mod tests {
         let mut prev_bit = 1;
         for i in 0..96 {
             let code = if i % 2 == 0 { 1 } else { 2 };
-            step = adapt_vbr_step(step, code, 2, &mut prev_bit);
+            step = adapt_vbr_step(step, code, 2, &mut prev_bit, VBR_MIN_STEP);
         }
         assert_eq!(step, VBR_MIN_STEP);
+    }
+
+    #[test]
+    fn test_vbr_and_fec_late_transient_attack_and_lead_in() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 60..SUBFRAME_FRAMES {
+            let v = (30_000.0 * (-((i - 60) as f32) / 12.0).exp()).round() as i16;
+            pcm[i * 2] = v;
+            pcm[i * 2 + 1] = v;
+        }
+
+        let measure = |decoded: &[f32; SUBFRAME_STEREO_SAMPLES]| -> (f32, f32) {
+            let mut lead_in_peak_lsb = 0.0f32;
+            for i in 0..60 {
+                for ch in 0..2 {
+                    let err = (decoded[i * 2 + ch] * 32_768.0 - pcm[i * 2 + ch] as f32).abs();
+                    lead_in_peak_lsb = lead_in_peak_lsb.max(err);
+                }
+            }
+            let mut sig = 0.0f64;
+            let mut err = 0.0f64;
+            for i in 60..90 {
+                for ch in 0..2 {
+                    let s = pcm[i * 2 + ch] as f64 / 32_768.0;
+                    let e = s - decoded[i * 2 + ch] as f64;
+                    sig += s * s;
+                    err += e * e;
+                }
+            }
+            let attack_snr_db = (10.0 * (sig / err.max(1e-12)).log10()) as f32;
+            (attack_snr_db, lead_in_peak_lsb)
+        };
+
+        for kbps in [160u16, 256, 320] {
+            let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let len = encode_vbr_subframe(&pcm, kbps, &mut enc);
+            let mut dec = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(&enc[..len], &mut dec));
+            let (attack_snr, lead_in_lsb) = measure(&dec);
+            assert!(
+                attack_snr >= 6.0,
+                "VBR {}k attack SNR {:.2} dB < 6.0 dB",
+                kbps,
+                attack_snr
+            );
+            assert!(
+                lead_in_lsb <= 512.0,
+                "VBR {}k lead-in {:.1} LSB > 512 LSB",
+                kbps,
+                lead_in_lsb
+            );
+        }
+
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+        let mut dec_fec = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut dec_fec));
+        let (fec_snr, fec_lead_in) = measure(&dec_fec);
+        assert!(
+            fec_snr >= 6.0,
+            "IMA-FEC attack SNR {:.2} dB < 6.0 dB",
+            fec_snr
+        );
+        assert!(
+            fec_lead_in <= 512.0,
+            "IMA-FEC lead-in {:.1} LSB > 512 LSB",
+            fec_lead_in
+        );
     }
 
     #[test]

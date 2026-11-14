@@ -89,13 +89,19 @@ fn primary_bundle_is_opus(primary: &[u8]) -> bool {
 ///
 /// `base_seq` and `opus_decoder` are needed for the stateful Opus backend:
 /// Opus must see frames in stream order, so the tagged payload is decoded with
-/// `decode_subframe_at_seq`. The other codecs are self-identifying and stay
+/// `decode_subframe_with_plc`. The other codecs are self-identifying and stay
 /// stateless.
+///
+/// `on_plc` receives every CELT concealment frame generated for a sequence gap,
+/// phase-aligned with the Opus lookahead, so the caller can heal empty
+/// sequencer slots. It must run before `on_subframe` for the frame that
+/// exposed the gap; the packet's own audio is reported afterwards.
 fn decode_primary_bundle(
     primary: &[u8],
     subframe_count: u8,
     base_seq: u16,
     mut opus_decoder: Option<&mut Option<OpusStreamDecoder>>,
+    mut on_plc: impl FnMut(u16, &[f32; SUBFRAME_STEREO_SAMPLES]),
     mut on_subframe: impl FnMut(usize, &[f32; SUBFRAME_STEREO_SAMPLES]),
 ) -> usize {
     let mut cursor = 0usize;
@@ -122,7 +128,9 @@ fn decode_primary_bundle(
                 }
                 decoder_slot
                     .as_mut()
-                    .map(|decoder| decoder.decode_subframe_at_seq(seq, payload, &mut pcm_f32))
+                    .map(|decoder| {
+                        decoder.decode_subframe_with_plc(seq, payload, &mut pcm_f32, &mut on_plc)
+                    })
                     .unwrap_or(false)
             } else {
                 false
@@ -520,6 +528,17 @@ impl PhoneMicReceiver {
                                 parsed.header.subframe_count,
                                 base_seq,
                                 Some(&mut opus_decoder),
+                                |missed_seq, plc_pcm| {
+                                    // Opus PLC is phase-aligned with the
+                                    // lookahead, so it can fill an empty slot
+                                    // directly. A late primary copy still wins
+                                    // because it arrives as a normal push.
+                                    if (missed_seq.wrapping_sub(next_seq) as i16) >= 0
+                                        && sequencer.is_slot_missing(missed_seq)
+                                    {
+                                        sequencer.try_heal_with_fec(missed_seq, plc_pcm);
+                                    }
+                                },
                                 |sub_idx, pcm_f32| {
                                     let mut max_peak = 0.0f32;
                                     for &v in pcm_f32.iter() {
@@ -693,13 +712,20 @@ mod tests {
         }
 
         let mut decoded = Vec::new();
-        let count = decode_primary_bundle(&bundle[..cursor], 2, 0, None, |idx, pcm| {
-            let mut samples = [0i16; SUBFRAME_STEREO_SAMPLES];
-            for (dst, &s) in samples.iter_mut().zip(pcm.iter()) {
-                *dst = (s * 32768.0).round() as i16;
-            }
-            decoded.push((idx, samples));
-        });
+        let count = decode_primary_bundle(
+            &bundle[..cursor],
+            2,
+            0,
+            None,
+            |_, _| {},
+            |idx, pcm| {
+                let mut samples = [0i16; SUBFRAME_STEREO_SAMPLES];
+                for (dst, &s) in samples.iter_mut().zip(pcm.iter()) {
+                    *dst = (s * 32768.0).round() as i16;
+                }
+                decoded.push((idx, samples));
+            },
+        );
 
         assert_eq!(count, 2);
         assert_eq!(decoded.len(), 2);
@@ -713,7 +739,14 @@ mod tests {
     fn test_decode_primary_bundle_rejects_truncated_length_prefix() {
         let mut short = [0u8; 4];
         short[0..2].copy_from_slice(&100u16.to_be_bytes());
-        let count = decode_primary_bundle(&short, 1, 0, None, |_, _| panic!("must not decode"));
+        let count = decode_primary_bundle(
+            &short,
+            1,
+            0,
+            None,
+            |_, _| {},
+            |_, _| panic!("must not decode"),
+        );
         assert_eq!(count, 0);
     }
 
@@ -746,7 +779,14 @@ mod tests {
         bundle[2..2 + len].copy_from_slice(&enc[..len]);
 
         let mut decoder = Some(OpusStreamDecoder::new().expect("create Opus decoder"));
-        let count = decode_primary_bundle(&bundle[..2 + len], 1, 0, Some(&mut decoder), |_, _| {});
+        let count = decode_primary_bundle(
+            &bundle[..2 + len],
+            1,
+            0,
+            Some(&mut decoder),
+            |_, _| {},
+            |_, _| {},
+        );
         assert_eq!(count, 1, "VBR payload must still decode");
         assert!(
             decoder.is_none(),
@@ -772,12 +812,19 @@ mod tests {
         bundle[2..2 + len].copy_from_slice(&enc[..len]);
 
         let mut peak = 0.0f32;
-        let count = decode_primary_bundle(&bundle[..2 + len], 1, 0, None, |idx, pcm| {
-            assert_eq!(idx, 0);
-            for &v in pcm {
-                peak = peak.max(v.abs());
-            }
-        });
+        let count = decode_primary_bundle(
+            &bundle[..2 + len],
+            1,
+            0,
+            None,
+            |_, _| {},
+            |idx, pcm| {
+                assert_eq!(idx, 0);
+                for &v in pcm {
+                    peak = peak.max(v.abs());
+                }
+            },
+        );
         assert_eq!(count, 1, "tagged VBR payload must decode");
         assert!(peak > 0.05, "decoded music must not be silence");
     }
@@ -805,10 +852,17 @@ mod tests {
         bundle[2..2 + len].copy_from_slice(&enc[..len]);
 
         let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-        let count = decode_primary_bundle(&bundle[..2 + len], 1, 42, None, |idx, pcm| {
-            assert_eq!(idx, 0);
-            decoded = *pcm;
-        });
+        let count = decode_primary_bundle(
+            &bundle[..2 + len],
+            1,
+            42,
+            None,
+            |_, _| {},
+            |idx, pcm| {
+                assert_eq!(idx, 0);
+                decoded = *pcm;
+            },
+        );
         assert_eq!(count, 1, "24-bit payload must decode");
         for (i, (&got, &source)) in decoded.iter().zip(pcm_f32.iter()).enumerate() {
             let q = (source.clamp(-1.0, 1.0) * 8_388_608.0)
@@ -857,10 +911,14 @@ mod tests {
 
         let mut decoder = Some(OpusStreamDecoder::new().expect("create Opus decoder"));
         let mut frames = Vec::new();
-        let count =
-            decode_primary_bundle(&bundle[..cursor], 2, 100, Some(&mut decoder), |idx, pcm| {
-                frames.push((idx, *pcm))
-            });
+        let count = decode_primary_bundle(
+            &bundle[..cursor],
+            2,
+            100,
+            Some(&mut decoder),
+            |_, _| {},
+            |idx, pcm| frames.push((idx, *pcm)),
+        );
         assert_eq!(
             count, 2,
             "both Opus subframes must decode through the bundle"
@@ -874,6 +932,68 @@ mod tests {
         assert!(
             peak > 0.02,
             "second Opus frame must carry real audio, peak={peak}"
+        );
+    }
+
+    #[test]
+    fn test_decode_primary_bundle_delivers_opus_plc_for_missing_slot() {
+        fn tone(frame_index: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let t = ((frame_index * SUBFRAME_FRAMES + i) as f32) / (SAMPLE_RATE as f32);
+                let l = (t * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+                let r = (t * 554.37 * std::f32::consts::TAU).sin() * 0.25;
+                pcm[i * 2] = (l * 32767.0) as i16;
+                pcm[i * 2 + 1] = (r * 32767.0) as i16;
+            }
+            pcm
+        }
+
+        // Materialize frames 99, 100 and 101 so the decoder has real history
+        // and a real future frame around the lost slot.
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut payloads = [[0u8; MAX_OPUS_SUBFRAME_BYTES]; 3];
+        let mut lens = [0usize; 3];
+        for frame_index in 0..3 {
+            lens[frame_index] = encoder
+                .encode_subframe(&tone(frame_index), 128, &mut payloads[frame_index])
+                .expect("encode Opus subframe");
+        }
+
+        let mut decoder = Some(OpusStreamDecoder::new().expect("create Opus decoder"));
+        let mut primed = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decoder.as_mut().unwrap().decode_subframe_at_seq(
+            99,
+            &payloads[0][..lens[0]],
+            &mut primed
+        ));
+
+        // Packet 100 was lost; packet 101 arrives with the next frame.
+        let mut bundle = [0u8; MAX_OPUS_SUBFRAME_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(lens[2] as u16).to_be_bytes());
+        bundle[2..2 + lens[2]].copy_from_slice(&payloads[2][..lens[2]]);
+
+        let mut plc = Vec::new();
+        let mut decoded = Vec::new();
+        let count = decode_primary_bundle(
+            &bundle[..2 + lens[2]],
+            1,
+            101,
+            Some(&mut decoder),
+            |missed_seq, pcm| plc.push((missed_seq, *pcm)),
+            |idx, pcm| decoded.push((idx, *pcm)),
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, 0);
+        assert_eq!(plc.len(), 1, "one lost slot must produce one PLC frame");
+        assert_eq!(plc[0].0, 100, "PLC must land on the missing sequence");
+        let plc_peak = plc[0].1.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(plc[0].1.iter().all(|sample| sample.is_finite()));
+        assert!(
+            plc_peak > 0.001,
+            "PLC frame must not be silent, peak={plc_peak}"
         );
     }
 
