@@ -185,7 +185,7 @@ impl ClockDriftResampler {
 }
 
 /// 2. Wait-Free SPSC Sample FIFO (Decouples 120-frame network quantum from Android SoC getFramesPerBurst())
-const FIFO_CAPACITY: usize = 8192; // Must be power of 2 (4096 stereo frames)
+const FIFO_CAPACITY: usize = 32768; // Power of 2 (16384 stereo frames = 341 ms @ 48 kHz for full BT Group Sync)
 const FIFO_MASK: usize = FIFO_CAPACITY - 1;
 
 pub struct BurstDecouplerRing {
@@ -472,6 +472,50 @@ mod tests {
 
         // Fourth pull: 0 samples remaining -> comfort dither injected and returns false
         assert!(!ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
+    }
+
+    #[test]
+    fn test_fifo_capacity_holds_64_subframes_at_96khz() {
+        assert_eq!(FIFO_CAPACITY, 32_768);
+        assert!(FIFO_CAPACITY.is_power_of_two());
+        let ring = BurstDecouplerRing::new();
+        assert_eq!(ring.capacity_samples(), 32_768);
+
+        let mut resampler = ClockDriftResampler::new();
+
+        // 48 kHz output: base_ratio 1.0, so 64 subframes are 15,360 samples.
+        resampler.set_output_sample_rate(48_000);
+        assert_eq!(resampler.base_ratio, 1.0);
+        assert_eq!(resampler.subframes_to_samples(64), 15_360);
+        assert!((resampler.samples_to_subframes(32_768) - 136.533_33).abs() < 1e-3);
+        assert!(resampler.subframes_to_samples(64) + 240 <= ring.capacity_samples());
+
+        // 96 kHz output: base_ratio 0.5, so 64 subframes are 30,720 output
+        // samples and the ring holds 68.27 subframe equivalents. 69
+        // subframes (33,120 samples) would overflow.
+        resampler.set_output_sample_rate(96_000);
+        assert_eq!(resampler.base_ratio, 0.5);
+        assert_eq!(resampler.subframes_to_samples(64), 30_720);
+        assert!((resampler.samples_to_subframes(32_768) - 68.266_67).abs() < 1e-3);
+        assert!(resampler.subframes_to_samples(69) > ring.capacity_samples());
+
+        // Simulate the client refill loop: push one output subframe at a
+        // time until the 64-subframe watermark is reached. Every push must
+        // be accepted whole, and one more subframe must still fit.
+        let watermark = resampler
+            .subframes_to_samples(64)
+            .min(ring.capacity_samples() - 2);
+        let subframe_samples = resampler.subframes_to_samples(1);
+        assert_eq!(subframe_samples, 480);
+        let chunk = vec![0.25f32; subframe_samples];
+        let mut pushes = 0;
+        while ring.available_samples() < watermark {
+            assert_eq!(ring.push_samples(&chunk), chunk.len());
+            pushes += 1;
+        }
+        assert_eq!(pushes, 64);
+        assert_eq!(ring.available_samples(), watermark);
+        assert!(watermark + subframe_samples <= ring.capacity_samples());
     }
 
     #[test]

@@ -110,10 +110,21 @@ fn parse_target_endpoints_with_locals(
         if item.is_empty() {
             continue;
         }
-        let host_only = item.split(':').next().unwrap_or(item);
-        let Ok(addr) = format!("{}:{}", host_only, PHONE_MIC_PORT).parse::<SocketAddr>() else {
+        // Always deliver phone-mic audio to `PHONE_MIC_PORT` (65532). The UI
+        // and discovery layer store `IP:65530` because 65530 is the control /
+        // client-stream port; the PC's `PhoneMicReceiver` listens on 65532,
+        // so preserving the user-visible port would send every hardware-mic
+        // and party-cast stream to a port nobody reads. Parse a bare address
+        // first so an IPv6 literal whose final hextet looks like a port is
+        // never mistaken for an explicit port.
+        let ip = if let Ok(ip) = item.parse::<IpAddr>() {
+            ip
+        } else if let Ok(explicit) = item.parse::<SocketAddr>() {
+            explicit.ip()
+        } else {
             continue;
         };
+        let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
 
         // A unicast phone-to-phone transmitter must never send to a broadcast,
         // multicast or unspecified address: 802.11 transmits those at the
@@ -167,6 +178,20 @@ fn initial_party_peers(
     // into lossy VBR (`peer_count >= 2`) even for a single-PC call, and sent
     // a second unicast copy to a port that often had nobody listening.
     peers
+}
+
+/// Count distinct destination IPs rather than raw socket entries. One listener
+/// can appear as both a configured endpoint (for example `IP:65532`) and a
+/// dynamic HELLO/feedback source (`IP:65530`); that is still one listener for
+/// codec-policy purposes, not two.
+fn unique_peer_ip_count(peers: &HashMap<SocketAddr, PartyPeerState>) -> usize {
+    let mut ips: Vec<IpAddr> = Vec::with_capacity(peers.len());
+    for addr in peers.keys() {
+        if !ips.contains(&addr.ip()) {
+            ips.push(addr.ip());
+        }
+    }
+    ips.len()
 }
 
 /// Replace any old dynamic port for this IP, but keep the configured PC
@@ -403,11 +428,15 @@ impl PhoneMicTransmitter {
                         let mut packet_is_silent = true;
                         let worst_loss_permille =
                             peers.values().map(|p| p.fec_permille).max().unwrap_or(0);
+                        // A single listener may be registered on two ports (a
+                        // configured PC endpoint plus its dynamic HELLO source),
+                        // so codec policy must count distinct listener IPs.
+                        let listener_ips = unique_peer_ip_count(&peers);
                         // A Party host feeding several phones cannot afford a
                         // lossless unicast copy per listener on 2.4 GHz. Step
                         // down to 256 kbps VBR when a second listener joins or
                         // when any listener reports more than 4.5% loss.
-                        let codec_mode = party_codec_mode(peers.len(), worst_loss_permille);
+                        let codec_mode = party_codec_mode(listener_ips, worst_loss_permille);
                         let use_compressed =
                             !use_hardware_mic && codec_mode == CodecMode::CompressedLowDelay;
 
@@ -462,7 +491,10 @@ impl PhoneMicTransmitter {
                             last_tx = Some(Instant::now());
                             continue;
                         }
-                        let max_peer_delay_ms = if peers.len() >= 2 {
+                        // Group-sync alignment only makes sense with at least
+                        // two distinct listeners; a single listener's two
+                        // ports must not enable it.
+                        let max_peer_delay_ms = if listener_ips >= 2 {
                             peers.values().map(|p| p.delay_ms).max().unwrap_or(0)
                         } else {
                             0
@@ -894,7 +926,8 @@ mod tests {
     fn test_party_targets_filter_self_broadcast_and_legacy_rndis() {
         let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let input = "192.168.1.50, 192.168.1.60, 255.255.255.255, \
-                     239.255.77.77, 0.0.0.0, 192.168.42.129:65530";
+                     255.255.255.255:65530, 239.255.77.77, 0.0.0.0, \
+                     0.0.0.0:65530, [ff02::1]:65530, 192.168.42.129:65530";
         let targets = parse_target_endpoints_with_locals(input, &[local], false);
         assert_eq!(
             targets,
@@ -905,6 +938,72 @@ mod tests {
         // A real USB tethering interface makes the legacy RNDIS target reachable.
         let targets = parse_target_endpoints_with_locals("192.168.42.129", &[local], true);
         assert_eq!(targets, vec!["192.168.42.129:65532".parse().unwrap()]);
+
+        // Local IP filtering applies to explicit IPv6 endpoints as well.
+        let local_v6: IpAddr = "fe80::1".parse().unwrap();
+        assert!(
+            parse_target_endpoints_with_locals("[fe80::1]:65530", &[local_v6], false).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_parse_target_endpoints_normalizes_explicit_ports() {
+        // The UI/discovery layer stores `IP:65530` (the control/client
+        // stream port). Phone-mic audio must still go to the PC receiver on
+        // 65532, so explicit ports are intentionally normalized rather than
+        // preserved. IPv4 and bracketed IPv6 endpoints both work, and
+        // duplicates are removed after normalization.
+        let input = "192.168.1.50:65533, 192.168.1.51:65530, \
+                     [fe80::1]:65530, 192.168.1.50:65533";
+        let addrs = parse_target_endpoints_with_locals(input, &[], false);
+        assert_eq!(
+            addrs,
+            vec![
+                "192.168.1.50:65532".parse().unwrap(),
+                "192.168.1.51:65532".parse().unwrap(),
+                "[fe80::1]:65532".parse().unwrap(),
+            ],
+            "explicit ports must map to PHONE_MIC_PORT and dedupe"
+        );
+    }
+
+    #[test]
+    fn test_ui_default_control_port_maps_to_phone_mic_port() {
+        // MainScreen's default host string and discovered endpoints always
+        // carry the control port 65530. With a real USB interface the RNDIS
+        // host is reachable, but the audio destination must still be 65532.
+        let targets = parse_target_endpoints_with_locals("192.168.42.129:65530", &[], true);
+        assert_eq!(targets, vec!["192.168.42.129:65532".parse().unwrap()]);
+    }
+
+    #[test]
+    fn test_parse_target_endpoints_defaults_bare_ips_to_phone_mic_port() {
+        let input = "192.168.1.50, fe80::1, 2001:db8::2";
+        let addrs = parse_target_endpoints_with_locals(input, &[], false);
+        assert_eq!(
+            addrs,
+            vec![
+                "192.168.1.50:65532".parse().unwrap(),
+                "[fe80::1]:65532".parse().unwrap(),
+                "[2001:db8::2]:65532".parse().unwrap(),
+            ],
+            "bare IPv4 and IPv6 endpoints must default to PHONE_MIC_PORT"
+        );
+    }
+
+    #[test]
+    fn test_party_broadcast_default_target_is_rejected() {
+        // `AudioEngineService` falls back to this Kotlin default when no
+        // TARGET_HOSTS extra is present. It must never become a unicast
+        // destination: 802.11 sends broadcast frames at the basic rate and
+        // they would consume the whole channel's airtime.
+        for has_usb_iface in [false, true] {
+            assert!(
+                parse_target_endpoints_with_locals("255.255.255.255:65530", &[], has_usb_iface)
+                    .is_empty(),
+                "the broadcast default must not produce a static target"
+            );
+        }
     }
 
     #[test]
@@ -963,6 +1062,70 @@ mod tests {
             CodecMode::CompressedLowDelay
         );
         assert_eq!(party_codec_mode(2, 0), CodecMode::CompressedLowDelay);
+    }
+
+    #[test]
+    fn test_unique_peer_ip_count_collapses_ports_per_listener() {
+        let now = Instant::now();
+        let pc_static: SocketAddr = "192.168.1.60:65532".parse().unwrap();
+        let pc_dynamic: SocketAddr = "192.168.1.60:65530".parse().unwrap();
+        let phone: SocketAddr = "192.168.1.70:40000".parse().unwrap();
+        let static_targets = [pc_static];
+
+        let mut peers = initial_party_peers(&static_targets, now);
+        assert_eq!(unique_peer_ip_count(&peers), 1);
+
+        // One PC registered on both its configured and dynamic ports is still
+        // one listener, even though both socket entries remain for TX.
+        register_party_peer(&mut peers, pc_dynamic, &static_targets, now);
+        assert_eq!(peers.len(), 2, "both TX endpoints remain in the map");
+        assert_eq!(
+            unique_peer_ip_count(&peers),
+            1,
+            "one PC on two ports must count as one listener"
+        );
+
+        register_party_peer(&mut peers, phone, &static_targets, now);
+        assert_eq!(
+            unique_peer_ip_count(&peers),
+            2,
+            "a second IP must count as the second listener"
+        );
+    }
+
+    #[test]
+    fn test_party_codec_mode_uses_unique_listener_ips() {
+        let now = Instant::now();
+        let pc_static: SocketAddr = "192.168.1.60:65532".parse().unwrap();
+        let pc_dynamic: SocketAddr = "192.168.1.60:65530".parse().unwrap();
+        let phone: SocketAddr = "192.168.1.70:40000".parse().unwrap();
+        let static_targets = [pc_static];
+
+        // Static PC endpoint plus its dynamic HELLO source: one IP, two
+        // ports. This must stay lossless, not step down to VBR.
+        let mut peers = initial_party_peers(&static_targets, now);
+        register_party_peer(&mut peers, pc_dynamic, &static_targets, now);
+        let listener_ips = unique_peer_ip_count(&peers);
+        assert_eq!(listener_ips, 1);
+        assert_eq!(
+            party_codec_mode(listener_ips, 0),
+            CodecMode::StudioLosslessLpc
+        );
+
+        // Loss still forces VBR even with a single listener IP.
+        assert_eq!(
+            party_codec_mode(listener_ips, PARTY_VBR_LOSS_THRESHOLD_PERMILLE + 1),
+            CodecMode::CompressedLowDelay
+        );
+
+        // A genuinely different IP is the second listener and forces VBR.
+        register_party_peer(&mut peers, phone, &static_targets, now);
+        let listener_ips = unique_peer_ip_count(&peers);
+        assert_eq!(listener_ips, 2);
+        assert_eq!(
+            party_codec_mode(listener_ips, 0),
+            CodecMode::CompressedLowDelay
+        );
     }
 
     #[test]
@@ -1083,10 +1246,20 @@ mod tests {
     }
 
     #[test]
-    fn test_phone_mic_transmitter_no_hardware_mic_start_stop() {
-        let tx = PhoneMicTransmitter::start("127.0.0.1", false);
+    fn test_party_transmitter_starts_with_zero_static_targets() {
+        // The Kotlin fallback TARGET_HOSTS is the broadcast address, which the
+        // parser rejects. Party mode must still start with no static targets:
+        // peers register themselves through HELLO/feedback after discovery.
+        let tx = PhoneMicTransmitter::start("255.255.255.255:65530", false);
         assert!(tx.is_ok());
         let mut tx = tx.unwrap();
         tx.stop();
+    }
+
+    #[test]
+    fn test_hardware_mic_transmitter_rejects_zero_static_targets() {
+        // Hardware-mic mode has no peer discovery, so it must not start
+        // without at least one configured PC receiver.
+        assert!(PhoneMicTransmitter::start("255.255.255.255:65530", true).is_err());
     }
 }

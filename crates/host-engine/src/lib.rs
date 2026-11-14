@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+#[cfg(not(target_os = "android"))]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,6 +10,8 @@ use audioshare_protocol::crypto::SessionKey;
 #[cfg(not(target_os = "android"))]
 use audioshare_protocol::dsp::downmix_to_stereo;
 use audioshare_protocol::dsp::BurstDecouplerRing;
+#[cfg(not(target_os = "android"))]
+use audioshare_protocol::dsp::ClockDriftResampler;
 use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_pcm24_subframe, encode_lossless_subframe,
     encode_vbr_subframe, QualityProfile, ADPCM_FEC_BYTES, MAX_LOSSLESS_PCM24_BYTES,
@@ -145,11 +149,237 @@ fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
 
 #[cfg(not(target_os = "android"))]
 pub(crate) struct ClientPreviewSink;
+
+/// Preallocated stereo scratch size for one portable preview resampling pass.
+/// Callbacks larger than this are served in several fixed chunks so the
+/// real-time callback never has to grow a buffer.
+#[cfg(not(target_os = "android"))]
+const PREVIEW_CHUNK_FRAMES: usize = 4096;
+/// Frames per pass while converting a f32 pull into an integer or f64 device
+/// format. Sized so `f32_scratch` is allocated once per stream.
+#[cfg(not(target_os = "android"))]
+const PREVIEW_CONVERT_CHUNK_FRAMES: usize = 1024;
+
+/// Portable pull source shared by every CPAL sample format.
+///
+/// The network FIFO is always 48 kHz stereo. A 48 kHz stereo output endpoint
+/// pops it directly (the original fast path); every other endpoint rate or
+/// channel count runs through [`ClockDriftResampler`] and a channel remapper.
+/// Buffers and the dither RNG live here so CPAL callbacks do not allocate.
+#[cfg(not(target_os = "android"))]
+struct PreviewPull {
+    fifo: Arc<BurstDecouplerRing>,
+    resampler: ClockDriftResampler,
+    /// Mirror of the resampler phase, used to pop exactly the input frames the
+    /// interpolator consumes. The preview sink never steers the clock loop, so
+    /// `ratio` stays constant after `set_output_sample_rate` and this mirror
+    /// cannot diverge (the resampler starts at phase 0.0 as well).
+    phase: f64,
+    out_channels: usize,
+    out_rate: u32,
+    dither_rng: u32,
+    observed_cb_frames: Option<Arc<AtomicUsize>>,
+    stereo_in: Vec<f32>,
+    stereo_out: Vec<f32>,
+    f32_scratch: Vec<f32>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl PreviewPull {
+    fn new(
+        fifo: Arc<BurstDecouplerRing>,
+        out_channels: usize,
+        out_rate: u32,
+        observed_cb_frames: Option<Arc<AtomicUsize>>,
+    ) -> Self {
+        let out_channels = out_channels.max(1);
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(out_rate);
+        Self {
+            fifo,
+            resampler,
+            phase: 0.0,
+            out_channels,
+            out_rate,
+            dither_rng: 12345,
+            observed_cb_frames,
+            stereo_in: vec![0.0; PREVIEW_CHUNK_FRAMES * 2],
+            stereo_out: vec![0.0; PREVIEW_CHUNK_FRAMES * 2 + 32],
+            f32_scratch: vec![0.0; PREVIEW_CONVERT_CHUNK_FRAMES * out_channels],
+        }
+    }
+
+    #[inline]
+    fn note_cb_frames(&self, samples: usize) {
+        if let Some(observed) = &self.observed_cb_frames {
+            let frames = samples / self.out_channels.max(1);
+            // The decoupler is a 48 kHz FIFO. Report the callback duration in
+            // 48 kHz-equivalent frames so a 44.1/32 kHz endpoint does not
+            // under-size the cushion (and a 96/192 kHz endpoint does not
+            // over-size it). Round to nearest to keep a 240-frame 48 kHz
+            // callback exactly 240.
+            let frames_48k = if self.out_rate == SAMPLE_RATE {
+                frames
+            } else {
+                ((frames as u64 * SAMPLE_RATE as u64 + self.out_rate as u64 / 2)
+                    / self.out_rate as u64) as usize
+            };
+            observed.store(frames_48k, Ordering::Relaxed);
+        }
+    }
+
+    /// Remap one stereo pass into `dst`, whose length is
+    /// `frames * out_channels`.
+    fn remap_stereo(
+        src: &[f32],
+        produced: usize,
+        dst: &mut [f32],
+        frames: usize,
+        out_channels: usize,
+    ) {
+        for frame in 0..frames {
+            if frame >= produced {
+                dst[frame * out_channels..(frame + 1) * out_channels].fill(0.0);
+                continue;
+            }
+            let l = src[frame * 2];
+            let r = src[frame * 2 + 1];
+            if out_channels == 1 {
+                // Mono endpoints receive the average of L/R, not just the
+                // left channel, so centred dialogue stays at full level.
+                dst[frame] = (l + r) * 0.5;
+            } else {
+                dst[frame * out_channels] = l;
+                dst[frame * out_channels + 1] = r;
+                // Extra surround/height channels carry silence rather than a
+                // duplicated feed, which would create a comb-filtered phantom
+                // centre on a >2-channel endpoint.
+                dst[frame * out_channels + 2..(frame + 1) * out_channels].fill(0.0);
+            }
+        }
+    }
+
+    /// Fill `frames` interleaved output frames. `dst` must be exactly
+    /// `frames * out_channels` long.
+    fn pull_chunk(&mut self, dst: &mut [f32], frames: usize) {
+        debug_assert_eq!(dst.len(), frames * self.out_channels);
+        if frames == 0 {
+            return;
+        }
+        if self.out_rate == SAMPLE_RATE {
+            self.fifo
+                .pop_exact_or_dither(&mut self.stereo_in[..frames * 2], &mut self.dither_rng);
+            Self::remap_stereo(&self.stereo_in, frames, dst, frames, self.out_channels);
+            return;
+        }
+
+        let ratio = self.resampler.ratio.max(1e-9);
+        let max_in_frames = self.stereo_in.len() / 2;
+        // `process` consumes `floor(phase + frames * ratio)` input frames.
+        // Pop exactly that many (one frame is held in reserve for a phase close
+        // to 1.0) so no resampled audio is silently discarded.
+        debug_assert!(frames <= max_in_frames);
+        let total = self.phase + frames as f64 * ratio;
+        let consumed = (total.floor() as usize).min(max_in_frames);
+        self.phase = total - consumed as f64;
+        self.fifo
+            .pop_exact_or_dither(&mut self.stereo_in[..consumed * 2], &mut self.dither_rng);
+        let produced = self.resampler.process(
+            &self.stereo_in[..consumed * 2],
+            &mut self.stereo_out[..frames * 2],
+        );
+        Self::remap_stereo(&self.stereo_out, produced, dst, frames, self.out_channels);
+    }
+
+    /// Pull one callback worth of interleaved f32 samples.
+    fn pull(&mut self, dst: &mut [f32]) {
+        let frames = dst.len() / self.out_channels;
+        if frames == 0 {
+            return;
+        }
+        if self.out_channels == 2 && self.out_rate == SAMPLE_RATE {
+            self.fifo.pop_exact_or_dither(dst, &mut self.dither_rng);
+            return;
+        }
+        let ratio = self.resampler.ratio.max(1e-9);
+        let max_in_frames = self.stereo_in.len() / 2;
+        let max_frames = ((max_in_frames.saturating_sub(1)) as f64 / ratio)
+            .floor()
+            .max(1.0) as usize;
+        let chunk_cap = max_frames.min(PREVIEW_CHUNK_FRAMES);
+        let mut offset = 0usize;
+        while offset < frames {
+            let chunk = (frames - offset).min(chunk_cap);
+            self.pull_chunk(
+                &mut dst[offset * self.out_channels..(offset + chunk) * self.out_channels],
+                chunk,
+            );
+            offset += chunk;
+        }
+    }
+
+    fn fill_f32(&mut self, out: &mut [f32]) {
+        self.note_cb_frames(out.len());
+        self.pull(out);
+    }
+
+    fn fill_converted<T>(&mut self, out: &mut [T], mut convert: impl FnMut(f32) -> T) {
+        self.note_cb_frames(out.len());
+        let channels = self.out_channels;
+        let frames = out.len() / channels;
+        // `take` lets `pull` borrow `self` mutably while we write the scratch
+        // slice; the same allocation is put back for the next callback.
+        let mut f32_scratch = std::mem::take(&mut self.f32_scratch);
+        let chunk_frames = (f32_scratch.len() / channels).max(1);
+        let mut frame = 0usize;
+        while frame < frames {
+            let chunk = (frames - frame).min(chunk_frames);
+            let samples = chunk * channels;
+            self.pull(&mut f32_scratch[..samples]);
+            for (dst, &src) in out[frame * channels..(frame + chunk) * channels]
+                .iter_mut()
+                .zip(f32_scratch[..samples].iter())
+            {
+                *dst = convert(src);
+            }
+            frame += chunk;
+        }
+        self.f32_scratch = f32_scratch;
+    }
+
+    fn fill_i16(&mut self, out: &mut [i16]) {
+        if self.out_channels == 2 && self.out_rate == SAMPLE_RATE {
+            self.note_cb_frames(out.len());
+            ClientPreviewSink::fill_i16_output(&self.fifo, out, &mut self.dither_rng);
+            return;
+        }
+        self.fill_converted(out, |sample| {
+            (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16
+        });
+    }
+
+    fn fill_u16(&mut self, out: &mut [u16]) {
+        self.fill_converted(out, |sample| {
+            ((sample.clamp(-1.0, 1.0) * 32768.0 + 32768.0).round()).clamp(0.0, 65535.0) as u16
+        });
+    }
+
+    fn fill_i32(&mut self, out: &mut [i32]) {
+        self.fill_converted(out, |sample| {
+            (f64::from(sample.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32
+        });
+    }
+
+    fn fill_f64(&mut self, out: &mut [f64]) {
+        self.fill_converted(out, |sample| f64::from(sample.clamp(-1.0, 1.0)));
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 impl ClientPreviewSink {
     #[allow(dead_code)]
     pub fn spawn(fifo: Arc<BurstDecouplerRing>) -> Result<cpal::Stream, String> {
-        Self::spawn_preferred(fifo, None)
+        Self::spawn_preferred_with_cb_frames(fifo, None, None)
     }
 
     fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
@@ -171,9 +401,21 @@ impl ClientPreviewSink {
 
     /// Spawn playback on the first output device whose name contains
     /// `preferred_name` (e.g. "CABLE Input"), falling back to the default.
+    #[allow(dead_code)]
     pub fn spawn_preferred(
         fifo: Arc<BurstDecouplerRing>,
         preferred_name: Option<&str>,
+    ) -> Result<cpal::Stream, String> {
+        Self::spawn_preferred_with_cb_frames(fifo, preferred_name, None)
+    }
+
+    /// Portable variant of [`Self::spawn_preferred`] that also reports the
+    /// observed native callback size in 48 kHz-equivalent frames (the clock
+    /// rate of the network FIFO) to `observed_cb_frames`.
+    pub fn spawn_preferred_with_cb_frames(
+        fifo: Arc<BurstDecouplerRing>,
+        preferred_name: Option<&str>,
+        observed_cb_frames: Option<Arc<AtomicUsize>>,
     ) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
         let preferred = preferred_name.and_then(|needle| {
@@ -191,48 +433,115 @@ impl ClientPreviewSink {
             .ok_or("No output device")?;
         let default_cfg = dev.default_output_config().map_err(|e| e.to_string())?;
         let sample_format = default_cfg.sample_format();
+        match sample_format {
+            cpal::SampleFormat::I16
+            | cpal::SampleFormat::U16
+            | cpal::SampleFormat::I32
+            | cpal::SampleFormat::F32
+            | cpal::SampleFormat::F64 => {}
+            other => {
+                return Err(format!(
+                    "Unsupported output sample format {other:?}; \
+                     supported formats are I16, U16, I32, F32 and F64"
+                ))
+            }
+        }
+        let dev_rate = default_cfg.sample_rate().0.max(1);
+        let dev_channels = default_cfg.channels().max(1);
 
         // A 240-frame (5 ms) callback matches the 2.5 ms network subframe and
         // stops the OS from draining 10-21 ms in one pull. Some backends
-        // reject a fixed period, so fall back to the device default instead of
-        // failing the preview entirely.
+        // reject a fixed period, so fall back to the stereo default and then
+        // to whatever rate/channel layout the endpoint natively opens.
         let low_lat_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Fixed(240),
         };
-        let default_stream_cfg = cpal::StreamConfig {
+        let stereo_default_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
+        let native_fallback_cfg = cpal::StreamConfig {
+            channels: dev_channels,
+            sample_rate: cpal::SampleRate(dev_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
 
-        let build_for_cfg = |cfg: &cpal::StreamConfig| {
-            let fifo = Arc::clone(&fifo);
-            let mut dither_rng = 12345u32;
+        let build_for_cfg = |cfg: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
+            let out_channels = cfg.channels.max(1) as usize;
+            let out_rate = cfg.sample_rate.0;
+            let make_pull = || {
+                PreviewPull::new(
+                    Arc::clone(&fifo),
+                    out_channels,
+                    out_rate,
+                    observed_cb_frames.clone(),
+                )
+            };
             match sample_format {
-                cpal::SampleFormat::I16 => dev.build_output_stream(
-                    cfg,
-                    move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        Self::fill_i16_output(&fifo, out, &mut dither_rng);
-                    },
-                    |_| {},
-                    None,
-                ),
-                _ => dev.build_output_stream(
-                    cfg,
-                    move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        fifo.pop_exact_or_dither(out, &mut dither_rng);
-                    },
-                    |_| {},
-                    None,
-                ),
+                cpal::SampleFormat::I16 => {
+                    let mut pull = make_pull();
+                    dev.build_output_stream(
+                        cfg,
+                        move |out: &mut [i16], _: &cpal::OutputCallbackInfo| pull.fill_i16(out),
+                        |_| {},
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                cpal::SampleFormat::U16 => {
+                    let mut pull = make_pull();
+                    dev.build_output_stream(
+                        cfg,
+                        move |out: &mut [u16], _: &cpal::OutputCallbackInfo| pull.fill_u16(out),
+                        |_| {},
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                cpal::SampleFormat::I32 => {
+                    let mut pull = make_pull();
+                    dev.build_output_stream(
+                        cfg,
+                        move |out: &mut [i32], _: &cpal::OutputCallbackInfo| pull.fill_i32(out),
+                        |_| {},
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                cpal::SampleFormat::F64 => {
+                    let mut pull = make_pull();
+                    dev.build_output_stream(
+                        cfg,
+                        move |out: &mut [f64], _: &cpal::OutputCallbackInfo| pull.fill_f64(out),
+                        |_| {},
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                cpal::SampleFormat::F32 => {
+                    let mut pull = make_pull();
+                    dev.build_output_stream(
+                        cfg,
+                        move |out: &mut [f32], _: &cpal::OutputCallbackInfo| pull.fill_f32(out),
+                        |_| {},
+                        None,
+                    )
+                    .map_err(|e| e.to_string())
+                }
+                other => Err(format!(
+                    "Unsupported output sample format {other:?}; \
+                     supported formats are I16, U16, I32, F32 and F64"
+                )),
             }
         };
 
         let stream = build_for_cfg(&low_lat_cfg)
-            .or_else(|_| build_for_cfg(&default_stream_cfg))
-            .map_err(|e| e.to_string())?;
+            .or_else(|_| build_for_cfg(&stereo_default_cfg))
+            .or_else(|_| build_for_cfg(&native_fallback_cfg))
+            .map_err(|e| format!("Failed to build preview output stream: {e}"))?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(stream)
     }
@@ -2992,5 +3301,104 @@ mod tests {
             "Max Stability packet cadence must be 100 pps"
         );
         engine.stop();
+    }
+
+    #[test]
+    fn test_preview_pull_remaps_channels_from_48k_stereo() {
+        let fifo = Arc::new(BurstDecouplerRing::new());
+        let mut stereo = vec![0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for frame in 0..SUBFRAME_FRAMES {
+            stereo[frame * 2] = 0.5;
+            stereo[frame * 2 + 1] = -0.25;
+        }
+        assert_eq!(fifo.push_samples(&stereo), stereo.len());
+
+        let observed = Arc::new(AtomicUsize::new(0));
+        let mut mono = PreviewPull::new(
+            Arc::clone(&fifo),
+            1,
+            SAMPLE_RATE,
+            Some(Arc::clone(&observed)),
+        );
+        let mut out = [0.0f32; SUBFRAME_FRAMES];
+        mono.fill_f32(&mut out);
+        assert_eq!(observed.load(Ordering::Relaxed), SUBFRAME_FRAMES);
+        for &sample in &out {
+            assert!(
+                (sample - 0.125).abs() < 1e-6,
+                "mono downmix must average L/R, got {sample}"
+            );
+        }
+
+        assert_eq!(fifo.push_samples(&stereo), stereo.len());
+        let mut surround = PreviewPull::new(Arc::clone(&fifo), 4, SAMPLE_RATE, None);
+        let mut out4 = [0.0f32; SUBFRAME_FRAMES * 4];
+        surround.fill_f32(&mut out4);
+        for frame in 0..SUBFRAME_FRAMES {
+            assert!((out4[frame * 4] - 0.5).abs() < 1e-6);
+            assert!((out4[frame * 4 + 1] + 0.25).abs() < 1e-6);
+            assert_eq!(out4[frame * 4 + 2], 0.0);
+            assert_eq!(out4[frame * 4 + 3], 0.0);
+        }
+    }
+
+    #[test]
+    fn test_preview_pull_reports_48k_equivalent_callback_frames() {
+        // The network FIFO runs at 48 kHz. A 240-frame callback at 96 kHz
+        // consumes only 120 input frames, while the same callback at 32 kHz
+        // consumes 360. The receiver must size its cushion from the input
+        // duration, not from the raw device frame count.
+        for (out_rate, consumed_frames) in [(96_000u32, 120usize), (32_000, 360)] {
+            let fifo = Arc::new(BurstDecouplerRing::new());
+            let block = vec![0.25f32; consumed_frames * 2];
+            assert_eq!(fifo.push_samples(&block), block.len());
+
+            let observed = Arc::new(AtomicUsize::new(0));
+            let mut pull =
+                PreviewPull::new(Arc::clone(&fifo), 2, out_rate, Some(Arc::clone(&observed)));
+            let mut out = vec![0.0f32; 240 * 2];
+            pull.fill_f32(&mut out);
+            assert_eq!(
+                observed.load(Ordering::Relaxed),
+                consumed_frames,
+                "callback at {out_rate} Hz must report its 48 kHz input equivalent"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preview_pull_resampler_consumes_exact_input_frames() {
+        let fifo = Arc::new(BurstDecouplerRing::new());
+        let mut block = vec![0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for frame in 0..SUBFRAME_FRAMES {
+            block[frame * 2] = 0.25;
+            block[frame * 2 + 1] = 0.25;
+        }
+
+        let mut pull = PreviewPull::new(Arc::clone(&fifo), 2, 44_100, None);
+        // 4410 stereo frames (8820 interleaved samples) per callback.
+        let mut out = vec![0.0f32; 4410 * 2];
+        let mut consumed_frames = 0usize;
+        for _ in 0..10 {
+            while fifo.available_samples() < 6000 * 2 {
+                assert_eq!(fifo.push_samples(&block), block.len());
+            }
+            let before = fifo.available_samples() / 2;
+            pull.pull(&mut out);
+            let after = fifo.available_samples() / 2;
+            consumed_frames += before - after;
+        }
+
+        // 44100 output frames at 44.1 kHz are one second of audio and must
+        // consume exactly 48000 input frames. Popping ceil(frames * ratio)
+        // per callback would silently discard a fraction of a frame each time.
+        assert!(
+            (consumed_frames as f64 - 48_000.0).abs() <= 1.0,
+            "resampler consumed {consumed_frames} input frames instead of 48000"
+        );
+        assert!(
+            out[out.len() - 2].abs() > 0.2,
+            "resampled output went silent at the end of the run"
+        );
     }
 }

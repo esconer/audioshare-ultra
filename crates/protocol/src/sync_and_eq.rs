@@ -169,7 +169,7 @@ impl GroupSyncEstimator {
         my_delay_ms: u16,
     ) -> f32 {
         let extra_ms = max_group_delay_ms.saturating_sub(my_delay_ms) as f32;
-        let extra_subframes = (extra_ms / 2.5).clamp(0.0, 40.0);
+        let extra_subframes = (extra_ms / 2.5).clamp(0.0, 64.0);
         base_target + extra_subframes
     }
 }
@@ -624,6 +624,19 @@ mod tests {
         assert_eq!(ChannelRole::from_u8(3), ChannelRole::CenterDialogue);
         assert_eq!(ChannelRole::from_u8(4), ChannelRole::SurroundAmbient);
         assert_eq!(ChannelRole::from_u8(0), ChannelRole::Stereo);
+    }
+
+    #[test]
+    fn test_group_sync_alignment_allows_64_extra_subframes() {
+        let sync = GroupSyncEstimator::new();
+        // 168 ms max group delay - 8 ms local delay = 160 ms = 64 subframes.
+        assert!((sync.aligned_target_subframes(2.0, 168, 8) - 66.0).abs() < 0.01);
+        // 64 extra subframes alone are allowed from a zero base target.
+        assert!((sync.aligned_target_subframes(0.0, 168, 8) - 64.0).abs() < 0.01);
+        // Larger mismatches still clamp at 64 extra subframes (160 ms).
+        assert!((sync.aligned_target_subframes(2.0, 400, 8) - 66.0).abs() < 0.01);
+        // A local delay longer than the group max adds nothing.
+        assert!((sync.aligned_target_subframes(2.0, 8, 28) - 2.0).abs() < 0.01);
     }
 
     #[test]

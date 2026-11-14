@@ -3,28 +3,43 @@ use std::io::Write;
 use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
 use audioshare_protocol::lpc_lossless::{
-    decode_fec_subframe_to_f32, decode_lossless_subframe, decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+    decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
+    decode_vbr_subframe_to_f32, TAG_VBR_BFP,
 };
+use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
 use audioshare_protocol::sequencer::ZeroJitterSequencer;
 use audioshare_protocol::wire::{CodecMode, ParsedPacket};
-use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
+use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
 use crate::{configure_realtime_udp_socket, promote_thread_realtime};
 
 pub const PHONE_MIC_PORT: u16 = 65532;
 
-/// Keep roughly 15 ms queued in the output decoupler. `ClientPreviewSink`
-/// asks for a 5 ms (240-frame) callback, but desktop backends may still pull
-/// 10-21 ms in one callback; two subframes could never cover that and
-/// underran on every pull. Six subframes absorb a full default-callback burst
-/// while keeping phone-call latency moderate.
-const MIC_FIFO_TARGET_SUBFRAMES: f32 = 6.0;
+/// Minimum decoupler cushion (6 subframes = 15 ms); scales up automatically if
+/// the OS output callback period is larger (e.g. 1024 frames = 8.5 subframes).
+const MIC_FIFO_MIN_TARGET_SUBFRAMES: f32 = 6.0;
+/// Upper bound so a pathologically large callback cannot add unbounded call
+/// latency. 20 subframes = 50 ms.
+const MIC_FIFO_MAX_TARGET_SUBFRAMES: f32 = 20.0;
+
+/// Compute the decoupler cushion from the native output callback size,
+/// expressed in 48 kHz-equivalent frames.
+///
+/// Covering one full OS callback plus 3 subframes (7.5 ms) of network jitter
+/// margin keeps the FIFO from underrunning on the next pull. The 240-frame
+/// (5 ms) low-latency callback stays at the 15 ms floor; 1024/2048-frame
+/// desktop callbacks grow to ~11.5/20 subframes instead of draining dry.
+#[inline]
+fn mic_fifo_target_subframes(observed_cb_frames: usize) -> f32 {
+    let cb_subframes = observed_cb_frames as f32 / SUBFRAME_FRAMES as f32;
+    (cb_subframes + 3.0).clamp(MIC_FIFO_MIN_TARGET_SUBFRAMES, MIC_FIFO_MAX_TARGET_SUBFRAMES)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhoneRxRoutingMode {
@@ -55,15 +70,32 @@ fn should_advance_mic_playhead(status: u32, latest_seq: u16, next_seq: u16) -> b
         || (latest_seq.wrapping_sub(next_seq) as i16) >= 0
 }
 
+/// True when the first length-prefixed subframe in a primary bundle is Opus.
+///
+/// ADPCM FEC must never heal an Opus stream: Opus carries its own 2.5 ms
+/// lookahead/PLC state, so splicing a zero-lookahead ADPCM frame into the
+/// stream would jump the waveform by one subframe.
+#[inline]
+fn primary_bundle_is_opus(primary: &[u8]) -> bool {
+    primary.get(2) == Some(&TAG_OPUS_RLD)
+}
+
 /// Decode every length-prefixed subframe in a primary bundle.
 ///
 /// The phone transmitter may bundle up to four 2.5 ms subframes per datagram.
 /// Each decoded subframe is reported with its index so the caller can map it
 /// to `base_seq + index`; reading only index 0 drops half of the audio in the
 /// two-subframe Party Mode / PhoneAudioCaster path.
+///
+/// `base_seq` and `opus_decoder` are needed for the stateful Opus backend:
+/// Opus must see frames in stream order, so the tagged payload is decoded with
+/// `decode_subframe_at_seq`. The other codecs are self-identifying and stay
+/// stateless.
 fn decode_primary_bundle(
     primary: &[u8],
     subframe_count: u8,
+    base_seq: u16,
+    mut opus_decoder: Option<&mut Option<OpusStreamDecoder>>,
     mut on_subframe: impl FnMut(usize, &[f32; SUBFRAME_STEREO_SAMPLES]),
 ) -> usize {
     let mut cursor = 0usize;
@@ -80,21 +112,46 @@ fn decode_primary_bundle(
 
         let payload = &primary[cursor..cursor + sub_len];
         let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-        let ok = if payload.first() == Some(&TAG_VBR_BFP) {
-            // The Party host switches between lossless and VBR without
-            // changing the header's mode. A VBR subframe is self-identifying
-            // through its tag, so sniff every payload instead of trusting one
-            // codec mode for the whole stream.
-            decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
-        } else {
-            let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
-            if decode_lossless_subframe(payload, &mut pcm_i16).is_ok() {
-                for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
-                    *dst = (s as f32) * (1.0 / 32768.0);
+        let seq = base_seq.wrapping_add(sub_idx as u16);
+        let ok = if payload.first() == Some(&TAG_OPUS_RLD) {
+            // Opus is stateful, so a decoder must be supplied. Without one,
+            // treat the frame as undecodable instead of guessing a codec.
+            if let Some(decoder_slot) = opus_decoder.as_deref_mut() {
+                if decoder_slot.is_none() {
+                    *decoder_slot = OpusStreamDecoder::new();
                 }
-                true
+                decoder_slot
+                    .as_mut()
+                    .map(|decoder| decoder.decode_subframe_at_seq(seq, payload, &mut pcm_f32))
+                    .unwrap_or(false)
             } else {
                 false
+            }
+        } else {
+            // A non-Opus payload means the host switched back to VBR or
+            // lossless. Drop the Opus decoder so a later switch starts with
+            // clean MDCT/band-energy state instead of stale history.
+            if let Some(decoder_slot) = opus_decoder.as_deref_mut() {
+                *decoder_slot = None;
+            }
+            if payload.first() == Some(&TAG_VBR_BFP) {
+                // The Party host switches between lossless and VBR without
+                // changing the header's mode. A VBR subframe is
+                // self-identifying through its tag, so sniff every payload
+                // instead of trusting one codec mode for the whole stream.
+                decode_vbr_subframe_to_f32(payload, &mut pcm_f32)
+            } else if decode_lossless_pcm24_to_f32(payload, &mut pcm_f32) {
+                true
+            } else {
+                let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+                if decode_lossless_subframe(payload, &mut pcm_i16).is_ok() {
+                    for (dst, &s) in pcm_f32.iter_mut().zip(pcm_i16.iter()) {
+                        *dst = (s as f32) * (1.0 / 32768.0);
+                    }
+                    true
+                } else {
+                    false
+                }
             }
         };
         if ok {
@@ -270,6 +327,11 @@ impl PhoneMicReceiver {
         let mic_packets_received = Arc::new(AtomicU64::new(0));
         let mic_peak_level_pct = Arc::new(AtomicU64::new(0));
         let last_chirp_rx_timestamp_us = Arc::new(AtomicU64::new(0));
+        // Default to the low-latency 240-frame callback the sink asks for,
+        // expressed in 48 kHz-equivalent frames. `ClientPreviewSink`
+        // overwrites this with the backend's real callback duration as soon
+        // as the first pull happens.
+        let observed_cb_frames = Arc::new(AtomicUsize::new(240));
 
         let mic_fifo = Arc::new(BurstDecouplerRing::new());
 
@@ -315,32 +377,49 @@ impl PhoneMicReceiver {
                             if linux_output_active {
                                 None
                             } else {
-                                crate::ClientPreviewSink::spawn_preferred(
+                                crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
                                     Arc::clone(&mic_fifo_thread),
                                     Some("AudioShare_Phone_Mic_Sink"),
+                                    Some(Arc::clone(&observed_cb_frames)),
                                 )
                                 .ok()
                             }
                         } else {
                             std::env::remove_var("PULSE_SINK");
-                            crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
+                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
+                                Arc::clone(&mic_fifo_thread),
+                                None,
+                                Some(Arc::clone(&observed_cb_frames)),
+                            )
+                            .ok()
                         }
                     }
                     #[cfg(target_os = "windows")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                            crate::ClientPreviewSink::spawn_preferred(
+                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
                                 Arc::clone(&mic_fifo_thread),
                                 Some("CABLE Input"),
+                                Some(Arc::clone(&observed_cb_frames)),
                             )
                             .ok()
                         } else {
-                            crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
+                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
+                                Arc::clone(&mic_fifo_thread),
+                                None,
+                                Some(Arc::clone(&observed_cb_frames)),
+                            )
+                            .ok()
                         }
                     }
                     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                     {
-                        crate::ClientPreviewSink::spawn(Arc::clone(&mic_fifo_thread)).ok()
+                        crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
+                            Arc::clone(&mic_fifo_thread),
+                            None,
+                            Some(Arc::clone(&observed_cb_frames)),
+                        )
+                        .ok()
                     }
                 };
 
@@ -351,9 +430,22 @@ impl PhoneMicReceiver {
                 let mut latest_seq: u16 = 0;
                 let mut next_tick = Instant::now() + Duration::from_micros(2500);
                 let mut resampler = ClockDriftResampler::new();
+                let mut opus_decoder: Option<OpusStreamDecoder> = None;
                 let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
 
                 while run_clone.load(Ordering::Relaxed) {
+                    // Size the decoupler target to cover at least one full OS
+                    // callback period plus 3 subframes (7.5 ms) of network
+                    // jitter margin. The sink reports the backend's real
+                    // callback size, so a 1024/2048-frame desktop callback
+                    // automatically gets a deeper cushion than 5 ms AAudio.
+                    let cb_frames = observed_cb_frames.load(Ordering::Relaxed);
+                    let target_subframes = mic_fifo_target_subframes(cb_frames);
+                    let target_depth = target_subframes.ceil() as i16;
+                    let fifo_watermark = resampler
+                        .subframes_to_samples(target_subframes.ceil() as usize)
+                        .min(mic_fifo_thread.capacity_samples());
+
                     while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
                         if let Ok(parsed) = ParsedPacket::parse(&recv_buf[..len]) {
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
@@ -371,6 +463,7 @@ impl PhoneMicReceiver {
                             // instead of replaying stale concealment.
                             if parsed.header.mode == CodecMode::SilenceHeartbeat {
                                 sequencer.reset();
+                                opus_decoder = None;
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
@@ -384,30 +477,36 @@ impl PhoneMicReceiver {
                             let seq_delta = base_seq.wrapping_sub(next_seq) as i16;
                             if seq_delta > 48 || seq_delta < -32 {
                                 sequencer.reset();
+                                opus_decoder = None;
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
                             }
 
-                            if !parsed.fec_n1_payload.is_empty() {
-                                let s1 = base_seq.wrapping_sub(1);
-                                if (s1.wrapping_sub(next_seq) as i16) >= 0
-                                    && sequencer.is_slot_missing(s1)
-                                {
-                                    let mut f1 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                    if decode_fec_subframe_to_f32(parsed.fec_n1_payload, &mut f1) {
-                                        sequencer.try_heal_with_fec(s1, &f1);
+                            // Opus carries its own lookahead/PLC state; an
+                            // ADPCM FEC backup is phase-shifted by one
+                            // subframe, so only heal VBR/lossless streams.
+                            if !primary_bundle_is_opus(parsed.primary_payload) {
+                                if !parsed.fec_n1_payload.is_empty() {
+                                    let s1 = base_seq.wrapping_sub(1);
+                                    if (s1.wrapping_sub(next_seq) as i16) >= 0
+                                        && sequencer.is_slot_missing(s1)
+                                    {
+                                        let mut f1 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                                        if decode_fec_subframe_to_f32(parsed.fec_n1_payload, &mut f1) {
+                                            sequencer.try_heal_with_fec(s1, &f1);
+                                        }
                                     }
                                 }
-                            }
-                            if !parsed.fec_n2_payload.is_empty() {
-                                let s2 = base_seq.wrapping_sub(2);
-                                if (s2.wrapping_sub(next_seq) as i16) >= 0
-                                    && sequencer.is_slot_missing(s2)
-                                {
-                                    let mut f2 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                    if decode_fec_subframe_to_f32(parsed.fec_n2_payload, &mut f2) {
-                                        sequencer.try_heal_with_fec(s2, &f2);
+                                if !parsed.fec_n2_payload.is_empty() {
+                                    let s2 = base_seq.wrapping_sub(2);
+                                    if (s2.wrapping_sub(next_seq) as i16) >= 0
+                                        && sequencer.is_slot_missing(s2)
+                                    {
+                                        let mut f2 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                                        if decode_fec_subframe_to_f32(parsed.fec_n2_payload, &mut f2) {
+                                            sequencer.try_heal_with_fec(s2, &f2);
+                                        }
                                     }
                                 }
                             }
@@ -419,6 +518,8 @@ impl PhoneMicReceiver {
                             decode_primary_bundle(
                                 parsed.primary_payload,
                                 parsed.header.subframe_count,
+                                base_seq,
+                                Some(&mut opus_decoder),
                                 |sub_idx, pcm_f32| {
                                     let mut max_peak = 0.0f32;
                                     for &v in pcm_f32.iter() {
@@ -449,17 +550,18 @@ impl PhoneMicReceiver {
                                 },
                             );
 
-                            // Wait for a 7.5 ms cushion before starting
-                            // playback. This absorbs the first network jitter
-                            // burst without adding noticeable call latency.
-                            // If a burst pushed the backlog beyond 40 ms, keep
-                            // only the newest 10 ms so call latency cannot
-                            // ratchet upwards.
+                            // Keep only the planned cushion (one callback plus
+                            // jitter margin) if a burst pushed the backlog far
+                            // past it, then start playback once that cushion is
+                            // actually buffered.
                             let buf_depth = buffered_subframes(latest_seq, next_seq);
-                            if buf_depth > 16 {
-                                next_seq = latest_seq.wrapping_add(1).wrapping_sub(4);
+                            let max_depth = target_depth + 8;
+                            if buf_depth > max_depth {
+                                next_seq = latest_seq
+                                    .wrapping_add(1)
+                                    .wrapping_sub(target_depth as u16);
                             }
-                            if buf_depth >= 3 {
+                            if buf_depth >= target_depth {
                                 prebuffer_ready = true;
                             }
                         }
@@ -469,6 +571,14 @@ impl PhoneMicReceiver {
                     while now >= next_tick {
                         next_tick += Duration::from_micros(2500);
                         if initialized && prebuffer_ready {
+                            // Keep the wall-clock 2.5 ms cadence, but do not
+                            // stack more than the planned cushion when a
+                            // scheduler stall makes this loop catch up in one
+                            // burst. The sequencer keeps the undelivered
+                            // subframes, so breaking here loses no audio.
+                            if mic_fifo_thread.available_samples() >= fifo_watermark {
+                                break;
+                            }
                             let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             let status = sequencer.pop_next(next_seq, &mut frame);
                             if should_advance_mic_playhead(status, latest_seq, next_seq) {
@@ -492,9 +602,15 @@ impl PhoneMicReceiver {
                             if frames > 0 {
                                 mic_fifo_thread.push_samples(&resampled_out[..frames * 2]);
                             }
-                            let fifo_subframes = resampler
-                                .samples_to_subframes(mic_fifo_thread.available_samples());
-                            resampler.update_clock_loop(fifo_subframes, MIC_FIFO_TARGET_SUBFRAMES);
+                            // Steer the drift loop from the planned cushion
+                            // (remaining network delay plus the decoupler
+                            // target), not from the post-callback FIFO trough.
+                            // Measuring right after a large OS pull would make
+                            // the controller chase the underrun instead of the
+                            // configured target.
+                            let planned_cushion =
+                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes;
+                            resampler.update_clock_loop(planned_cushion, target_subframes);
                         }
                     }
 
@@ -547,8 +663,11 @@ impl Drop for PhoneMicReceiver {
 mod tests {
     use super::*;
     use audioshare_protocol::lpc_lossless::{
-        encode_lossless_subframe, encode_vbr_subframe, MAX_LOSSLESS_SUBFRAME_BYTES, TAG_VBR_BFP,
+        encode_lossless_pcm24_subframe, encode_lossless_subframe, encode_vbr_subframe,
+        MAX_LOSSLESS_PCM24_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES, TAG_VBR_BFP,
     };
+    use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
+    use audioshare_protocol::SAMPLE_RATE;
 
     #[test]
     fn test_decode_primary_bundle_returns_every_bundled_subframe() {
@@ -574,7 +693,7 @@ mod tests {
         }
 
         let mut decoded = Vec::new();
-        let count = decode_primary_bundle(&bundle[..cursor], 2, |idx, pcm| {
+        let count = decode_primary_bundle(&bundle[..cursor], 2, 0, None, |idx, pcm| {
             let mut samples = [0i16; SUBFRAME_STEREO_SAMPLES];
             for (dst, &s) in samples.iter_mut().zip(pcm.iter()) {
                 *dst = (s * 32768.0).round() as i16;
@@ -594,8 +713,45 @@ mod tests {
     fn test_decode_primary_bundle_rejects_truncated_length_prefix() {
         let mut short = [0u8; 4];
         short[0..2].copy_from_slice(&100u16.to_be_bytes());
-        let count = decode_primary_bundle(&short, 1, |_, _| panic!("must not decode"));
+        let count = decode_primary_bundle(&short, 1, 0, None, |_, _| panic!("must not decode"));
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_primary_bundle_is_opus_reads_first_length_prefixed_tag() {
+        let mut opus = [0u8; 3];
+        opus[0..2].copy_from_slice(&1u16.to_be_bytes());
+        opus[2] = TAG_OPUS_RLD;
+        assert!(primary_bundle_is_opus(&opus));
+
+        let vbr = [0u8, 1, TAG_VBR_BFP];
+        assert!(!primary_bundle_is_opus(&vbr));
+        assert!(!primary_bundle_is_opus(&[0, 1]));
+        assert!(!primary_bundle_is_opus(&[]));
+    }
+
+    #[test]
+    fn test_decode_primary_bundle_resets_opus_decoder_on_non_opus() {
+        let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            pcm_i16[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm_i16[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let len = encode_vbr_subframe(&pcm_i16, 256, &mut enc);
+        let mut bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        bundle[2..2 + len].copy_from_slice(&enc[..len]);
+
+        let mut decoder = Some(OpusStreamDecoder::new().expect("create Opus decoder"));
+        let count = decode_primary_bundle(&bundle[..2 + len], 1, 0, Some(&mut decoder), |_, _| {});
+        assert_eq!(count, 1, "VBR payload must still decode");
+        assert!(
+            decoder.is_none(),
+            "a non-Opus payload must drop stale Opus state"
+        );
     }
 
     #[test]
@@ -616,7 +772,7 @@ mod tests {
         bundle[2..2 + len].copy_from_slice(&enc[..len]);
 
         let mut peak = 0.0f32;
-        let count = decode_primary_bundle(&bundle[..2 + len], 1, |idx, pcm| {
+        let count = decode_primary_bundle(&bundle[..2 + len], 1, 0, None, |idx, pcm| {
             assert_eq!(idx, 0);
             for &v in pcm {
                 peak = peak.max(v.abs());
@@ -627,19 +783,132 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_primary_bundle_handles_24bit_payload() {
+        let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for (i, sample) in pcm_f32.iter_mut().enumerate() {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            // The tiny linear term guarantees a non-zero 8-bit LSB plane so
+            // the encoder emits the true 24-bit extension instead of falling
+            // back to the 16-bit payload.
+            *sample = (t * 880.0 * std::f32::consts::TAU).sin() * 0.4 + (i as f32) * 0.000_000_1;
+        }
+
+        let mut enc = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let len = encode_lossless_pcm24_subframe(&pcm_f32, &mut enc);
+        assert!(
+            len > MAX_LOSSLESS_SUBFRAME_BYTES,
+            "payload must carry the 24-bit LSB plane, len={len}"
+        );
+
+        let mut bundle = [0u8; MAX_LOSSLESS_PCM24_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        bundle[2..2 + len].copy_from_slice(&enc[..len]);
+
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let count = decode_primary_bundle(&bundle[..2 + len], 1, 42, None, |idx, pcm| {
+            assert_eq!(idx, 0);
+            decoded = *pcm;
+        });
+        assert_eq!(count, 1, "24-bit payload must decode");
+        for (i, (&got, &source)) in decoded.iter().zip(pcm_f32.iter()).enumerate() {
+            let q = (source.clamp(-1.0, 1.0) * 8_388_608.0)
+                .round()
+                .clamp(-8_388_608.0, 8_388_607.0);
+            let expected = q / 8_388_608.0;
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "sample {i}: decoded {got} != expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_primary_bundle_handles_opus_payload() {
+        fn tone(frame_index: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let t = ((frame_index * SUBFRAME_FRAMES + i) as f32) / (SAMPLE_RATE as f32);
+                let l = (t * 440.0 * std::f32::consts::TAU).sin() * 0.25;
+                let r = (t * 554.37 * std::f32::consts::TAU).sin() * 0.25;
+                pcm[i * 2] = (l * 32767.0) as i16;
+                pcm[i * 2 + 1] = (r * 32767.0) as i16;
+            }
+            pcm
+        }
+
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut payloads = [[0u8; MAX_OPUS_SUBFRAME_BYTES]; 2];
+        let mut lens = [0usize; 2];
+        for (frame_index, (payload, len)) in payloads.iter_mut().zip(lens.iter_mut()).enumerate() {
+            *len = encoder
+                .encode_subframe(&tone(frame_index), 128, payload)
+                .expect("encode Opus subframe");
+            assert_eq!(payload[0], TAG_OPUS_RLD);
+        }
+
+        let mut bundle = [0u8; (MAX_OPUS_SUBFRAME_BYTES + 2) * 2];
+        let mut cursor = 0usize;
+        for (payload, &len) in payloads.iter().zip(lens.iter()) {
+            bundle[cursor..cursor + 2].copy_from_slice(&(len as u16).to_be_bytes());
+            cursor += 2;
+            bundle[cursor..cursor + len].copy_from_slice(&payload[..len]);
+            cursor += len;
+        }
+
+        let mut decoder = Some(OpusStreamDecoder::new().expect("create Opus decoder"));
+        let mut frames = Vec::new();
+        let count =
+            decode_primary_bundle(&bundle[..cursor], 2, 100, Some(&mut decoder), |idx, pcm| {
+                frames.push((idx, *pcm))
+            });
+        assert_eq!(
+            count, 2,
+            "both Opus subframes must decode through the bundle"
+        );
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].0, 0);
+        assert_eq!(frames[1].0, 1);
+        // Restricted-low-delay Opus has one 2.5 ms frame of lookahead, so the
+        // second decoded frame reconstructs the first tone instead of silence.
+        let peak = frames[1].1.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            peak > 0.02,
+            "second Opus frame must carry real audio, peak={peak}"
+        );
+    }
+
+    #[test]
     fn test_mic_clock_resampler_depth_conversion() {
         let resampler = ClockDriftResampler::new();
         let one = resampler.samples_to_subframes(SUBFRAME_STEREO_SAMPLES);
         assert!((one - 1.0).abs() < 1e-6);
-        let target_samples = SUBFRAME_STEREO_SAMPLES * MIC_FIFO_TARGET_SUBFRAMES as usize;
+        let target_subframes = mic_fifo_target_subframes(240);
+        assert!((target_subframes - MIC_FIFO_MIN_TARGET_SUBFRAMES).abs() < 1e-6);
+        let target_samples = SUBFRAME_STEREO_SAMPLES * target_subframes as usize;
         let target = resampler.samples_to_subframes(target_samples);
-        assert!((target - MIC_FIFO_TARGET_SUBFRAMES).abs() < 1e-6);
+        assert!((target - target_subframes).abs() < 1e-6);
         // A 10 ms default desktop callback drains four subframes in one pull;
         // the cushion must cover at least that plus the poll interval.
         assert!(
-            MIC_FIFO_TARGET_SUBFRAMES >= 6.0,
+            target_subframes >= 6.0,
             "mic FIFO target must absorb a 10-15 ms callback burst"
         );
+    }
+
+    #[test]
+    fn test_mic_fifo_target_scales_with_callback_size() {
+        // 5 ms low-latency callback: 2 subframes + 3 margin = 5, floored at 6.
+        assert!((mic_fifo_target_subframes(240) - 6.0).abs() < 1e-6);
+        // 1024 frames = 8.53 subframes -> 11.53 subframes of cushion.
+        let expected_1024 = 1024.0 / SUBFRAME_FRAMES as f32 + 3.0;
+        assert!((mic_fifo_target_subframes(1024) - expected_1024).abs() < 1e-6);
+        // 2048 frames would ask for 20.07 subframes; clamp to the 50 ms ceiling.
+        assert!((mic_fifo_target_subframes(2048) - MIC_FIFO_MAX_TARGET_SUBFRAMES).abs() < 1e-6);
+        assert!((mic_fifo_target_subframes(8192) - MIC_FIFO_MAX_TARGET_SUBFRAMES).abs() < 1e-6);
+        // The floor still applies to tiny callback sizes and the result is
+        // monotonic between 240 and 1024 frames.
+        assert!((mic_fifo_target_subframes(64) - MIC_FIFO_MIN_TARGET_SUBFRAMES).abs() < 1e-6);
+        assert!(mic_fifo_target_subframes(512) <= mic_fifo_target_subframes(1024));
     }
 
     #[test]

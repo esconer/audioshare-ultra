@@ -169,16 +169,18 @@ fn update_pkt_subframe_count(current: &mut u8, smaller_run: &mut u8, incoming: u
     }
 }
 
-/// Output decoupler watermark in 2.5 ms subframes (4..=32).
+/// Output decoupler watermark in 2.5 ms subframes (4..=64, up to 160 ms).
 ///
 /// The upper bound used to be 12 (30 ms), which silently capped group-sync
-/// alignment: a wired client could never add enough cushion to match an
-/// 80 ms Bluetooth peer. 32 subframes (80 ms) still leaves two subframes of
-/// headroom in the 8192-sample decoupler, which the playhead fills one
-/// subframe at a time.
+/// alignment: a wired client could never add enough cushion to match a
+/// Bluetooth peer. 64 subframes (160 ms) is the deliberate maximum that
+/// still fits the 32,768-sample decoupler at the two supported output rates:
+/// at 96 kHz `base_ratio` is 0.5, so one subframe is 480 samples and 64
+/// subframes are 30,720 samples, leaving 2,048 samples (10.7 ms) of
+/// headroom. 69 subframes (33,120 samples) would overflow the ring.
 #[inline]
 fn fifo_target_subframes(target_buf: f32) -> usize {
-    (target_buf.ceil() as usize).clamp(4, 32)
+    (target_buf.ceil() as usize).clamp(4, 64)
 }
 
 /// Number of subframes of real audio left after the current decoupler
@@ -1342,7 +1344,7 @@ impl ClientEngine {
             };
 
             // Two-Level DAC Watermark:
-            // 1. `fifo_watermark` holds enough ready PCM (4 to 12 subframes = 10-30ms) so neither
+            // 1. `fifo_watermark` holds enough ready PCM (4 to 64 subframes = 10-160ms) so neither
             //    Desktop CPAL (480-1024 frame callbacks) nor Android AAudio ever starves.
             // 2. `plc_emergency_watermark` (1 subframe = 2.5ms): If `next_play_seq` is missing in
             //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 1 subframe!
@@ -1673,16 +1675,53 @@ mod tests {
 
     #[test]
     fn test_group_sync_target_is_not_capped_at_30ms() {
-        // Group sync adds up to 40 subframes to match a Bluetooth peer's
-        // output delay. The old 12-subframe clamp silently capped it at
-        // 30 ms, so a wired client could never align with an 80 ms peer.
+        // Group sync adds up to 64 subframes (160 ms) to match a Bluetooth
+        // peer's output delay. The old 12-subframe clamp silently capped it
+        // at 30 ms, and the subsequent 32-subframe clamp capped it at 80 ms.
         assert_eq!(fifo_target_subframes(26.0), 26);
         assert_eq!(fifo_target_subframes(32.0), 32);
-        assert_eq!(fifo_target_subframes(40.0), 32);
+        assert_eq!(fifo_target_subframes(40.0), 40);
+        assert_eq!(fifo_target_subframes(64.0), 64);
+        assert_eq!(fifo_target_subframes(64.5), 64);
+        assert_eq!(fifo_target_subframes(100.0), 64);
+        assert_eq!(fifo_target_subframes(3.0), 4);
         assert!(
-            (32 + 1) * SUBFRAME_STEREO_SAMPLES <= BurstDecouplerRing::new().capacity_samples(),
-            "80 ms target plus one pushed subframe must fit the decoupler"
+            (64 + 1) * SUBFRAME_STEREO_SAMPLES <= BurstDecouplerRing::new().capacity_samples(),
+            "160 ms target plus one pushed subframe must fit the decoupler"
         );
+    }
+
+    #[test]
+    fn test_fifo_target_64_subframes_fits_ring_at_96khz() {
+        let ring = BurstDecouplerRing::new();
+        assert_eq!(ring.capacity_samples(), 32_768);
+
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(96_000);
+        assert_eq!(resampler.base_ratio, 0.5);
+
+        // A 160 ms group-sync target clamps to 64 subframes, which is
+        // 30,720 output samples at 96 kHz and fits the 32,768-sample ring.
+        let target = fifo_target_subframes(100.0);
+        assert_eq!(target, 64);
+        let watermark = resampler
+            .subframes_to_samples(target)
+            .min(ring.capacity_samples() - 2);
+        assert_eq!(watermark, 30_720);
+        let subframe_samples = resampler.subframes_to_samples(1);
+        assert_eq!(subframe_samples, 480);
+        assert!(watermark + subframe_samples <= ring.capacity_samples());
+
+        // Refill one output subframe at a time until the watermark is
+        // reached; every push must fit without truncation.
+        let chunk = vec![0.1f32; subframe_samples];
+        let mut pushes = 0;
+        while ring.available_samples() < watermark {
+            assert_eq!(ring.push_samples(&chunk), subframe_samples);
+            pushes += 1;
+        }
+        assert_eq!(pushes, 64);
+        assert_eq!(ring.available_samples(), watermark);
     }
 
     #[test]
