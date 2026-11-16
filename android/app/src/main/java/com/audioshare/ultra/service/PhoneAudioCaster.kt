@@ -25,6 +25,7 @@ import kotlin.concurrent.thread
 class PhoneAudioCaster(
     private val mediaProjection: MediaProjection,
     private val targetEndpoints: List<String>, // Can be 1 PC or multiple Phones (Party Mode!)
+    private val pinCode: String = "",
     private val onProjectionStopped: (() -> Unit)? = null
 ) {
     @Volatile
@@ -119,7 +120,7 @@ class PhoneAudioCaster(
             // Start our Rust lossless transmitter for all target phones / PCs
             // (Party Mode!) before the reader thread pushes samples.
             val targetListStr = targetEndpoints.joinToString(",")
-            nativeStarted = AudioEngineService.nativeStartPhoneMic(targetListStr, false)
+            nativeStarted = AudioEngineService.nativeStartPhoneMic(targetListStr, false, pinCode)
             if (!nativeStarted) {
                 abortStart(record, stopNative = false)
                 return false

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,9 @@ use audioshare_host_engine::discovery_and_os::{DiscoveryBeacon, DiscoveryScanner
 use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
 use audioshare_host_engine::{
     configure_realtime_udp_socket, list_valid_host_interfaces, promote_thread_realtime,
+    DEFAULT_PORT,
 };
+use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::BurstDecouplerRing;
 use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
@@ -19,7 +21,8 @@ use audioshare_protocol::lpc_lossless::{
 };
 use audioshare_protocol::opus_codec::OpusStreamEncoder;
 use audioshare_protocol::wire::{
-    pack_datagram, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
+    pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader,
+    CONTROL_FEEDBACK_MAGIC,
 };
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 
@@ -31,12 +34,20 @@ pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
     GLOBAL_SCANNER.get_or_init(DiscoveryScanner::start)
 }
 
+pub struct PartyHostTelemetry {
+    pub listener_count: AtomicU8,
+    pub active_codec_mode: AtomicU8,
+    pub max_group_delay_ms: AtomicU16,
+    pub pending_remote_media_cmd: AtomicU8,
+    pub bound_port: u16,
+    pub rt_thread_tid: AtomicI32,
+}
+
 pub struct PhoneMicTransmitter {
     running: Arc<AtomicBool>,
     pub mic_input_ring: Arc<BurstDecouplerRing>,
+    pub party_telemetry: Arc<PartyHostTelemetry>,
     _party_beacon: Option<DiscoveryBeacon>,
-    #[cfg(target_os = "android")]
-    _mic_input_stream: Option<AAudioInputGuard>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -89,9 +100,27 @@ const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 
 const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
 const PARTY_VBR_LOSS_THRESHOLD_PERMILLE: u16 = 45;
+const PARTY_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
+const PARTY_CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
+const PARTY_LOSS_HOLD: Duration = Duration::from_secs(3);
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
 const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
 const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
+
+/// Select Party compressed bitrate based on peer fan-out and worst link loss.
+/// Phone-to-phone traffic traverses the AP twice (uplink + downlink), so 3+
+/// peers or heavy loss steps down from 256 kbps to 160 / 96 kbps to prevent
+/// 802.11 TX queue saturation.
+#[inline]
+fn party_target_bitrate_kbps(listener_ips: usize, worst_loss_permille: u16) -> u16 {
+    if worst_loss_permille > PARTY_CRITICAL_LOSS_THRESHOLD_PERMILLE {
+        96
+    } else if listener_ips >= 3 || worst_loss_permille > PARTY_HIGH_LOSS_THRESHOLD_PERMILLE {
+        160
+    } else {
+        PARTY_VBR_BITRATE_KBPS
+    }
+}
 
 #[derive(Clone, Copy)]
 struct PartyPeerState {
@@ -296,6 +325,14 @@ fn bind_phone_mic_socket(use_hardware_mic: bool) -> std::io::Result<UdpSocket> {
 
 impl PhoneMicTransmitter {
     pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
+        Self::start_with_pin(target_hosts, use_hardware_mic, None)
+    }
+
+    pub fn start_with_pin(
+        target_hosts: &str,
+        use_hardware_mic: bool,
+        pin: Option<&str>,
+    ) -> Result<Self, String> {
         let static_targets = parse_target_endpoints(target_hosts);
         // Hardware-mic mode streams to explicitly configured PC receivers. A
         // Party host is allowed to start with only its beacon: peer phones
@@ -316,6 +353,18 @@ impl PhoneMicTransmitter {
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
         let initial_peers = initial_party_peers(&static_targets, Instant::now());
+        let party_telemetry = Arc::new(PartyHostTelemetry {
+            listener_count: AtomicU8::new(unique_peer_ip_count(&initial_peers) as u8),
+            active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
+            max_group_delay_ms: AtomicU16::new(0),
+            pending_remote_media_cmd: AtomicU8::new(0),
+            bound_port,
+            rt_thread_tid: AtomicI32::new(0),
+        });
+        let session_key = pin
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(SessionKey::from_pin);
 
         // Party peers discover this phone through the beacon on the port the
         // transmitter actually bound. Advertising a hardcoded 65530 after a
@@ -324,16 +373,10 @@ impl PhoneMicTransmitter {
         let _party_beacon = party_beacon_port(use_hardware_mic, bound_port)
             .map(|bound_port| DiscoveryBeacon::start(bound_port, "Android-Party-Host".into()));
 
-        #[cfg(target_os = "android")]
-        let _mic_input_stream = if use_hardware_mic {
-            AAudioInputGuard::open_low_latency_mic(Arc::clone(&mic_input_ring))
-        } else {
-            None
-        };
-
         let run_clone = Arc::clone(&running);
         let ring_clone = Arc::clone(&mic_input_ring);
-        let local_ips: Vec<IpAddr> = list_valid_host_interfaces()
+        let party_telem_clone = Arc::clone(&party_telemetry);
+        let mut local_ips: Vec<IpAddr> = list_valid_host_interfaces()
             .into_iter()
             .map(|iface| iface.ip)
             .collect();
@@ -342,6 +385,18 @@ impl PhoneMicTransmitter {
             .name("as-ultra-phone-mic-tx".into())
             .spawn(move || {
                 promote_thread_realtime();
+                #[cfg(target_os = "android")]
+                unsafe {
+                    party_telem_clone.rt_thread_tid.store(libc::gettid(), Ordering::Relaxed);
+                }
+                #[cfg(target_os = "android")]
+                let mut mic_input_stream = if use_hardware_mic {
+                    AAudioInputGuard::open_low_latency_mic(Arc::clone(&ring_clone))
+                } else {
+                    None
+                };
+                #[cfg(target_os = "android")]
+                let mut last_mic_open_attempt = Instant::now();
                 let start = Instant::now();
                 let mut seq: u16 = 0;
                 let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
@@ -366,12 +421,30 @@ impl PhoneMicTransmitter {
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
                 let mut last_sweep = Instant::now();
+                let mut governed_loss_permille: u16 = 0;
+                let mut loss_hold_until = Instant::now();
                 let mut silent_subframes: u32 = 0;
                 let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
                 let mut last_tx: Option<Instant> = None;
                 let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
 
                 while run_clone.load(Ordering::Relaxed) {
+                    #[cfg(target_os = "android")]
+                    if use_hardware_mic {
+                        let disconnected = mic_input_stream
+                            .as_ref()
+                            .map(|s| s.needs_reopen())
+                            .unwrap_or(false);
+                        let retry_due = mic_input_stream.is_none()
+                            && last_mic_open_attempt.elapsed() >= Duration::from_millis(500);
+                        if disconnected || retry_due {
+                            last_mic_open_attempt = Instant::now();
+                            mic_input_stream = None;
+                            mic_input_stream =
+                                AAudioInputGuard::open_low_latency_mic(Arc::clone(&ring_clone));
+                        }
+                    }
+
                     if !use_hardware_mic {
                         // Party Mode only: accept incoming HELLO and
                         // ClientFeedbackPacket from peer phones for
@@ -392,7 +465,15 @@ impl PhoneMicTransmitter {
                                     Instant::now(),
                                 );
                             } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
-                                if let Some(fb) = ClientFeedbackPacket::decode(&ctrl_buf[..len]) {
+                                if let Some(fb) = ClientFeedbackPacket::decode_verified(
+                                    &ctrl_buf[..len],
+                                    session_key.as_ref(),
+                                ) {
+                                    if (10..=12).contains(&fb.requested_mode) {
+                                        party_telem_clone
+                                            .pending_remote_media_cmd
+                                            .store(fb.requested_mode, Ordering::Relaxed);
+                                    }
                                     // Align the fixed downstream delay (A2DP or
                                     // measured DAC), never the adaptive network
                                     // jitter buffer.
@@ -414,6 +495,10 @@ impl PhoneMicTransmitter {
                         if last_sweep.elapsed() >= Duration::from_secs(1) {
                             last_sweep = Instant::now();
                             expire_party_peers(&mut peers, &static_targets, last_sweep);
+                            local_ips = list_valid_host_interfaces()
+                                .into_iter()
+                                .map(|iface| iface.ip)
+                                .collect();
                         }
                     }
 
@@ -439,12 +524,23 @@ impl PhoneMicTransmitter {
                         let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
                         let mut cursor = 0usize;
                         let mut packet_is_silent = true;
-                        let worst_loss_permille =
+                        let raw_worst_loss =
                             peers.values().map(|p| p.fec_permille).max().unwrap_or(0);
+                        let loop_now = Instant::now();
+                        if raw_worst_loss > PARTY_VBR_LOSS_THRESHOLD_PERMILLE {
+                            governed_loss_permille = governed_loss_permille.max(raw_worst_loss);
+                            loss_hold_until = loop_now + PARTY_LOSS_HOLD;
+                        } else if loop_now >= loss_hold_until {
+                            governed_loss_permille = raw_worst_loss;
+                        }
+                        let worst_loss_permille = governed_loss_permille;
                         // A single listener may be registered on two ports (a
                         // configured PC endpoint plus its dynamic HELLO source),
                         // so codec policy must count distinct listener IPs.
                         let listener_ips = unique_peer_ip_count(&peers);
+                        party_telem_clone
+                            .listener_count
+                            .store(listener_ips.min(255) as u8, Ordering::Relaxed);
                         // A Party host feeding several phones cannot afford a
                         // lossless unicast copy per listener on 2.4 GHz. Step
                         // down to 256 kbps compressed when a second listener
@@ -452,6 +548,8 @@ impl PhoneMicTransmitter {
                         // loss. Opus RLD replaces VBR when the encoder is
                         // available; VBR remains the fallback.
                         let packet_codec = party_codec_mode(listener_ips, worst_loss_permille);
+                        let target_kbps =
+                            party_target_bitrate_kbps(listener_ips, worst_loss_permille);
                         let use_compressed =
                             !use_hardware_mic && packet_codec == CodecMode::CompressedLowDelay;
 
@@ -463,7 +561,7 @@ impl PhoneMicTransmitter {
                         if !use_compressed {
                             opus_encoder = None;
                         } else if opus_encoder.is_none() && opus_available {
-                            opus_encoder = OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS);
+                            opus_encoder = OpusStreamEncoder::new(target_kbps);
                             opus_available = opus_encoder.is_some();
                         }
 
@@ -498,7 +596,7 @@ impl PhoneMicTransmitter {
                                 let encoded = opus_encoder.as_mut().and_then(|enc_opus| {
                                     enc_opus.encode_subframe(
                                         frame,
-                                        PARTY_VBR_BITRATE_KBPS,
+                                        target_kbps,
                                         &mut enc,
                                     )
                                 });
@@ -523,7 +621,7 @@ impl PhoneMicTransmitter {
                             cursor = 0;
                             for frame in pcm_frames.iter().take(subframes_per_pkt) {
                                 let enc_len = if use_compressed {
-                                    encode_vbr_subframe(frame, PARTY_VBR_BITRATE_KBPS, &mut enc)
+                                    encode_vbr_subframe(frame, target_kbps, &mut enc)
                                 } else {
                                     encode_lossless_subframe(frame, &mut enc)
                                 };
@@ -565,6 +663,11 @@ impl PhoneMicTransmitter {
                         // the next non-silent packet.
                         let dtx = !use_hardware_mic
                             && party_dtx_active(packet_is_silent, silent_subframes);
+                        if dtx {
+                            opus_encoder = None;
+                            has_fec_n1 = false;
+                            has_fec_n2 = false;
+                        }
                         if dtx && !party_dtx_heartbeat_due(base_seq, subframes_per_pkt) {
                             last_tx = Some(Instant::now());
                             continue;
@@ -577,6 +680,17 @@ impl PhoneMicTransmitter {
                         } else {
                             0
                         };
+                        party_telem_clone
+                            .max_group_delay_ms
+                            .store(max_peer_delay_ms, Ordering::Relaxed);
+                        party_telem_clone.active_codec_mode.store(
+                            if dtx {
+                                CodecMode::SilenceHeartbeat as u8
+                            } else {
+                                codec_mode as u8
+                            },
+                            Ordering::Relaxed,
+                        );
                         let hdr = WireHeader {
                             mode: if dtx {
                                 CodecMode::SilenceHeartbeat
@@ -584,7 +698,7 @@ impl PhoneMicTransmitter {
                                 codec_mode
                             },
                             subframe_count: if dtx { 0 } else { subframes_per_pkt as u8 },
-                            encrypted: false,
+                            encrypted: session_key.is_some(),
                             sequence: base_seq,
                             tx_timestamp_us: start.elapsed().as_micros() as u32,
                             primary_len: 0,
@@ -603,7 +717,14 @@ impl PhoneMicTransmitter {
                         };
                         let f1 = if !dtx && send_n1 { &prev_n1[..] } else { &[] };
                         let f2 = if !dtx && send_n2 { &prev_n2[..] } else { &[] };
-                        if let Ok(pkt_len) = pack_datagram(hdr, primary, f1, f2, &mut dgram) {
+                        if let Ok(pkt_len) = pack_datagram_with_key(
+                            hdr,
+                            primary,
+                            f1,
+                            f2,
+                            session_key.as_ref(),
+                            &mut dgram,
+                        ) {
                             for target in peers.keys() {
                                 let _ = socket.send_to(&dgram[..pkt_len], *target);
                             }
@@ -619,9 +740,8 @@ impl PhoneMicTransmitter {
         Ok(Self {
             running,
             mic_input_ring,
+            party_telemetry,
             _party_beacon,
-            #[cfg(target_os = "android")]
-            _mic_input_stream,
             handle: Some(handle),
         })
     }
@@ -629,10 +749,6 @@ impl PhoneMicTransmitter {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
         drop(self._party_beacon.take());
-        #[cfg(target_os = "android")]
-        if let Some(stream) = self._mic_input_stream.take() {
-            drop(stream);
-        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -646,12 +762,18 @@ pub fn android_start_stream(
     pin: Option<&str>,
     dolby_effects: bool,
 ) -> Result<(), String> {
-    let addr: SocketAddr = host_ip_port
-        .parse()
+    let trimmed = host_ip_port.trim();
+    let addr: SocketAddr = trimmed
+        .parse::<SocketAddr>()
+        .or_else(|_| {
+            trimmed
+                .parse::<IpAddr>()
+                .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
+        })
         .map_err(|e| format!("Invalid SocketAddr {}: {}", host_ip_port, e))?;
 
-    let mut guard = GLOBAL_ANDROID_CLIENT.lock().unwrap();
-    if let Some(mut existing) = guard.take() {
+    let existing = GLOBAL_ANDROID_CLIENT.lock().unwrap().take();
+    if let Some(mut existing) = existing {
         existing.stop();
     }
 
@@ -667,19 +789,25 @@ pub fn android_start_stream(
     };
 
     let client = ClientEngine::connect_with_pin(cfg, pin)?;
-    *guard = Some(client);
+    *GLOBAL_ANDROID_CLIENT.lock().unwrap() = Some(client);
     Ok(())
 }
 
-pub fn android_stop_stream() {
-    if let Some(mut client) = GLOBAL_ANDROID_CLIENT.lock().unwrap().take() {
+pub fn android_stop_client_only() {
+    let client = GLOBAL_ANDROID_CLIENT.lock().unwrap().take();
+    if let Some(mut client) = client {
         client.stop();
     }
+}
+
+pub fn android_stop_stream() {
+    android_stop_client_only();
     android_stop_phone_mic();
 }
 
 pub fn android_stop_phone_mic() {
-    if let Some(mut mic) = GLOBAL_PHONE_MIC_TX.lock().unwrap().take() {
+    let mic = GLOBAL_PHONE_MIC_TX.lock().unwrap().take();
+    if let Some(mut mic) = mic {
         mic.stop();
     }
 }
@@ -846,7 +974,7 @@ pub mod android_native {
         _env: JNIEnv,
         _class: JClass,
     ) {
-        android_stop_stream();
+        android_stop_client_only();
     }
 
     #[no_mangle]
@@ -921,13 +1049,23 @@ pub mod android_native {
         _class: JClass,
         host_ip: JString,
         use_hardware_mic: jboolean,
+        pin: JString,
     ) -> jboolean {
         let Ok(ip_str) = env.get_string(&host_ip) else {
             return 0;
         };
         let ip_rust: String = ip_str.into();
+        let pin_rust: String = env
+            .get_string(&pin)
+            .map(|v| v.into())
+            .unwrap_or_default();
+        let pin_opt = if pin_rust.is_empty() {
+            None
+        } else {
+            Some(pin_rust.as_str())
+        };
         android_stop_phone_mic();
-        if let Ok(tx) = PhoneMicTransmitter::start(&ip_rust, use_hardware_mic != 0) {
+        if let Ok(tx) = PhoneMicTransmitter::start_with_pin(&ip_rust, use_hardware_mic != 0, pin_opt) {
             *GLOBAL_PHONE_MIC_TX.lock().unwrap() = Some(tx);
             1
         } else {
@@ -980,6 +1118,21 @@ pub mod android_native {
             stats[20] = (latency.estimated_one_way_ms() * 10.0).round() as i64;
             stats[21] = (latency.codec_lookahead_ms * 10.0).round() as i64;
         }
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+            // Pack Party Host telemetry into slots 22 and 23:
+            // stats[22]: (remote_cmd << 32) | (bound_port << 16) | (active_codec_mode << 8) | listener_count
+            // stats[23]: party max_group_delay_ms
+            let listeners = tx.party_telemetry.listener_count.load(Ordering::Relaxed) as i64;
+            let mode = tx.party_telemetry.active_codec_mode.load(Ordering::Relaxed) as i64;
+            let port = tx.party_telemetry.bound_port as i64;
+            let remote_cmd =
+                tx.party_telemetry.pending_remote_media_cmd.swap(0, Ordering::Relaxed) as i64;
+            stats[22] = (remote_cmd << 32) | (port << 16) | (mode << 8) | listeners;
+            stats[23] = tx
+                .party_telemetry
+                .max_group_delay_ms
+                .load(Ordering::Relaxed) as i64;
+        }
         let arr = env.new_long_array(24).unwrap();
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
@@ -989,6 +1142,7 @@ pub mod android_native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audioshare_protocol::wire::pack_datagram;
 
     #[test]
     fn test_parse_target_endpoints_party_mode() {
@@ -1441,5 +1595,78 @@ mod tests {
         // Hardware-mic mode has no peer discovery, so it must not start
         // without at least one configured PC receiver.
         assert!(PhoneMicTransmitter::start("255.255.255.255:65530", true).is_err());
+    }
+
+    #[test]
+    fn test_party_target_bitrate_adapts_to_peers_and_loss() {
+        // 1-2 peers and low loss -> 256 kbps
+        assert_eq!(party_target_bitrate_kbps(1, 0), 256);
+        assert_eq!(party_target_bitrate_kbps(2, 45), 256);
+        assert_eq!(party_target_bitrate_kbps(2, 120), 256);
+
+        // 3+ peers -> 160 kbps (saves AP airtime)
+        assert_eq!(party_target_bitrate_kbps(3, 0), 160);
+        assert_eq!(party_target_bitrate_kbps(4, 50), 160);
+
+        // High loss (>12%) -> 160 kbps
+        assert_eq!(party_target_bitrate_kbps(1, 121), 160);
+
+        // Critical loss (>20%) -> 96 kbps
+        assert_eq!(party_target_bitrate_kbps(1, 201), 96);
+        assert_eq!(party_target_bitrate_kbps(5, 250), 96);
+    }
+
+    #[test]
+    fn test_party_host_telemetry_packed_slots() {
+        let listeners: i64 = 3;
+        let mode: i64 = CodecMode::CompressedLowDelay as i64;
+        let port: i64 = 65530;
+        let remote_cmd: i64 = 11; // KEYCODE_MEDIA_NEXT
+        let packed_slot22: i64 = (remote_cmd << 32) | (port << 16) | (mode << 8) | listeners;
+
+        // Verify Kotlin bit unpacking logic
+        let unpacked_cmd = ((packed_slot22 as u64 >> 32) & 0xFF) as i64;
+        let unpacked_port = (packed_slot22 >> 16) & 0xFFFF;
+        let unpacked_mode = (packed_slot22 >> 8) & 0xFF;
+        let unpacked_listeners = packed_slot22 & 0xFF;
+
+        assert_eq!(unpacked_cmd, 11);
+        assert_eq!(unpacked_port, 65530);
+        assert_eq!(unpacked_mode, CodecMode::CompressedLowDelay as i64);
+        assert_eq!(unpacked_listeners, 3);
+    }
+
+    #[test]
+    fn test_bare_ip_port_resolution() {
+        let trimmed = "192.168.1.50";
+        let addr = trimmed
+            .parse::<SocketAddr>()
+            .or_else(|_| {
+                trimmed
+                    .parse::<IpAddr>()
+                    .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
+            })
+            .expect("bare IP must parse to DEFAULT_PORT");
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 65530));
+
+        let trimmed_v6 = "fe80::1";
+        let addr_v6 = trimmed_v6
+            .parse::<SocketAddr>()
+            .or_else(|_| {
+                trimmed_v6
+                    .parse::<IpAddr>()
+                    .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
+            })
+            .expect("bare IPv6 must parse to DEFAULT_PORT");
+        assert_eq!(addr_v6.port(), 65530);
+    }
+
+    #[test]
+    fn test_party_transmitter_start_with_pin() {
+        let tx = PhoneMicTransmitter::start_with_pin("", false, Some("1234"));
+        assert!(tx.is_ok());
+        let mut tx = tx.unwrap();
+        assert_eq!(tx.party_telemetry.listener_count.load(Ordering::Relaxed), 0);
+        tx.stop();
     }
 }

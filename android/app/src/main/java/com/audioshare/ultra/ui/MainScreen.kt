@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
+import android.view.KeyEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -322,6 +323,9 @@ fun MainScreen() {
     // mirrors the service's broadcast so a system-revoked projection turns
     // the switch off even if the app was backgrounded.
     var castPhoneInternalAudio by remember { mutableStateOf(AudioEngineService.isPartyCasting) }
+    var forwardPartyToPc by remember { mutableStateOf(prefs.getBoolean("party_forward_pc", false)) }
+    var muteHostSpeakerInParty by remember { mutableStateOf(prefs.getBoolean("party_mute_local", false)) }
+    var savedMusicVolume by remember { mutableIntStateOf(-1) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
     // 0..10 legacy counters, 11..21 live latency breakdown.
@@ -367,6 +371,18 @@ fun MainScreen() {
         }
     }
 
+    fun applyLocalPartySpeakerMute(mute: Boolean) {
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (mute) {
+            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (cur > 0) savedMusicVolume = cur
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        } else if (savedMusicVolume > 0) {
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0)
+            savedMusicVolume = -1
+        }
+    }
+
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
     // switch back even when this screen was not the caller.
@@ -374,10 +390,14 @@ fun MainScreen() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 if (intent?.action == AudioEngineService.ACTION_PARTY_CAST_STATE) {
-                    castPhoneInternalAudio = intent.getBooleanExtra(
+                    val active = intent.getBooleanExtra(
                         AudioEngineService.EXTRA_PARTY_CAST_ACTIVE,
                         false
                     )
+                    castPhoneInternalAudio = active
+                    if (!active && muteHostSpeakerInParty) {
+                        applyLocalPartySpeakerMute(false)
+                    }
                 }
             }
         }
@@ -440,7 +460,7 @@ fun MainScreen() {
         if (granted) {
             sharePhoneMic = true
             enterCaptureForeground("PC Video-Call Mic Active")
-            AudioEngineService.nativeStartPhoneMic(hostAddress, true)
+            AudioEngineService.nativeStartPhoneMic(hostAddress, true, pinCode)
         } else {
             sharePhoneMic = false
         }
@@ -473,7 +493,7 @@ fun MainScreen() {
                 action = AudioEngineService.ACTION_START_PARTY_CAST
                 putExtra("PROJECTION_RESULT_CODE", result.resultCode)
                 putExtra("PROJECTION_DATA", resultData)
-                putExtra("TARGET_HOSTS", hostAddress)
+                putExtra("TARGET_HOSTS", if (forwardPartyToPc) hostAddress else "")
             }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -482,6 +502,9 @@ fun MainScreen() {
                     context.startService(svcIntent)
                 }
                 castPhoneInternalAudio = true
+                if (muteHostSpeakerInParty) {
+                    applyLocalPartySpeakerMute(true)
+                }
             } catch (_: Exception) {
                 castPhoneInternalAudio = false
             }
@@ -522,6 +545,7 @@ fun MainScreen() {
     var discoveredHosts by remember { mutableStateOf<List<String>>(emptyList()) }
     LaunchedEffect(Unit) {
         while (true) {
+            isConnected = AudioEngineService.isStreaming
             discoveredHosts = runCatching {
                 AudioEngineService.nativeGetDiscoveredHosts()
             }.getOrDefault("").lines().filter { it.isNotBlank() }
@@ -530,20 +554,38 @@ fun MainScreen() {
     }
 
     // Poll 4Hz native telemetry & check if Bluetooth A2DP headphones are connected
-    LaunchedEffect(isConnected, dolbyEffects) {
+    LaunchedEffect(isConnected, castPhoneInternalAudio, sharePhoneMic, dolbyEffects) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        while (isConnected) {
+        while (isConnected || castPhoneInternalAudio || sharePhoneMic) {
+            if (isConnected && !AudioEngineService.isStreaming) {
+                isConnected = false
+            }
             telemetry = AudioEngineService.nativeGetTelemetry()
+            val remoteMediaCmd = ((telemetry.getOrElse(22) { 0L } ushr 32) and 0xFFL).toInt()
+            if (remoteMediaCmd in 10..12) {
+                val keyCode = when (remoteMediaCmd) {
+                    10 -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                    11 -> KeyEvent.KEYCODE_MEDIA_NEXT
+                    else -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                }
+                audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+                audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            }
 
             // Auto-disconnect if PC host has been silent/unreachable for 5 minutes (300 seconds)
             val silenceSec = telemetry.getOrElse(6) { 0L }
-            if (silenceSec >= 300L) {
+            if (isConnected && silenceSec >= 300L && !sharePhoneMic && !castPhoneInternalAudio) {
                 val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                     action = "ACTION_STOP"
                 }
                 context.startService(stopIntent)
                 isConnected = false
                 break
+            }
+
+            if (!isConnected) {
+                delay(250)
+                continue
             }
 
             // Only treat Bluetooth as active when media audio is actually routed there.
@@ -584,11 +626,18 @@ fun MainScreen() {
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        val topBadgeText = when {
+                            castPhoneInternalAudio -> "• ON AIR"
+                            sharePhoneMic -> "• MIC LIVE"
+                            isConnected -> "• LIVE"
+                            else -> "• STANDBY"
+                        }
+                        val anyActive = isConnected || castPhoneInternalAudio || sharePhoneMic
                         Text("AudioShare Ultra", fontWeight = FontWeight.Bold)
                         StatusBadge(
-                            text = if (isConnected) "• LIVE" else "• STANDBY",
-                            containerColor = if (isConnected) Color(0xFF14532D) else Color(0xFF1A2436),
-                            contentColor = if (isConnected) Color(0xFF86EFAC) else Color(0xFF94A3B8)
+                            text = topBadgeText,
+                            containerColor = if (anyActive) Color(0xFF14532D) else Color(0xFF1A2436),
+                            contentColor = if (anyActive) Color(0xFF86EFAC) else Color(0xFF94A3B8)
                         )
                     }
                 },
@@ -629,8 +678,16 @@ fun MainScreen() {
                 val hostVol = telemetry.getOrElse(8) { 100L }
                 val groupDelay = telemetry.getOrElse(9) { 0L }
                 val codecMode = telemetry.getOrElse(19) { 0L }
+                val partyPacked = telemetry.getOrElse(22) { 0L }
+                val partyListeners = (partyPacked and 0xFFL).toInt()
+                val partyCodec = (partyPacked shr 8) and 0xFFL
+                val partySyncMs = telemetry.getOrElse(23) { 0L }
 
                 val statusTitle = when {
+                    castPhoneInternalAudio && !isConnected ->
+                        "🟣 Party Broadcast Live — $partyListeners Peer(s) • ${codecModeName(partyCodec)} • Sync +${partySyncMs}ms"
+                    sharePhoneMic && !isConnected ->
+                        "🎙️ Wireless Microphone Live — Streaming 48 kHz to $hostAddress"
                     !isConnected -> "⚪ Ready to Connect — Select a host below or scan QR"
                     authErr > 5 -> "🔴 Wrong Encryption PIN! ($authErr packets rejected)"
                     idleSecs >= 3 -> "⚠️ Host Signal Lost (${idleSecs}s) — Reconnecting..."
@@ -792,7 +849,7 @@ fun MainScreen() {
                                 .apply()
                             val intent = Intent(context, AudioEngineService::class.java)
                             if (isConnected) {
-                                intent.action = "ACTION_STOP"
+                                intent.action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
                                 context.startService(intent)
                                 isConnected = false
                             } else {
@@ -1394,6 +1451,9 @@ fun MainScreen() {
                                     }
                                 } else {
                                     castPhoneInternalAudio = false
+                                    if (muteHostSpeakerInParty) {
+                                        applyLocalPartySpeakerMute(false)
+                                    }
                                     val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_STOP_PARTY_CAST
                                     }
@@ -1401,6 +1461,59 @@ fun MainScreen() {
                                 }
                             }
                         )
+
+                        SettingSwitchRow(
+                            title = "Mute This Phone's Speaker During Party Cast",
+                            subtitle = "Silences local speaker so all room audio comes from synced peer phones/PCs without echo",
+                            checked = muteHostSpeakerInParty,
+                            onCheckedChange = { mute ->
+                                muteHostSpeakerInParty = mute
+                                prefs.edit().putBoolean("party_mute_local", mute).apply()
+                                if (castPhoneInternalAudio) {
+                                    applyLocalPartySpeakerMute(mute)
+                                }
+                            }
+                        )
+
+                        SettingSwitchRow(
+                            title = "Also Forward to PC Receiver (Port 65532)",
+                            subtitle = "Unicast stream to $hostAddress (OFF = Pure Peer Auto-Discovery)",
+                            checked = forwardPartyToPc,
+                            onCheckedChange = { enabled ->
+                                forwardPartyToPc = enabled
+                                prefs.edit().putBoolean("party_forward_pc", enabled).apply()
+                            }
+                        )
+
+                        AnimatedVisibility(visible = castPhoneInternalAudio) {
+                            val partyPacked = telemetry.getOrElse(22) { 0L }
+                            val partyListeners = (partyPacked and 0xFFL).toInt()
+                            val partyCodec = (partyPacked shr 8) and 0xFFL
+                            val partyPort = ((partyPacked shr 16) and 0xFFFFL).let { if (it > 0) it else 65530L }
+                            val partySyncMs = telemetry.getOrElse(23) { 0L }
+
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                HorizontalDivider(color = Color(0xFF243047))
+                                Text(
+                                    "Live Party Host Telemetry (Port $partyPort)",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    MetricTile("Connected Peers", "$partyListeners", Modifier.weight(1f))
+                                    MetricTile("Party Codec", codecModeName(partyCodec), Modifier.weight(1f))
+                                    MetricTile("Group Sync", "+${partySyncMs} ms", Modifier.weight(1f))
+                                }
+                                Text(
+                                    "Other phones & PCs can join by tapping 'Party Phone: Android-Party-Host' on their Connect tab.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                     }
 
                     SettingSwitchRow(
@@ -1422,7 +1535,7 @@ fun MainScreen() {
                                 if (hasPerm) {
                                     sharePhoneMic = true
                                     enterCaptureForeground("PC Video-Call Mic Active")
-                                    AudioEngineService.nativeStartPhoneMic(hostAddress, true)
+                                    AudioEngineService.nativeStartPhoneMic(hostAddress, true, pinCode)
                                 } else {
                                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }

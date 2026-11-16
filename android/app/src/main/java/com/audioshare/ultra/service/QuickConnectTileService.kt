@@ -10,7 +10,7 @@ class QuickConnectTileService : TileService() {
 
     override fun onStartListening() {
         super.onStartListening()
-        syncTileState()
+        syncTileState(AudioEngineService.isStreaming)
     }
 
     override fun onClick() {
@@ -22,6 +22,7 @@ class QuickConnectTileService : TileService() {
         if (AudioEngineService.isStreaming) {
             intent.action = "ACTION_STOP"
             startService(intent)
+            syncTileState(false)
         } else {
             intent.putExtra("HOST_ADDR", lastHost)
             intent.putExtra("PIN", prefs.getString("pin_code", "") ?: "")
@@ -30,13 +31,13 @@ class QuickConnectTileService : TileService() {
             } else {
                 startService(intent)
             }
+            syncTileState(true)
         }
-        syncTileState()
     }
 
-    private fun syncTileState() {
+    private fun syncTileState(streaming: Boolean) {
         val tile = qsTile ?: return
-        if (AudioEngineService.isStreaming) {
+        if (streaming) {
             tile.state = Tile.STATE_ACTIVE
             tile.label = "PC Audio: ON"
         } else {

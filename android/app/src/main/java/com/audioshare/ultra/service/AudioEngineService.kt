@@ -43,6 +43,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val ACTION_START_PARTY_CAST = "ACTION_START_PARTY_CAST"
         const val ACTION_STOP_PARTY_CAST = "ACTION_STOP_PARTY_CAST"
         const val ACTION_PARTY_CAST_STATE = "ACTION_PARTY_CAST_STATE"
+        const val ACTION_STOP_CLIENT_ONLY = "ACTION_STOP_CLIENT_ONLY"
         const val EXTRA_PARTY_CAST_ACTIVE = "PARTY_CAST_ACTIVE"
 
         @Volatile
@@ -89,7 +90,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativePushCapturedAudio(pcmFloat: FloatArray)
 
         @JvmStatic
-        external fun nativeStartPhoneMic(hostIp: String, useHardwareMic: Boolean): Boolean
+        external fun nativeStartPhoneMic(hostIp: String, useHardwareMic: Boolean, pin: String): Boolean
 
         @JvmStatic
         external fun nativeStopPhoneMic()
@@ -137,6 +138,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         if (intent?.action == "ACTION_STOP") {
             stopStreamAndService()
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_STOP_CLIENT_ONLY) {
+            nativeStopClient()
+            isStreaming = false
+            if (!isPartyCasting && !micCaptureActive) {
+                stopStreamAndService()
+                return START_NOT_STICKY
+            }
+            startForegroundNotification(currentHostAddr, currentIsUsb)
+            return START_STICKY
         }
         if (intent?.action == "ACTION_SET_DOLBY") {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
@@ -227,6 +238,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
 
         isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
+        if (!isStreaming && !isPartyCasting && !micCaptureActive) {
+            stopStreamAndService()
+            return START_NOT_STICKY
+        }
         // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
         // Lock and the Dolby/system-effects preference automatically!
         applyDspFromPrefs()
@@ -530,9 +545,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val acquired = mgr.getMediaProjection(resultCode, resultData)
                 ?: return failPartyCastStart()
             projection = acquired
+            val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+            val pin = prefs.getString("pin_code", "") ?: ""
 
             var casterRef: PhoneAudioCaster? = null
-            val caster = PhoneAudioCaster(acquired, targets) {
+            val caster = PhoneAudioCaster(acquired, targets, pin) {
                 // Ignore a late callback from a caster that was already
                 // replaced or explicitly stopped.
                 val stopped = casterRef
@@ -696,12 +713,20 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     override fun onAudioFocusChange(focusChange: Int) {
+        if (isLocallyMuted) {
+            // Never unmute a user-muted or headphone-unplugged stream when a
+            // transient notification finishes and returns AUDIOFOCUS_GAIN.
+            return
+        }
+        val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+        val liveGainDb = prefs.getFloat("gain_db", currentGainDb)
+        currentGainDb = liveGainDb
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS -> nativeSetGainDb(-96.0f) // Auto-mute during phone call
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK ->
-                nativeSetGainDb((currentGainDb - 12.0f).coerceAtLeast(-96.0f))
-            AudioManager.AUDIOFOCUS_GAIN -> nativeSetGainDb(currentGainDb)
+                nativeSetGainDb((liveGainDb - 12.0f).coerceAtLeast(-96.0f))
+            AudioManager.AUDIOFOCUS_GAIN -> nativeSetGainDb(liveGainDb)
         }
     }
 

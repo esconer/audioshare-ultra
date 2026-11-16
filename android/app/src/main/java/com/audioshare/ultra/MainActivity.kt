@@ -44,6 +44,24 @@ class MainActivity : ComponentActivity() {
             if (!isHeld) acquire()
         }
 
+        if (savedInstanceState == null) {
+            handleConnectIntent(intent)
+        }
+
+        setContent {
+            MaterialTheme(colorScheme = StudioDarkColors) {
+                MainScreen()
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleConnectIntent(intent)
+    }
+
+    private fun handleConnectIntent(intent: Intent?) {
         // Check if launched via 1-Scan QR Code (asultra://connect?host=IP:PORT&pin=PIN)
         intent?.data?.let { uri ->
             if (uri.scheme == "asultra" && uri.host == "connect") {
@@ -66,12 +84,6 @@ class MainActivity : ComponentActivity() {
                         startService(svcIntent)
                     }
                 }
-            }
-        }
-
-        setContent {
-            MaterialTheme(colorScheme = StudioDarkColors) {
-                MainScreen()
             }
         }
     }
