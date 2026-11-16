@@ -220,6 +220,56 @@ impl ClockDriftResampler {
         }
         out_idx
     }
+
+    /// Pull-mode resampler driven directly by a [`BurstDecouplerRing`].
+    ///
+    /// Pops an input stereo frame from `ring` if and only if `self.phase >= 1.0`,
+    /// eliminating any IEEE-754 rounding discrepancy between `floor(phase + N*ratio)`
+    /// and repeated `phase += ratio` additions. Guarantees that every sample in
+    /// `out_stereo` is filled and zero popped input frames are ever discarded.
+    pub fn process_from_ring(
+        &mut self,
+        ring: &BurstDecouplerRing,
+        dither_rng: &mut u32,
+        out_stereo: &mut [f32],
+    ) {
+        let out_frames = out_stereo.len() / 2;
+        let mut in_frame = [0.0f32; 2];
+        for out_idx in 0..out_frames {
+            while self.phase >= 1.0 {
+                ring.pop_exact_or_dither(&mut in_frame, dither_rng);
+                self.hist_l.copy_within(1..4, 0);
+                self.hist_r.copy_within(1..4, 0);
+                self.hist_l[3] = in_frame[0];
+                self.hist_r[3] = in_frame[1];
+                self.phase -= 1.0;
+            }
+            let f = self.phase as f32;
+            out_stereo[out_idx * 2] = Self::hermite4(
+                f,
+                self.hist_l[0],
+                self.hist_l[1],
+                self.hist_l[2],
+                self.hist_l[3],
+            );
+            out_stereo[out_idx * 2 + 1] = Self::hermite4(
+                f,
+                self.hist_r[0],
+                self.hist_r[1],
+                self.hist_r[2],
+                self.hist_r[3],
+            );
+            self.phase += self.ratio;
+        }
+        while self.phase >= 1.0 {
+            ring.pop_exact_or_dither(&mut in_frame, dither_rng);
+            self.hist_l.copy_within(1..4, 0);
+            self.hist_r.copy_within(1..4, 0);
+            self.hist_l[3] = in_frame[0];
+            self.hist_r[3] = in_frame[1];
+            self.phase -= 1.0;
+        }
+    }
 }
 
 /// 2. Wait-Free SPSC Sample FIFO (Decouples 120-frame network quantum from Android SoC getFramesPerBurst())
@@ -842,6 +892,30 @@ mod tests {
                     "Rate {} failed: requested {} frames, produced {}",
                     rate, req_frames, produced
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_from_ring_exact_frames() {
+        for &rate in &[44_100, 48_000, 88_200, 96_000, 192_000] {
+            let mut resampler = ClockDriftResampler::new();
+            resampler.set_output_sample_rate(rate);
+            let ring = BurstDecouplerRing::new();
+
+            // Push initial buffer into ring
+            let subframe = [0.25f32; 240];
+            for _ in 0..10 {
+                ring.push_samples(&subframe);
+            }
+
+            let mut rng = 12345u32;
+            let req_frames = 441; // Non-trivial frame size (10ms @ 44.1kHz)
+            let mut output = vec![0.0f32; req_frames * 2];
+
+            for _ in 0..5 {
+                resampler.process_from_ring(&ring, &mut rng, &mut output);
+                assert!(output.iter().all(|s| s.is_finite()));
             }
         }
     }

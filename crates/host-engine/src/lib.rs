@@ -267,16 +267,12 @@ impl PreviewPull {
             return;
         }
 
-        let max_in_frames = self.stereo_in.len() / 2;
-        debug_assert!(frames <= max_in_frames);
-        let consumed = self.resampler.needed_input_frames(frames).min(max_in_frames);
-        self.fifo
-            .pop_exact_or_dither(&mut self.stereo_in[..consumed * 2], &mut self.dither_rng);
-        let produced = self.resampler.process_pull(
-            &self.stereo_in[..consumed * 2],
+        self.resampler.process_from_ring(
+            &self.fifo,
+            &mut self.dither_rng,
             &mut self.stereo_out[..frames * 2],
         );
-        Self::remap_stereo(&self.stereo_out, produced, dst, frames, self.out_channels);
+        Self::remap_stereo(&self.stereo_out, frames, dst, frames, self.out_channels);
     }
 
     /// Pull one callback worth of interleaved f32 samples.
