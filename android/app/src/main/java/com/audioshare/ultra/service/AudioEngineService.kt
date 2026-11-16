@@ -362,8 +362,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun reportBluetoothRoute() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        var fallbackBtDelayMs = 0
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val fallbackBtDelayMs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val attrs = AudioAttributes.Builder().apply {
                 if (dolbyEffects) {
                     setUsage(AudioAttributes.USAGE_MEDIA)
@@ -374,7 +373,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 }
             }.build()
             val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
-            fallbackBtDelayMs = when (routedType) {
+            when (routedType) {
                 AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145
                 AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60
                 AudioDeviceInfo.TYPE_BLE_HEADSET,
@@ -393,7 +392,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val a2dpRouted = am.isBluetoothA2dpOn
             @Suppress("DEPRECATION")
             val scoRouted = am.isBluetoothScoOn()
-            fallbackBtDelayMs = when {
+            when {
                 a2dpRouted -> 145
                 scoRouted -> 60
                 else -> 0

@@ -439,7 +439,7 @@ impl PhoneMicTransmitter {
                             && last_mic_open_attempt.elapsed() >= Duration::from_millis(500);
                         if disconnected || retry_due {
                             last_mic_open_attempt = Instant::now();
-                            mic_input_stream = None;
+                            drop(mic_input_stream.take());
                             mic_input_stream =
                                 AAudioInputGuard::open_low_latency_mic(Arc::clone(&ring_clone));
                         }

@@ -3,7 +3,9 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 #[cfg(not(target_os = "android"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
@@ -1637,6 +1639,8 @@ impl HostEngine {
         running: Arc<AtomicBool>,
         start_epoch: Instant,
     ) -> Result<HostCaptureStream, String> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = &running;
         #[cfg(target_os = "linux")]
         {
             // Spawn native PipeWire / PulseAudio 3ms desktop speaker monitor stream (`@DEFAULT_MONITOR@`)

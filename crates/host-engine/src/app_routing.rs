@@ -402,7 +402,7 @@ fn isolate_windows_audio_session(target_pid: Option<u32>) {
                                 }
                             } else {
                                 let mut already_muted: i32 = 0;
-                                let _ = ((*vol_vtbl).set_mute)(vol, &mut already_muted);
+                                let _ = ((*vol_vtbl).get_mute)(vol, &mut already_muted);
                                 if already_muted == 0 {
                                     let _ = ((*vol_vtbl).set_mute)(vol, 1, core::ptr::null());
                                     if !muted_list.contains(&pid) {
