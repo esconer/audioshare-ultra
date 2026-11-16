@@ -1,7 +1,13 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::process::{Child, Stdio};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +18,17 @@ pub const DISCOVERY_PORT: u16 = 65531;
 /// Wi-Fi nodes drop directed/limited broadcasts but still forward multicast.
 pub const DISCOVERY_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 const BEACON_PREFIX: &str = "ASULTRA_BEACON|";
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn silent_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredHost {
@@ -122,8 +139,17 @@ impl DiscoveryScanner {
                 }
                 let _ = sock.set_read_timeout(Some(Duration::from_millis(250)));
                 let mut buf = [0u8; 256];
+                let mut last_mcast_refresh = Instant::now();
 
                 while run_clone.load(Ordering::Relaxed) {
+                    if last_mcast_refresh.elapsed() >= Duration::from_secs(2) {
+                        last_mcast_refresh = Instant::now();
+                        for iface in crate::list_valid_host_interfaces() {
+                            if let IpAddr::V4(ip) = iface.ip {
+                                let _ = sock.join_multicast_v4(&DISCOVERY_MULTICAST_GROUP, &ip);
+                            }
+                        }
+                    }
                     if let Ok((len, src)) = sock.recv_from(&mut buf) {
                         if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
                             if let Some(rest) = msg.strip_prefix(BEACON_PREFIX) {
@@ -236,6 +262,12 @@ impl Drop for AdbUsbWatcher {
 /// 1-Hop Wi-Fi Direct / SoftAP Hotspot Controller (Bypasses congested or AP-isolated routers)
 pub struct DirectHotspotController;
 
+#[cfg(target_os = "windows")]
+fn windows_hotspot_holder() -> &'static Mutex<Option<Child>> {
+    static HOLDER: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+    HOLDER.get_or_init(|| Mutex::new(None))
+}
+
 impl DirectHotspotController {
     pub fn start_direct_5ghz_hotspot(ssid: &str, password: &str) -> Result<String, String> {
         #[cfg(target_os = "linux")]
@@ -259,14 +291,40 @@ impl DirectHotspotController {
 
         #[cfg(target_os = "windows")]
         {
+            Self::stop_direct_hotspot();
+            let safe_ssid = ssid.replace('\'', "''");
+            let safe_pass = password.replace('\'', "''");
+            // Modern Windows 10/11 Wi-Fi Direct Legacy SoftAP (works without
+            // an internet connection and on WDI Wi-Fi 6/6E/7 drivers where
+            // `netsh wlan start hostednetwork` was removed). The SoftAP stays
+            // active for the lifetime of this hidden holder process.
             let script = format!(
-                "netsh wlan set hostednetwork mode=allow ssid={} key={}; netsh wlan start hostednetwork",
-                ssid, password
+                "$ErrorActionPreference = 'Stop'; \
+                 $pub = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementPublisher,Windows.Devices.WiFiDirect,ContentType=WindowsRuntime]::new(); \
+                 $pub.Advertisement.ListenStateDiscoverability = [Windows.Devices.WiFiDirect.WiFiDirectAdvertisementListenStateDiscoverability]::Intensive; \
+                 $pub.Advertisement.IsAutonomousGroupOwnerEnabled = $true; \
+                 $legacy = $pub.Advertisement.LegacySettings; \
+                 $legacy.IsEnabled = $true; \
+                 $legacy.Ssid = '{}'; \
+                 $cred = [Windows.Security.Credentials.PasswordCredential,Windows.Security.Credentials,ContentType=WindowsRuntime]::new(); \
+                 $cred.Password = '{}'; \
+                 $legacy.Passphrase = $cred; \
+                 $pub.Start(); \
+                 while ($true) {{ Start-Sleep -Seconds 3600 }}",
+                safe_ssid, safe_pass
             );
-            let _ = Command::new("powershell")
-                .args(["-NoProfile", "-Command", &script])
-                .output();
-            Ok(format!("1-Hop Direct Link '{}' Requested", ssid))
+            let child = silent_command("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Failed to launch WinRT SoftAP host: {}", e))?;
+            *windows_hotspot_holder().lock().unwrap() = Some(child);
+            Ok(format!(
+                "1-Hop Direct Link '{}' Active (IP: 192.168.137.1)",
+                ssid
+            ))
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -285,7 +343,11 @@ impl DirectHotspotController {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("netsh")
+            if let Some(mut child) = windows_hotspot_holder().lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = silent_command("netsh")
                 .args(["wlan", "stop", "hostednetwork"])
                 .output();
         }
@@ -428,7 +490,20 @@ impl HostVolumeMonitor {
                         std::thread::sleep(Duration::from_millis(500));
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "windows")]
+                {
+                    let mut last_os_volume: Option<u8> = None;
+                    while run_clone.load(Ordering::Relaxed) {
+                        if let Some(volume) = read_windows_master_volume() {
+                            if last_os_volume != Some(volume) {
+                                telemetry.host_volume.store(volume, Ordering::Relaxed);
+                                last_os_volume = Some(volume);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     let _ = telemetry;
                     while run_clone.load(Ordering::Relaxed) {
@@ -483,6 +558,165 @@ fn read_linux_master_volume() -> Option<u8> {
         return None;
     }
     parse_pactl_volume_percent(&String::from_utf8_lossy(&volume.stdout))
+}
+
+/// Zero-dependency Windows CoreAudio COM reader for master speaker volume & mute.
+#[cfg(target_os = "windows")]
+fn read_windows_master_volume() -> Option<u8> {
+    use core::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    #[repr(C)]
+    struct IMMDeviceEnumeratorVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(*mut IMMDeviceEnumerator) -> u32,
+        enum_audio_endpoints: usize,
+        get_default_audio_endpoint: unsafe extern "system" fn(
+            *mut IMMDeviceEnumerator,
+            u32,
+            u32,
+            *mut *mut IMMDevice,
+        ) -> i32,
+    }
+    #[repr(C)]
+    struct IMMDeviceEnumerator {
+        lp_vtbl: *const IMMDeviceEnumeratorVtbl,
+    }
+
+    #[repr(C)]
+    struct IMMDeviceVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(*mut IMMDevice) -> u32,
+        activate: unsafe extern "system" fn(
+            *mut IMMDevice,
+            *const Guid,
+            u32,
+            *const c_void,
+            *mut *mut IAudioEndpointVolume,
+        ) -> i32,
+    }
+    #[repr(C)]
+    struct IMMDevice {
+        lp_vtbl: *const IMMDeviceVtbl,
+    }
+
+    #[repr(C)]
+    struct IAudioEndpointVolumeVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(*mut IAudioEndpointVolume) -> u32,
+        register_control_change_notify: usize,
+        unregister_control_change_notify: usize,
+        get_channel_count: usize,
+        set_master_volume_level: usize,
+        set_master_volume_level_scalar: usize,
+        get_master_volume_level: usize,
+        get_master_volume_level_scalar:
+            unsafe extern "system" fn(*mut IAudioEndpointVolume, *mut f32) -> i32,
+        set_channel_volume_level: usize,
+        set_channel_volume_level_scalar: usize,
+        get_channel_volume_level: usize,
+        get_channel_volume_level_scalar: usize,
+        set_mute: usize,
+        get_mute: unsafe extern "system" fn(*mut IAudioEndpointVolume, *mut i32) -> i32,
+    }
+    #[repr(C)]
+    struct IAudioEndpointVolume {
+        lp_vtbl: *const IAudioEndpointVolumeVtbl,
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoCreateInstance(
+            rclsid: *const Guid,
+            p_unk_outer: *mut c_void,
+            dw_cls_context: u32,
+            riid: *const Guid,
+            ppv: *mut *mut c_void,
+        ) -> i32;
+    }
+
+    const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xBCDE_0395,
+        data2: 0xE52F,
+        data3: 0x467C,
+        data4: [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E],
+    };
+    const IID_IMMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xA956_64D2,
+        data2: 0x9614,
+        data3: 0x4F35,
+        data4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6],
+    };
+    const IID_IAUDIO_ENDPOINT_VOLUME: Guid = Guid {
+        data1: 0x5CDF_2C82,
+        data2: 0x841E,
+        data3: 0x4546,
+        data4: [0x97, 0x22, 0x0C, 0xF7, 0x40, 0x78, 0x22, 0x9A],
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(core::ptr::null_mut(), 0);
+        let mut enumerator: *mut IMMDeviceEnumerator = core::ptr::null_mut();
+        if CoCreateInstance(
+            &CLSID_MMDEVICE_ENUMERATOR,
+            core::ptr::null_mut(),
+            1, // CLSCTX_INPROC_SERVER
+            &IID_IMMDEVICE_ENUMERATOR,
+            &mut enumerator as *mut _ as *mut *mut c_void,
+        ) < 0
+            || enumerator.is_null()
+        {
+            return None;
+        }
+        let mut device: *mut IMMDevice = core::ptr::null_mut();
+        let hr_dev = ((*(*enumerator).lp_vtbl).get_default_audio_endpoint)(
+            enumerator,
+            0, // eRender
+            0, // eConsole
+            &mut device,
+        );
+        ((*(*enumerator).lp_vtbl).release)(enumerator);
+        if hr_dev < 0 || device.is_null() {
+            return None;
+        }
+        let mut ep_vol: *mut IAudioEndpointVolume = core::ptr::null_mut();
+        let hr_act = ((*(*device).lp_vtbl).activate)(
+            device,
+            &IID_IAUDIO_ENDPOINT_VOLUME,
+            1,
+            core::ptr::null(),
+            &mut ep_vol,
+        );
+        ((*(*device).lp_vtbl).release)(device);
+        if hr_act < 0 || ep_vol.is_null() {
+            return None;
+        }
+        let mut muted: i32 = 0;
+        let mut scalar: f32 = 1.0;
+        let ok_mute = ((*(*ep_vol).lp_vtbl).get_mute)(ep_vol, &mut muted) >= 0;
+        let ok_vol =
+            ((*(*ep_vol).lp_vtbl).get_master_volume_level_scalar)(ep_vol, &mut scalar) >= 0;
+        ((*(*ep_vol).lp_vtbl).release)(ep_vol);
+        if ok_mute && muted != 0 {
+            Some(0)
+        } else if ok_vol {
+            Some((scalar.clamp(0.0, 1.0) * 100.0).round() as u8)
+        } else {
+            None
+        }
+    }
 }
 
 /// Virtual Speaker & OS Wi-Fi Scan Suppressor Guard.
@@ -598,8 +832,10 @@ impl VirtualSpeakerAndRadioGuard {
     pub fn acquire(enable_virtual_speaker: bool) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let prev_default_sink = pactl_get_default("sink");
-            let prev_default_source = pactl_get_default("source");
+            let prev_default_sink =
+                pactl_get_default("sink").filter(|s| s != "AudioShare_Ultra");
+            let prev_default_source =
+                pactl_get_default("source").filter(|s| s != "AudioShare_Ultra.monitor");
             let mut pactl_module_id = None;
             if enable_virtual_speaker {
                 if let Ok(output) = Command::new("pactl")

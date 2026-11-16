@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 #[cfg(not(target_os = "android"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
@@ -170,11 +170,6 @@ const PREVIEW_CONVERT_CHUNK_FRAMES: usize = 1024;
 struct PreviewPull {
     fifo: Arc<BurstDecouplerRing>,
     resampler: ClockDriftResampler,
-    /// Mirror of the resampler phase, used to pop exactly the input frames the
-    /// interpolator consumes. The preview sink never steers the clock loop, so
-    /// `ratio` stays constant after `set_output_sample_rate` and this mirror
-    /// cannot diverge (the resampler starts at phase 0.0 as well).
-    phase: f64,
     out_channels: usize,
     out_rate: u32,
     dither_rng: u32,
@@ -198,7 +193,6 @@ impl PreviewPull {
         Self {
             fifo,
             resampler,
-            phase: 0.0,
             out_channels,
             out_rate,
             dither_rng: 12345,
@@ -273,18 +267,12 @@ impl PreviewPull {
             return;
         }
 
-        let ratio = self.resampler.ratio.max(1e-9);
         let max_in_frames = self.stereo_in.len() / 2;
-        // `process` consumes `floor(phase + frames * ratio)` input frames.
-        // Pop exactly that many (one frame is held in reserve for a phase close
-        // to 1.0) so no resampled audio is silently discarded.
         debug_assert!(frames <= max_in_frames);
-        let total = self.phase + frames as f64 * ratio;
-        let consumed = (total.floor() as usize).min(max_in_frames);
-        self.phase = total - consumed as f64;
+        let consumed = self.resampler.needed_input_frames(frames).min(max_in_frames);
         self.fifo
             .pop_exact_or_dither(&mut self.stereo_in[..consumed * 2], &mut self.dither_rng);
-        let produced = self.resampler.process(
+        let produced = self.resampler.process_pull(
             &self.stereo_in[..consumed * 2],
             &mut self.stereo_out[..frames * 2],
         );
@@ -1014,6 +1002,9 @@ pub struct HostTelemetry {
     pub packets_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub dtx_silent_mode: AtomicBool,
+    pub enable_smart_dtx: AtomicBool,
+    pub use_test_tone: AtomicBool,
+    pub configured_subframes_per_packet: AtomicU8,
     pub active_codec_mode: AtomicU8,
     pub quality_profile: AtomicU8,
     /// Opt-in compressed-codec backend switch. `false` (default) keeps the
@@ -1044,6 +1035,43 @@ pub struct HostTelemetry {
     pub tx_packet_interval_us: AtomicU32,
     /// Captured audio waiting in the host ring at send time, in microseconds.
     pub capture_buffer_us: AtomicU32,
+}
+
+impl Default for HostTelemetry {
+    fn default() -> Self {
+        Self {
+            packets_sent: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            dtx_silent_mode: AtomicBool::new(false),
+            enable_smart_dtx: AtomicBool::new(false),
+            use_test_tone: AtomicBool::new(false),
+            configured_subframes_per_packet: AtomicU8::new(1),
+            active_codec_mode: AtomicU8::new(0),
+            quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
+            prefer_opus: AtomicBool::new(false),
+            client_gaming_lock: AtomicBool::new(false),
+            enable_group_sync: AtomicBool::new(false),
+            manual_group_sync_trim_ms: AtomicU16::new(0),
+            target_bitrate_kbps: AtomicU16::new(256),
+            host_volume: AtomicU8::new(100),
+            host_vu_peak_pct: AtomicU8::new(0),
+            active_clients_count: AtomicU8::new(0),
+            max_client_bt_delay_ms: AtomicU16::new(0),
+            max_client_downstream_delay_ms: AtomicU16::new(0),
+            hotplug_rebinds: AtomicU16::new(0),
+            trigger_sonar_ping: AtomicBool::new(false),
+            sonar_tx_timestamp_us: AtomicU64::new(0),
+            tx_subframes_per_packet: AtomicU8::new(1),
+            tx_packet_interval_us: AtomicU32::new(2500),
+            capture_buffer_us: AtomicU32::new(0),
+        }
+    }
+}
+
+impl HostTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1092,6 +1120,9 @@ impl HostEngine {
             packets_sent: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             dtx_silent_mode: AtomicBool::new(false),
+            enable_smart_dtx: AtomicBool::new(config.enable_smart_dtx),
+            use_test_tone: AtomicBool::new(config.use_test_tone),
+            configured_subframes_per_packet: AtomicU8::new(config.subframes_per_packet.clamp(1, 4)),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
             prefer_opus: AtomicBool::new(false),
@@ -1319,6 +1350,14 @@ impl HostEngine {
                 let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
 
                 fn query_default_monitor() -> Option<String> {
+                    if let Ok(out) = Command::new("pactl").arg("get-default-source").output() {
+                        if out.status.success() {
+                            let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if src == "AudioShare_Ultra.monitor" {
+                                return Some(src);
+                            }
+                        }
+                    }
                     Command::new("pactl")
                         .arg("get-default-sink")
                         .output()
@@ -1507,19 +1546,23 @@ impl HostEngine {
             unsafe extern "C" fn(*mut core::ffi::c_void, *mut u8, usize, *mut i32) -> i32;
         type FnPaSimpleFree = unsafe extern "C" fn(*mut core::ffi::c_void);
 
+        static PULSE_SIMPLE_LIB: OnceLock<usize> = OnceLock::new();
+
         unsafe {
-            let lib = libc::dlopen(
-                b"libpulse-simple.so.0\0".as_ptr() as *const i8,
-                libc::RTLD_LAZY,
-            );
-            if lib.is_null() {
+            let lib_addr = *PULSE_SIMPLE_LIB.get_or_init(|| {
+                libc::dlopen(
+                    b"libpulse-simple.so.0\0".as_ptr() as *const i8,
+                    libc::RTLD_LAZY,
+                ) as usize
+            });
+            if lib_addr == 0 {
                 return false;
             }
+            let lib = lib_addr as *mut core::ffi::c_void;
             let p_new = libc::dlsym(lib, b"pa_simple_new\0".as_ptr() as *const i8);
             let p_read = libc::dlsym(lib, b"pa_simple_read\0".as_ptr() as *const i8);
             let p_free = libc::dlsym(lib, b"pa_simple_free\0".as_ptr() as *const i8);
             if p_new.is_null() || p_read.is_null() || p_free.is_null() {
-                libc::dlclose(lib);
                 return false;
             }
             let pa_new: FnPaSimpleNew = core::mem::transmute(p_new);
@@ -1563,7 +1606,6 @@ impl HostEngine {
                 &mut err,
             );
             if handle.is_null() {
-                libc::dlclose(lib);
                 return false;
             }
 
@@ -1587,7 +1629,6 @@ impl HostEngine {
                 }
             }
             pa_free(handle);
-            libc::dlclose(lib);
             true
         }
     }
@@ -1596,6 +1637,7 @@ impl HostEngine {
     fn spawn_loopback_capture(
         ring: Arc<BurstDecouplerRing>,
         heartbeat_ms: Arc<AtomicU64>,
+        stream_error: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
         start_epoch: Instant,
     ) -> Result<HostCaptureStream, String> {
@@ -1647,11 +1689,16 @@ impl HostEngine {
         // Use our 4-Point Hermite Cubic Fractional Interpolator for alias-free 44.1k/96k -> 48k conversion
         let mut host_resampler = audioshare_protocol::dsp::ClockDriftResampler::new();
         host_resampler.ratio = (src_rate as f64) / (SAMPLE_RATE as f64);
+        // Ensure `chunk_frames` never produces more than 2000 output stereo
+        // frames into the 4096-sample `resampled` buffer when `src_rate < 48kHz`.
+        let ratio_cap = ((2000.0 * host_resampler.ratio).floor() as usize).max(1);
+        stream_error.store(false, Ordering::Relaxed);
 
         let stream = match sample_format {
             cpal::SampleFormat::I16 => {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -1661,7 +1708,7 @@ impl HostEngine {
                         let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
                         let mut f32_tmp = [0.0f32; 2048];
-                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
@@ -1686,13 +1733,16 @@ impl HostEngine {
                             frame_offset += chunk_frames;
                         }
                     },
-                    |_| {},
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
                     None,
                 )
             }
             cpal::SampleFormat::U16 => {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -1702,7 +1752,7 @@ impl HostEngine {
                         let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
                         let mut f32_tmp = [0.0f32; 2048];
-                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
@@ -1727,13 +1777,16 @@ impl HostEngine {
                             frame_offset += chunk_frames;
                         }
                     },
-                    |_| {},
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
                     None,
                 )
             }
             _ => {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -1742,7 +1795,7 @@ impl HostEngine {
                         let ch = channels.max(1);
                         let in_frames = data.len() / ch;
                         let mut stereo_buf = [0.0f32; 2048];
-                        let max_chunk_frames = (2048 / ch).min(1024).max(1);
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
@@ -1760,7 +1813,9 @@ impl HostEngine {
                             frame_offset += chunk_frames;
                         }
                     },
-                    |_| {},
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
                     None,
                 )
             }
@@ -1787,11 +1842,22 @@ impl HostEngine {
         #[cfg(target_os = "android")]
         let _ = &capture_heartbeat_ms;
         let start_instant = Instant::now();
+        #[cfg(not(target_os = "android"))]
+        let capture_stream_error = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "windows")]
+        let current_default_output_name = || -> Option<String> {
+            cpal::default_host()
+                .default_output_device()
+                .and_then(|d| d.name().ok())
+        };
+        #[cfg(target_os = "windows")]
+        let mut bound_output_name = current_default_output_name();
         #[cfg(target_os = "windows")]
         let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
                 Arc::clone(&capture_heartbeat_ms),
+                Arc::clone(&capture_stream_error),
                 Arc::clone(&running),
                 start_instant,
             )
@@ -1803,10 +1869,11 @@ impl HostEngine {
         let mut last_watchdog_check = Instant::now();
 
         #[cfg(target_os = "linux")]
-        let _active_stream = if !config.use_test_tone {
+        let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
                 Arc::clone(&capture_heartbeat_ms),
+                Arc::clone(&capture_stream_error),
                 Arc::clone(&running),
                 start_instant,
             )
@@ -1852,27 +1919,55 @@ impl HostEngine {
         let mut last_client_sweep = Instant::now();
 
         while running.load(Ordering::Relaxed) {
+            let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
+
+            #[cfg(target_os = "linux")]
+            if !use_test_tone && active_stream.is_none() {
+                active_stream = Self::spawn_loopback_capture(
+                    Arc::clone(&ring),
+                    Arc::clone(&capture_heartbeat_ms),
+                    Arc::clone(&capture_stream_error),
+                    Arc::clone(&running),
+                    start_instant,
+                )
+                .ok();
+            } else if use_test_tone && active_stream.is_some() {
+                active_stream = None;
+            }
+
             // 1. Hot-Plug Audio Device Watchdog (Solves Issues #173, #122, #103)
             #[cfg(target_os = "windows")]
-            if !config.use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500)
+            if !use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500)
             {
                 last_watchdog_check = Instant::now();
                 let now_ms = start_instant.elapsed().as_millis() as u64;
-                let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                if active_stream.is_none() || now_ms.saturating_sub(last_cb) > 2500 {
+                let latest_name = current_default_output_name();
+                let device_changed = latest_name.is_some() && latest_name != bound_output_name;
+                // Only rebind when the stream is missing, reported a device error,
+                // or the default output endpoint changed. WASAPI stops firing
+                // loopback callbacks during silence, so silence alone must not
+                // tear down and recreate a healthy stream every 2.5 seconds.
+                if active_stream.is_none()
+                    || capture_stream_error.load(Ordering::Acquire)
+                    || device_changed
+                {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
                     active_stream = Self::spawn_loopback_capture(
                         Arc::clone(&ring),
                         Arc::clone(&capture_heartbeat_ms),
+                        Arc::clone(&capture_stream_error),
                         Arc::clone(&running),
                         start_instant,
                     )
                     .ok();
                     if active_stream.is_some() {
+                        bound_output_name = latest_name;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+            } else if use_test_tone && active_stream.is_some() {
+                active_stream = None;
             }
 
             // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
@@ -2064,7 +2159,10 @@ impl HostEngine {
             let base_subframes = if gaming_lock {
                 1
             } else {
-                config.subframes_per_packet.clamp(1, 2) as usize
+                telemetry
+                    .configured_subframes_per_packet
+                    .load(Ordering::Relaxed)
+                    .clamp(1, 2) as usize
             };
             // Tier selection uses the governor's paced estimate, not the raw
             // last report, so a post-hold release walks through Tier 1 instead
@@ -2161,7 +2259,7 @@ impl HostEngine {
             // Wait until soundcard pushes a full packet of samples into `ring`,
             // or fall back to silence synthesis only if capture endpoint is truly idle >80ms.
             let needed_samples = subframes_per_pkt * SUBFRAME_STEREO_SAMPLES;
-            if !config.use_test_tone {
+            if !use_test_tone {
                 let avail = ring.available_samples();
                 // Allow up to 24 subframes (60ms = 5760 samples) so normal 10-22ms OS callbacks
                 // on Windows WASAPI and Linux PipeWire are NEVER discarded mid-callback!
@@ -2203,12 +2301,13 @@ impl HostEngine {
             let send_n1 = prev_hist_len >= 1;
             let send_n2 = prev_hist_len >= 2;
             let mut packet_is_silent = true;
+            let mut packet_max_vu_pct: u8 = 0;
 
             for sub_idx in 0..subframes_per_pkt {
                 let mut f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 let mut dummy_rng = 1u32;
 
-                if config.use_test_tone {
+                if use_test_tone {
                     for i in 0..SUBFRAME_FRAMES {
                         let l = (tone_phase * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.25;
                         let r = (tone_phase * 2.0 * std::f32::consts::PI * 554.37).sin() * 0.25;
@@ -2239,7 +2338,7 @@ impl HostEngine {
                 let max_abs =
                     noise_shaper.quantize_stereo_subframe(&f32_subframe, &mut i16_subframe);
                 let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
-                telemetry.host_vu_peak_pct.store(vu_pct, Ordering::Relaxed);
+                packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
                 if max_abs > 3 {
                     packet_is_silent = false;
@@ -2332,6 +2431,9 @@ impl HostEngine {
 
                 seq = seq.wrapping_add(1);
             }
+            telemetry
+                .host_vu_peak_pct
+                .store(packet_max_vu_pct, Ordering::Relaxed);
 
             // If an Opus encode failed mid-packet we fell back to VBR above;
             // publish the mode that matches the payload actually built.
@@ -2343,14 +2445,19 @@ impl HostEngine {
             let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
             let active_key = *session_key.lock().unwrap();
 
-            let is_dtx_active =
-                config.enable_smart_dtx && packet_is_silent && silent_subframes > 200;
+            let is_dtx_active = telemetry.enable_smart_dtx.load(Ordering::Relaxed)
+                && packet_is_silent
+                && silent_subframes > 200;
             telemetry
                 .dtx_silent_mode
                 .store(is_dtx_active, Ordering::Relaxed);
 
             let mut sent_any = false;
             if is_dtx_active {
+                // Receivers drop their Opus decoder and sequencer state on
+                // SilenceHeartbeat; reset the sender's codec/FEC history to match.
+                opus_encoder = None;
+                fec_hist_len = 0;
                 if (base_seq % 80) == 0 {
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
@@ -2529,7 +2636,7 @@ impl HostEngine {
             // test tone (no capture clock) and for a stalled capture endpoint,
             // where silence must still be synthesized at real-time cadence.
             let now = Instant::now();
-            let capture_active = !config.use_test_tone
+            let capture_active = !use_test_tone
                 && (start_instant.elapsed().as_millis() as u64)
                     .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
                     <= 80;
@@ -2557,7 +2664,7 @@ impl HostEngine {
                 next_tick = last_tx_instant + packet_interval;
             } else {
                 let step_interval =
-                    if !config.use_test_tone && ring.available_samples() > needed_samples * 3 {
+                    if !use_test_tone && ring.available_samples() > needed_samples * 3 {
                         Duration::from_micros(((2300 * subframes_per_pkt) as u64).max(1000))
                     } else {
                         packet_interval
@@ -3400,5 +3507,80 @@ mod tests {
             out[out.len() - 2].abs() > 0.2,
             "resampled output went silent at the end of the run"
         );
+    }
+
+    #[test]
+    fn test_preview_pull_resampler_at_88_2khz() {
+        let fifo = Arc::new(BurstDecouplerRing::new());
+        let mut block = vec![0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for frame in 0..SUBFRAME_FRAMES {
+            block[frame * 2] = 0.35;
+            block[frame * 2 + 1] = 0.35;
+        }
+
+        let mut pull = PreviewPull::new(Arc::clone(&fifo), 2, 88_200, None);
+        // 8820 stereo frames per callback (10 callbacks = 88200 frames = 1.0s)
+        let mut out = vec![0.0f32; 8820 * 2];
+        let mut consumed_frames = 0usize;
+        for _ in 0..10 {
+            while fifo.available_samples() < 10000 * 2 {
+                assert_eq!(fifo.push_samples(&block), block.len());
+            }
+            let before = fifo.available_samples() / 2;
+            pull.pull(&mut out);
+            let after = fifo.available_samples() / 2;
+            consumed_frames += before - after;
+        }
+
+        // 88200 output frames at 88.2 kHz must consume exactly 48000 input frames at 48 kHz.
+        assert!(
+            (consumed_frames as f64 - 48_000.0).abs() <= 2.0,
+            "resampler consumed {consumed_frames} input frames at 88.2kHz instead of 48000"
+        );
+        assert!(
+            out[out.len() - 2].abs() > 0.3,
+            "resampled output signal attenuated or lost at 88.2kHz"
+        );
+    }
+
+    #[test]
+    fn test_host_telemetry_atomic_fields() {
+        let telemetry = HostTelemetry::new();
+        assert!(!telemetry.enable_smart_dtx.load(Ordering::Relaxed));
+        assert!(!telemetry.use_test_tone.load(Ordering::Relaxed));
+        assert_eq!(
+            telemetry.configured_subframes_per_packet.load(Ordering::Relaxed),
+            1
+        );
+
+        telemetry.enable_smart_dtx.store(true, Ordering::Relaxed);
+        telemetry.use_test_tone.store(true, Ordering::Relaxed);
+        telemetry.configured_subframes_per_packet.store(2, Ordering::Relaxed);
+
+        assert!(telemetry.enable_smart_dtx.load(Ordering::Relaxed));
+        assert!(telemetry.use_test_tone.load(Ordering::Relaxed));
+        assert_eq!(
+            telemetry.configured_subframes_per_packet.load(Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn test_spawn_loopback_capture_ratio_cap() {
+        // Test ratio_cap across diverse sample rates: 16k, 22.05k, 44.1k, 48k, 96k
+        let rates = [16_000u32, 22_050, 44_100, 48_000, 96_000];
+        for src_rate in rates {
+            let ratio = (src_rate as f64) / (SAMPLE_RATE as f64);
+            let ratio_cap = ((2000.0 * ratio).floor() as usize).max(1);
+
+            // Chunk frames bounded by ratio_cap must never produce more than 2000 frames
+            // into resampled buffer (which has capacity 2048 frames = 4096 samples).
+            let max_chunk_frames = (2048 / 2).min(1024).min(ratio_cap).max(1);
+            let est_out_frames = (max_chunk_frames as f64) / ratio;
+            assert!(
+                est_out_frames <= 2048.0,
+                "At rate {src_rate}, max_chunk_frames={max_chunk_frames} produces {est_out_frames} > 2048 frames"
+            );
+        }
     }
 }
