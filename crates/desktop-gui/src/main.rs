@@ -2171,20 +2171,33 @@ impl AudioShareApp {
 
                 ui.columns(2, |cols| {
                     cols[0].vertical(|ui| {
-                        Self::setting_switch_row(
+                        if Self::setting_switch_row(
                             ui,
                             dark,
                             "2.5 ms USB Frame Pacing",
                             "Single-subframe packets (OFF = 5.0 ms bundled Wi-Fi)",
                             &mut self.usb_low_latency_pacing,
-                        );
-                        Self::setting_switch_row(
+                        ) {
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry.configured_subframes_per_packet.store(
+                                    if self.usb_low_latency_pacing { 1 } else { 2 },
+                                    Ordering::Relaxed,
+                                );
+                            }
+                        }
+                        if Self::setting_switch_row(
                             ui,
                             dark,
                             "Smart DTX Silence Saver",
                             "Halts audio packets during silence (0.6 kbps heartbeat)",
                             &mut self.enable_smart_dtx,
-                        );
+                        ) {
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .enable_smart_dtx
+                                    .store(self.enable_smart_dtx, Ordering::Relaxed);
+                            }
+                        }
                         if Self::setting_switch_row(
                             ui,
                             dark,
@@ -2219,13 +2232,19 @@ impl AudioShareApp {
                                     .store(self.enable_group_sync, Ordering::Relaxed);
                             }
                         }
-                        Self::setting_switch_row(
+                        if Self::setting_switch_row(
                             ui,
                             dark,
                             "440 Hz / 554 Hz Test Chord",
                             "Synthesizes reference tone instead of system capture",
                             &mut self.use_test_tone,
-                        );
+                        ) {
+                            if let Some(ref host) = self.host_engine {
+                                host.telemetry
+                                    .use_test_tone
+                                    .store(self.use_test_tone, Ordering::Relaxed);
+                            }
+                        }
                     });
                 });
 
