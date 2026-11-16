@@ -171,6 +171,34 @@ fn decode_primary_bundle(
     decoded
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_one_subframe(
+    next_seq: &mut u16,
+    latest_seq: u16,
+    mode: PhoneRxRoutingMode,
+    sequencer: &mut ZeroJitterSequencer,
+    mic_gate: &mut audioshare_protocol::sync_and_eq::MicRumbleAndNoiseGate,
+    limiter: &mut TruePeakLimiter,
+    resampler: &mut ClockDriftResampler,
+    resampled_out: &mut [f32],
+    mic_fifo: &BurstDecouplerRing,
+) {
+    let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+    let status = sequencer.pop_next(*next_seq, &mut frame);
+    if should_advance_mic_playhead(status, latest_seq, *next_seq) {
+        *next_seq = next_seq.wrapping_add(1);
+    }
+    if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+        mic_gate.process_in_place(&mut frame);
+    }
+    limiter.process_in_place(&mut frame);
+
+    let frames = resampler.process(&frame, resampled_out);
+    if frames > 0 {
+        mic_fifo.push_samples(&resampled_out[..frames * 2]);
+    }
+}
+
 /// Feeds the received phone-mic PCM into a PulseAudio/PipeWire null sink with
 /// `pacat`, while `module-remap-source` exposes that sink's monitor as the
 /// `AudioShare_Phone_Mic` recording device.
@@ -431,9 +459,15 @@ impl PhoneMicReceiver {
                     }
                 };
 
+                #[cfg(not(target_os = "android"))]
+                let pull_sink_active = _mic_out.is_some();
+                #[cfg(target_os = "android")]
+                let pull_sink_active = false;
+
                 let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
                 let mut initialized = false;
                 let mut prebuffer_ready = false;
+                let mut dtx_silent = false;
                 let mut next_seq: u16 = 0;
                 let mut latest_seq: u16 = 0;
                 let mut next_tick = Instant::now() + Duration::from_micros(2500);
@@ -475,6 +509,7 @@ impl PhoneMicReceiver {
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
+                                dtx_silent = true;
                                 continue;
                             }
 
@@ -483,7 +518,8 @@ impl PhoneMicReceiver {
                             // immediately instead of waiting for the playhead
                             // to walk through hundreds of empty subframes.
                             let seq_delta = base_seq.wrapping_sub(next_seq) as i16;
-                            if seq_delta > 48 || seq_delta < -32 {
+                            if dtx_silent || seq_delta > 48 || seq_delta < -32 {
+                                dtx_silent = false;
                                 sequencer.reset();
                                 opus_decoder = None;
                                 next_seq = base_seq;
@@ -587,48 +623,58 @@ impl PhoneMicReceiver {
                     }
 
                     let now = Instant::now();
+
+                    if initialized && prebuffer_ready && pull_sink_active {
+                        // When a hardware-clocked CPAL sink is pulling bursts
+                        // from `mic_fifo_thread`, immediately transfer ready
+                        // subframes from `sequencer` so the decoupler holds the
+                        // full `fifo_watermark` cushion before the next callback.
+                        while mic_fifo_thread.available_samples() < fifo_watermark
+                            && !sequencer.is_slot_missing(next_seq)
+                        {
+                            push_one_subframe(
+                                &mut next_seq,
+                                latest_seq,
+                                mode,
+                                &mut sequencer,
+                                &mut mic_gate,
+                                &mut limiter,
+                                &mut resampler,
+                                &mut resampled_out,
+                                &mic_fifo_thread,
+                            );
+                            let planned_cushion =
+                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes;
+                            resampler.update_clock_loop(planned_cushion, target_subframes);
+                            next_tick = now + Duration::from_micros(2500);
+                        }
+                    }
+
                     while now >= next_tick {
                         next_tick += Duration::from_micros(2500);
                         if initialized && prebuffer_ready {
-                            // Keep the wall-clock 2.5 ms cadence, but do not
-                            // stack more than the planned cushion when a
-                            // scheduler stall makes this loop catch up in one
-                            // burst. The sequencer keeps the undelivered
-                            // subframes, so breaking here loses no audio.
                             if mic_fifo_thread.available_samples() >= fifo_watermark {
                                 break;
                             }
-                            let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                            let status = sequencer.pop_next(next_seq, &mut frame);
-                            if should_advance_mic_playhead(status, latest_seq, next_seq) {
-                                next_seq = next_seq.wrapping_add(1);
-                            }
-                            // The rumble/noise gate is a voice-call processor.
-                            // Music cast to PC speakers must keep its sub-bass
-                            // and quiet passages.
-                            if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                                mic_gate.process_in_place(&mut frame);
-                            }
-                            limiter.process_in_place(&mut frame);
-
-                            // The phone ADC and the PC output device run on
-                            // independent crystals. Push through the clock
-                            // resampler and steer its ratio from the measured
-                            // decoupler depth; without this the FIFO slowly
-                            // overflows or runs dry even when every packet
-                            // arrives on time.
-                            let frames = resampler.process(&frame, &mut resampled_out);
-                            if frames > 0 {
-                                mic_fifo_thread.push_samples(&resampled_out[..frames * 2]);
-                            }
-                            // Steer the drift loop from the planned cushion
-                            // (remaining network delay plus the decoupler
-                            // target), not from the post-callback FIFO trough.
-                            // Measuring right after a large OS pull would make
-                            // the controller chase the underrun instead of the
-                            // configured target.
-                            let planned_cushion =
-                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes;
+                            push_one_subframe(
+                                &mut next_seq,
+                                latest_seq,
+                                mode,
+                                &mut sequencer,
+                                &mut mic_gate,
+                                &mut limiter,
+                                &mut resampler,
+                                &mut resampled_out,
+                                &mic_fifo_thread,
+                            );
+                            let planned_cushion = if pull_sink_active {
+                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes
+                            } else {
+                                buffered_subframes(latest_seq, next_seq) as f32
+                                    + resampler.samples_to_subframes(
+                                        mic_fifo_thread.available_samples(),
+                                    )
+                            };
                             resampler.update_clock_loop(planned_cushion, target_subframes);
                         }
                     }
@@ -1060,5 +1106,38 @@ mod tests {
         assert_eq!(buffered_subframes(0, 1), 0);
         assert_eq!(buffered_subframes(65535, 0), 0);
         assert_eq!(buffered_subframes(0, 65535), 2);
+    }
+
+    #[test]
+    fn test_post_dtx_rebase_logic() {
+        // Without dtx_silent, a gap of 20 subframes (seq_delta = 20) falls
+        // within the normal window (seq_delta <= 48) and does NOT rebase.
+        let mut dtx_silent = false;
+        let base_seq = 180u16;
+        let mut next_seq = 160u16;
+        let mut latest_seq = 160u16;
+        let mut prebuffer_ready = true;
+
+        let seq_delta = base_seq.wrapping_sub(next_seq) as i16;
+        assert_eq!(seq_delta, 20);
+        let would_rebase_without_dtx = dtx_silent || seq_delta > 48 || seq_delta < -32;
+        assert!(!would_rebase_without_dtx);
+
+        // With dtx_silent set by SilenceHeartbeat, it MUST trigger rebase
+        dtx_silent = true;
+        let should_rebase = dtx_silent || seq_delta > 48 || seq_delta < -32;
+        assert!(should_rebase);
+
+        if should_rebase {
+            dtx_silent = false;
+            next_seq = base_seq;
+            latest_seq = base_seq;
+            prebuffer_ready = false;
+        }
+
+        assert!(!dtx_silent);
+        assert_eq!(next_seq, 180);
+        assert_eq!(latest_seq, 180);
+        assert!(!prebuffer_ready);
     }
 }

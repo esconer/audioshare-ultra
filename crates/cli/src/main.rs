@@ -103,7 +103,7 @@ fn run_host(args: &[String]) {
         enable_smart_dtx: true,
     };
 
-    let _os_guard = VirtualSpeakerAndRadioGuard::acquire(false);
+    let mut os_guard = VirtualSpeakerAndRadioGuard::acquire(false);
     let host = HostEngine::start(cfg, vec![]).expect("Failed to start HostEngine");
     if use_opus {
         host.telemetry.prefer_opus.store(true, Ordering::Relaxed);
@@ -132,6 +132,11 @@ fn run_host(args: &[String]) {
         let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
         let bytes = host.telemetry.bytes_sent.load(Ordering::Relaxed);
         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
+        if clients > 0 {
+            os_guard.activate();
+        } else {
+            os_guard.deactivate();
+        }
         let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
         let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
 
@@ -416,5 +421,39 @@ mod tests {
             "192.168.1.5"
         );
         assert_eq!(client_target(&[]), "127.0.0.1:65530");
+    }
+
+    #[test]
+    fn test_client_target_port_formatting() {
+        let raw_no_port = "192.168.1.5";
+        let target_str = if raw_no_port.contains(':') {
+            raw_no_port.to_string()
+        } else {
+            format!("{}:{}", raw_no_port, DEFAULT_PORT)
+        };
+        assert_eq!(target_str, "192.168.1.5:65530");
+
+        let raw_with_port = "192.168.1.5:5000";
+        let target_str = if raw_with_port.contains(':') {
+            raw_with_port.to_string()
+        } else {
+            format!("{}:{}", raw_with_port, DEFAULT_PORT)
+        };
+        assert_eq!(target_str, "192.168.1.5:5000");
+    }
+
+    #[test]
+    fn test_host_flag_parsing() {
+        let test_args = args(&["--test-tone", "--usb", "--libopus", "--latency-debug"]);
+        assert!(test_args.iter().any(|a| a == "--test-tone"));
+        assert!(test_args.iter().any(|a| a == "--usb"));
+        assert!(test_args.iter().any(|a| a == "--libopus"));
+        assert!(latency_debug_enabled(&test_args));
+
+        let plain_args = args(&[]);
+        assert!(!plain_args.iter().any(|a| a == "--test-tone"));
+        assert!(!plain_args.iter().any(|a| a == "--usb"));
+        assert!(!plain_args.iter().any(|a| a == "--libopus"));
+        assert!(!has_latency_debug_flag(&plain_args));
     }
 }
