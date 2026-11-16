@@ -27,6 +27,39 @@ impl RemoteMediaCommand {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
+    let def = Command::new("pactl").arg("get-default-sink").output().ok()?;
+    let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
+    if default_sink.is_empty() {
+        return None;
+    }
+    let sinks = Command::new("pactl").args(["list", "sinks"]).output().ok()?;
+    let text = String::from_utf8_lossy(&sinks.stdout);
+    let mut in_target = false;
+    let mut card_idx: Option<String> = None;
+    let mut active_port: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Sink #") {
+            if in_target {
+                break;
+            }
+            card_idx = None;
+            active_port = None;
+        } else if let Some(name) = trimmed.strip_prefix("Name: ") {
+            in_target = name.trim() == default_sink;
+        } else if in_target {
+            if let Some(card) = trimmed.strip_prefix("alsa.card = \"") {
+                card_idx = Some(card.trim_end_matches('"').to_string());
+            } else if let Some(port) = trimmed.strip_prefix("Active Port: ") {
+                active_port = Some(port.trim().to_string());
+            }
+        }
+    }
+    Some((card_idx?, active_port?))
+}
+
 /// Automatically informs Linux PipeWire/PulseAudio of the phone's downstream Bluetooth earbud delay
 /// so web browsers (YouTube/Netflix) and video players (MPV/VLC) automatically delay video to match!
 pub fn apply_automatic_video_lipsync_offset_ms(bt_delay_ms: u16) {
@@ -46,24 +79,35 @@ pub fn apply_automatic_video_lipsync_offset_ms(bt_delay_ms: u16) {
 
         // PipeWire/PulseAudio latency offset is specified in microseconds.
         let offset_us = (bt_delay_ms as u64) * 1_000;
+        let offset_ns = offset_us * 1_000;
         let _ = std::thread::Builder::new()
             .name("as-ultra-bt-lipsync".into())
             .spawn(move || {
-                // Serialize `pactl` invocations and drop a request that was
+                // Serialize invocations and drop a request that was
                 // superseded while waiting, so an older slow invocation can
                 // never overwrite the newest delay.
                 let _guard = APPLY_LOCK.lock().unwrap();
                 if LAST_REQUESTED.load(Ordering::Relaxed) != bt_delay_ms {
                     return;
                 }
-                let _ = Command::new("pactl")
-                    .args([
-                        "set-port-latency-offset",
-                        "AudioShare_Ultra",
-                        "analog-output",
-                        &offset_us.to_string(),
-                    ])
+                // 1. PipeWire native node latency offset (works on virtual
+                //    `AudioShare_Ultra` null-sink as well as physical sinks).
+                let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
+                let _ = Command::new("pw-cli")
+                    .args(["s", "AudioShare_Ultra", "Props", &prop])
                     .output();
+                // 2. PulseAudio / PipeWire card port latency offset on the
+                //    active physical card + port.
+                if let Some((card, port)) = resolve_default_sink_card_and_port() {
+                    let _ = Command::new("pactl")
+                        .args([
+                            "set-port-latency-offset",
+                            &card,
+                            &port,
+                            &offset_us.to_string(),
+                        ])
+                        .output();
+                }
             });
     }
     #[cfg(not(target_os = "linux"))]
@@ -148,5 +192,11 @@ mod tests {
         );
         assert_eq!(RemoteMediaCommand::from_u8(0), RemoteMediaCommand::None);
         execute_remote_media_command(RemoteMediaCommand::None);
+    }
+
+    #[test]
+    fn test_apply_automatic_video_lipsync_offset_ms_runs_without_panic() {
+        apply_automatic_video_lipsync_offset_ms(0);
+        apply_automatic_video_lipsync_offset_ms(145);
     }
 }
