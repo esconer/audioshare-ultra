@@ -23,6 +23,7 @@ import android.os.Looper
 import android.os.PerformanceHintManager
 import android.os.PowerManager
 import android.util.Log
+import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import com.audioshare.ultra.R
 
@@ -111,6 +112,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
+    private var remoteMediaPlaying: Boolean = true
     // Raw low-latency output is the default. `true` opts into the shared
     // mixer so OEM post-processing (Dolby Atmos, Dirac, system EQ) applies.
     private var dolbyEffects: Boolean = false
@@ -266,14 +268,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun setupHardwareBluetoothMediaSession() {
         if (mediaSession != null) return
-        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
-            setCallback(object : MediaSession.Callback() {
-                override fun onPlay() { nativeSendMediaCommand(10) }
-                override fun onPause() { nativeSendMediaCommand(10) }
-                override fun onSkipToNext() { nativeSendMediaCommand(11) }
-                override fun onSkipToPrevious() { nativeSendMediaCommand(12) }
-            })
-            setPlaybackState(
+        fun updateSessionState(playing: Boolean) {
+            remoteMediaPlaying = playing
+            mediaSession?.setPlaybackState(
                 PlaybackState.Builder()
                     .setActions(
                         PlaybackState.ACTION_PLAY or
@@ -282,11 +279,58 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                             PlaybackState.ACTION_SKIP_TO_NEXT or
                             PlaybackState.ACTION_SKIP_TO_PREVIOUS
                     )
-                    .setState(PlaybackState.STATE_PLAYING, 0L, 1.0f)
+                    .setState(
+                        if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                        0L,
+                        1.0f
+                    )
                     .build()
             )
+        }
+        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() {
+                    updateSessionState(true)
+                    nativeSendMediaCommand(10)
+                }
+                override fun onPause() {
+                    updateSessionState(false)
+                    nativeSendMediaCommand(10)
+                }
+                override fun onSkipToNext() { nativeSendMediaCommand(11) }
+                override fun onSkipToPrevious() { nativeSendMediaCommand(12) }
+                override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                    @Suppress("DEPRECATION")
+                    val event: KeyEvent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                    } else {
+                        mediaButtonIntent.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    }
+                    if (event?.action == KeyEvent.ACTION_DOWN) {
+                        when (event.keyCode) {
+                            KeyEvent.KEYCODE_MEDIA_PLAY,
+                            KeyEvent.KEYCODE_MEDIA_PAUSE,
+                            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                                updateSessionState(!remoteMediaPlaying)
+                                nativeSendMediaCommand(10)
+                                return true
+                            }
+                            KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                                nativeSendMediaCommand(11)
+                                return true
+                            }
+                            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                                nativeSendMediaCommand(12)
+                                return true
+                            }
+                        }
+                    }
+                    return super.onMediaButtonEvent(mediaButtonIntent)
+                }
+            })
             isActive = true
         }
+        updateSessionState(true)
     }
 
     /// Report the active Bluetooth route independently of the Compose UI.
@@ -318,11 +362,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun reportBluetoothRoute() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val hasBt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Match the attributes of the active AAudio stream: raw mode opens
-            // with GAME/SONIFICATION, Dolby mode with MEDIA/MUSIC. Querying
-            // the wrong usage can report the speaker while audio is routed to
-            // Bluetooth.
+        var fallbackBtDelayMs = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val attrs = AudioAttributes.Builder().apply {
                 if (dolbyEffects) {
                     setUsage(AudioAttributes.USAGE_MEDIA)
@@ -333,22 +374,43 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 }
             }.build()
             val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
-            routedType == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                routedType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                routedType == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                routedType == AudioDeviceInfo.TYPE_BLE_SPEAKER
+            fallbackBtDelayMs = when (routedType) {
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60
+                AudioDeviceInfo.TYPE_BLE_HEADSET,
+                AudioDeviceInfo.TYPE_BLE_SPEAKER -> 45
+                AudioDeviceInfo.TYPE_HEARING_AID -> 65
+                else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    routedType == AudioDeviceInfo.TYPE_BLE_BROADCAST
+                ) {
+                    45
+                } else {
+                    0
+                }
+            }
         } else {
-            // API < 31 has no per-attributes routing query; the deprecated
-            // flags are the only way to distinguish a routed headset from a
-            // paired-but-idle one.
             @Suppress("DEPRECATION")
             val a2dpRouted = am.isBluetoothA2dpOn
             @Suppress("DEPRECATION")
             val scoRouted = am.isBluetoothScoOn()
-            a2dpRouted || scoRouted
+            fallbackBtDelayMs = when {
+                a2dpRouted -> 145
+                scoRouted -> 60
+                else -> 0
+            }
         }
-        // 0 means "no BT route"; never fake the A2DP allowance.
-        nativeReportBluetoothDelayMs(if (hasBt) 145 else 0)
+        val reportedDelayMs = if (fallbackBtDelayMs == 145) {
+            // Query Android's live AVDTP v1.3 delay report via AudioManager.getOutputLatency
+            // so LDAC (~210 ms), AAC (~165 ms), and aptX LL (~70 ms) report their true delay.
+            val avdtpMs = runCatching {
+                val m = am.javaClass.getMethod("getOutputLatency", Int::class.javaPrimitiveType)
+                (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
+            }.getOrDefault(0)
+            if (avdtpMs in 35..350) avdtpMs else fallbackBtDelayMs
+        } else {
+            fallbackBtDelayMs
+        }
+        nativeReportBluetoothDelayMs(reportedDelayMs)
     }
 
     private fun requestAudioFocus(useDolby: Boolean) {

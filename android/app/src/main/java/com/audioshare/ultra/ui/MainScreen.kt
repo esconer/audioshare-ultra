@@ -588,32 +588,7 @@ fun MainScreen() {
                 continue
             }
 
-            // Only treat Bluetooth as active when media audio is actually routed there.
-            val hasBt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val attrs = AudioAttributes.Builder().apply {
-                    if (dolbyEffects) {
-                        setUsage(AudioAttributes.USAGE_MEDIA)
-                        setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    } else {
-                        setUsage(AudioAttributes.USAGE_GAME)
-                        setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    }
-                }.build()
-                val routedType = audioManager.getAudioDevicesForAttributes(attrs)
-                    .firstOrNull()?.type
-                routedType == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-                    routedType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                    routedType == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    routedType == AudioDeviceInfo.TYPE_BLE_SPEAKER
-            } else {
-                @Suppress("DEPRECATION")
-                val a2dpRouted = audioManager.isBluetoothA2dpOn
-                @Suppress("DEPRECATION")
-                val scoRouted = audioManager.isBluetoothScoOn()
-                a2dpRouted || scoRouted
-            }
-            btEarbudsDetected = hasBt
-            AudioEngineService.nativeReportBluetoothDelayMs(if (hasBt) 145 else 0)
+            btEarbudsDetected = telemetry.getOrElse(17) { 0L } > 0L
             delay(250)
         }
     }
@@ -1044,7 +1019,7 @@ fun MainScreen() {
 
                         if (btEarbudsDetected) {
                             StatusBadge(
-                                text = "Bluetooth Earbuds Active: Reporting +145ms A/V Sync Offset to PC",
+                                text = "Bluetooth Audio Active: Reporting +${telemetry.getOrElse(17) { 145L }}ms A/V Sync Offset to PC",
                                 containerColor = Color(0xFF14532D),
                                 contentColor = Color(0xFF86EFAC)
                             )
