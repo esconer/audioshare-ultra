@@ -301,12 +301,15 @@ impl StudioEqualizer {
 
     #[inline]
     pub fn process(&mut self, stereo: &mut [f32]) {
-        if self.last_bass_tenths == 0 && self.last_pres_tenths == 0 && self.last_treb_tenths == 0 {
-            return;
+        if self.last_bass_tenths != 0 {
+            self.bass.process_stereo_in_place(stereo);
         }
-        self.bass.process_stereo_in_place(stereo);
-        self.presence.process_stereo_in_place(stereo);
-        self.treble.process_stereo_in_place(stereo);
+        if self.last_pres_tenths != 0 {
+            self.presence.process_stereo_in_place(stereo);
+        }
+        if self.last_treb_tenths != 0 {
+            self.treble.process_stereo_in_place(stereo);
+        }
     }
 }
 
@@ -1120,5 +1123,22 @@ mod tests {
             // Filter states should remain finite and free of NaN/Inf
             assert!(s.abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn test_per_band_biquad_bypass_is_bit_transparent() {
+        let mut eq = StudioEqualizer::new();
+        // Boost only bass (+3 dB), presence and treble flat (0 dB)
+        eq.update_if_changed(30, 0, 0);
+
+        let mut signal = [0.5f32; 240];
+        eq.process(&mut signal);
+
+        // When all bands are 0 dB, signal must be bit-exact untouched
+        let mut flat_signal = [0.12345f32; 240];
+        let original = flat_signal;
+        eq.update_if_changed(0, 0, 0);
+        eq.process(&mut flat_signal);
+        assert_eq!(flat_signal, original, "0dB EQ must be bit-identical");
     }
 }
