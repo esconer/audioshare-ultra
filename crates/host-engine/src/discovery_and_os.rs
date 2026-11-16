@@ -22,12 +22,19 @@ const BEACON_PREFIX: &str = "ASULTRA_BEACON|";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(target_os = "windows")]
 #[inline]
-fn silent_command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd
+pub(crate) fn silent_command(program: &str) -> Command {
+    let cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = cmd;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +229,7 @@ impl AdbUsbWatcher {
             .spawn(move || {
                 let mut was_connected = false;
                 while run_clone.load(Ordering::Relaxed) {
-                    let has_device = Command::new("adb")
+                    let has_device = silent_command("adb")
                         .args(["get-state"])
                         .output()
                         .map(|o| o.status.success())
@@ -232,7 +239,7 @@ impl AdbUsbWatcher {
 
                     if has_device && !was_connected {
                         let port_spec = format!("tcp:{}", port);
-                        let _ = Command::new("adb")
+                        let _ = silent_command("adb")
                             .args(["reverse", &port_spec, &port_spec])
                             .output();
                     }
@@ -366,7 +373,7 @@ pub fn open_os_firewall_ports() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        let status = Command::new("netsh")
+        let status = silent_command("netsh")
             .args([
                 "advfirewall",
                 "firewall",
@@ -421,7 +428,7 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
     #[cfg(target_os = "windows")]
     {
         if enable {
-            let _ = Command::new("reg")
+            let _ = silent_command("reg")
                 .args([
                     "add",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -436,7 +443,7 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
                 .output();
             "Enabled Windows Boot Auto-Start (HKCU Run)".into()
         } else {
-            let _ = Command::new("reg")
+            let _ = silent_command("reg")
                 .args([
                     "delete",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -798,7 +805,7 @@ fn disable_wifi_power_save() {
 
 #[cfg(target_os = "windows")]
 fn windows_default_playback_name() -> Option<String> {
-    let output = Command::new("powershell")
+    let output = silent_command("powershell")
         .args([
             "-NoProfile",
             "-Command",
@@ -821,7 +828,7 @@ fn windows_set_playback_name(name: &str) {
         "Get-AudioDevice -List | Where-Object {{$_.Name -eq '{}'}} | Set-AudioDevice",
         escaped
     );
-    let _ = Command::new("powershell")
+    let _ = silent_command("powershell")
         .args(["-NoProfile", "-Command", &script])
         .output();
 }
@@ -905,14 +912,14 @@ impl VirtualSpeakerAndRadioGuard {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("powershell")
+            let _ = silent_command("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
                     "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Input*' -or $_.Name -like '*Virtual*'} | Set-AudioDevice",
                 ])
                 .output();
-            let _ = Command::new("powershell")
+            let _ = silent_command("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",

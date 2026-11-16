@@ -3,6 +3,9 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(target_os = "windows")]
+use crate::discovery_and_os::silent_command;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioAppEntry {
     /// OS Sink-Input ID (Linux PipeWire/Pulse) or Process ID (Windows WASAPI Process Loopback)
@@ -72,7 +75,7 @@ fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
 fn list_windows_audio_processes() -> Vec<AudioAppEntry> {
     let mut apps = Vec::new();
     // Query active desktop apps with window titles (candidates for WASAPI Process Loopback)
-    let Ok(output) = Command::new("tasklist")
+    let Ok(output) = silent_command("tasklist")
         .args(["/FO", "CSV", "/NH"])
         .output()
     else {
