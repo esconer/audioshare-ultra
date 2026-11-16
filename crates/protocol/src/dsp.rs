@@ -143,6 +143,15 @@ impl ClockDriftResampler {
         ((c3 * frac + c2) * frac + c1) * frac + c0
     }
 
+    /// Exact number of input stereo frames required by [`Self::process_pull`]
+    /// to produce `out_frames` output stereo frames at the current phase and
+    /// ratio.
+    #[inline]
+    pub fn needed_input_frames(&self, out_frames: usize) -> usize {
+        let ratio = self.ratio.max(1e-9);
+        (self.phase + out_frames as f64 * ratio).floor().max(0.0) as usize
+    }
+
     /// Resamples interleaved stereo input into interleaved stereo output.
     /// Returns number of stereo frames (sample pairs) written to `out_stereo`.
     pub fn process(&mut self, in_stereo: &[f32], out_stereo: &mut [f32]) -> usize {
@@ -179,6 +188,35 @@ impl ClockDriftResampler {
                 in_idx += 1;
                 self.phase -= 1.0;
             }
+        }
+        out_idx
+    }
+
+    /// Pull-mode resampler: consumes `in_stereo` (sized via
+    /// [`Self::needed_input_frames`]) and fills `out_stereo`, emitting any
+    /// trailing output frames satisfied by the updated history window after the
+    /// final input frame is shifted in.
+    pub fn process_pull(&mut self, in_stereo: &[f32], out_stereo: &mut [f32]) -> usize {
+        let max_out_frames = out_stereo.len() / 2;
+        let mut out_idx = self.process(in_stereo, out_stereo);
+        while self.phase < 1.0 && out_idx < max_out_frames {
+            let f = self.phase as f32;
+            out_stereo[out_idx * 2] = Self::hermite4(
+                f,
+                self.hist_l[0],
+                self.hist_l[1],
+                self.hist_l[2],
+                self.hist_l[3],
+            );
+            out_stereo[out_idx * 2 + 1] = Self::hermite4(
+                f,
+                self.hist_r[0],
+                self.hist_r[1],
+                self.hist_r[2],
+                self.hist_r[3],
+            );
+            out_idx += 1;
+            self.phase += self.ratio;
         }
         out_idx
     }
@@ -784,5 +822,27 @@ mod tests {
         let mut rng = 1u32;
         assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
         assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_process_pull_emits_exact_requested_frames_across_rates() {
+        for &rate in &[44_100, 48_000, 88_200, 96_000, 192_000] {
+            let mut resampler = ClockDriftResampler::new();
+            resampler.set_output_sample_rate(rate);
+
+            let req_frames = 240;
+            let mut output = vec![0.0f32; req_frames * 2];
+
+            for _ in 0..20 {
+                let needed = resampler.needed_input_frames(req_frames);
+                let input = vec![0.5f32; needed * 2];
+                let produced = resampler.process_pull(&input, &mut output);
+                assert_eq!(
+                    produced, req_frames,
+                    "Rate {} failed: requested {} frames, produced {}",
+                    rate, req_frames, produced
+                );
+            }
+        }
     }
 }
