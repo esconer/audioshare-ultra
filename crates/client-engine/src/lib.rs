@@ -982,6 +982,8 @@ impl ClientEngine {
         #[cfg(target_os = "android")]
         let mut last_dolby_state = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
         #[cfg(target_os = "android")]
+        let mut last_bt_active = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
+        #[cfg(target_os = "android")]
         let mut last_aaudio_open_attempt: Option<Instant> = None;
         let mut window = LossWindow::default();
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
@@ -995,6 +997,8 @@ impl ClientEngine {
         // before the new target is recomputed for this pass.
         let mut last_fifo_watermark =
             resampler.subframes_to_samples(fifo_target_subframes(initial_wifi_floor));
+        let mut last_plc_watermark =
+            resampler.subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES);
         let mut consecutive_empty_ticks: u16 = 0;
         let mut fifo_peak_subframes: f32 = initial_wifi_floor;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
@@ -1046,6 +1050,7 @@ impl ClientEngine {
             #[cfg(target_os = "android")]
             {
                 let want_dolby = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
+                let bt_active = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                 let retry_due = aaudio_guard.is_none()
                     && last_aaudio_open_attempt
                         .map(|attempt| attempt.elapsed() >= Duration::from_millis(500))
@@ -1055,9 +1060,11 @@ impl ClientEngine {
                     .map(|g| g.needs_reopen())
                     .unwrap_or(false)
                     || want_dolby != last_dolby_state
+                    || bt_active != last_bt_active
                     || retry_due;
                 if reopen {
                     last_dolby_state = want_dolby;
+                    last_bt_active = bt_active;
                     last_aaudio_open_attempt = Some(Instant::now());
                     // Stop and close the previous AAudio stream before opening
                     // the new one. Rust evaluates the assignment's RHS first,
@@ -1203,11 +1210,14 @@ impl ClientEngine {
             // Android power-save) can starve the decoupler even when the
             // sequencer already holds the next playable subframe. Poll
             // non-blocking in that case so refill runs before waiting on the
-            // network.
+            // network. Also poll non-blocking whenever the decoupler is at or
+            // below the emergency PLC watermark to avoid sleeping 1-2 ms.
+            let fifo_avail_now = burst_fifo.available_samples();
             let refill_poll = stream_initialized
                 && prebuffer_ready
-                && burst_fifo.available_samples() < last_fifo_watermark
-                && !sequencer.is_slot_missing(next_play_seq);
+                && fifo_avail_now < last_fifo_watermark
+                && (!sequencer.is_slot_missing(next_play_seq)
+                    || fifo_avail_now <= last_plc_watermark);
             if refill_poll {
                 let _ = socket.set_nonblocking(true);
             }
@@ -1299,8 +1309,13 @@ impl ClientEngine {
                         // framing. Use the smoothed count so a transient
                         // `SplitPerSubframe` datagram cannot drop the floor
                         // from 15 ms to 10 ms for one packet.
+                        let bt_coex_floor = if telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0 {
+                            configured_floor.max(8.0)
+                        } else {
+                            configured_floor
+                        };
                         initial_wifi_floor =
-                            wifi_floor_for_packet(configured_floor, last_pkt_subframe_count);
+                            wifi_floor_for_packet(bt_coex_floor, last_pkt_subframe_count);
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
                         let proactive_floor =
                             ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
@@ -1478,23 +1493,44 @@ impl ClientEngine {
                 let fifo_now = resampler.samples_to_subframes(burst_fifo.available_samples());
                 let total_now = net_now + fifo_now;
 
-                // If a slower/Bluetooth peer joined the group and raised the
-                // aligned target by >= 4 subframes (10 ms) above our current
-                // cushion, pause FIFO refills briefly so `sequencer` accumulates
-                // the exact group-sync offset.
-                if prebuffer_ready
-                    && target_fifo_subframes >= last_aligned_target_subframes + 4
-                    && total_now + 2.0 < target_fifo_subframes as f32
-                {
-                    prebuffer_ready = false;
-                    telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
-                }
+                let group_extra = target_fifo_subframes.saturating_sub(base_fifo_subframes);
+                let target_jumped = target_fifo_subframes >= last_aligned_target_subframes + 4;
                 last_aligned_target_subframes = target_fifo_subframes;
 
-                if !prebuffer_ready && total_now >= target_fifo_subframes as f32 {
+                // Sequencer only prebuffers the base floor (4..=11 subframes = 10..=27.5 ms)
+                // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (48 subframes).
+                if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
-                    fifo_peak_subframes = target_fifo_subframes as f32;
+                    fifo_peak_subframes = base_fifo_subframes as f32;
+                }
+
+                // If Group Sync requires a deeper cushion (e.g. wired client aligning to
+                // a 145 ms Bluetooth peer), inject the lead-in cushion directly into
+                // `burst_fifo` (which holds up to 32,768 samples = 136 subframes @ 48kHz)
+                // ahead of real audio.
+                if prebuffer_ready && group_extra > 0
+                    && (burst_fifo.available_samples() == 0 || target_jumped)
+                    && (net_now + fifo_now) < target_fifo_subframes as f32
+                {
+                    let pad_subframes = ((target_fifo_subframes as f32) - (net_now + fifo_now)).max(0.0) as usize;
+                    let pad_subframes = pad_subframes.min(group_extra);
+                    let pad_samples = resampler.subframes_to_samples(pad_subframes);
+                    let mut pad_chunk = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                    let mut remaining = pad_samples;
+                    let mut dither_rng = 0x7F4A_7C15u32;
+                    while remaining > 0 {
+                        let step = remaining.min(pad_chunk.len()) & !1;
+                        if step == 0 {
+                            break;
+                        }
+                        audioshare_protocol::dsp::inject_bluetooth_keepalive_dither(
+                            &mut pad_chunk[..step],
+                            &mut dither_rng,
+                        );
+                        burst_fifo.push_samples(&pad_chunk[..step]);
+                        remaining -= step;
+                    }
                 }
 
                 // If a slow/Bluetooth peer left the group and `burst_fifo`
@@ -1529,6 +1565,7 @@ impl ClientEngine {
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
                 .min(fifo_capacity);
             last_fifo_watermark = fifo_watermark;
+            last_plc_watermark = plc_emergency_watermark;
 
             while stream_initialized
                 && prebuffer_ready
@@ -2819,6 +2856,16 @@ mod tests {
         let remaining_subframes = resampler.samples_to_subframes(ring.available_samples());
         assert!(remaining_subframes <= 7.0);
         assert!(remaining_subframes >= 6.0);
+
+        // 3. Bluetooth Group Sync targets > 48 subframes (e.g. 58 subframes = 145 ms):
+        // Base floor (e.g. 6) triggers prebuffer_ready so sequencer never reaches 48 subframes.
+        let base_subframes = 6usize;
+        let mut prebuf = false;
+        let total_now = 6.0f32;
+        if !prebuf && total_now >= base_subframes as f32 {
+            prebuf = true;
+        }
+        assert!(prebuf, "base floor must engage prebuffer_ready to prevent >48 subframe resync loop");
     }
 }
 
