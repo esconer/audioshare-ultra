@@ -9,6 +9,8 @@ use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realt
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
 use audioshare_protocol::latency::ClientLatencySnapshot;
+#[cfg(not(target_os = "android"))]
+use audioshare_protocol::latency::DESKTOP_OUTPUT_BUFFER_MS;
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
@@ -149,6 +151,39 @@ fn decay_adaptive_cushion(adaptive: f32, floor: f32, fec_permille: u16) -> f32 {
 #[inline]
 fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
     net_subframes.max(0.0) + target_buf.max(0.0)
+}
+
+/// Unaligned local pipeline delay in milliseconds (above the 4-subframe / 10 ms
+/// minimum FIFO floor) reported to the host for multi-device acoustic sync.
+///
+/// Including `(base_fifo_subframes - 4) * 2.5 ms` alongside the hardware/BT
+/// downstream delay ensures two peers with different adaptive Wi-Fi cushions
+/// (e.g. 10 ms USB vs 35 ms 2.4 GHz) still converge to the exact same total
+/// acoustic delay (`max_group_delay_ms + 10 ms`). Because `base_fifo_subframes`
+/// is computed *before* group-sync alignment, this value is independent of
+/// `max_group_delay_ms` and cannot oscillate in a feedback loop.
+#[inline]
+fn effective_unaligned_delay_ms(base_fifo_subframes: usize, downstream_delay_ms: u16) -> u16 {
+    let excess_fifo_ms = ((base_fifo_subframes.saturating_sub(4) as u32) * 5) / 2;
+    downstream_delay_ms.saturating_add(excess_fifo_ms.min(255) as u16)
+}
+
+/// Platform minimum downstream output stage when hardware timestamping is
+/// unavailable (e.g. Desktop CPAL or shared-mixer Android routes).
+#[inline]
+fn fallback_output_delay_ms(hw_delay_ms: u16) -> u16 {
+    #[cfg(not(target_os = "android"))]
+    {
+        hw_delay_ms.max(DESKTOP_OUTPUT_BUFFER_MS.round() as u16)
+    }
+    #[cfg(target_os = "android")]
+    {
+        if hw_delay_ms > 0 {
+            hw_delay_ms
+        } else {
+            10
+        }
+    }
 }
 
 /// Lower the packet framing count only after a sustained run of smaller
@@ -534,6 +569,8 @@ pub struct ClientTelemetry {
     pub plc_extrapolated_frames: AtomicU64,
     pub auth_failures: AtomicU64,
     pub clock_drift_ppm: AtomicI32,
+    /// Linux/Android kernel TID of the real-time RX/DSP thread for ADPF hints.
+    pub rt_thread_tid: AtomicI32,
     pub preamp_gain_db_tenths: AtomicI32,
     pub eq_bass_db_tenths: AtomicI32,
     pub eq_presence_db_tenths: AtomicI32,
@@ -640,6 +677,7 @@ impl ClientEngine {
             plc_extrapolated_frames: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
             clock_drift_ppm: AtomicI32::new(0),
+            rt_thread_tid: AtomicI32::new(0),
             preamp_gain_db_tenths: AtomicI32::new((config.preamp_gain_db * 10.0) as i32),
             eq_bass_db_tenths: AtomicI32::new(0),
             eq_presence_db_tenths: AtomicI32::new(0),
@@ -709,9 +747,15 @@ impl ClientEngine {
             .name("as-ultra-client-rx".into())
             .spawn(move || {
                 promote_thread_realtime();
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                unsafe {
+                    telemetry_clone
+                        .rt_thread_tid
+                        .store(libc::gettid(), Ordering::Relaxed);
+                }
 
                 #[cfg(not(target_os = "android"))]
-                let _audio_stream = Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo)).ok();
+                let mut _audio_stream: Option<(cpal::Stream, u32, Arc<AtomicBool>)> = None;
 
                 #[cfg(target_os = "android")]
                 let mut _android_aaudio: Option<android_aaudio::AAudioOutputGuard> = None;
@@ -720,6 +764,8 @@ impl ClientEngine {
                     socket,
                     config,
                     burst_fifo,
+                    #[cfg(not(target_os = "android"))]
+                    &mut _audio_stream,
                     #[cfg(target_os = "android")]
                     &mut _android_aaudio,
                     running_clone,
@@ -750,33 +796,51 @@ impl ClientEngine {
     }
 
     #[cfg(not(target_os = "android"))]
-    fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
-        // CPAL callbacks can be larger than 4096 samples on PulseAudio/ALSA.
-        // Fill every sample in chunks; the old code only filled the first
-        // 4096 and left the rest of the buffer uninitialized.
-        let mut tmp = [0.0f32; 4096];
-        let mut offset = 0usize;
-        while offset < out.len() {
-            let chunk = (out.len() - offset).min(tmp.len());
-            fifo.pop_exact_or_dither(&mut tmp[..chunk], dither_rng);
-            for (dst, &s) in out[offset..offset + chunk]
-                .iter_mut()
-                .zip(tmp[..chunk].iter())
-            {
-                // Round instead of truncating. `as i16` truncates toward
-                // zero, which doubles the width of the zero-crossing
-                // quantization bin and adds signal-dependent DC offset and
-                // odd-harmonic distortion on quiet passages.
-                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+    pub fn pull_stereo_to_channels(
+        fifo: &BurstDecouplerRing,
+        channels: usize,
+        frames: usize,
+        stereo_scratch: &mut [f32; 2048],
+        dither_rng: &mut u32,
+        mut write_sample: impl FnMut(usize, f32),
+    ) {
+        let ch = channels.max(1);
+        let max_chunk_frames = stereo_scratch.len() / 2;
+        let mut frame_offset = 0usize;
+        while frame_offset < frames {
+            let chunk_frames = (frames - frame_offset).min(max_chunk_frames);
+            fifo.pop_exact_or_dither(&mut stereo_scratch[..chunk_frames * 2], dither_rng);
+            for f in 0..chunk_frames {
+                let l = stereo_scratch[f * 2];
+                let r = stereo_scratch[f * 2 + 1];
+                let base = (frame_offset + f) * ch;
+                if ch == 1 {
+                    write_sample(base, (l + r) * 0.5);
+                } else {
+                    write_sample(base, l);
+                    write_sample(base + 1, r);
+                    for extra in 2..ch {
+                        write_sample(base + extra, 0.0);
+                    }
+                }
             }
-            offset += chunk;
+            frame_offset += chunk_frames;
         }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
+        let mut scratch = [0.0f32; 2048];
+        let frames = out.len() / 2;
+        Self::pull_stereo_to_channels(fifo, 2, frames, &mut scratch, dither_rng, |idx, s| {
+            out[idx] = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        });
     }
 
     #[cfg(not(target_os = "android"))]
     fn spawn_desktop_output_sink(
         burst_fifo: Arc<BurstDecouplerRing>,
-    ) -> Result<cpal::Stream, String> {
+    ) -> Result<(cpal::Stream, u32, Arc<AtomicBool>), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -785,10 +849,13 @@ impl ClientEngine {
             .default_output_config()
             .map_err(|e| format!("Output config error: {}", e))?;
         let sample_format = default_cfg.sample_format();
+        let dev_rate = default_cfg.sample_rate().0.max(8_000);
+        let dev_channels = default_cfg.channels().max(1);
+        let stream_error = Arc::new(AtomicBool::new(false));
 
         // Prefer a 5 ms fixed callback buffer to cut desktop output latency.
         // Many ALSA/PulseAudio backends reject an unsupported period size, so
-        // fall back to the device default instead of failing to start audio.
+        // fall back to 48 kHz default and then to the device's native rate/channels.
         let low_lat_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
@@ -799,44 +866,91 @@ impl ClientEngine {
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
             buffer_size: cpal::BufferSize::Default,
         };
+        let native_stream_cfg = cpal::StreamConfig {
+            channels: dev_channels,
+            sample_rate: cpal::SampleRate(dev_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
 
-        let build_for_cfg = |cfg: &cpal::StreamConfig| {
+        let build_for_cfg = |cfg: &cpal::StreamConfig| -> Result<(cpal::Stream, u32), cpal::BuildStreamError> {
             let fifo = Arc::clone(&burst_fifo);
+            let err_flag = Arc::clone(&stream_error);
+            let ch = cfg.channels.max(1) as usize;
+            let rate = cfg.sample_rate.0;
             let mut dither_rng = 0x9E37_79B9u32;
-            match sample_format {
+            let mut scratch = [0.0f32; 2048];
+            let err_cb = move |_: cpal::StreamError| {
+                err_flag.store(true, Ordering::Release);
+            };
+            let stream = match sample_format {
                 cpal::SampleFormat::I16 => device.build_output_stream(
                     cfg,
                     move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        Self::fill_i16_output(&fifo, out, &mut dither_rng);
+                        let frames = out.len() / ch;
+                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                            out[idx] = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                        });
                     },
-                    |_| {},
+                    err_cb,
                     None,
-                ),
+                )?,
+                cpal::SampleFormat::U16 => device.build_output_stream(
+                    cfg,
+                    move |out: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                        let frames = out.len() / ch;
+                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                            out[idx] = ((s.clamp(-1.0, 1.0) * 32768.0 + 32768.0).round()).clamp(0.0, 65535.0) as u16;
+                        });
+                    },
+                    err_cb,
+                    None,
+                )?,
+                cpal::SampleFormat::I32 => device.build_output_stream(
+                    cfg,
+                    move |out: &mut [i32], _: &cpal::OutputCallbackInfo| {
+                        let frames = out.len() / ch;
+                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                            out[idx] = (f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32;
+                        });
+                    },
+                    err_cb,
+                    None,
+                )?,
                 _ => device.build_output_stream(
                     cfg,
                     move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        fifo.pop_exact_or_dither(out, &mut dither_rng);
+                        if ch == 2 {
+                            fifo.pop_exact_or_dither(out, &mut dither_rng);
+                        } else {
+                            let frames = out.len() / ch;
+                            Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                                out[idx] = s;
+                            });
+                        }
                     },
-                    |_| {},
+                    err_cb,
                     None,
-                ),
-            }
+                )?,
+            };
+            Ok((stream, rate))
         };
 
-        let stream = build_for_cfg(&low_lat_cfg)
+        let (stream, actual_rate) = build_for_cfg(&low_lat_cfg)
             .or_else(|_| build_for_cfg(&default_stream_cfg))
+            .or_else(|_| build_for_cfg(&native_stream_cfg))
             .map_err(|e| format!("Failed to open audio output: {}", e))?;
 
         stream
             .play()
             .map_err(|e| format!("Failed to start audio output: {}", e))?;
-        Ok(stream)
+        Ok((stream, actual_rate, stream_error))
     }
 
     fn realtime_rx_and_dsp_loop(
         socket: UdpSocket,
         config: ClientConfig,
         burst_fifo: Arc<BurstDecouplerRing>,
+        #[cfg(not(target_os = "android"))] desktop_stream: &mut Option<(cpal::Stream, u32, Arc<AtomicBool>)>,
         #[cfg(target_os = "android")] aaudio_guard: &mut Option<android_aaudio::AAudioOutputGuard>,
         running: Arc<AtomicBool>,
         telemetry: Arc<ClientTelemetry>,
@@ -863,6 +977,8 @@ impl ClientEngine {
         let mut last_packet_instant = Instant::now();
         #[cfg(target_os = "android")]
         let mut last_hw_latency_poll = Instant::now();
+        #[cfg(not(target_os = "android"))]
+        let mut last_desktop_open_attempt: Option<Instant> = None;
         #[cfg(target_os = "android")]
         let mut last_dolby_state = telemetry.enable_dolby_effects.load(Ordering::Relaxed);
         #[cfg(target_os = "android")]
@@ -880,6 +996,8 @@ impl ClientEngine {
         let mut last_fifo_watermark =
             resampler.subframes_to_samples(fifo_target_subframes(initial_wifi_floor));
         let mut consecutive_empty_ticks: u16 = 0;
+        let mut fifo_peak_subframes: f32 = initial_wifi_floor;
+        let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
         let mut prev_tx_us: u32 = 0;
@@ -898,6 +1016,28 @@ impl ClientEngine {
         let mut last_gaming_feedback = Instant::now();
 
         while running.load(Ordering::Relaxed) {
+            #[cfg(not(target_os = "android"))]
+            {
+                let failed = desktop_stream
+                    .as_ref()
+                    .map(|(_, _, err)| err.load(Ordering::Acquire))
+                    .unwrap_or(false);
+                let retry_due = desktop_stream.is_none()
+                    && last_desktop_open_attempt
+                        .map(|t| t.elapsed() >= Duration::from_millis(500))
+                        .unwrap_or(true);
+                if failed || retry_due {
+                    last_desktop_open_attempt = Some(Instant::now());
+                    *desktop_stream = None;
+                    if let Ok((stream, rate, err)) =
+                        Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo))
+                    {
+                        resampler.set_output_sample_rate(rate);
+                        *desktop_stream = Some((stream, rate, err));
+                    }
+                }
+            }
+
             // Auto-recover the AAudio stream within 25 ms when the
             // headphones/Bluetooth route changes, or reopen it when the user
             // toggles Dolby/system post-processing. The resampler is pointed
@@ -1032,12 +1172,23 @@ impl ClientEngine {
                 // host echo a stale buffer depth back to the only client and
                 // causes `target_buf` to inflate/collapse every 500ms.
                 let bt_delay_ms = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed);
-                let hw_delay_ms = telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed);
+                let raw_hw_delay_ms =
+                    fallback_output_delay_ms(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
+                let base_target_for_fb = if gaming_lock_now {
+                    gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
+                } else {
+                    adaptive_wifi_subframes
+                };
+                let base_fifo_for_fb = fifo_target_subframes(base_target_for_fb);
+                let effective_hw_delay_ms = effective_unaligned_delay_ms(
+                    base_fifo_for_fb,
+                    raw_hw_delay_ms.max(bt_delay_ms),
+                );
 
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
                     bluetooth_delay_ms: bt_delay_ms,
-                    hardware_delay_ms: hw_delay_ms,
+                    hardware_delay_ms: effective_hw_delay_ms,
                     client_volume: client_vol,
                     requested_mode: media_cmd,
                     auth_mac32: 0,
@@ -1279,28 +1430,6 @@ impl ClientEngine {
                             }
                             cursor += sub_len;
                         }
-
-                        let buffered = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
-                            as i16)
-                            .max(0) as f32;
-                        // Gaming lock uses the same live target as the refill
-                        // loop. Waiting for the non-gaming packet floor (for
-                        // example 11 subframes on a 4-subframe stream) while
-                        // the target is only 7 makes the first playback pass
-                        // trim several subframes immediately.
-                        let prebuffer_floor =
-                            if telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed) {
-                                gaming_base_target_subframes(
-                                    last_pkt_subframe_count,
-                                    jitter_estimate_us,
-                                )
-                            } else {
-                                initial_wifi_floor
-                            };
-                        if buffered >= prebuffer_floor {
-                            prebuffer_ready = true;
-                            telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
-                        }
                     }
                     Err(WireError::AuthenticationFailed) => {
                         telemetry.auth_failures.fetch_add(1, Ordering::Relaxed);
@@ -1322,37 +1451,69 @@ impl ClientEngine {
             } else {
                 adaptive_wifi_subframes
             };
+            let base_fifo_subframes = fifo_target_subframes(base_target);
             let my_downstream_delay_ms = telemetry
                 .downstream_bt_delay_ms
                 .load(Ordering::Relaxed)
-                .max(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
-            // `base_target` already contains this client's adaptive network
-            // jitter cushion. Group sync only aligns the fixed downstream
-            // hardware/A2DP delay, so the network buffer is deliberately not
-            // added here (that was the source of the 500ms oscillation).
-            // Gaming hard-lock is an explicit lowest-latency, independent
-            // mode: adding room-wide alignment delay would defeat it and can
-            // push a 2-subframe Wi-Fi stream back into the PLC path.
+                .max(fallback_output_delay_ms(
+                    telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed),
+                ));
+            let my_effective_delay_ms =
+                effective_unaligned_delay_ms(base_fifo_subframes, my_downstream_delay_ms);
             let target_buf = if gaming_lock {
                 base_target
             } else {
                 group_sync.aligned_target_subframes(
                     base_target,
                     telemetry.max_group_delay_ms.load(Ordering::Relaxed),
-                    my_downstream_delay_ms,
+                    my_effective_delay_ms,
                 )
             };
 
-            // Two-Level DAC Watermark:
-            // 1. `fifo_watermark` holds enough ready PCM (4 to 64 subframes = 10-160ms) so neither
-            //    Desktop CPAL (480-1024 frame callbacks) nor Android AAudio ever starves.
-            // 2. `plc_emergency_watermark` (1 subframe = 2.5ms): If `next_play_seq` is missing in
-            //    `sequencer`, we DO NOT synthesize PLC while `burst_fifo` still has >= 1 subframe!
-            //    We wait for the delayed packet or Packet [K+1]'s FEC to arrive first!
-            //    Gaming Mode targets 6 subframes on 2-subframe Wi-Fi, leaving
-            //    (6 - 1) - 2 = 3 subframes (7.5ms) of real jitter margin instead of 0.
-            let base_fifo_subframes = fifo_target_subframes(base_target);
             let target_fifo_subframes = fifo_target_subframes(target_buf);
+
+            if stream_initialized && !telemetry.server_dtx_silent.load(Ordering::Relaxed) {
+                let net_now = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq) as i16)
+                    .max(0) as f32;
+                let fifo_now = resampler.samples_to_subframes(burst_fifo.available_samples());
+                let total_now = net_now + fifo_now;
+
+                // If a slower/Bluetooth peer joined the group and raised the
+                // aligned target by >= 4 subframes (10 ms) above our current
+                // cushion, pause FIFO refills briefly so `sequencer` accumulates
+                // the exact group-sync offset.
+                if prebuffer_ready
+                    && target_fifo_subframes >= last_aligned_target_subframes + 4
+                    && total_now + 2.0 < target_fifo_subframes as f32
+                {
+                    prebuffer_ready = false;
+                    telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                }
+                last_aligned_target_subframes = target_fifo_subframes;
+
+                if !prebuffer_ready && total_now >= target_fifo_subframes as f32 {
+                    prebuffer_ready = true;
+                    telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
+                    fifo_peak_subframes = target_fifo_subframes as f32;
+                }
+
+                // If a slow/Bluetooth peer left the group and `burst_fifo`
+                // itself holds more than `target_buf + max_over`, shed the old
+                // alignment cushion from `burst_fifo` immediately.
+                let max_over = max_backlog_over_target_subframes(last_pkt_subframe_count);
+                if prebuffer_ready && fifo_now > target_buf + max_over {
+                    let keep_samples = resampler.subframes_to_samples(target_fifo_subframes);
+                    let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                    let mut rng = 1u32;
+                    while burst_fifo.available_samples() > keep_samples + SUBFRAME_STEREO_SAMPLES {
+                        if !burst_fifo.pop_exact_or_dither(&mut discard, &mut rng) {
+                            break;
+                        }
+                    }
+                    fifo_peak_subframes =
+                        resampler.samples_to_subframes(burst_fifo.available_samples());
+                }
+            }
             telemetry
                 .target_buffer_us
                 .store((target_fifo_subframes as u32) * 2500, Ordering::Relaxed);
@@ -1431,6 +1592,9 @@ impl ClientEngine {
                         // aggressive for 2.4GHz bursts and caused false standby.
                         if consecutive_empty_ticks >= 80 {
                             prebuffer_ready = false;
+                            stream_initialized = false;
+                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            sequencer.reset();
                             consecutive_empty_ticks = 0;
                         }
                     }
@@ -1530,12 +1694,18 @@ impl ClientEngine {
                 let net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
+                if fifo_subframes >= fifo_peak_subframes {
+                    fifo_peak_subframes = fifo_subframes;
+                } else {
+                    fifo_peak_subframes =
+                        (fifo_peak_subframes - 0.005).max(fifo_subframes);
+                }
                 telemetry.buffered_audio_us.store(
                     ((net_subframes + fifo_subframes).max(0.0) * 2500.0) as u32,
                     Ordering::Relaxed,
                 );
                 resampler.update_clock_loop(
-                    clock_loop_observation(net_subframes, target_buf),
+                    clock_loop_observation(net_subframes, fifo_peak_subframes),
                     target_buf,
                 );
                 let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
@@ -2409,6 +2579,247 @@ mod tests {
         assert!(!malformed.is_slot_missing(99));
         assert!(malformed.is_slot_missing(98));
     }
+
+    #[test]
+    fn test_effective_unaligned_delay_ms_accounts_for_excess_jitter_and_output_buffer() {
+        // Minimum 4 subframes (10 ms) baseline: excess is 0 ms.
+        assert_eq!(effective_unaligned_delay_ms(4, 10), 10);
+        // Sub-4 clamped to 0 excess.
+        assert_eq!(effective_unaligned_delay_ms(2, 10), 10);
+        // 6 subframes (15 ms): excess is (6 - 4) * 2.5 ms = 5 ms.
+        assert_eq!(effective_unaligned_delay_ms(6, 10), 15);
+        // 14 subframes (35 ms): excess is (14 - 4) * 2.5 ms = 25 ms.
+        assert_eq!(effective_unaligned_delay_ms(14, 10), 35);
+        // 64 subframes (160 ms): excess is (64 - 4) * 2.5 ms = 150 ms.
+        assert_eq!(effective_unaligned_delay_ms(64, 20), 170);
+
+        // Desktop output delay fallback when hardware timestamping is 0 ms.
+        assert_eq!(fallback_output_delay_ms(0), 5);
+        assert_eq!(fallback_output_delay_ms(15), 15);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_pull_stereo_to_channels_mono_stereo_surround_formats() {
+        let ring = BurstDecouplerRing::new();
+        let input: [f32; 4] = [0.2, 0.4, -0.6, 0.8]; // 2 stereo frames
+        assert_eq!(ring.push_samples(&input), 4);
+
+        let mut scratch = [0.0f32; 2048];
+        let mut rng = 1u32;
+
+        // 1. Mono downmix (ch = 1): (L + R) * 0.5
+        let mut mono = [0.0f32; 2];
+        ClientEngine::pull_stereo_to_channels(
+            &ring,
+            1,
+            2,
+            &mut scratch,
+            &mut rng,
+            |idx, s| mono[idx] = s,
+        );
+        assert!((mono[0] - 0.3).abs() < 1e-6, "mono[0] expected 0.3, got {}", mono[0]);
+        assert!((mono[1] - 0.1).abs() < 1e-6, "mono[1] expected 0.1, got {}", mono[1]);
+
+        // Push another 2 frames for stereo test
+        ring.push_samples(&input);
+        let mut stereo = [0.0f32; 4];
+        ClientEngine::pull_stereo_to_channels(
+            &ring,
+            2,
+            2,
+            &mut scratch,
+            &mut rng,
+            |idx, s| stereo[idx] = s,
+        );
+        assert_eq!(stereo[0], 0.2);
+        assert_eq!(stereo[1], 0.4);
+        assert_eq!(stereo[2], -0.6);
+        assert_eq!(stereo[3], 0.8);
+
+        // Push for 5.1 surround test (ch = 6): L, R populated, 4 extra channels zeroed
+        ring.push_samples(&input);
+        let mut surround51 = [99.0f32; 12];
+        ClientEngine::pull_stereo_to_channels(
+            &ring,
+            6,
+            2,
+            &mut scratch,
+            &mut rng,
+            |idx, s| surround51[idx] = s,
+        );
+        assert_eq!(surround51[0], 0.2);
+        assert_eq!(surround51[1], 0.4);
+        assert_eq!(surround51[2], 0.0);
+        assert_eq!(surround51[3], 0.0);
+        assert_eq!(surround51[4], 0.0);
+        assert_eq!(surround51[5], 0.0);
+        assert_eq!(surround51[6], -0.6);
+        assert_eq!(surround51[7], 0.8);
+        assert_eq!(surround51[8], 0.0);
+
+        // Push for 7.1 surround test (ch = 8): L, R populated, 6 extra channels zeroed
+        ring.push_samples(&input);
+        let mut surround71 = [99.0f32; 16];
+        ClientEngine::pull_stereo_to_channels(
+            &ring,
+            8,
+            2,
+            &mut scratch,
+            &mut rng,
+            |idx, s| surround71[idx] = s,
+        );
+        assert_eq!(surround71[0], 0.2);
+        assert_eq!(surround71[1], 0.4);
+        for extra in 2..8 {
+            assert_eq!(surround71[extra], 0.0);
+        }
+
+        // I32 conversion test
+        ring.push_samples(&input);
+        let mut i32_out = [0i32; 4];
+        ClientEngine::pull_stereo_to_channels(
+            &ring,
+            2,
+            2,
+            &mut scratch,
+            &mut rng,
+            |idx, s| i32_out[idx] = (f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32,
+        );
+        let expected_i32_0 = (f64::from(input[0]) * 2_147_483_647.0).round() as i32;
+        assert_eq!(i32_out[0], expected_i32_0);
+    }
+
+    #[test]
+    fn test_standby_after_80_empty_ticks_resets_stream_and_recovers_without_loss() {
+        // Scenario: Stream starts at seq 100.
+        let mut stream_initialized = true;
+        let mut prebuffer_ready = true;
+        let mut next_play_seq = 100u16;
+        let mut latest_rx_seq = 100u16;
+        let mut consecutive_empty_ticks = 0u16;
+
+        // 80 empty ticks occur (200 ms packet stall)
+        for _ in 0..80 {
+            next_play_seq = next_play_seq.wrapping_add(1);
+            consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
+        }
+        assert_eq!(next_play_seq, 180);
+        assert_eq!(consecutive_empty_ticks, 80);
+
+        // Standby trigger
+        if consecutive_empty_ticks >= 80 {
+            prebuffer_ready = false;
+            stream_initialized = false; // Fixed: reset stream_initialized
+            consecutive_empty_ticks = 0;
+        }
+        assert!(!prebuffer_ready);
+        assert!(!stream_initialized);
+        assert_eq!(consecutive_empty_ticks, 0);
+
+        // Packets resume at seq 150 (a 125 ms gap)
+        let resuming_packet_base = 150u16;
+        // In the unpatched bug, stream_initialized was left true, so seq_delta = 150 - 180 = -30.
+        // Because -30 is not < -32, needs_stream_resync(-30) was false!
+        let buggy_delta = resuming_packet_base.wrapping_sub(next_play_seq) as i16;
+        assert_eq!(buggy_delta, -30);
+        assert!(!needs_stream_resync(buggy_delta), "Old code failed to resync at delta -30");
+
+        // With the fix (stream_initialized == false), stream immediately reinitializes:
+        if !stream_initialized {
+            next_play_seq = resuming_packet_base;
+            latest_rx_seq = resuming_packet_base;
+            stream_initialized = true;
+        }
+        assert!(stream_initialized);
+        assert_eq!(next_play_seq, 150);
+        assert_eq!(latest_rx_seq, 150);
+        assert_eq!(resuming_packet_base.wrapping_sub(next_play_seq) as i16, 0);
+    }
+
+    #[test]
+    fn test_clock_loop_observation_with_peak_hold_detects_drift() {
+        let target_buf = 8.0f32;
+        let mut fifo_peak_subframes = 8.0f32;
+
+        // In steady state: observation matches target
+        assert_eq!(clock_loop_observation(0.0, fifo_peak_subframes), 8.0);
+
+        // DAC runs fast and drains FIFO to 6.0 subframes:
+        // Peak-hold envelope tracks downward:
+        for _ in 0..500 {
+            let fifo_current = 6.0f32;
+            if fifo_current >= fifo_peak_subframes {
+                fifo_peak_subframes = fifo_current;
+            } else {
+                fifo_peak_subframes = (fifo_peak_subframes - 0.005).max(fifo_current);
+            }
+        }
+        assert!((fifo_peak_subframes - 6.0).abs() < 1e-4);
+
+        // Observation now reports 6.0, allowing ClockDriftResampler to slow down
+        let obs = clock_loop_observation(0.0, fifo_peak_subframes);
+        assert_eq!(obs, 6.0);
+        assert!(obs < target_buf, "observation must fall below target when FIFO is depleted");
+    }
+
+    #[test]
+    fn test_group_sync_prebuffer_gating_and_excess_cushion_shedding() {
+        let ring = BurstDecouplerRing::new();
+        let resampler = ClockDriftResampler::new();
+
+        // 1. Prebuffer gating: target_fifo_subframes = 32 (80 ms)
+        let target_fifo_subframes = 32usize;
+        let mut prebuffer_ready = false;
+
+        // At only 6 subframes (15 ms), prebuffer must NOT be ready
+        let net_now = 6.0f32;
+        let fifo_now = 0.0f32;
+        let total_now = net_now + fifo_now;
+        if !prebuffer_ready && total_now >= target_fifo_subframes as f32 {
+            prebuffer_ready = true;
+        }
+        assert!(!prebuffer_ready, "must not prebuffer before target is reached");
+
+        // When 32 subframes accumulate, prebuffer engages
+        let total_now = 32.0f32;
+        if !prebuffer_ready && total_now >= target_fifo_subframes as f32 {
+            prebuffer_ready = true;
+        }
+        assert!(prebuffer_ready, "must prebuffer when target is reached");
+
+        // 2. Excess cushion shedding:
+        // Slow peer leaves, target_buf drops from 32 down to 6 subframes.
+        // ring currently holds 32 subframes = 32 * 120 = 3840 stereo samples (7680 f32 samples)
+        let chunk = [0.1f32; SUBFRAME_STEREO_SAMPLES];
+        for _ in 0..32 {
+            ring.push_samples(&chunk);
+        }
+        assert_eq!(ring.available_samples(), 32 * SUBFRAME_STEREO_SAMPLES);
+
+        let new_target_buf = 6.0f32;
+        let new_target_fifo = fifo_target_subframes(new_target_buf);
+        assert_eq!(new_target_fifo, 6);
+        let max_over = max_backlog_over_target_subframes(2); // 6.0
+        let fifo_now = resampler.samples_to_subframes(ring.available_samples());
+        assert_eq!(fifo_now, 32.0);
+
+        // Shed excess cushion
+        if prebuffer_ready && fifo_now > new_target_buf + max_over {
+            let keep_samples = resampler.subframes_to_samples(new_target_fifo);
+            let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            let mut rng = 1u32;
+            while ring.available_samples() > keep_samples + SUBFRAME_STEREO_SAMPLES {
+                if !ring.pop_exact_or_dither(&mut discard, &mut rng) {
+                    break;
+                }
+            }
+        }
+        // Retained samples must be within 1 subframe of target (6 subframes = 1440 samples)
+        let remaining_subframes = resampler.samples_to_subframes(ring.available_samples());
+        assert!(remaining_subframes <= 7.0);
+        assert!(remaining_subframes >= 6.0);
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -2792,7 +3203,11 @@ pub mod android_aaudio {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
 
-                AAudioStream_requestStart(stream);
+                if AAudioStream_requestStart(stream) != 0 {
+                    AAudioStream_close(stream);
+                    let _ = Box::from_raw(ctx_ptr);
+                    return None;
+                }
                 Some(Self {
                     stream,
                     ctx_ptr,
@@ -2818,6 +3233,7 @@ pub mod android_aaudio {
 
     struct InputContext {
         fifo: Arc<BurstDecouplerRing>,
+        disconnected: AtomicBool,
     }
 
     extern "C" fn aaudio_input_callback(
@@ -2830,7 +3246,7 @@ pub mod android_aaudio {
             return AAUDIO_CALLBACK_RESULT_CONTINUE;
         }
         unsafe {
-            let ctx = &mut *(user_data as *mut InputContext);
+            let ctx = &*(user_data as *const InputContext);
             let frames = num_frames as usize;
             let mono = core::slice::from_raw_parts(audio_data as *const f32, frames);
             // The ring is interleaved stereo; expand the mono capture stream.
@@ -2850,6 +3266,19 @@ pub mod android_aaudio {
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
 
+    extern "C" fn aaudio_input_error_callback(
+        _stream: *mut AAudioStream,
+        user_data: *mut c_void,
+        _error: i32,
+    ) {
+        if !user_data.is_null() {
+            unsafe {
+                let ctx = &*(user_data as *const InputContext);
+                ctx.disconnected.store(true, Ordering::Release);
+            }
+        }
+    }
+
     pub struct AAudioInputGuard {
         stream: *mut AAudioStream,
         ctx_ptr: *mut InputContext,
@@ -2858,6 +3287,14 @@ pub mod android_aaudio {
     unsafe impl Send for AAudioInputGuard {}
 
     impl AAudioInputGuard {
+        #[inline]
+        pub fn needs_reopen(&self) -> bool {
+            if self.ctx_ptr.is_null() {
+                return true;
+            }
+            unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
+        }
+
         /// Open a low-latency mono microphone stream and expand it to the
         /// stereo ring consumed by `PhoneMicTransmitter`.
         pub fn open_low_latency_mic(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
@@ -2872,7 +3309,10 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                let ctx = Box::new(InputContext { fifo });
+                let ctx = Box::new(InputContext {
+                    fifo,
+                    disconnected: AtomicBool::new(false),
+                });
                 let ctx_ptr = Box::into_raw(ctx);
 
                 AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
@@ -2887,6 +3327,11 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_input_callback,
+                    ctx_ptr as *mut c_void,
+                );
+                AAudioStreamBuilder_setErrorCallback(
+                    builder,
+                    aaudio_input_error_callback,
                     ctx_ptr as *mut c_void,
                 );
 
@@ -2905,7 +3350,11 @@ pub mod android_aaudio {
                     AAudioStream_setBufferSizeInFrames(stream, (burst * 3).max(256));
                 }
 
-                AAudioStream_requestStart(stream);
+                if AAudioStream_requestStart(stream) != 0 {
+                    AAudioStream_close(stream);
+                    let _ = Box::from_raw(ctx_ptr);
+                    return None;
+                }
                 Some(Self { stream, ctx_ptr })
             }
         }
