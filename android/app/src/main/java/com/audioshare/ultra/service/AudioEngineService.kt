@@ -25,6 +25,7 @@ import android.os.PowerManager
 import android.util.Log
 import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
+import com.audioshare.ultra.MainActivity
 import com.audioshare.ultra.R
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
@@ -200,6 +201,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
         }
+        if (intent?.action == "ACTION_REMOTE_PLAY_PAUSE") {
+            remoteMediaPlaying = !remoteMediaPlaying
+            nativeSendMediaCommand(10)
+            startForegroundNotification(currentHostAddr, currentIsUsb)
+            return START_STICKY
+        }
 
         val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
         val hostAddr = intent?.getStringExtra("HOST_ADDR")
@@ -224,9 +231,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         currentIsUsb = isUsb
         isLocallyMuted = false
 
+        setupHardwareBluetoothMediaSession()
         startForegroundNotification(hostAddr, isUsb)
         acquireRealtimeHardwareLocks()
-        setupHardwareBluetoothMediaSession()
         requestAudioFocus(dolbyEffects)
         startBluetoothRouteMonitoring()
         if (!noisyReceiverRegistered) {
@@ -292,10 +299,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 override fun onPlay() {
                     updateSessionState(true)
                     nativeSendMediaCommand(10)
+                    if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
                 override fun onPause() {
                     updateSessionState(false)
                     nativeSendMediaCommand(10)
+                    if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
                 override fun onSkipToNext() { nativeSendMediaCommand(11) }
                 override fun onSkipToPrevious() { nativeSendMediaCommand(12) }
@@ -313,6 +322,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
                                 updateSessionState(!remoteMediaPlaying)
                                 nativeSendMediaCommand(10)
+                                if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                                 return true
                             }
                             KeyEvent.KEYCODE_MEDIA_NEXT -> {
@@ -721,6 +731,20 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
         }
 
+        val openAppIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openAppPending = PendingIntent.getActivity(
+            this, 3, openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val playPauseIntent = Intent(this, AudioEngineService::class.java).apply {
+            action = "ACTION_REMOTE_PLAY_PAUSE"
+        }
+        val playPausePending = PendingIntent.getService(
+            this, 2, playPauseIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val stopIntent = Intent(this, AudioEngineService::class.java).apply {
             action = "ACTION_STOP"
         }
@@ -736,13 +760,21 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val playPauseIcon = if (remoteMediaPlaying) {
+            android.R.drawable.ic_media_pause
+        } else {
+            android.R.drawable.ic_media_play
+        }
+        val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
         val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
         val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("AudioShare Ultra • $badge")
             .setContentText(statusText)
             .setSmallIcon(R.drawable.ic_qs_tile_audio)
+            .setContentIntent(openAppPending)
             .setOngoing(true)
+            .addAction(playPauseIcon, playPauseLabel, playPausePending)
             .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
             .addAction(android.R.drawable.ic_media_pause, "Disconnect", stopPending)
             .build()
