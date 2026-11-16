@@ -509,7 +509,7 @@ impl AudioShareApp {
                     "prefer_opus" => self.prefer_opus = v.trim() == "true",
                     "target_bitrate_kbps" => {
                         if let Ok(n) = v.trim().parse::<u16>() {
-                            self.target_bitrate_kbps = n;
+                            self.target_bitrate_kbps = n.clamp(96, 320);
                         }
                     }
                     "usb_low_latency_pacing" => self.usb_low_latency_pacing = v.trim() == "true",
@@ -592,7 +592,7 @@ impl AudioShareApp {
 
             match HostEngine::start(cfg, vec![]) {
                 Ok(engine) => {
-                    if self.enable_pin_encryption {
+                    if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
                         engine.set_encryption_pin(Some(&self.pairing_pin));
                     }
                     engine
@@ -646,7 +646,7 @@ impl AudioShareApp {
             preamp_gain_db: self.preamp_gain_db,
             dolby_effects: false,
         };
-        let pin_opt = if self.enable_pin_encryption {
+        let pin_opt = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
             Some(self.pairing_pin.as_str())
         } else {
             None
@@ -1471,6 +1471,9 @@ impl eframe::App for AudioShareApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_persistent_config();
+        if self.selected_app_idx.is_some() {
+            let _ = restore_all_apps_to_default_sink();
+        }
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
         }
@@ -1666,13 +1669,18 @@ impl AudioShareApp {
                         "Encrypts all audio and control packets with RFC 8439 ChaCha20",
                         &mut self.enable_pin_encryption,
                     ) {
+                        let pin = if self.enable_pin_encryption
+                            && !self.pairing_pin.trim().is_empty()
+                        {
+                            Some(self.pairing_pin.as_str())
+                        } else {
+                            None
+                        };
                         if let Some(ref host) = self.host_engine {
-                            let pin = if self.enable_pin_encryption {
-                                Some(self.pairing_pin.as_str())
-                            } else {
-                                None
-                            };
                             host.set_encryption_pin(pin);
+                        }
+                        if let Some(ref client) = self.client_engine {
+                            client.set_encryption_pin(pin);
                         }
                     }
                     ui.horizontal(|ui| {
@@ -1682,13 +1690,18 @@ impl AudioShareApp {
                             egui::TextEdit::singleline(&mut self.pairing_pin),
                         );
                         if ui.button("Apply PIN").clicked() {
+                            let pin = if self.enable_pin_encryption
+                                && !self.pairing_pin.trim().is_empty()
+                            {
+                                Some(self.pairing_pin.as_str())
+                            } else {
+                                None
+                            };
                             if let Some(ref host) = self.host_engine {
-                                let pin = if self.enable_pin_encryption {
-                                    Some(self.pairing_pin.as_str())
-                                } else {
-                                    None
-                                };
                                 host.set_encryption_pin(pin);
+                            }
+                            if let Some(ref client) = self.client_engine {
+                                client.set_encryption_pin(pin);
                             }
                         }
                     });
@@ -2172,13 +2185,18 @@ impl AudioShareApp {
                             "Halts audio packets during silence (0.6 kbps heartbeat)",
                             &mut self.enable_smart_dtx,
                         );
-                        Self::setting_switch_row(
+                        if Self::setting_switch_row(
                             ui,
                             dark,
                             "Auto Virtual Speaker & Scan Lock",
                             "Switches PC output on connect & suppresses 60s Wi-Fi scans",
                             &mut self.enable_virtual_speaker,
-                        );
+                        ) && self.host_engine.is_some()
+                        {
+                            self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
+                                self.enable_virtual_speaker,
+                            ));
+                        }
                     });
                     cols[1].vertical(|ui| {
                         Self::setting_switch_row(
@@ -2281,7 +2299,13 @@ impl AudioShareApp {
                                 self.app_route_status = restore_all_apps_to_default_sink();
                             }
                             if ui.button("Refresh Apps").clicked() {
+                                let prev_pid = self
+                                    .selected_app_idx
+                                    .and_then(|idx| self.audio_apps.get(idx).map(|a| a.pid));
                                 self.audio_apps = list_active_audio_apps();
+                                self.selected_app_idx = prev_pid.and_then(|pid| {
+                                    self.audio_apps.iter().position(|a| a.pid == pid)
+                                });
                             }
                         });
                         if !self.audio_apps.is_empty() {
@@ -3228,6 +3252,85 @@ phone_rx_mode=1
         assert!(app.latency_debug);
         assert!(app.gaming_hard_lock);
         assert_eq!(app.phone_rx_mode, PhoneRxRoutingMode::PlayOnPcSpeakers);
+    }
+
+    #[test]
+    fn test_desktop_config_string_parser_bitrate_clamping() {
+        let mut app = AudioShareApp::new();
+        // Lower bound clamp (min 96)
+        app.parse_config_string("target_bitrate_kbps=32\n");
+        assert_eq!(app.target_bitrate_kbps, 96);
+
+        // Upper bound clamp (max 320)
+        app.parse_config_string("target_bitrate_kbps=1000\n");
+        assert_eq!(app.target_bitrate_kbps, 320);
+
+        // Within range
+        app.parse_config_string("target_bitrate_kbps=160\n");
+        assert_eq!(app.target_bitrate_kbps, 160);
+    }
+
+    #[test]
+    fn test_app_selection_pid_retention_across_refresh() {
+        let app1 = AudioAppEntry {
+            id: 1,
+            pid: 1001,
+            name: "Browser".into(),
+        };
+        let app2 = AudioAppEntry {
+            id: 2,
+            pid: 2002,
+            name: "Music Player".into(),
+        };
+        let app3 = AudioAppEntry {
+            id: 3,
+            pid: 3003,
+            name: "Game".into(),
+        };
+
+        let audio_apps_initial = vec![app1.clone(), app2.clone(), app3.clone()];
+        // Select app2 (index 1, PID 2002)
+        let selected_app_idx = Some(1);
+        let prev_pid = selected_app_idx.and_then(|idx| audio_apps_initial.get(idx).map(|a| a.pid));
+        assert_eq!(prev_pid, Some(2002));
+
+        // After refresh, Browser (app1) closed, and a new app (Chat) opened before Music Player
+        let app_chat = AudioAppEntry {
+            id: 4,
+            pid: 4004,
+            name: "Chat".into(),
+        };
+        let audio_apps_refreshed = vec![app_chat, app2.clone(), app3.clone()];
+
+        // With PID-based preservation:
+        let new_selected_idx = prev_pid.and_then(|pid| {
+            audio_apps_refreshed.iter().position(|a| a.pid == pid)
+        });
+        assert_eq!(new_selected_idx, Some(1)); // Still points to Music Player (PID 2002)
+
+        // Now test when Music Player (PID 2002) exits entirely
+        let audio_apps_closed = vec![app3.clone()];
+        let closed_selected_idx = prev_pid.and_then(|pid| {
+            audio_apps_closed.iter().position(|a| a.pid == pid)
+        });
+        assert_eq!(closed_selected_idx, None);
+    }
+
+    #[test]
+    fn test_pairing_pin_effective_resolution() {
+        fn effective_pin<'a>(enabled: bool, pin: &'a str) -> Option<&'a str> {
+            if enabled && !pin.trim().is_empty() {
+                Some(pin)
+            } else {
+                None
+            }
+        }
+
+        assert_eq!(effective_pin(true, "1234"), Some("1234"));
+        assert_eq!(effective_pin(true, "  "), None);
+        assert_eq!(effective_pin(true, ""), None);
+        assert_eq!(effective_pin(false, "1234"), None);
+        assert_eq!(effective_pin(false, ""), None);
     }
 
     fn icon_pixel(icon: &egui::IconData, x: usize, y: usize) -> [u8; 4] {
