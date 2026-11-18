@@ -144,10 +144,13 @@ fn decay_adaptive_cushion(adaptive: f32, floor: f32, fec_permille: u16) -> f32 {
 /// of each callback period at a structural trough. Feeding that trough to the
 /// windowed-min controller makes it compare "post-burst low" against the mean
 /// target and wind the integral negative until the sequencer piles up the same
-/// burst worth of latency. Regulate the planned cushion instead: the sequencer
-/// backlog plus the decoupler target. Genuine starvation is signalled by
-/// `STATUS_EMPTY`/FEC and grows the adaptive target; slowing the resampler by
-/// a few hundred ppm cannot replace the missing audio.
+/// burst worth of latency. A peak-hold of the raw decoupler level is equally
+/// biased: every whole-subframe refill re-arms the peak between `target + 0.6`
+/// and `target + 1.0`, so the windowed minimum never sees the intended
+/// watermark and the controller runs permanently fast. Regulate the planned
+/// cushion instead: the sequencer backlog plus the decoupler target. Genuine
+/// starvation is signalled by `STATUS_EMPTY`/FEC and grows the adaptive target;
+/// slowing the resampler by a few hundred ppm cannot replace the missing audio.
 #[inline]
 fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
     net_subframes.max(0.0) + target_buf.max(0.0)
@@ -1000,7 +1003,6 @@ impl ClientEngine {
         let mut last_plc_watermark =
             resampler.subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES);
         let mut consecutive_empty_ticks: u16 = 0;
-        let mut fifo_peak_subframes: f32 = initial_wifi_floor;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
@@ -1502,7 +1504,6 @@ impl ClientEngine {
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
-                    fifo_peak_subframes = base_fifo_subframes as f32;
                 }
 
                 // If Group Sync requires a deeper cushion (e.g. wired client aligning to
@@ -1533,22 +1534,12 @@ impl ClientEngine {
                     }
                 }
 
-                // If a slow/Bluetooth peer left the group and `burst_fifo`
-                // itself holds more than `target_buf + max_over`, shed the old
-                // alignment cushion from `burst_fifo` immediately.
-                let max_over = max_backlog_over_target_subframes(last_pkt_subframe_count);
-                if prebuffer_ready && fifo_now > target_buf + max_over {
-                    let keep_samples = resampler.subframes_to_samples(target_fifo_subframes);
-                    let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                    let mut rng = 1u32;
-                    while burst_fifo.available_samples() > keep_samples + SUBFRAME_STEREO_SAMPLES {
-                        if !burst_fifo.pop_exact_or_dither(&mut discard, &mut rng) {
-                            break;
-                        }
-                    }
-                    fifo_peak_subframes =
-                        resampler.samples_to_subframes(burst_fifo.available_samples());
-                }
+                // A deeper group-sync cushion drains naturally through the
+                // output callback after the target shrinks. Never pop from the
+                // RX thread: `BurstDecouplerRing` is SPSC and the audio
+                // callback is its only consumer, so a second `read_idx` writer
+                // can rewind or skip samples. The refill loop stops topping up
+                // until the surplus is gone.
             }
             telemetry
                 .target_buffer_us
@@ -1731,18 +1722,12 @@ impl ClientEngine {
                 let net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
-                if fifo_subframes >= fifo_peak_subframes {
-                    fifo_peak_subframes = fifo_subframes;
-                } else {
-                    fifo_peak_subframes =
-                        (fifo_peak_subframes - 0.005).max(fifo_subframes);
-                }
                 telemetry.buffered_audio_us.store(
                     ((net_subframes + fifo_subframes).max(0.0) * 2500.0) as u32,
                     Ordering::Relaxed,
                 );
                 resampler.update_clock_loop(
-                    clock_loop_observation(net_subframes, fifo_peak_subframes),
+                    clock_loop_observation(net_subframes, target_buf),
                     target_buf,
                 );
                 let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
@@ -2775,33 +2760,64 @@ mod tests {
     }
 
     #[test]
-    fn test_clock_loop_observation_with_peak_hold_detects_drift() {
-        let target_buf = 8.0f32;
-        let mut fifo_peak_subframes = 8.0f32;
+    fn test_clock_loop_ignores_refill_overshoot() {
+        let target = 4.0f32;
 
-        // In steady state: observation matches target
-        assert_eq!(clock_loop_observation(0.0, fifo_peak_subframes), 8.0);
-
-        // DAC runs fast and drains FIFO to 6.0 subframes:
-        // Peak-hold envelope tracks downward:
-        for _ in 0..500 {
-            let fifo_current = 6.0f32;
-            if fifo_current >= fifo_peak_subframes {
-                fifo_peak_subframes = fifo_current;
+        // A whole-subframe refill at a 1 ms RX cadence starts between
+        // `target - 0.4` and `target`, so the post-refill peak sits between
+        // `target + 0.6` and `target + 1.0` on every callback. The old
+        // peak-hold observation latched that overshoot and drove a permanent
+        // positive correction.
+        let mut old = ClockDriftResampler::new();
+        let mut fifo_peak = target;
+        for pass in 0..6000 {
+            let fifo = if pass % 3 == 0 {
+                target + 0.8
             } else {
-                fifo_peak_subframes = (fifo_peak_subframes - 0.005).max(fifo_current);
+                target + 0.4
+            };
+            if fifo >= fifo_peak {
+                fifo_peak = fifo;
+            } else {
+                fifo_peak = (fifo_peak - 0.005).max(fifo);
             }
+            old.update_clock_loop(clock_loop_observation(0.0, fifo_peak), target);
         }
-        assert!((fifo_peak_subframes - 6.0).abs() < 1e-4);
+        let old_ppm = ((old.ratio - 1.0) * 1_000_000.0) as i32;
+        assert!(
+            old_ppm > 70,
+            "refill overshoot must bias the old peak-hold loop fast, got {} ppm",
+            old_ppm
+        );
 
-        // Observation now reports 6.0, allowing ClockDriftResampler to slow down
-        let obs = clock_loop_observation(0.0, fifo_peak_subframes);
-        assert_eq!(obs, 6.0);
-        assert!(obs < target_buf, "observation must fall below target when FIFO is depleted");
+        // The planned-cushion observation ignores the refill sawtooth: the
+        // decoupler is still regulated to `target` by the refill watermark, and
+        // only a real sequencer backlog moves the controller.
+        let mut fixed = ClockDriftResampler::new();
+        for _ in 0..1200 {
+            fixed.update_clock_loop(clock_loop_observation(0.0, target), target);
+        }
+        let fixed_ppm = ((fixed.ratio - 1.0) * 1_000_000.0) as i32;
+        assert_eq!(
+            fixed_ppm, 0,
+            "a locked stream at the refill watermark must not change the clock ratio"
+        );
+
+        // A genuine sequencer backlog still produces a fast correction.
+        let mut backlog = ClockDriftResampler::new();
+        for _ in 0..1200 {
+            backlog.update_clock_loop(clock_loop_observation(4.0, target), target);
+        }
+        let backlog_ppm = ((backlog.ratio - 1.0) * 1_000_000.0) as i32;
+        assert!(
+            backlog_ppm > 50,
+            "real sequencer backlog must still speed the resampler, got {} ppm",
+            backlog_ppm
+        );
     }
 
     #[test]
-    fn test_group_sync_prebuffer_gating_and_excess_cushion_shedding() {
+    fn test_group_sync_prebuffer_gating_and_single_consumer_drain() {
         let ring = BurstDecouplerRing::new();
         let resampler = ClockDriftResampler::new();
 
@@ -2825,9 +2841,9 @@ mod tests {
         }
         assert!(prebuffer_ready, "must prebuffer when target is reached");
 
-        // 2. Excess cushion shedding:
+        // 2. Excess cushion drains through the audio-callback consumer:
         // Slow peer leaves, target_buf drops from 32 down to 6 subframes.
-        // ring currently holds 32 subframes = 32 * 120 = 3840 stereo samples (7680 f32 samples)
+        // ring currently holds 32 subframes = 32 * 120 = 3840 stereo samples
         let chunk = [0.1f32; SUBFRAME_STEREO_SAMPLES];
         for _ in 0..32 {
             ring.push_samples(&chunk);
@@ -2837,22 +2853,21 @@ mod tests {
         let new_target_buf = 6.0f32;
         let new_target_fifo = fifo_target_subframes(new_target_buf);
         assert_eq!(new_target_fifo, 6);
-        let max_over = max_backlog_over_target_subframes(2); // 6.0
         let fifo_now = resampler.samples_to_subframes(ring.available_samples());
         assert_eq!(fifo_now, 32.0);
 
-        // Shed excess cushion
-        if prebuffer_ready && fifo_now > new_target_buf + max_over {
-            let keep_samples = resampler.subframes_to_samples(new_target_fifo);
-            let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-            let mut rng = 1u32;
-            while ring.available_samples() > keep_samples + SUBFRAME_STEREO_SAMPLES {
-                if !ring.pop_exact_or_dither(&mut discard, &mut rng) {
-                    break;
-                }
+        // The output callback is the ring's single consumer. Draining the
+        // surplus there (rather than racing on `read_idx` from the RX thread)
+        // brings the decoupler back to the new watermark.
+        let keep_samples = resampler.subframes_to_samples(new_target_fifo);
+        let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut rng = 1u32;
+        while ring.available_samples() > keep_samples + SUBFRAME_STEREO_SAMPLES {
+            if !ring.pop_exact_or_dither(&mut discard, &mut rng) {
+                break;
             }
         }
-        // Retained samples must be within 1 subframe of target (6 subframes = 1440 samples)
+        // Retained samples must be within 1 subframe of target (6 subframes).
         let remaining_subframes = resampler.samples_to_subframes(ring.available_samples());
         assert!(remaining_subframes <= 7.0);
         assert!(remaining_subframes >= 6.0);
