@@ -196,6 +196,25 @@ fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
     net_subframes.max(0.0) + target_buf.max(0.0)
 }
 
+/// Apply the host master volume without a per-subframe step discontinuity.
+///
+/// A PC volume key changes `host_volume` between two 2.5 ms subframes; applying
+/// the new gain instantly leaves a click at the boundary. Ramp the gain over a
+/// few milliseconds instead (0.01 per 48 kHz sample is a ~2 ms time constant),
+/// and snap back to exact unity once settled so an unused gain stage stays
+/// bit-transparent.
+#[inline]
+fn apply_host_volume(samples: &mut [f32], smoothed: &mut f32, target: f32) {
+    if (target - 1.0).abs() <= 0.005 && (*smoothed - 1.0).abs() <= 0.001 {
+        *smoothed = 1.0;
+        return;
+    }
+    for sample in samples {
+        *smoothed += 0.01 * (target - *smoothed);
+        *sample *= *smoothed;
+    }
+}
+
 /// Unaligned local pipeline delay in milliseconds (above the 4-subframe / 10 ms
 /// minimum FIFO floor) reported to the host for multi-device acoustic sync.
 ///
@@ -1043,6 +1062,7 @@ impl ClientEngine {
         let mut last_plc_watermark =
             resampler.subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES);
         let mut consecutive_empty_ticks: u16 = 0;
+        let mut smoothed_host_vol: f32 = 1.0;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
@@ -1722,13 +1742,10 @@ impl ClientEngine {
                 limiter.set_gain_db(gain_db);
                 limiter.process_in_place(&mut raw_subframe);
 
-                // Apply Host Master Volume (0..=100%)
+                // Apply Host Master Volume (0..=100%) with a short per-sample
+                // ramp so PC volume keys do not step the waveform.
                 let host_vol = (telemetry.host_volume.load(Ordering::Relaxed) as f32) / 100.0;
-                if (host_vol - 1.0).abs() > 0.005 {
-                    for s in &mut raw_subframe {
-                        *s *= host_vol;
-                    }
-                }
+                apply_host_volume(&mut raw_subframe, &mut smoothed_host_vol, host_vol);
 
                 // Move the popped subframe through the resampler and into the
                 // decoupler before measuring either queue. Measuring first
@@ -2135,6 +2152,32 @@ mod tests {
         let reordered = 7i16;
         assert!(reordered < in_flight_wait_subframes(4));
         assert!(!(reordered < 3));
+    }
+
+    #[test]
+    fn test_host_volume_ramps_instead_of_stepping() {
+        let mut smoothed = 1.0f32;
+        let mut first = [1.0f32; 240];
+        apply_host_volume(&mut first, &mut smoothed, 0.5);
+        // The first sample moves by ~0.005 instead of the old 0.5 step.
+        assert!((first[0] - 0.995).abs() < 1e-6);
+        assert!(smoothed > 0.5 && smoothed < 1.0);
+
+        let mut previous = smoothed;
+        for _ in 0..10 {
+            let mut block = [1.0f32; 240];
+            apply_host_volume(&mut block, &mut smoothed, 0.5);
+            assert!(smoothed <= previous);
+            previous = smoothed;
+        }
+        assert!((smoothed - 0.5).abs() < 0.01);
+
+        // Returning to unity ramps up and snaps to exact bit-transparent 1.0.
+        for _ in 0..100 {
+            let mut block = [1.0f32; 240];
+            apply_host_volume(&mut block, &mut smoothed, 1.0);
+        }
+        assert_eq!(smoothed, 1.0);
     }
 
     #[test]
