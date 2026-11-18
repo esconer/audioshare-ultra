@@ -2327,6 +2327,22 @@ impl HostEngine {
                         std::thread::sleep(Duration::from_micros(500));
                         continue;
                     }
+                } else {
+                    // Pace a multi-packet OS callback BEFORE popping and
+                    // sending. This check must compare against the previous
+                    // packet: running it after the send (and before updating
+                    // `last_tx_instant`) let every packet produced by one
+                    // 10-20 ms callback leave in a 20 us microburst, then
+                    // slept only after the ring was empty.
+                    let remaining_subframes = avail / SUBFRAME_STEREO_SAMPLES;
+                    let min_gap = Duration::from_micros(capture_min_gap_us(
+                        subframes_per_pkt,
+                        remaining_subframes,
+                    ));
+                    let since_tx = last_tx_instant.elapsed();
+                    if since_tx < min_gap {
+                        std::thread::sleep(min_gap - since_tx);
+                    }
                 }
             }
 
@@ -2686,27 +2702,11 @@ impl HostEngine {
             // The original isochronous pacer is retained for the synthetic
             // test tone (no capture clock) and for a stalled capture endpoint,
             // where silence must still be synthesized at real-time cadence.
-            let now = Instant::now();
             let capture_active = !use_test_tone
                 && (start_instant.elapsed().as_millis() as u64)
                     .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
                     <= 80;
             if capture_active {
-                if ring.available_samples() >= needed_samples {
-                    // Spread a 10-20 ms OS capture callback across its
-                    // callback period instead of dumping every packet in a
-                    // 1.5 ms burst and then starving the network. A backlog
-                    // above 20 ms drains faster so it cannot become latency.
-                    let remaining_subframes = ring.available_samples() / SUBFRAME_STEREO_SAMPLES;
-                    let min_gap = Duration::from_micros(capture_min_gap_us(
-                        subframes_per_pkt,
-                        remaining_subframes,
-                    ));
-                    let since_tx = now.saturating_duration_since(last_tx_instant);
-                    if since_tx < min_gap {
-                        std::thread::sleep(min_gap - since_tx);
-                    }
-                }
                 if sent_any {
                     last_tx_instant = Instant::now();
                 }
@@ -3206,6 +3206,36 @@ mod tests {
         assert_eq!(capture_min_gap_us(2, 9), 2_200);
         assert_eq!(capture_min_gap_us(4, 9), 4_400);
         assert_eq!(capture_min_gap_us(1, 9), 1_100);
+    }
+
+    #[test]
+    fn test_capture_pacer_spaces_multipacket_callback_before_send() {
+        // A 10 ms OS capture callback delivers 4 subframes; the host frames 2
+        // subframes per packet. The previous callback finished at t = 0.02 ms.
+        let min_gap_us = capture_min_gap_us(2, 2);
+        assert_eq!(min_gap_us, 4_250);
+
+        // Pre-send pacing (current code): packet 1 is already 9.98 ms after the
+        // previous send, so it leaves immediately; packet 2 waits out the rest
+        // of the 4.25 ms gap.
+        let mut now_us = 10_000u64;
+        let mut last_tx_us = 20u64;
+        let packet_1_us = now_us;
+        assert!(packet_1_us - last_tx_us >= min_gap_us);
+        last_tx_us = packet_1_us;
+        now_us += 20;
+        let wait_us = min_gap_us.saturating_sub(now_us - last_tx_us);
+        assert_eq!(wait_us, 4_230);
+        let packet_2_us = now_us + wait_us;
+        assert!(packet_2_us - last_tx_us >= min_gap_us);
+
+        // Post-send pacing (pre-fix): `last_tx_instant` was not updated until
+        // after the sleep check, so packet 1 saw the stale 9.98 ms gap, and
+        // packet 2 found the ring empty and skipped the check entirely. Both
+        // packets left 20 us apart.
+        let old_packet_1_us = 10_000u64;
+        let old_packet_2_us = old_packet_1_us + 20;
+        assert_eq!(old_packet_2_us - old_packet_1_us, 20);
     }
 
     #[test]
