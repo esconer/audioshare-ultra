@@ -2230,6 +2230,11 @@ impl AudioShareApp {
                             &mut self.enable_virtual_speaker,
                         ) && self.host_engine.is_some()
                         {
+                            // Drop the previous guard first: its Drop restores
+                            // the old default sink/source. Reassigning without
+                            // this lets the stale restore race with the new
+                            // guard and leaves duplicate virtual sinks.
+                            self.os_guard = None;
                             self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
                                 self.enable_virtual_speaker,
                             ));
