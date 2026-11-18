@@ -294,11 +294,9 @@ fn party_dtx_active(packet_is_silent: bool, silent_subframes: u32) -> bool {
     packet_is_silent && silent_subframes > PARTY_DTX_SILENT_SUBFRAMES
 }
 
-fn party_dtx_heartbeat_due(base_seq: u16, subframes_per_pkt: usize) -> bool {
-    // `base_seq` counts 2.5 ms subframes, not packets. Two subframes per
-    // datagram means one heartbeat every 80 packets (200 ms).
-    let interval_subframes = PARTY_DTX_HEARTBEAT_INTERVAL as usize * subframes_per_pkt.max(1);
-    base_seq as usize % interval_subframes == 0
+fn party_dtx_heartbeat_due(last: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last)
+        >= Duration::from_micros(PARTY_DTX_HEARTBEAT_INTERVAL as u64 * 2_500)
 }
 
 fn party_beacon_port(use_hardware_mic: bool, bound_port: u16) -> Option<u16> {
@@ -426,6 +424,7 @@ impl PhoneMicTransmitter {
                 let mut silent_subframes: u32 = 0;
                 let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
                 let mut last_tx: Option<Instant> = None;
+                let mut last_party_dtx_heartbeat = Instant::now();
                 let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
 
                 while run_clone.load(Ordering::Relaxed) {
@@ -674,9 +673,13 @@ impl PhoneMicTransmitter {
                             has_fec_n1 = false;
                             has_fec_n2 = false;
                         }
-                        if dtx && !party_dtx_heartbeat_due(base_seq, subframes_per_pkt) {
-                            last_tx = Some(Instant::now());
-                            continue;
+                        if dtx {
+                            let now = Instant::now();
+                            if !party_dtx_heartbeat_due(last_party_dtx_heartbeat, now) {
+                                last_tx = Some(now);
+                                continue;
+                            }
+                            last_party_dtx_heartbeat = now;
                         }
                         // Group-sync alignment only makes sense with at least
                         // two distinct listeners; a single listener's two
@@ -1410,13 +1413,17 @@ mod tests {
         assert!(!party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES));
         assert!(party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES + 1));
 
-        // Two subframes per packet: a heartbeat every 160 subframes is one
-        // every 80 packets, i.e. every 200 ms.
-        assert!(party_dtx_heartbeat_due(0, 2));
-        assert!(!party_dtx_heartbeat_due(80, 2));
-        assert!(party_dtx_heartbeat_due(160, 2));
-        assert!(!party_dtx_heartbeat_due(159, 2));
-        assert!(party_dtx_heartbeat_due(80, 1));
+        let start = Instant::now();
+        // A sequence that starts odd can never hit a multiple of 160 when it
+        // advances by two, so the old modulo gate goes silent forever after a
+        // framing change. The wall-clock gate still fires every 200 ms.
+        let mut seq = 101u16;
+        for _ in 0..200 {
+            assert_ne!(seq % 160, 0);
+            seq = seq.wrapping_add(2);
+        }
+        assert!(!party_dtx_heartbeat_due(start, start + Duration::from_millis(199)));
+        assert!(party_dtx_heartbeat_due(start, start + Duration::from_millis(200)));
     }
 
     #[test]
