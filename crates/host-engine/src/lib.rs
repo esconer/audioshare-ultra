@@ -744,6 +744,16 @@ const CAPTURE_SMOOTH_GAP_PER_SUBFRAME_US: u64 = 2_125;
 const CAPTURE_CATCHUP_GAP_PER_SUBFRAME_US: u64 = 1_100;
 const CAPTURE_CATCHUP_BACKLOG_SUBFRAMES: usize = 8;
 
+/// DTX heartbeat cadence. The heartbeat keeps the receiver's NAT mapping and
+/// clock alive while the host is silent; it must not depend on the sequence
+/// number, because framing can switch between 1- and 2-subframe packets.
+const DTX_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(200);
+
+#[inline]
+fn dtx_heartbeat_due(last: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last) >= DTX_HEARTBEAT_INTERVAL
+}
+
 #[inline]
 fn capture_min_gap_us(subframes_per_pkt: usize, remaining_subframes: usize) -> u64 {
     let count = subframes_per_pkt.max(1) as u64;
@@ -1961,6 +1971,7 @@ impl HostEngine {
             }
         }
         let mut last_client_sweep = Instant::now();
+        let mut last_dtx_heartbeat = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
@@ -2525,7 +2536,9 @@ impl HostEngine {
                 // SilenceHeartbeat; reset the sender's codec/FEC history to match.
                 opus_encoder = None;
                 fec_hist_len = 0;
-                if (base_seq % 80) == 0 {
+                let heartbeat_now = Instant::now();
+                if dtx_heartbeat_due(last_dtx_heartbeat, heartbeat_now) {
+                    last_dtx_heartbeat = heartbeat_now;
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
                         subframe_count: subframes_per_pkt as u8,
@@ -3188,6 +3201,22 @@ mod tests {
         assert_eq!(stability_bitrate_kbps(320, 200), 160);
         assert_eq!(stability_bitrate_kbps(320, 201), 96);
         assert_eq!(stability_bitrate_kbps(96, 900), 96);
+    }
+
+    #[test]
+    fn test_dtx_heartbeat_is_time_based_not_sequence_parity() {
+        let start = Instant::now();
+        // A 1-subframe period can stop on an odd sequence. Switching to
+        // 2-subframe framing then steps over every even multiple of 80, so the
+        // old modulo gate never fires again.
+        let mut seq = 101u16;
+        for _ in 0..200 {
+            assert_ne!(seq % 80, 0, "odd sequence + 2 can never hit the old gate");
+            seq = seq.wrapping_add(2);
+        }
+        // The wall-clock gate still fires after 200 ms.
+        assert!(!dtx_heartbeat_due(start, start + Duration::from_millis(199)));
+        assert!(dtx_heartbeat_due(start, start + Duration::from_millis(200)));
     }
 
     #[test]
