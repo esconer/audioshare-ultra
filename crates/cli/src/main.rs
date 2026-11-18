@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,17 @@ fn client_target(args: &[String]) -> &str {
         .find(|a| !a.starts_with("--"))
         .map(|s| s.as_str())
         .unwrap_or("127.0.0.1:65530")
+}
+
+/// Parse `IP` or `IP:PORT` without mistaking a bare IPv6 address for an
+/// `address:port` pair. `fe80::1` is an address, `[fe80::1]:5000` is a pair.
+fn parse_client_target(raw: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = raw.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    raw.parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
+        .map_err(|_| format!("Invalid host address '{}' (expected IP or IP:PORT)", raw))
 }
 
 fn run_host(args: &[String]) {
@@ -192,15 +203,7 @@ fn run_client(args: &[String]) {
     let latency_debug = latency_debug_enabled(args);
     // Allow `client --latency-debug 192.168.1.5` as well as the address first.
     let raw_target = client_target(args);
-    let target_str = if raw_target.contains(':') {
-        raw_target.to_string()
-    } else {
-        format!("{}:{}", raw_target, DEFAULT_PORT)
-    };
-
-    let server_addr: SocketAddr = target_str
-        .parse()
-        .expect("Invalid host address (expected IP or IP:PORT)");
+    let server_addr = parse_client_target(raw_target).unwrap_or_else(|e| panic!("{}", e));
 
     // Loopback + legacy and randomized Android USB-tethering subnets.
     let is_usb_or_local = is_usb_subnet_ip(server_addr.ip());
@@ -425,21 +428,32 @@ mod tests {
 
     #[test]
     fn test_client_target_port_formatting() {
-        let raw_no_port = "192.168.1.5";
-        let target_str = if raw_no_port.contains(':') {
-            raw_no_port.to_string()
-        } else {
-            format!("{}:{}", raw_no_port, DEFAULT_PORT)
-        };
-        assert_eq!(target_str, "192.168.1.5:65530");
+        assert_eq!(
+            parse_client_target("192.168.1.5"),
+            Ok(SocketAddr::from(([192, 168, 1, 5], DEFAULT_PORT)))
+        );
+        assert_eq!(
+            parse_client_target("192.168.1.5:5000"),
+            Ok(SocketAddr::from(([192, 168, 1, 5], 5000)))
+        );
+    }
 
-        let raw_with_port = "192.168.1.5:5000";
-        let target_str = if raw_with_port.contains(':') {
-            raw_with_port.to_string()
-        } else {
-            format!("{}:{}", raw_with_port, DEFAULT_PORT)
-        };
-        assert_eq!(target_str, "192.168.1.5:5000");
+    #[test]
+    fn test_client_target_accepts_bare_and_bracketed_ipv6() {
+        // A bare IPv6 address contains ':' but is not an address:port pair.
+        assert_eq!(
+            parse_client_target("fe80::1"),
+            Ok(SocketAddr::new("fe80::1".parse().unwrap(), DEFAULT_PORT))
+        );
+        assert_eq!(
+            parse_client_target("[fe80::1]:5000"),
+            Ok(SocketAddr::new("fe80::1".parse().unwrap(), 5000))
+        );
+        assert_eq!(
+            parse_client_target("::1"),
+            Ok(SocketAddr::new("::1".parse().unwrap(), DEFAULT_PORT))
+        );
+        assert!(parse_client_target("not-an-ip").is_err());
     }
 
     #[test]
