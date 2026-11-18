@@ -335,24 +335,32 @@ impl BurstDecouplerRing {
         let r = self.read_idx.load(Ordering::Relaxed);
         let w = self.write_idx.load(Ordering::Acquire);
         let avail = w.wrapping_sub(r);
+        // The ring is stereo-interleaved. Advancing by an odd sample count
+        // would make every later pull start on a Right sample, permanently
+        // swapping channels. Consume whole frames only and pad a trailing odd
+        // slot with silence.
+        let req_even = out.len() & !1;
 
-        if avail >= out.len() {
+        if req_even > 0 && avail >= req_even {
             let buf_ptr = self.buf.get() as *const f32;
-            for (i, dst) in out.iter_mut().enumerate() {
+            for (i, dst) in out[..req_even].iter_mut().enumerate() {
                 unsafe {
                     *dst = *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK);
                 }
             }
+            if req_even < out.len() {
+                out[req_even] = 0.0;
+            }
             self.read_idx
-                .store(r.wrapping_add(out.len()), Ordering::Release);
+                .store(r.wrapping_add(req_even), Ordering::Release);
             true
-        } else if (avail & !1) > 0 {
+        } else if req_even > 0 && (avail & !1) > 0 {
             // Partial underrun: copy what is left, but cross-fade the final
             // frames to zero before the exponential tail. A callback that is
             // only one frame short would otherwise leave the output at ~98.5%
             // amplitude, and the next (empty) callback starts at -90 dBFS
             // comfort dither: a full-scale step into the DAC.
-            let safe_avail = avail & !1; // Keep stereo L/R alignment
+            let safe_avail = (avail & !1).min(req_even); // Keep stereo L/R alignment
             let fade_frames = (safe_avail / 2).min(16);
             let fade_samples = fade_frames * 2;
             let fade_start = safe_avail - fade_samples;
@@ -429,8 +437,12 @@ impl TruePeakLimiter {
 
         for frame in stereo_samples.chunks_exact_mut(2) {
             self.current_gain_linear += 0.01 * (self.target_gain_linear - self.current_gain_linear);
-            let mut l = frame[0] * self.current_gain_linear;
-            let mut r = frame[1] * self.current_gain_linear;
+            // A non-finite capture sample (driver glitch, decoder damage) must
+            // not propagate NaN/Inf into the ring, DAC, or envelope follower.
+            let in_l = if frame[0].is_finite() { frame[0] } else { 0.0 };
+            let in_r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            let mut l = in_l * self.current_gain_linear;
+            let mut r = in_r * self.current_gain_linear;
             let peak = l.abs().max(r.abs());
 
             if peak > self.envelope {
@@ -521,8 +533,11 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
             }
             _ => (src[0], *src.get(1).unwrap_or(&src[0])),
         };
-        out_stereo[i * 2] = l;
-        out_stereo[i * 2 + 1] = r;
+        // Keep non-finite capture samples out of the resampler history and the
+        // downstream limiter; one NaN would otherwise survive every later
+        // interpolation stage.
+        out_stereo[i * 2] = if l.is_finite() { l } else { 0.0 };
+        out_stereo[i * 2 + 1] = if r.is_finite() { r } else { 0.0 };
     }
 }
 
@@ -872,6 +887,61 @@ mod tests {
         let mut rng = 1u32;
         assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
         assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_burst_decoupler_odd_pop_preserves_stereo_alignment() {
+        let ring = BurstDecouplerRing::new();
+        assert_eq!(ring.push_samples(&[1.0, 2.0, 3.0, 4.0]), 4);
+
+        // A caller asking for an odd sample count must not advance the read
+        // cursor by a half frame; the unpaired trailing sample is dropped and
+        // the next pull still starts on a Left sample.
+        let mut out = [0.0f32; 3];
+        let mut rng = 1u32;
+        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert_eq!(&out[..2], &[1.0, 2.0]);
+        assert_eq!(out[2], 0.0);
+        assert_eq!(ring.available_samples(), 2);
+
+        assert_eq!(ring.push_samples(&[5.0, 6.0]), 2);
+        let mut out4 = [0.0f32; 4];
+        assert!(ring.pop_exact_or_dither(&mut out4, &mut rng));
+        assert_eq!(out4, [3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_true_peak_limiter_recovers_from_non_finite_input() {
+        let mut limiter = TruePeakLimiter::new(0.0);
+        let mut poisoned = [f32::NAN, f32::INFINITY];
+        limiter.process_in_place(&mut poisoned);
+        assert!(
+            poisoned.iter().all(|sample| sample.is_finite()),
+            "non-finite input must not reach the output"
+        );
+
+        let mut normal = [0.25f32, -0.25, 0.5, -0.5];
+        limiter.process_in_place(&mut normal);
+        assert!(
+            normal.iter().all(|sample| sample.is_finite()),
+            "a single NaN frame must not poison the limiter envelope"
+        );
+        assert!((normal[0] - 0.25).abs() < 1e-3);
+        assert!((normal[1] + 0.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_sanitizes_non_finite_channels() {
+        let input = [f32::NAN, 0.5, f32::INFINITY, -0.25, 0.1, f32::NEG_INFINITY];
+        let mut out = [0.0f32; 6];
+        downmix_to_stereo(&input, 2, &mut out);
+        assert!(
+            out.iter().all(|sample| sample.is_finite()),
+            "non-finite capture samples must be replaced with silence"
+        );
+        assert_eq!(out[1], 0.5);
+        assert_eq!(out[3], -0.25);
+        assert_eq!(out[4], 0.1);
     }
 
     #[test]

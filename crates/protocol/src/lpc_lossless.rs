@@ -917,6 +917,13 @@ pub fn decode_lossless_subframe(
         let r = mid - (side >> 1);
         let l = r + side;
 
+        // 16-bit residual codes can drive the second-order predictor outside
+        // the i16 domain on a corrupt/truncated payload. Reject instead of
+        // silently wrapping into plausible-looking audio.
+        if !(-32_768..=32_767).contains(&l) || !(-32_768..=32_767).contains(&r) {
+            return Err("Corrupt LPC residual out of i16 range");
+        }
+
         out_pcm[i * 2] = l as i16;
         out_pcm[i * 2 + 1] = r as i16;
     }
@@ -1985,6 +1992,47 @@ mod tests {
             &wrong_tag[..enc_len],
             &mut decoded
         ));
+    }
+
+    #[test]
+    fn test_decode_lossless_rejects_out_of_range_reconstruction() {
+        // 15 Mid + 15 Side blocks, each with 8 x 16-bit residual codes of all
+        // ones (zigzag -32768). The second-order predictor then diverges far
+        // outside i16, so the decoder must reject the frame instead of
+        // silently wrapping samples.
+        let mut encoded = vec![0u8; 1 + 30 * (1 + 16)];
+        encoded[0] = TAG_LPC_PACKED;
+        let mut cursor = 1;
+        for _ in 0..30 {
+            encoded[cursor] = 16;
+            cursor += 1;
+            encoded[cursor..cursor + 16].fill(0xFF);
+            cursor += 16;
+        }
+
+        let mut out = [0i16; SUBFRAME_STEREO_SAMPLES];
+        assert!(
+            decode_lossless_subframe(&encoded, &mut out).is_err(),
+            "corrupt residual must not wrap into plausible i16 audio"
+        );
+    }
+
+    #[test]
+    fn test_pcm24_non_finite_input_matches_silence() {
+        // `NaN as i32` already saturates to 0 in Rust, so the proposed
+        // is_finite() guard would not change the encoded bytes. Keep this
+        // test as evidence that no extra PCM24 guard is required.
+        let mut with_nan = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut with_zero = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        with_nan[0] = f32::NAN;
+        with_nan[1] = f32::NAN;
+
+        let mut enc_nan = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let mut enc_zero = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+        let len_nan = encode_lossless_pcm24_subframe(&with_nan, &mut enc_nan);
+        let len_zero = encode_lossless_pcm24_subframe(&with_zero, &mut enc_zero);
+        assert_eq!(len_nan, len_zero);
+        assert_eq!(&enc_nan[..len_nan], &enc_zero[..len_zero]);
     }
 
     #[test]

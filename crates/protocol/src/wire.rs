@@ -453,6 +453,53 @@ mod tests {
     }
 
     #[test]
+    fn test_mac_binds_header_fields_against_recomputed_crc_tampering() {
+        let key = SessionKey::from_pin("4829");
+        let hdr = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 1,
+            encrypted: true,
+            sequence: 31,
+            tx_timestamp_us: 777_000,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 3,
+            header_crc16: 0,
+        };
+        let primary = [0x5Au8; 64];
+        let mut packed = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len = pack_datagram_with_key(
+            hdr,
+            &primary,
+            &[],
+            &[],
+            Some(&key),
+            &mut packed,
+        )
+        .unwrap();
+
+        // The CRC is deliberately unkeyed, so an attacker can rewrite any
+        // header byte and repair bytes 14..16. Fields that influence playback
+        // must still be covered by the keyed MAC.
+        for (offset, tampered) in [(12usize, 5u8), (13, 9)] {
+            let mut copy = packed;
+            copy[offset] = tampered;
+            let crc = WireHeader::compute_crc16(copy[..14].try_into().unwrap()).to_be_bytes();
+            copy[14] = crc[0];
+            copy[15] = crc[1];
+
+            assert_eq!(
+                ParsedPacket::parse_and_decrypt(&mut copy[..len], Some(&key)).err(),
+                Some(WireError::AuthenticationFailed),
+                "tampered header byte {} must fail authentication",
+                offset
+            );
+        }
+    }
+
+    #[test]
     fn test_wire_header_rejects_invalid_subframe_count() {
         let mut buf = [0u8; HEADER_LEN];
         let mut hdr = WireHeader {

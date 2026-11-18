@@ -481,8 +481,19 @@ impl NoiseShapedQuantizer {
     ) -> i16 {
         let mut max_abs: i16 = 0;
         for i in 0..120 {
-            let in_l = src_f32[i * 2].clamp(-1.0, 1.0);
-            let in_r = src_f32[i * 2 + 1].clamp(-1.0, 1.0);
+            // One non-finite sample would otherwise poison the 0.85 error
+            // integrator and silence that channel for the rest of the
+            // stream (or pin it to full scale for +Inf).
+            let in_l = if src_f32[i * 2].is_finite() {
+                src_f32[i * 2].clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let in_r = if src_f32[i * 2 + 1].is_finite() {
+                src_f32[i * 2 + 1].clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
 
             // Exact digital silence must stay exactly zero: dither here would
             // allocate bits in the lossless encoder and keep DTX from reaching
@@ -984,6 +995,26 @@ mod tests {
         let max_abs = quantizer.quantize_stereo_subframe(&src, &mut dst);
         assert!(max_abs > 0);
         assert!((dst[0] - 8192).abs() < 100);
+    }
+
+    #[test]
+    fn test_noise_shaped_quantizer_recovers_from_non_finite_input() {
+        let mut quantizer = NoiseShapedQuantizer::new();
+        let mut src = [0.0f32; 240];
+        for i in 0..120 {
+            src[i * 2] = 0.5;
+            src[i * 2 + 1] = -0.5;
+        }
+        src[0] = f32::NAN;
+
+        let mut dst = [0i16; 240];
+        let max_abs = quantizer.quantize_stereo_subframe(&src, &mut dst);
+        assert!(max_abs > 16_000);
+        assert!(
+            dst[2..].iter().step_by(2).filter(|&&s| s != 0).count() > 100,
+            "one NaN sample must not silence the rest of the left channel"
+        );
+        assert!(dst.iter().all(|&s| s != i16::MAX && s != i16::MIN));
     }
 
     #[test]

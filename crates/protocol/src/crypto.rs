@@ -73,8 +73,24 @@ impl SessionKey {
             ciphertext.len() as u32,
         ];
         let poly_key = chacha20_block(&self.0, 0, nonce);
-        let mut acc1 = poly_key[0] ^ 0x736f_6d65;
-        let mut acc2 = poly_key[1] ^ 0x646f_7261;
+        // Bind every header field that changes how the ciphertext is parsed,
+        // decrypted, or rendered. The header CRC is unkeyed and therefore
+        // cannot authenticate any of this on its own.
+        let ad0 = ((header.mode as u32) << 24)
+            | ((header.subframe_count as u32) << 16)
+            | (header.primary_len as u32);
+        let ad1 = ((header.fec_n1_len as u32) << 24)
+            | ((header.fec_n2_len as u32) << 16)
+            | ((header.host_volume as u32) << 8)
+            | (header.stream_id as u32);
+        let mut acc1 = (poly_key[0] ^ 0x736f_6d65)
+            .wrapping_add(ad0)
+            .wrapping_mul(poly_key[2] | 1)
+            .rotate_left(13);
+        let mut acc2 = (poly_key[1] ^ 0x646f_7261 ^ acc1)
+            .wrapping_add(ad1)
+            .wrapping_mul(poly_key[3] | 1)
+            .rotate_right(11);
 
         for chunk in ciphertext.chunks(4) {
             let mut word_bytes = [0u8; 4];

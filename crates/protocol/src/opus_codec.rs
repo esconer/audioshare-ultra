@@ -241,6 +241,17 @@ impl OpusStreamDecoder {
         out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES],
         mut on_plc_frame: impl FnMut(u16, &[f32; SUBFRAME_STEREO_SAMPLES]),
     ) -> bool {
+        // Validate the incoming packet before the gap path mutates the
+        // stateful codec through concealment frames. Otherwise a malformed
+        // packet with a high sequence number can advance the decoder and
+        // desynchronise all later valid audio.
+        if encoded.len() < 2
+            || encoded[0] != TAG_OPUS_RLD
+            || encoded.len() - 1 > MAX_OPUS_PACKET_BYTES
+        {
+            return false;
+        }
+
         if let Some(previous) = self.last_seq {
             let delta = seq.wrapping_sub(previous) as i16;
             if delta <= 0 {
@@ -510,6 +521,38 @@ mod tests {
             &mut on_late
         ));
         assert_eq!(late_calls, 0);
+    }
+
+    #[test]
+    fn test_invalid_payload_does_not_advance_plc_or_sequence() {
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        let first = tone_frame(0);
+        let len = encoder.encode_subframe(&first, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(10, &payload[..len], &mut out));
+
+        // A malformed packet that also leaves a sequence gap must be rejected
+        // before the codec is advanced through PLC, otherwise an attacker can
+        // desynchronise the decoder by sending junk with a high sequence
+        // number.
+        let mut plc_calls = 0u32;
+        let mut invalid = [0u8; 2];
+        invalid[0] = 0x00; // foreign tag: rejected by decode_subframe
+        assert!(!decoder.decode_subframe_with_plc(
+            12,
+            &invalid,
+            &mut out,
+            |_, _| plc_calls += 1,
+        ));
+        assert_eq!(plc_calls, 0);
+
+        // Sequence 11 is still the next expected frame and must decode.
+        let second = tone_frame(1);
+        let second_len = encoder.encode_subframe(&second, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(11, &payload[..second_len], &mut out));
     }
 
     #[test]
