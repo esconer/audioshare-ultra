@@ -299,6 +299,21 @@ fn should_apply_lipsync(new_delay_ms: u16, last_delay_ms: u16) -> bool {
     new_delay_ms.abs_diff(last_delay_ms) >= 10
 }
 
+/// Offset the GUI must push to PipeWire this frame, or `None` when nothing
+/// changed. Turning the feature off must actively clear a previously applied
+/// sink offset: otherwise the last Bluetooth delay stays latched into the
+/// default sink and every other audio source keeps playing behind the video.
+fn lipsync_offset_to_apply(
+    enabled: bool,
+    bt_delay_ms: u16,
+    last_applied_ms: u16,
+) -> Option<u16> {
+    if !enabled {
+        return if last_applied_ms == 0 { None } else { Some(0) };
+    }
+    should_apply_lipsync(bt_delay_ms, last_applied_ms).then_some(bt_delay_ms)
+}
+
 /// Default pairing adapter: the first Wi-Fi/Ethernet interface. The interface
 /// list sorts USB tethering first so the Android host page can surface it, but
 /// a QR code containing the RNDIS address is unreachable for a phone that is
@@ -1246,11 +1261,14 @@ impl eframe::App for AudioShareApp {
                 self.last_rate_calc = Instant::now();
             }
 
-            if self.auto_bt_video_lipsync
-                && should_apply_lipsync(bt_delay, self.last_applied_bt_delay)
-            {
-                apply_automatic_video_lipsync_offset_ms(bt_delay);
-                self.last_applied_bt_delay = bt_delay;
+            let lipsync = lipsync_offset_to_apply(
+                self.auto_bt_video_lipsync,
+                bt_delay,
+                self.last_applied_bt_delay,
+            );
+            if let Some(offset) = lipsync {
+                apply_automatic_video_lipsync_offset_ms(offset);
+                self.last_applied_bt_delay = offset;
             }
 
             if let Some(ref mut guard) = self.os_guard {
@@ -3197,6 +3215,23 @@ mod tests {
             should_apply_lipsync(5, 60),
             "a large downward change must apply"
         );
+    }
+
+    #[test]
+    fn test_lipsync_toggle_off_clears_applied_offset() {
+        // Enabled: feed the first BT report through, then apply only changes
+        // that pass the hysteresis filter.
+        assert_eq!(lipsync_offset_to_apply(true, 145, 0), Some(145));
+        assert_eq!(lipsync_offset_to_apply(true, 150, 145), None);
+        assert_eq!(lipsync_offset_to_apply(true, 160, 145), Some(160));
+
+        // Disabled after a 160 ms offset was applied: the sink must be reset
+        // instead of keeping audio 160 ms behind the video forever.
+        assert_eq!(lipsync_offset_to_apply(false, 160, 160), Some(0));
+        // ... and the reset happens exactly once.
+        assert_eq!(lipsync_offset_to_apply(false, 160, 0), None);
+        // Disabled before anything was applied: nothing to do.
+        assert_eq!(lipsync_offset_to_apply(false, 145, 0), None);
     }
 
     #[test]
