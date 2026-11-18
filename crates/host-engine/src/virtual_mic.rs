@@ -4,7 +4,7 @@ use std::net::UdpSocket;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
@@ -307,8 +307,18 @@ impl Drop for LinuxVirtualMicOutput {
     }
 }
 
+#[inline]
+fn session_key_from_pin(pin: Option<&str>) -> Option<SessionKey> {
+    pin.map(str::trim)
+        .filter(|pin| !pin.is_empty())
+        .map(SessionKey::from_pin)
+}
+
 pub struct PhoneMicReceiver {
     running: Arc<AtomicBool>,
+    /// Shared with the RX thread so a PIN edit in the desktop UI applies to
+    /// already-running receivers instead of only to the next start.
+    session_key: Arc<Mutex<Option<SessionKey>>>,
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
     pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
@@ -338,10 +348,7 @@ impl PhoneMicReceiver {
         mode: PhoneRxRoutingMode,
         pin: Option<&str>,
     ) -> Result<Self, String> {
-        let session_key = pin
-            .map(str::trim)
-            .filter(|pin| !pin.is_empty())
-            .map(SessionKey::from_pin);
+        let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
         configure_realtime_udp_socket(&socket)
@@ -423,6 +430,7 @@ impl PhoneMicReceiver {
         let peak_clone = Arc::clone(&mic_peak_level_pct);
         let chirp_clone = Arc::clone(&last_chirp_rx_timestamp_us);
         let mic_fifo_thread = Arc::clone(&mic_fifo);
+        let session_key_thread = Arc::clone(&session_key);
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-phone-mic-rx".into())
@@ -515,6 +523,11 @@ impl PhoneMicReceiver {
                 let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
 
                 while run_clone.load(Ordering::Relaxed) {
+                    // PIN edits from the UI land between batches; snapshot once
+                    // per 2.5 ms tick instead of locking on every datagram.
+                    let key_for_batch = *session_key_thread
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
                     // Size the decoupler target to cover at least one full OS
                     // callback period plus 3 subframes (7.5 ms) of network
                     // jitter margin. The sink reports the backend's real
@@ -530,7 +543,7 @@ impl PhoneMicReceiver {
                     while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
                         if let Ok(parsed) = ParsedPacket::parse_and_decrypt(
                             &mut recv_buf[..len],
-                            session_key.as_ref(),
+                            key_for_batch.as_ref(),
                         ) {
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
                             let base_seq = parsed.header.sequence;
@@ -749,6 +762,7 @@ impl PhoneMicReceiver {
 
         Ok(Self {
             running,
+            session_key,
             mic_packets_received,
             mic_peak_level_pct,
             last_chirp_rx_timestamp_us,
@@ -760,6 +774,16 @@ impl PhoneMicReceiver {
             linux_output,
             handle: Some(handle),
         })
+    }
+
+    /// Update the PIN used to decrypt phone-mic datagrams. The RX thread
+    /// snapshots this value every tick, so toggling encryption takes effect
+    /// within one subframe without restarting the receiver.
+    pub fn set_encryption_pin(&self, pin: Option<&str>) {
+        *self
+            .session_key
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = session_key_from_pin(pin);
     }
 
     pub fn stop(&mut self) {
@@ -841,6 +865,15 @@ mod tests {
             5,
             SUBFRAME_STEREO_SAMPLES
         ));
+    }
+
+    #[test]
+    fn test_session_key_from_pin_trims_and_ignores_blank_pins() {
+        assert!(session_key_from_pin(None).is_none());
+        assert!(session_key_from_pin(Some("")).is_none());
+        assert!(session_key_from_pin(Some("   ")).is_none());
+        assert!(session_key_from_pin(Some(" 4829 ")).is_some());
+        assert!(session_key_from_pin(Some(" 4829 ")) == Some(SessionKey::from_pin("4829")));
     }
 
     #[test]

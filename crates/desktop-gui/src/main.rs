@@ -1700,6 +1700,9 @@ impl AudioShareApp {
                         if let Some(ref client) = self.client_engine {
                             client.set_encryption_pin(pin);
                         }
+                        if let Some(ref mic) = self.phone_mic_receiver {
+                            mic.set_encryption_pin(pin);
+                        }
                     }
                     ui.horizontal(|ui| {
                         ui.label("Pairing PIN:");
@@ -1720,6 +1723,9 @@ impl AudioShareApp {
                             }
                             if let Some(ref client) = self.client_engine {
                                 client.set_encryption_pin(pin);
+                            }
+                            if let Some(ref mic) = self.phone_mic_receiver {
+                                mic.set_encryption_pin(pin);
                             }
                         }
                     });
