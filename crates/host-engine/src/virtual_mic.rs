@@ -71,6 +71,29 @@ fn should_advance_mic_playhead(status: u32, latest_seq: u16, next_seq: u16) -> b
         || (latest_seq.wrapping_sub(next_seq) as i16) >= 0
 }
 
+/// True when the tick loop should wait instead of queueing concealment into a
+/// pull-driven phone-mic sink.
+///
+/// At the live edge (`latest_seq < next_seq`) no newer packet exists yet, so
+/// the slot is late rather than lost. A hardware/CPAL sink pulls from the
+/// decoupler, and one full subframe of real audio covers the next 2.5 ms tick;
+/// hold the playhead instead of placing PLC in front of the packet that is
+/// still in flight. Once less than one subframe remains, conceal so the sink
+/// never starves.
+#[inline]
+fn should_hold_mic_live_edge(
+    pull_sink_active: bool,
+    slot_missing: bool,
+    latest_seq: u16,
+    next_seq: u16,
+    fifo_samples: usize,
+) -> bool {
+    pull_sink_active
+        && slot_missing
+        && (latest_seq.wrapping_sub(next_seq) as i16) < 0
+        && fifo_samples >= SUBFRAME_STEREO_SAMPLES
+}
+
 /// True when the first length-prefixed subframe in a primary bundle is Opus.
 ///
 /// ADPCM FEC must never heal an Opus stream: Opus carries its own 2.5 ms
@@ -641,6 +664,13 @@ impl PhoneMicReceiver {
                     }
 
                     let now = Instant::now();
+                    // Do not let `next_tick` accumulate while the receiver is
+                    // still prebuffering. Otherwise the first ready loop can
+                    // walk every missed tick at CPU speed and fill the
+                    // decoupler with PLC.
+                    if !initialized || !prebuffer_ready {
+                        next_tick = now + Duration::from_micros(2500);
+                    }
 
                     if initialized && prebuffer_ready && pull_sink_active {
                         // When a hardware-clocked CPAL sink is pulling bursts
@@ -672,6 +702,20 @@ impl PhoneMicReceiver {
                         next_tick += Duration::from_micros(2500);
                         if initialized && prebuffer_ready {
                             if mic_fifo_thread.available_samples() >= fifo_watermark {
+                                // Re-anchor rather than banking every tick the
+                                // sink was full; a later dip must not release a
+                                // catch-up burst.
+                                next_tick = now + Duration::from_micros(2500);
+                                break;
+                            }
+                            if should_hold_mic_live_edge(
+                                pull_sink_active,
+                                sequencer.is_slot_missing(next_seq),
+                                latest_seq,
+                                next_seq,
+                                mic_fifo_thread.available_samples(),
+                            ) {
+                                next_tick = now + Duration::from_micros(2500);
                                 break;
                             }
                             push_one_subframe(
@@ -752,6 +796,51 @@ mod tests {
     use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
     use audioshare_protocol::wire::{pack_datagram_with_key, WireHeader};
     use audioshare_protocol::SAMPLE_RATE;
+
+    #[test]
+    fn test_pull_sink_holds_live_edge_until_real_audio_is_nearly_drained() {
+        // No newer packet has arrived; the slot at `next_seq` is missing.
+        assert!(should_hold_mic_live_edge(
+            true,
+            true,
+            4,
+            5,
+            SUBFRAME_STEREO_SAMPLES
+        ));
+        // One sample short of a full subframe: conceal instead of starving.
+        assert!(!should_hold_mic_live_edge(
+            true,
+            true,
+            4,
+            5,
+            SUBFRAME_STEREO_SAMPLES - 1
+        ));
+        // Without a pull sink the timer is the only producer, so keep ticking.
+        assert!(!should_hold_mic_live_edge(
+            false,
+            true,
+            4,
+            5,
+            SUBFRAME_STEREO_SAMPLES
+        ));
+        // A newer packet is already buffered; the slot is recoverable through
+        // the normal refill loop rather than being at the live edge.
+        assert!(!should_hold_mic_live_edge(
+            true,
+            true,
+            5,
+            5,
+            SUBFRAME_STEREO_SAMPLES
+        ));
+        // The slot is present and can simply be popped.
+        assert!(!should_hold_mic_live_edge(
+            true,
+            false,
+            4,
+            5,
+            SUBFRAME_STEREO_SAMPLES
+        ));
+    }
 
     #[test]
     fn test_decode_primary_bundle_returns_every_bundled_subframe() {
