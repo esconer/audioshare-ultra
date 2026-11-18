@@ -18,6 +18,16 @@ pub const DISCOVERY_PORT: u16 = 65531;
 /// Wi-Fi nodes drop directed/limited broadcasts but still forward multicast.
 pub const DISCOVERY_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 const BEACON_PREFIX: &str = "ASULTRA_BEACON|";
+/// Ports advertised by a discovery beacon. Port 0 is not connectable, so a
+/// malformed or truncated beacon must not add a host at `IP:0`.
+fn beacon_port(raw: &str) -> u16 {
+    raw.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .unwrap_or(crate::DEFAULT_PORT)
+}
+
+
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -163,7 +173,7 @@ impl DiscoveryScanner {
                                 let parts: Vec<&str> = rest.split('|').collect();
                                 if parts.len() >= 2 {
                                     let hostname = parts[0].to_string();
-                                    let port: u16 = parts[1].parse().unwrap_or(crate::DEFAULT_PORT);
+                                    let port = beacon_port(parts[1]);
                                     let host_addr = SocketAddr::new(src.ip(), port);
                                     let is_usb = crate::is_usb_subnet_ip(src.ip());
 
@@ -1101,6 +1111,14 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_discovery_beacon_rejects_port_zero() {
+        assert_eq!(beacon_port("65530"), 65530);
+        assert_eq!(beacon_port("0"), crate::DEFAULT_PORT);
+        assert_eq!(beacon_port("garbage"), crate::DEFAULT_PORT);
+        assert_eq!(beacon_port("65536"), crate::DEFAULT_PORT);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
