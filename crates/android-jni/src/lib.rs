@@ -937,7 +937,10 @@ pub mod android_native {
         _class: JClass,
     ) -> jstring {
         let csv = android_get_discovered_hosts_csv();
-        env.new_string(csv).unwrap().into_raw()
+        match env.new_string(csv) {
+            Ok(value) => value.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 
     #[no_mangle]
@@ -958,10 +961,11 @@ pub mod android_native {
             .get_string(&pin)
             .map(|value| value.into())
             .unwrap_or_default();
-        let pin_opt = if pin_rust.is_empty() {
+        let pin_trimmed = pin_rust.trim();
+        let pin_opt = if pin_trimmed.is_empty() {
             None
         } else {
-            Some(pin_rust.as_str())
+            Some(pin_trimmed)
         };
         match android_start_stream(
             &addr_rust,
@@ -1065,10 +1069,11 @@ pub mod android_native {
             .get_string(&pin)
             .map(|v| v.into())
             .unwrap_or_default();
-        let pin_opt = if pin_rust.is_empty() {
+        let pin_trimmed = pin_rust.trim();
+        let pin_opt = if pin_trimmed.is_empty() {
             None
         } else {
-            Some(pin_rust.as_str())
+            Some(pin_trimmed)
         };
         android_stop_phone_mic();
         if let Ok(tx) = PhoneMicTransmitter::start_with_pin(&ip_rust, use_hardware_mic != 0, pin_opt) {
@@ -1109,7 +1114,9 @@ pub mod android_native {
                 tids.push(tid);
             }
         }
-        let arr = env.new_int_array(tids.len() as i32).unwrap();
+        let Ok(arr) = env.new_int_array(tids.len() as i32) else {
+            return std::ptr::null_mut();
+        };
         if !tids.is_empty() {
             let _ = env.set_int_array_region(&arr, 0, &tids);
         }
@@ -1168,7 +1175,9 @@ pub mod android_native {
                 .max_group_delay_ms
                 .load(Ordering::Relaxed) as i64;
         }
-        let arr = env.new_long_array(24).unwrap();
+        let Ok(arr) = env.new_long_array(24) else {
+            return std::ptr::null_mut();
+        };
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
     }
