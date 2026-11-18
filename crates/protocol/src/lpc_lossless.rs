@@ -2023,7 +2023,7 @@ mod tests {
         // is_finite() guard would not change the encoded bytes. Keep this
         // test as evidence that no extra PCM24 guard is required.
         let mut with_nan = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-        let mut with_zero = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let with_zero = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         with_nan[0] = f32::NAN;
         with_nan[1] = f32::NAN;
 
