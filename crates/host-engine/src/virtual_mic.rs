@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
@@ -303,7 +304,21 @@ impl PhoneMicReceiver {
     }
 
     pub fn start_with_mode(port: u16, mode: PhoneRxRoutingMode) -> Result<Self, String> {
-        let _ = mode;
+        Self::start_with_mode_and_pin(port, mode, None)
+    }
+
+    /// Start the receiver with an optional pairing PIN. When set, incoming
+    /// phone-mic datagrams are ChaCha20-encrypted and MAC-authenticated, so
+    /// the receiver must decrypt before parsing the codec payload.
+    pub fn start_with_mode_and_pin(
+        port: u16,
+        mode: PhoneRxRoutingMode,
+        pin: Option<&str>,
+    ) -> Result<Self, String> {
+        let session_key = pin
+            .map(str::trim)
+            .filter(|pin| !pin.is_empty())
+            .map(SessionKey::from_pin);
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
         configure_realtime_udp_socket(&socket)
@@ -489,7 +504,10 @@ impl PhoneMicReceiver {
                         .min(mic_fifo_thread.capacity_samples());
 
                     while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
-                        if let Ok(parsed) = ParsedPacket::parse(&recv_buf[..len]) {
+                        if let Ok(parsed) = ParsedPacket::parse_and_decrypt(
+                            &mut recv_buf[..len],
+                            session_key.as_ref(),
+                        ) {
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
                             let base_seq = parsed.header.sequence;
                             if !initialized {
@@ -732,6 +750,7 @@ mod tests {
         MAX_LOSSLESS_PCM24_BYTES, MAX_LOSSLESS_SUBFRAME_BYTES, TAG_VBR_BFP,
     };
     use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
+    use audioshare_protocol::wire::{pack_datagram_with_key, WireHeader};
     use audioshare_protocol::SAMPLE_RATE;
 
     #[test]
@@ -779,6 +798,62 @@ mod tests {
         assert_eq!(decoded[1].0, 1);
         assert_eq!(decoded[0].1, first);
         assert_eq!(decoded[1].1, second);
+    }
+
+    #[test]
+    fn test_pin_encrypted_phone_mic_datagram_decrypts_and_decodes() {
+        let key = SessionKey::from_pin("4829");
+        let wrong_key = SessionKey::from_pin("0000");
+
+        let pcm = [1234i16; SUBFRAME_STEREO_SAMPLES];
+        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let enc_len = encode_lossless_subframe(&pcm, &mut enc);
+        let mut bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(enc_len as u16).to_be_bytes());
+        bundle[2..2 + enc_len].copy_from_slice(&enc[..enc_len]);
+
+        let header = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 1,
+            encrypted: true,
+            sequence: 7,
+            tx_timestamp_us: 42_000,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+        let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len = pack_datagram_with_key(
+            header,
+            &bundle[..2 + enc_len],
+            &[],
+            &[],
+            Some(&key),
+            &mut datagram,
+        )
+        .unwrap();
+
+        let mut forged = datagram;
+        assert!(
+            ParsedPacket::parse_and_decrypt(&mut forged[..len], Some(&wrong_key)).is_err(),
+            "wrong PIN must not decrypt phone-mic audio"
+        );
+
+        let parsed =
+            ParsedPacket::parse_and_decrypt(&mut datagram[..len], Some(&key)).expect("decrypt");
+        let mut decoded = 0usize;
+        decode_primary_bundle(
+            parsed.primary_payload,
+            1,
+            7,
+            None,
+            |_, _| {},
+            |_, _| decoded += 1,
+        );
+        assert_eq!(decoded, 1);
     }
 
     #[test]

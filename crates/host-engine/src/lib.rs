@@ -1783,6 +1783,50 @@ impl HostEngine {
                     None,
                 )
             }
+            cpal::SampleFormat::I32 => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
+                        let mut stereo_buf = [0.0f32; 2048];
+                        let mut f32_tmp = [0.0f32; 2048];
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                                *dst = i32_capture_to_f32(s);
+                            }
+                            downmix_to_stereo(
+                                &f32_tmp[..chunk_frames * ch],
+                                ch,
+                                &mut stereo_buf[..chunk_frames * 2],
+                            );
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let mut resampled = [0.0f32; 4096];
+                                let out_frames = host_resampler
+                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
+                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
+                        }
+                    },
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
+                    None,
+                )
+            }
             _ => {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
@@ -1975,6 +2019,13 @@ impl HostEngine {
                 let is_usb = is_usb_subnet_ip(src_addr.ip());
 
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
+                    // A bare HELLO carries no PIN/MAC. When the host has a
+                    // session key, only authenticated feedback may register a
+                    // client; otherwise any LAN host could add itself to the
+                    // stream target list without knowing the PIN.
+                    if session_key.lock().unwrap().is_some() {
+                        continue;
+                    }
                     let mut map = clients.lock().unwrap();
                     Self::evict_same_ip_stale_ports(&mut map, src_addr);
                     map.entry(src_addr)
@@ -2686,6 +2737,13 @@ impl HostEngine {
     }
 }
 
+/// Convert a 32-bit PCM capture sample into the protocol's ±1.0 f32 domain.
+/// `i32::MIN` maps exactly to -1.0 and `i32::MAX` rounds to +1.0.
+#[inline]
+fn i32_capture_to_f32(sample: i32) -> f32 {
+    ((sample as f64) * (1.0 / 2_147_483_648.0)) as f32
+}
+
 impl Drop for HostEngine {
     fn drop(&mut self) {
         self.stop();
@@ -2712,6 +2770,15 @@ mod tests {
         downmix_to_stereo(&f32_tmp, 2, &mut stereo_buf);
         assert_eq!(stereo_buf[0], f32_tmp[0]);
         assert_eq!(stereo_buf[1], f32_tmp[1]);
+    }
+
+    #[test]
+    fn test_i32_capture_conversion_matches_pcm_scale() {
+        assert_eq!(i32_capture_to_f32(0), 0.0);
+        assert_eq!(i32_capture_to_f32(i32::MIN), -1.0);
+        assert!((i32_capture_to_f32(i32::MAX) - 1.0).abs() < 1e-7);
+        assert!((i32_capture_to_f32(1 << 30) - 0.5).abs() < 1e-7);
+        assert!(i32_capture_to_f32(-(1 << 30)) == -0.5);
     }
 
     #[test]

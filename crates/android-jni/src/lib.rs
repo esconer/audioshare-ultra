@@ -458,6 +458,12 @@ impl PhoneMicTransmitter {
                                 continue;
                             }
                             if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
+                                // A bare HELLO carries no PIN/MAC. With a PIN
+                                // active, only authenticated feedback may add a
+                                // peer; configured static targets still work.
+                                if session_key.is_some() {
+                                    continue;
+                                }
                                 register_party_peer(
                                     &mut peers,
                                     src_addr,

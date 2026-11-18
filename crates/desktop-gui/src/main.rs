@@ -2388,9 +2388,17 @@ impl AudioShareApp {
                             if let Some(mut m) = self.phone_mic_receiver.take() {
                                 m.stop();
                             }
-                            self.phone_mic_receiver = PhoneMicReceiver::start_with_mode(
+                            let phone_pin = if self.enable_pin_encryption
+                                && !self.pairing_pin.trim().is_empty()
+                            {
+                                Some(self.pairing_pin.clone())
+                            } else {
+                                None
+                            };
+                            self.phone_mic_receiver = PhoneMicReceiver::start_with_mode_and_pin(
                                 PHONE_MIC_PORT,
                                 self.phone_rx_mode,
+                                phone_pin.as_deref(),
                             )
                             .ok();
                         }
@@ -2417,11 +2425,23 @@ impl AudioShareApp {
                             if ui.add(btn).clicked() {
                                 if let Some(mut m) = self.phone_mic_receiver.take() {
                                     m.stop();
-                                } else if let Ok(rx) = PhoneMicReceiver::start_with_mode(
-                                    PHONE_MIC_PORT,
-                                    self.phone_rx_mode,
-                                ) {
-                                    self.phone_mic_receiver = Some(rx);
+                                } else {
+                                    let phone_pin = if self.enable_pin_encryption
+                                        && !self.pairing_pin.trim().is_empty()
+                                    {
+                                        Some(self.pairing_pin.clone())
+                                    } else {
+                                        None
+                                    };
+                                    if let Ok(rx) =
+                                        PhoneMicReceiver::start_with_mode_and_pin(
+                                            PHONE_MIC_PORT,
+                                            self.phone_rx_mode,
+                                            phone_pin.as_deref(),
+                                        )
+                                    {
+                                        self.phone_mic_receiver = Some(rx);
+                                    }
                                 }
                             }
 
