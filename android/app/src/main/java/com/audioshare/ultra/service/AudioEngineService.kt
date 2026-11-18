@@ -99,6 +99,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeGetDiscoveredHosts(): String
+
+        @JvmStatic
+        external fun nativeGetRealtimeTids(): IntArray
     }
 
     private var wifiLock: WifiManager.WifiLock? = null
@@ -125,6 +128,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var projectionActive: Boolean = false
     private var activeCaster: PhoneAudioCaster? = null
     private var foregroundStarted: Boolean = false
+    // The native RX/TX threads publish their TIDs shortly after start, so the
+    // first ADPF query can race them. Refresh once immediately and once on the
+    // next half-second without accumulating delayed callbacks.
+    private val adpfHandler = Handler(Looper.getMainLooper())
+    private val adpfRefreshRunnable = Runnable { refreshAdpfHintSession() }
 
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
@@ -270,6 +278,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         nativeSendMediaCommand(savedBitrateCmd)
         nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
+        refreshAdpfHintSession()
+        scheduleAdpfRefresh()
         return START_STICKY
     }
 
@@ -491,21 +501,41 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         wakeLock?.let { if (!it.isHeld) it.acquire() }
 
-        // Android 12+ ADPF (Dynamic Performance Framework): Request 2.5ms real-time scheduler boost
-        // to prevent ARM CPU cores from entering deep C3 sleep between Wi-Fi packets!
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            try {
-                perfHintSession?.close()
-            } catch (_: Exception) {
-            }
-            perfHintSession = null
-            try {
-                val hintMgr = getSystemService(PerformanceHintManager::class.java)
-                val tids = intArrayOf(android.os.Process.myTid())
-                perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L) // 2.5ms deadline
-            } catch (_: Exception) {
-            }
+        // Android 12+ ADPF (Dynamic Performance Framework): Request a 2.5 ms
+        // real-time scheduler boost for the native audio threads, not for the
+        // service main thread that merely calls JNI.
+        refreshAdpfHintSession()
+    }
+
+    private fun refreshAdpfHintSession() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        if (!isStreaming && !isPartyCasting && !micCaptureActive) return
+        try {
+            perfHintSession?.close()
+        } catch (_: Exception) {
         }
+        perfHintSession = null
+        try {
+            val hintMgr = getSystemService(PerformanceHintManager::class.java)
+            val nativeTids = runCatching { nativeGetRealtimeTids() }
+                .getOrDefault(IntArray(0))
+                .distinct()
+                .toIntArray()
+            // Before the Rust thread has published its TID, keep a session for
+            // the caller so a short race does not disable the hint entirely.
+            val tids = if (nativeTids.isNotEmpty()) {
+                nativeTids
+            } else {
+                intArrayOf(android.os.Process.myTid())
+            }
+            perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun scheduleAdpfRefresh() {
+        adpfHandler.removeCallbacks(adpfRefreshRunnable)
+        adpfHandler.postDelayed(adpfRefreshRunnable, 500L)
     }
 
     private fun isUsbHost(hostAddr: String): Boolean {
@@ -635,6 +665,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
             activeCaster = caster
             broadcastPartyCastState(true)
+            refreshAdpfHintSession()
+            scheduleAdpfRefresh()
             // A projection token cannot be resumed after process death, so a
             // party-cast-only service must not be sticky. A concurrent PC
             // stream keeps its normal sticky restart behavior.
@@ -855,6 +887,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         mediaSession?.isActive = false
         mediaSession?.release()
         mediaSession = null
+        adpfHandler.removeCallbacks(adpfRefreshRunnable)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try { perfHintSession?.close() } catch (_: Exception) {}
             perfHintSession = null

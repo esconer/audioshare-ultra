@@ -928,7 +928,7 @@ pub fn android_get_discovered_hosts_csv() -> String {
 pub mod android_native {
     use super::*;
     use jni::objects::{JClass, JString};
-    use jni::sys::{jboolean, jfloat, jint, jlongArray, jstring};
+    use jni::sys::{jboolean, jfloat, jint, jintArray, jlongArray, jstring};
     use jni::JNIEnv;
 
     #[no_mangle]
@@ -1085,6 +1085,35 @@ pub mod android_native {
         _class: JClass,
     ) {
         android_stop_phone_mic();
+    }
+
+    /// Return the kernel TIDs of the native real-time threads that are
+    /// currently running (client RX/DSP first, then the phone-mic/Party
+    /// transmitter). ADPF hint sessions must cover those threads, not the
+    /// Android main thread that happens to call the JNI function.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetRealtimeTids(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jintArray {
+        let mut tids: Vec<jint> = Vec::with_capacity(2);
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+            let tid = client.telemetry.rt_thread_tid.load(Ordering::Relaxed);
+            if tid > 0 && !tids.contains(&tid) {
+                tids.push(tid);
+            }
+        }
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+            let tid = tx.party_telemetry.rt_thread_tid.load(Ordering::Relaxed);
+            if tid > 0 && !tids.contains(&tid) {
+                tids.push(tid);
+            }
+        }
+        let arr = env.new_int_array(tids.len() as i32).unwrap();
+        if !tids.is_empty() {
+            let _ = env.set_int_array_region(&arr, 0, &tids);
+        }
+        arr.into_raw()
     }
 
     #[no_mangle]

@@ -2739,6 +2739,9 @@ impl HostEngine {
 
 /// Convert a 32-bit PCM capture sample into the protocol's ±1.0 f32 domain.
 /// `i32::MIN` maps exactly to -1.0 and `i32::MAX` rounds to +1.0.
+///
+/// The cpal capture path is desktop-only; Android uses AAudio instead.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 #[inline]
 fn i32_capture_to_f32(sample: i32) -> f32 {
     ((sample as f64) * (1.0 / 2_147_483_648.0)) as f32
