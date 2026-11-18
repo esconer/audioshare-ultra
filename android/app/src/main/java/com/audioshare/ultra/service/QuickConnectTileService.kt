@@ -20,7 +20,7 @@ class QuickConnectTileService : TileService() {
 
         val intent = Intent(this, AudioEngineService::class.java)
         if (AudioEngineService.isStreaming) {
-            intent.action = "ACTION_STOP"
+            intent.action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
             startService(intent)
             syncTileState(false)
         } else {

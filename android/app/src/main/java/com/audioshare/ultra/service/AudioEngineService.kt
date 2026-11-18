@@ -808,7 +808,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             .setOngoing(true)
             .addAction(playPauseIcon, playPauseLabel, playPausePending)
             .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
-            .addAction(android.R.drawable.ic_media_pause, "Disconnect", stopPending)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPending)
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
