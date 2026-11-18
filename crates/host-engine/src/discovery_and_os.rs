@@ -655,6 +655,7 @@ fn read_windows_master_volume() -> Option<u8> {
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const Guid,
             p_unk_outer: *mut c_void,
@@ -662,6 +663,22 @@ fn read_windows_master_volume() -> Option<u8> {
             riid: *const Guid,
             ppv: *mut *mut c_void,
         ) -> i32;
+    }
+
+    // Balance every successful CoInitializeEx, including S_FALSE when COM
+    // was already initialized on this thread, on all early-return paths.
+    struct ComInit(bool);
+    impl ComInit {
+        fn new() -> Self {
+            Self(unsafe { CoInitializeEx(core::ptr::null_mut(), 0) >= 0 })
+        }
+    }
+    impl Drop for ComInit {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
 
     const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid {
@@ -684,7 +701,7 @@ fn read_windows_master_volume() -> Option<u8> {
     };
 
     unsafe {
-        let _ = CoInitializeEx(core::ptr::null_mut(), 0);
+        let _com_init = ComInit::new();
         let mut enumerator: *mut IMMDeviceEnumerator = core::ptr::null_mut();
         if CoCreateInstance(
             &CLSID_MMDEVICE_ENUMERATOR,

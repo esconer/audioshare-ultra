@@ -287,6 +287,7 @@ fn isolate_windows_audio_session(target_pid: Option<u32>) {
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
         fn CoCreateInstance(
             rclsid: *const Guid,
             p_unk_outer: *mut c_void,
@@ -294,6 +295,22 @@ fn isolate_windows_audio_session(target_pid: Option<u32>) {
             riid: *const Guid,
             ppv: *mut *mut c_void,
         ) -> i32;
+    }
+
+    // Balance COM init on every return path (including S_FALSE when COM was
+    // already initialized on this thread).
+    struct ComInit(bool);
+    impl ComInit {
+        fn new() -> Self {
+            Self(unsafe { CoInitializeEx(core::ptr::null_mut(), 0) >= 0 })
+        }
+    }
+    impl Drop for ComInit {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
 
     const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid {
@@ -328,7 +345,7 @@ fn isolate_windows_audio_session(target_pid: Option<u32>) {
     };
 
     unsafe {
-        let _ = CoInitializeEx(core::ptr::null_mut(), 0);
+        let _com_init = ComInit::new();
         let mut enumerator: *mut c_void = core::ptr::null_mut();
         if CoCreateInstance(
             &CLSID_MMDEVICE_ENUMERATOR,
