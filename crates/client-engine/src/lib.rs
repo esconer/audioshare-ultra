@@ -96,6 +96,46 @@ fn in_flight_wait_subframes(pkt_subframes: u8) -> i16 {
     ((pkt_subframes.max(1) as i16) * 2).max(3)
 }
 
+/// How long a missing slot at the live edge is assumed to be in flight rather
+/// than lost. One sender packet interval plus 10 ms of scheduling/network
+/// jitter: 15 ms for 5 ms framing, 30 ms for a 20 ms Bluetooth bundle.
+#[inline]
+fn live_edge_grace(pkt_subframes: u8) -> Duration {
+    Duration::from_micros(pkt_subframes.max(1) as u64 * 2_500 + 10_000)
+}
+
+/// Decide whether the refill loop must wait instead of concealing the slot at
+/// `next_play_seq`.
+///
+/// `missing_delta < 0` means the playhead has reached the live edge: every
+/// packet the host has sent is already queued ahead of it, so the slot is not
+/// lost, it simply has not been captured yet. Concealing it walks
+/// `next_play_seq` into the future and makes the on-time packet that follows
+/// fail the `s < next_play_seq` acceptance check, so a real subframe is thrown
+/// away and replaced with PLC. Only conceal at the live edge once the sender
+/// has actually gone quiet for a full packet interval plus jitter allowance.
+#[inline]
+fn should_hold_missing_slot(
+    slot_missing: bool,
+    fifo_samples: usize,
+    plc_emergency_watermark: usize,
+    missing_delta: i16,
+    in_flight_wait: i16,
+    since_last_packet: Duration,
+    live_edge_grace: Duration,
+) -> bool {
+    if !slot_missing {
+        return false;
+    }
+    if missing_delta < 0 {
+        return since_last_packet < live_edge_grace;
+    }
+    // A newer packet arrived out of order, leaving a hole at the playhead.
+    // Wait for the in-flight packet or [N-1]/[N-2] FEC while the FIFO still
+    // has emergency headroom.
+    fifo_samples >= plc_emergency_watermark && missing_delta < in_flight_wait
+}
+
 /// Gaming hard-lock never adds group-sync delay. The target must stay above
 /// the sender's packet size plus the one-subframe PLC watermark, otherwise
 /// every packet arrival starts from behind and the clock loop has to drain.
@@ -1225,6 +1265,12 @@ impl ClientEngine {
             }
 
             let mut packets_drained = 0u8;
+            // Only the first audio packet of a drain pass feeds the RFC 3550
+            // jitter estimator. A second packet read from the kernel queue a
+            // few microseconds later would compare its ~5 µs receive gap
+            // against the sender's 5 ms timestamp gap and invent ~5 ms of
+            // "jitter" on a perfectly paced link.
+            let mut audio_packets_drained = 0u8;
 
             while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
                 if packets_drained == 0 {
@@ -1288,21 +1334,27 @@ impl ClientEngine {
                             continue;
                         }
 
-                        // RFC 3550 Inter-Arrival Jitter calculation using sender `tx_timestamp_us`
+                        // RFC 3550 Inter-Arrival Jitter calculation using sender `tx_timestamp_us`.
+                        // Sample only the first audio packet per drain: packets
+                        // already queued in the socket would otherwise report a
+                        // near-zero receive gap against a full sender interval.
+                        audio_packets_drained = audio_packets_drained.saturating_add(1);
                         let rx_now_us = start_instant.elapsed().as_micros() as u32;
                         let tx_now_us = parsed.header.tx_timestamp_us;
-                        if let Some(last_r) = prev_rx_us {
-                            let d_rx = rx_now_us.wrapping_sub(last_r) as i32;
-                            let d_tx = tx_now_us.wrapping_sub(prev_tx_us) as i32;
-                            let transit_delta = (d_rx - d_tx).unsigned_abs().min(50_000) as f32;
-                            jitter_estimate_us +=
-                                (transit_delta - jitter_estimate_us) * (1.0 / 16.0);
+                        if audio_packets_drained == 1 {
+                            if let Some(last_r) = prev_rx_us {
+                                let d_rx = rx_now_us.wrapping_sub(last_r) as i32;
+                                let d_tx = tx_now_us.wrapping_sub(prev_tx_us) as i32;
+                                let transit_delta = (d_rx - d_tx).unsigned_abs().min(50_000) as f32;
+                                jitter_estimate_us +=
+                                    (transit_delta - jitter_estimate_us) * (1.0 / 16.0);
+                            }
+                            prev_rx_us = Some(rx_now_us);
+                            prev_tx_us = tx_now_us;
                         }
                         telemetry
                             .network_jitter_us
                             .store(jitter_estimate_us.max(0.0) as u32, Ordering::Relaxed);
-                        prev_rx_us = Some(rx_now_us);
-                        prev_tx_us = tx_now_us;
                         // Track the sender's current bundling mode instead of
                         // ratcheting the floor upward. A single 10 ms packet
                         // (4 subframes) used to raise the floor to 11
@@ -1569,12 +1621,21 @@ impl ClientEngine {
                 // single reordered 10 ms packet puts the playhead 4 subframes
                 // behind the newest packet, so the old fixed `< 3` check
                 // synthesized PLC even with 20+ ms of audio still queued.
+                // At the live edge (`missing_delta < 0`) the slot is not lost;
+                // hold it for one packet interval instead of walking the
+                // playhead past the next on-time packet.
                 let missing_delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
-                if sequencer.is_slot_missing(next_play_seq)
-                    && burst_fifo.available_samples() >= plc_emergency_watermark
-                    && missing_delta < in_flight_wait_subframes(last_pkt_subframe_count)
-                {
-                    // Wait for in-flight packet or [N-1]/[N-2] FEC before triggering WSOLA PLC!
+                if should_hold_missing_slot(
+                    sequencer.is_slot_missing(next_play_seq),
+                    burst_fifo.available_samples(),
+                    plc_emergency_watermark,
+                    missing_delta,
+                    in_flight_wait_subframes(last_pkt_subframe_count),
+                    last_packet_instant.elapsed(),
+                    live_edge_grace(last_pkt_subframe_count),
+                ) {
+                    // Wait for the in-flight packet or [N-1]/[N-2] FEC before
+                    // triggering WSOLA PLC!
                     break;
                 }
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
@@ -2074,6 +2135,152 @@ mod tests {
         let reordered = 7i16;
         assert!(reordered < in_flight_wait_subframes(4));
         assert!(!(reordered < 3));
+    }
+
+    #[test]
+    fn test_live_edge_holds_instead_of_walking_the_playhead() {
+        // 2-subframe (5 ms) framing: one packet interval plus 10 ms jitter.
+        let grace = live_edge_grace(2);
+        assert_eq!(grace, Duration::from_millis(15));
+        assert_eq!(live_edge_grace(8), Duration::from_millis(30));
+
+        // The playhead has caught up with the newest packet
+        // (`latest_rx_seq = 100`, `next_play_seq = 101`) and the audio
+        // callback just drained the decoupler below the 2.5 ms emergency
+        // watermark. The old predicate concealed the slot immediately, walked
+        // `next_play_seq` to 102, and then dropped the real packet 101 as
+        // "past". At a 0%-loss link the slot is merely still in the sender's
+        // capture pipeline, so the refill loop must wait.
+        let fifo_below_watermark = 0usize;
+        let emergency = 240usize;
+        let old_hold = fifo_below_watermark >= emergency && (-1i16) < in_flight_wait_subframes(2);
+        assert!(!old_hold, "the old guard concealed this on-time live-edge slot");
+        assert!(should_hold_missing_slot(
+            true,
+            fifo_below_watermark,
+            emergency,
+            -1,
+            in_flight_wait_subframes(2),
+            Duration::from_millis(1),
+            grace,
+        ));
+        // A live-edge slot is still held while the packet interval has not
+        // elapsed, even with an otherwise comfortable FIFO.
+        assert!(should_hold_missing_slot(
+            true,
+            emergency,
+            emergency,
+            -1,
+            in_flight_wait_subframes(2),
+            Duration::from_millis(14),
+            grace,
+        ));
+        // Once the sender has been quiet for a full interval plus jitter
+        // allowance, the slot is genuinely missing and real PLC is required.
+        assert!(!should_hold_missing_slot(
+            true,
+            fifo_below_watermark,
+            emergency,
+            -1,
+            in_flight_wait_subframes(2),
+            Duration::from_millis(16),
+            grace,
+        ));
+
+        // An out-of-order hole is unchanged: wait only while real audio
+        // remains for the DAC.
+        assert!(should_hold_missing_slot(
+            true,
+            emergency,
+            emergency,
+            7,
+            in_flight_wait_subframes(4),
+            Duration::from_millis(1),
+            grace,
+        ));
+        assert!(!should_hold_missing_slot(
+            true,
+            fifo_below_watermark,
+            emergency,
+            7,
+            in_flight_wait_subframes(4),
+            Duration::from_millis(1),
+            grace,
+        ));
+        // A present slot never blocks the refill loop.
+        assert!(!should_hold_missing_slot(
+            false,
+            0,
+            emergency,
+            0,
+            in_flight_wait_subframes(2),
+            Duration::from_millis(0),
+            grace,
+        ));
+    }
+
+    #[test]
+    fn test_jitter_estimator_ignores_batched_packets() {
+        // The sender paces 10 ms packets, but the receive loop wakes every
+        // 20 ms (desktop timer granularity / Windows power-save), so each
+        // drain pass returns two packets back to back. Sampling the second
+        // packet compares a ~0 us receive gap with the sender's 10 ms
+        // timestamp gap and invents 10 ms of jitter.
+        const PACKET_US: u32 = 10_000;
+        const DRAIN_US: u32 = 20_000;
+        let mut old_jitter = 2500.0f32;
+        let mut old_prev: Option<(u32, u32)> = None;
+        let mut new_jitter = 2500.0f32;
+        let mut new_prev: Option<(u32, u32)> = None;
+
+        for drain in 1..=200u32 {
+            let rx_base = drain * DRAIN_US;
+            for packet in 0..2u32 {
+                // Both packets were sitting in the kernel queue when the
+                // loop woke, so their receive timestamps are one microsecond
+                // apart regardless of the 10 ms sender spacing.
+                let rx = rx_base + packet;
+                let tx = rx_base - PACKET_US + packet * PACKET_US;
+
+                // Old behavior: every drained packet updates the estimator
+                // and the previous-sample state.
+                if let Some((last_rx, last_tx)) = old_prev {
+                    let d_rx = rx.wrapping_sub(last_rx) as i32;
+                    let d_tx = tx.wrapping_sub(last_tx) as i32;
+                    let delta = (d_rx - d_tx).unsigned_abs().min(50_000) as f32;
+                    old_jitter += (delta - old_jitter) * (1.0 / 16.0);
+                }
+                old_prev = Some((rx, tx));
+
+                // Fixed behavior: only the first audio packet of the drain
+                // is a real arrival sample.
+                if packet == 0 {
+                    if let Some((last_rx, last_tx)) = new_prev {
+                        let d_rx = rx.wrapping_sub(last_rx) as i32;
+                        let d_tx = tx.wrapping_sub(last_tx) as i32;
+                        let delta = (d_rx - d_tx).unsigned_abs().min(50_000) as f32;
+                        new_jitter += (delta - new_jitter) * (1.0 / 16.0);
+                    }
+                    new_prev = Some((rx, tx));
+                }
+            }
+        }
+
+        let initial_floor = 6.0f32;
+        let old_floor = ((old_jitter / 2500.0) * 2.2).clamp(initial_floor, 14.0);
+        let new_floor = ((new_jitter / 2500.0) * 2.2).clamp(initial_floor, 14.0);
+        assert!(
+            old_jitter > 9_000.0,
+            "batched reads should inflate the old estimator, got {old_jitter} us"
+        );
+        assert!(
+            new_jitter < 500.0,
+            "first-packet-only sampling should stay stable, got {new_jitter} us"
+        );
+        assert!(
+            old_floor > new_floor + 2.0,
+            "old proactive floor {old_floor} should exceed fixed {new_floor}"
+        );
     }
 
     #[test]
