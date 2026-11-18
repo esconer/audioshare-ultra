@@ -978,6 +978,17 @@ impl ClientEngine {
                     err_cb,
                     None,
                 )?,
+                cpal::SampleFormat::F64 => device.build_output_stream(
+                    cfg,
+                    move |out: &mut [f64], _: &cpal::OutputCallbackInfo| {
+                        let frames = out.len() / ch;
+                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                            out[idx] = f64::from(s.clamp(-1.0, 1.0));
+                        });
+                    },
+                    err_cb,
+                    None,
+                )?,
                 _ => device.build_output_stream(
                     cfg,
                     move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
