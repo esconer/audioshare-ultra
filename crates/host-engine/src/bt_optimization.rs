@@ -27,15 +27,13 @@ impl RemoteMediaCommand {
     }
 }
 
+/// Extract the controlling card and active port of `default_sink` from
+/// `pactl list sinks` output.
+///
+/// BlueZ sinks expose `Card: N` but no `alsa.card` property, so accepting only
+/// the latter silently disabled the lip-sync offset for BT headphones.
 #[cfg(target_os = "linux")]
-fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
-    let def = Command::new("pactl").arg("get-default-sink").output().ok()?;
-    let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
-    if default_sink.is_empty() {
-        return None;
-    }
-    let sinks = Command::new("pactl").args(["list", "sinks"]).output().ok()?;
-    let text = String::from_utf8_lossy(&sinks.stdout);
+fn parse_default_sink_card_and_port(text: &str, default_sink: &str) -> Option<(String, String)> {
     let mut in_target = false;
     let mut card_idx: Option<String> = None;
     let mut active_port: Option<String> = None;
@@ -50,7 +48,9 @@ fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
         } else if let Some(name) = trimmed.strip_prefix("Name: ") {
             in_target = name.trim() == default_sink;
         } else if in_target {
-            if let Some(card) = trimmed.strip_prefix("alsa.card = \"") {
+            if let Some(card) = trimmed.strip_prefix("Card: ") {
+                card_idx = Some(card.trim().to_string());
+            } else if let Some(card) = trimmed.strip_prefix("alsa.card = \"") {
                 card_idx = Some(card.trim_end_matches('"').to_string());
             } else if let Some(port) = trimmed.strip_prefix("Active Port: ") {
                 active_port = Some(port.trim().to_string());
@@ -58,6 +58,18 @@ fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
         }
     }
     Some((card_idx?, active_port?))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
+    let def = Command::new("pactl").arg("get-default-sink").output().ok()?;
+    let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
+    if default_sink.is_empty() {
+        return None;
+    }
+    let sinks = Command::new("pactl").args(["list", "sinks"]).output().ok()?;
+    let text = String::from_utf8_lossy(&sinks.stdout);
+    parse_default_sink_card_and_port(&text, &default_sink)
 }
 
 /// Automatically informs Linux PipeWire/PulseAudio of the phone's downstream Bluetooth earbud delay
@@ -175,6 +187,50 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sink_card_parser_accepts_bluez_card_line() {
+        let listing = "\
+Sink #0
+\tState: SUSPENDED
+\tName: alsa_output.pci-0000_00_1f.3.analog-stereo
+\tCard: 0
+\tActive Port: analog-output-lineout
+
+Sink #1
+\tState: RUNNING
+\tName: bluez_sink.AA_BB_CC_DD_EE_FF.a2dp_sink
+\tCard: 3
+\tActive Port: a2dp-sink
+";
+        // BlueZ has no `alsa.card` property; `Card:` is the only card id.
+        assert_eq!(
+            parse_default_sink_card_and_port(listing, "bluez_sink.AA_BB_CC_DD_EE_FF.a2dp_sink"),
+            Some(("3".to_string(), "a2dp-sink".to_string()))
+        );
+        assert_eq!(
+            parse_default_sink_card_and_port(listing, "alsa_output.pci-0000_00_1f.3.analog-stereo"),
+            Some(("0".to_string(), "analog-output-lineout".to_string()))
+        );
+        assert_eq!(parse_default_sink_card_and_port(listing, "missing"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_sink_card_parser_prefers_alsa_card_property() {
+        let listing = "\
+Sink #2
+\tName: alsa_output.usb-Corsair
+\tCard: 4
+\talsa.card = \"7\"
+\tActive Port: analog-output
+";
+        assert_eq!(
+            parse_default_sink_card_and_port(listing, "alsa_output.usb-Corsair"),
+            Some(("7".to_string(), "analog-output".to_string()))
+        );
+    }
 
     #[test]
     fn test_remote_media_command() {
