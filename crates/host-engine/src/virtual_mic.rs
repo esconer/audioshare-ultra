@@ -442,12 +442,14 @@ impl PhoneMicReceiver {
                 // On Linux the pacat writer consumes the FIFO and feeds the
                 // AudioShare_Phone_Mic_Sink. On Windows, prefer VB-Cable's
                 // "CABLE Input" endpoint; otherwise use the default output.
+                // Do not retarget `PULSE_SINK`: mutating the process
+                // environment from this thread races with libc getenv() in
+                // every other thread (POSIX setenv is not thread-safe).
                 #[cfg(not(target_os = "android"))]
                 let _mic_out = {
                     #[cfg(target_os = "linux")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                            std::env::set_var("PULSE_SINK", "AudioShare_Phone_Mic_Sink");
                             if linux_output_active {
                                 None
                             } else {
@@ -459,7 +461,6 @@ impl PhoneMicReceiver {
                                 .ok()
                             }
                         } else {
-                            std::env::remove_var("PULSE_SINK");
                             crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
                                 Arc::clone(&mic_fifo_thread),
                                 None,
