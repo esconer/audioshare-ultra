@@ -18,10 +18,25 @@ pub struct ClockDriftResampler {
     pub ratio: f64,
     hist_l: [f32; 4],
     hist_r: [f32; 4],
-    short_ema_queue: f32,
-    min_queue_frames_window: f32,
+    /// Running sum of (observed queue depth - clock setpoint) over the current
+    /// 200-tick window. A windowed mean of the *error* cancels periodic HAL
+    /// burst sawtooths while tracking both positive and negative drift.
+    err_sum_window: f64,
     window_ticks: u32,
     integral_err: f64,
+    // 2nd-order Butterworth anti-aliasing LPF. Active only when the input rate
+    // exceeds the output rate by >2% (44.1 kHz A2DP, 96 kHz -> 48 kHz capture);
+    // completely bypassed (zero CPU cost) on native 48 kHz streams.
+    aa_active: bool,
+    aa_b0: f32,
+    aa_b1: f32,
+    aa_b2: f32,
+    aa_a1: f32,
+    aa_a2: f32,
+    aa_z1_l: f32,
+    aa_z2_l: f32,
+    aa_z1_r: f32,
+    aa_z2_r: f32,
 }
 
 impl ClockDriftResampler {
@@ -32,11 +47,78 @@ impl ClockDriftResampler {
             ratio: 1.0,
             hist_l: [0.0; 4],
             hist_r: [0.0; 4],
-            short_ema_queue: -1.0,
-            min_queue_frames_window: 999.0,
+            err_sum_window: 0.0,
             window_ticks: 0,
             integral_err: 0.0,
+            aa_active: false,
+            aa_b0: 1.0,
+            aa_b1: 0.0,
+            aa_b2: 0.0,
+            aa_a1: 0.0,
+            aa_a2: 0.0,
+            aa_z1_l: 0.0,
+            aa_z2_l: 0.0,
+            aa_z1_r: 0.0,
+            aa_z2_r: 0.0,
         }
+    }
+
+    /// Configure exact input -> output sample rates. Automatically enables the
+    /// Butterworth anti-aliasing filter only when downsampling (`ratio > 1.02`).
+    #[inline]
+    pub fn set_sample_rates(&mut self, input_rate_hz: u32, output_rate_hz: u32) {
+        let in_r = input_rate_hz.clamp(8_000, 384_000) as f64;
+        let out_r = output_rate_hz.clamp(8_000, 384_000) as f64;
+        let new_base = in_r / out_r;
+        if (new_base - self.base_ratio).abs() > 1e-9 {
+            self.base_ratio = new_base;
+            self.ratio = new_base;
+            self.err_sum_window = 0.0;
+            self.window_ticks = 0;
+            self.integral_err = 0.0;
+            self.configure_anti_aliasing(new_base);
+        }
+    }
+
+    fn configure_anti_aliasing(&mut self, base_ratio: f64) {
+        self.aa_z1_l = 0.0;
+        self.aa_z2_l = 0.0;
+        self.aa_z1_r = 0.0;
+        self.aa_z2_r = 0.0;
+        if base_ratio <= 1.02 {
+            self.aa_active = false;
+            return;
+        }
+        // Cutoff at 0.45 * output_rate expressed in input-rate normalized cycles.
+        let norm_fc = (0.45 / base_ratio).clamp(0.02, 0.46) as f32;
+        let w0 = std::f32::consts::TAU * norm_fc;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() * std::f32::consts::FRAC_1_SQRT_2;
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        self.aa_b0 = ((1.0 - cos_w0) * 0.5) * inv_a0;
+        self.aa_b1 = (1.0 - cos_w0) * inv_a0;
+        self.aa_b2 = self.aa_b0;
+        self.aa_a1 = (-2.0 * cos_w0) * inv_a0;
+        self.aa_a2 = (1.0 - alpha) * inv_a0;
+        self.aa_active = true;
+    }
+
+    #[inline(always)]
+    fn filter_input_pair(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        if !self.aa_active {
+            return (in_l, in_r);
+        }
+        const ANTI_DENORMAL: f32 = 1.0e-25;
+        let xl = in_l + ANTI_DENORMAL;
+        let yl = self.aa_b0 * xl + self.aa_z1_l;
+        self.aa_z1_l = self.aa_b1 * xl - self.aa_a1 * yl + self.aa_z2_l;
+        self.aa_z2_l = self.aa_b2 * xl - self.aa_a2 * yl;
+
+        let xr = in_r + ANTI_DENORMAL;
+        let yr = self.aa_b0 * xr + self.aa_z1_r;
+        self.aa_z1_r = self.aa_b1 * xr - self.aa_a1 * yr + self.aa_z2_r;
+        self.aa_z2_r = self.aa_b2 * xr - self.aa_a2 * yr;
+        (yl, yr)
     }
 
     /// Point the resampler at the sample rate AAudio actually opened.
@@ -51,15 +133,7 @@ impl ClockDriftResampler {
     /// observations were expressed in the previous output rate.
     #[inline]
     pub fn set_output_sample_rate(&mut self, output_rate_hz: u32) {
-        let new_base = (crate::SAMPLE_RATE as f64) / (output_rate_hz.clamp(8_000, 384_000) as f64);
-        if (new_base - self.base_ratio).abs() > 1e-9 {
-            self.base_ratio = new_base;
-            self.ratio = new_base;
-            self.short_ema_queue = -1.0;
-            self.min_queue_frames_window = 999.0;
-            self.window_ticks = 0;
-            self.integral_err = 0.0;
-        }
+        self.set_sample_rates(crate::SAMPLE_RATE, output_rate_hz);
     }
 
     /// Convert an output-sample count into 2.5 ms network subframes.
@@ -87,49 +161,40 @@ impl ClockDriftResampler {
     }
 
     /// Observe current queue depth every 2.5ms subframe.
-    /// Uses a 200-subframe (500ms) minimum envelope to reject Wi-Fi arrival jitter completely.
+    /// Uses a 200-subframe (500ms) error-relative windowed mean so periodic HAL
+    /// bursts cancel out while tracking both positive and negative crystal drift.
     #[inline]
     pub fn update_clock_loop(&mut self, current_queued_subframes: f32, target_min_subframes: f32) {
-        if self.short_ema_queue < 0.0 {
-            self.short_ema_queue = current_queued_subframes;
-        } else {
-            self.short_ema_queue = 0.85 * self.short_ema_queue + 0.15 * current_queued_subframes;
-        }
-        if self.short_ema_queue < self.min_queue_frames_window {
-            self.min_queue_frames_window = self.short_ema_queue;
-        }
+        self.err_sum_window += (current_queued_subframes - target_min_subframes) as f64;
         self.window_ticks += 1;
 
         if self.window_ticks >= 200 {
-            let err = (self.min_queue_frames_window - target_min_subframes) as f64;
+            let err = self.err_sum_window / (self.window_ticks as f64);
 
-            // Ignore sub-frame phase-beat noise in the integral accumulator.
-            // Without this deadband, a tiny persistent quantization offset
-            // slowly winds the integral and then releases it as a ratio step.
+            // Hold the learned crystal offset inside the deadband rather than
+            // decaying it (the old `*= 0.9` erased the offset every 500 ms).
+            // Anti-windup clamps per-window steps; +/-100.0 gives full
+            // +/-500 ppm steady-state integral authority for real crystals.
             if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
-                self.integral_err = (self.integral_err + err * 0.5).clamp(-10.0, 10.0);
-            } else {
-                self.integral_err *= 0.9;
+                let step = err.clamp(-1.0, 1.0) * 0.6;
+                self.integral_err = (self.integral_err + step).clamp(-100.0, 100.0);
             }
 
             // Dual-slope catch-up: +/- 500 ppm for normal drift, up to +2500 ppm after a Wi-Fi burst spike
             let (kp, max_clamp) = if err > 2.0 {
                 (0.00025, 0.0025)
             } else {
-                (0.00005, 0.0005)
+                (0.00012, 0.0005)
             };
             let corr = (kp * err + 0.000005 * self.integral_err).clamp(-0.0005, max_clamp);
             let target_ratio = self.base_ratio * (1.0 + corr);
 
-            // A ratio step every 500 ms modulates pitch. Large burst errors
-            // still snap immediately, but normal corrections slew over a few
-            // windows so the resampler phase stays continuous.
             if err > 2.0 {
                 self.ratio = target_ratio;
             } else {
                 self.ratio = 0.3 * self.ratio + 0.7 * target_ratio;
             }
-            self.min_queue_frames_window = 999.0;
+            self.err_sum_window = 0.0;
             self.window_ticks = 0;
         }
     }
@@ -183,8 +248,9 @@ impl ClockDriftResampler {
             while self.phase >= 1.0 && in_idx < in_frames {
                 self.hist_l.copy_within(1..4, 0);
                 self.hist_r.copy_within(1..4, 0);
-                self.hist_l[3] = in_stereo[in_idx * 2];
-                self.hist_r[3] = in_stereo[in_idx * 2 + 1];
+                let (fl, fr) = self.filter_input_pair(in_stereo[in_idx * 2], in_stereo[in_idx * 2 + 1]);
+                self.hist_l[3] = fl;
+                self.hist_r[3] = fr;
                 in_idx += 1;
                 self.phase -= 1.0;
             }
@@ -240,8 +306,9 @@ impl ClockDriftResampler {
                 ring.pop_exact_or_dither(&mut in_frame, dither_rng);
                 self.hist_l.copy_within(1..4, 0);
                 self.hist_r.copy_within(1..4, 0);
-                self.hist_l[3] = in_frame[0];
-                self.hist_r[3] = in_frame[1];
+                let (fl, fr) = self.filter_input_pair(in_frame[0], in_frame[1]);
+                self.hist_l[3] = fl;
+                self.hist_r[3] = fr;
                 self.phase -= 1.0;
             }
             let f = self.phase as f32;
@@ -265,8 +332,9 @@ impl ClockDriftResampler {
             ring.pop_exact_or_dither(&mut in_frame, dither_rng);
             self.hist_l.copy_within(1..4, 0);
             self.hist_r.copy_within(1..4, 0);
-            self.hist_l[3] = in_frame[0];
-            self.hist_r[3] = in_frame[1];
+            let (fl, fr) = self.filter_input_pair(in_frame[0], in_frame[1]);
+            self.hist_l[3] = fl;
+            self.hist_r[3] = fr;
             self.phase -= 1.0;
         }
     }
@@ -276,9 +344,12 @@ impl ClockDriftResampler {
 const FIFO_CAPACITY: usize = 32768; // Power of 2 (16384 stereo frames = 341 ms @ 48 kHz for full BT Group Sync)
 const FIFO_MASK: usize = FIFO_CAPACITY - 1;
 
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
 pub struct BurstDecouplerRing {
-    write_idx: AtomicUsize,
-    read_idx: AtomicUsize,
+    write_idx: CachePadded<AtomicUsize>,
+    read_idx: CachePadded<AtomicUsize>,
     buf: UnsafeCell<[f32; FIFO_CAPACITY]>,
 }
 
@@ -287,16 +358,16 @@ unsafe impl Sync for BurstDecouplerRing {}
 impl BurstDecouplerRing {
     pub fn new() -> Self {
         Self {
-            write_idx: AtomicUsize::new(0),
-            read_idx: AtomicUsize::new(0),
+            write_idx: CachePadded(AtomicUsize::new(0)),
+            read_idx: CachePadded(AtomicUsize::new(0)),
             buf: UnsafeCell::new([0.0; FIFO_CAPACITY]),
         }
     }
 
     #[inline]
     pub fn available_samples(&self) -> usize {
-        let w = self.write_idx.load(Ordering::Acquire);
-        let r = self.read_idx.load(Ordering::Acquire);
+        let w = self.write_idx.0.load(Ordering::Acquire);
+        let r = self.read_idx.0.load(Ordering::Acquire);
         w.wrapping_sub(r)
     }
 
@@ -311,8 +382,8 @@ impl BurstDecouplerRing {
 
     #[inline]
     pub fn push_samples(&self, samples: &[f32]) -> usize {
-        let w = self.write_idx.load(Ordering::Relaxed);
-        let r = self.read_idx.load(Ordering::Acquire);
+        let w = self.write_idx.0.load(Ordering::Relaxed);
+        let r = self.read_idx.0.load(Ordering::Acquire);
         let free = FIFO_CAPACITY - w.wrapping_sub(r);
         // The ring is stereo-interleaved. An odd write count would shift every
         // subsequent Left/Right pair by one sample, so always write whole frames.
@@ -324,7 +395,7 @@ impl BurstDecouplerRing {
                 *buf_ptr.add((w.wrapping_add(i)) & FIFO_MASK) = s;
             }
         }
-        self.write_idx
+        self.write_idx.0
             .store(w.wrapping_add(to_write), Ordering::Release);
         to_write
     }
@@ -332,8 +403,8 @@ impl BurstDecouplerRing {
     /// Pull exact `out.len()` samples required by Android AAudio hardware burst (e.g., 96, 128, or 192 stereo frames)
     #[inline]
     pub fn pop_exact_or_dither(&self, out: &mut [f32], dither_rng: &mut u32) -> bool {
-        let r = self.read_idx.load(Ordering::Relaxed);
-        let w = self.write_idx.load(Ordering::Acquire);
+        let r = self.read_idx.0.load(Ordering::Relaxed);
+        let w = self.write_idx.0.load(Ordering::Acquire);
         let avail = w.wrapping_sub(r);
         // The ring is stereo-interleaved. Advancing by an odd sample count
         // would make every later pull start on a Right sample, permanently
@@ -351,7 +422,7 @@ impl BurstDecouplerRing {
             if req_even < out.len() {
                 out[req_even] = 0.0;
             }
-            self.read_idx
+            self.read_idx.0
                 .store(r.wrapping_add(req_even), Ordering::Release);
             true
         } else if req_even > 0 && (avail & !1) > 0 {
@@ -388,7 +459,7 @@ impl BurstDecouplerRing {
                     last_r = s;
                 }
             }
-            self.read_idx
+            self.read_idx.0
                 .store(r.wrapping_add(safe_avail), Ordering::Release);
             for i in (safe_avail..out.len()).step_by(2) {
                 last_l *= 0.985;
@@ -415,8 +486,17 @@ pub struct TruePeakLimiter {
 }
 
 impl TruePeakLimiter {
+    #[inline]
+    fn gain_db_to_linear(gain_db: f32) -> f32 {
+        if gain_db <= -60.0 {
+            0.0
+        } else {
+            10.0f32.powf(gain_db.clamp(-60.0, 24.0) / 20.0)
+        }
+    }
+
     pub fn new(gain_db: f32) -> Self {
-        let g = 10.0f32.powf(gain_db.clamp(-24.0, 24.0) / 20.0);
+        let g = Self::gain_db_to_linear(gain_db);
         Self {
             current_gain_linear: g,
             target_gain_linear: g,
@@ -425,7 +505,7 @@ impl TruePeakLimiter {
     }
 
     pub fn set_gain_db(&mut self, gain_db: f32) {
-        self.target_gain_linear = 10.0f32.powf(gain_db.clamp(-24.0, 24.0) / 20.0);
+        self.target_gain_linear = Self::gain_db_to_linear(gain_db);
     }
 
     #[inline]
@@ -460,17 +540,35 @@ impl TruePeakLimiter {
             // that would actually exceed the ceiling.
             let unity_gain = (self.current_gain_linear - 1.0).abs() <= 1e-4
                 && (self.target_gain_linear - 1.0).abs() <= 1e-4;
-            if (!unity_gain || peak > CEILING) && self.envelope > THRESHOLD {
-                let over = self.envelope - THRESHOLD;
+            let det = self.envelope.max(peak);
+            if (!unity_gain || peak > CEILING) && det > THRESHOLD {
+                let over = det - THRESHOLD;
                 let compressed =
                     THRESHOLD + (CEILING - THRESHOLD) * (over / (over + (CEILING - THRESHOLD)));
-                let scale = compressed / self.envelope;
+                let scale = compressed / det;
                 l *= scale;
                 r *= scale;
             }
 
             frame[0] = l.clamp(-CEILING, CEILING);
             frame[1] = r.clamp(-CEILING, CEILING);
+        }
+    }
+}
+
+/// Transparent safety soft-clipper applied *after* fractional resampling so
+/// 4-point Hermite inter-sample overshoots (> 0.96) smoothly round off below
+/// 0.999 instead of hard-clipping in AAudio/CPAL. Bit-transparent <= 0.96.
+#[inline]
+pub fn soft_limit_post_resample(samples: &mut [f32]) {
+    const KNEE: f32 = 0.96;
+    const HEADROOM: f32 = 0.039; // asymptotic ceiling = 0.999
+    for s in samples.iter_mut() {
+        let a = s.abs();
+        if a > KNEE {
+            let over = a - KNEE;
+            let shaped = KNEE + HEADROOM * (over / (over + HEADROOM));
+            *s = shaped.copysign(*s);
         }
     }
 }
@@ -619,6 +717,48 @@ mod tests {
         assert_eq!(pushes, 64);
         assert_eq!(ring.available_samples(), watermark);
         assert!(watermark + subframe_samples <= ring.capacity_samples());
+    }
+
+    #[test]
+    fn test_anti_aliasing_filter_only_when_downsampling() {
+        let mut r = ClockDriftResampler::new();
+        r.set_sample_rates(48_000, 48_000);
+        assert!(!r.aa_active, "native 48 kHz must bypass the LPF");
+        r.set_sample_rates(48_000, 44_100);
+        assert!(r.aa_active, "48->44.1 kHz downsampling must enable the LPF");
+        r.set_sample_rates(96_000, 48_000);
+        assert!(r.aa_active, "96->48 kHz capture must enable the LPF");
+        // A 2 kHz tone through the filter path must stay finite and bounded.
+        let mut out = [0.0f32; 64];
+        let mut input = [0.0f32; 128];
+        for i in 0..64 {
+            let v = (i as f32 * 0.5).sin() * 0.5;
+            input[i * 2] = v;
+            input[i * 2 + 1] = v;
+        }
+        r.process(&input, &mut out);
+        assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn test_soft_limit_post_resample_bounds_overshoot() {
+        let mut s = [1.23f32, -1.23, 0.5, -0.5, 0.96, -0.96];
+        soft_limit_post_resample(&mut s);
+        assert!(s.iter().all(|v| v.abs() < 0.999));
+        assert_eq!(s[4], 0.96); // bit-transparent at/below the knee
+        assert_eq!(s[5], -0.96);
+        assert!(s[0] > 0.96 && s[0] < 0.999);
+    }
+
+    #[test]
+    fn test_burst_ring_indices_are_cache_line_padded() {
+        assert!(std::mem::align_of::<CachePadded<AtomicUsize>>() >= 64);
+        assert!(std::mem::size_of::<CachePadded<AtomicUsize>>() >= 64);
+        let ring = BurstDecouplerRing::new();
+        let off_w = std::mem::offset_of!(BurstDecouplerRing, write_idx);
+        let off_r = std::mem::offset_of!(BurstDecouplerRing, read_idx);
+        assert_ne!(off_w / 64, off_r / 64, "write/read indices share a cache line");
+        let _ = ring;
     }
 
     #[test]
@@ -799,19 +939,23 @@ mod tests {
     }
 
     #[test]
-    fn test_clock_drift_resampler_ema_smoothing() {
+    fn test_clock_drift_windowed_mean_rejects_single_tick_dip() {
         let mut resampler = ClockDriftResampler::new();
-        // Prime loop at 4.0 subframes
-        for _ in 0..50 {
+        // A locked stream with a single-tick packet-arrival dip must not be
+        // mistaken for drift: the error-relative windowed mean divides the
+        // -4 subframe dip across 200 ticks => -0.02, inside the deadband.
+        for _ in 0..200 {
             resampler.update_clock_loop(4.0, 4.0);
         }
-        // Inject a single-tick sudden packet arrival dip to 0.0
         resampler.update_clock_loop(0.0, 4.0);
-        // EMA smoothing must prevent min_queue_frames_window from crashing directly to 0.0
+        for _ in 0..199 {
+            resampler.update_clock_loop(4.0, 4.0);
+        }
+        let corr_ppm = (resampler.ratio / resampler.base_ratio - 1.0) * 1e6;
         assert!(
-            resampler.min_queue_frames_window > 2.0,
-            "EMA must cushion against single-tick packet arrival dips: {}",
-            resampler.min_queue_frames_window
+            corr_ppm.abs() < 20.0,
+            "single-tick dip must not move the clock lock: {} ppm",
+            corr_ppm
         );
     }
 
@@ -826,7 +970,7 @@ mod tests {
         // Target correction for err=1.0 is ~52.5 ppm. The first window must
         // apply only part of it instead of jumping to the full target.
         assert!(
-            first_ratio < 1.000_05,
+            first_ratio < 1.000_10,
             "normal ratio correction must slew, got {}",
             first_ratio
         );
