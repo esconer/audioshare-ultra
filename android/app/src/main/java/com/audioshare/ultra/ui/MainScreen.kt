@@ -25,21 +25,27 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.audioshare.ultra.service.AudioEngineService
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 private fun usToMs(us: Long): String = "%.1f".format(us / 1000.0)
@@ -53,219 +59,36 @@ private fun codecModeName(mode: Long): String = when (mode.toInt()) {
     else -> "Unknown"
 }
 
-@Composable
-private fun StudioCard(
-    modifier: Modifier = Modifier,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    OutlinedCard(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.outlinedCardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.78f)
-        ),
-        border = BorderStroke(1.dp, Color(0xFF243047))
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            content = content
-        )
-    }
-}
-
-@Composable
-private fun StatusBadge(
-    text: String,
-    containerColor: Color = Color(0xFF1A2436),
-    contentColor: Color = Color(0xFFCBD5E1),
-    onClick: (() -> Unit)? = null
-) {
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = containerColor,
-        contentColor = contentColor,
-        border = BorderStroke(1.dp, Color(0xFF2B3852)),
-        modifier = if (onClick != null) Modifier.clickable { onClick() } else Modifier
-    ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelSmall,
-            fontFamily = FontFamily.Monospace,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-        )
-    }
-}
-
-@Composable
-private fun MetricTile(label: String, value: String, modifier: Modifier = Modifier) {
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(10.dp),
-        color = Color(0xFF0E131D),
-        border = BorderStroke(1.dp, Color(0xFF202A3E))
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                text = value,
-                style = MaterialTheme.typography.bodyMedium,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
-    }
-}
-
-@Composable
-private fun SettingSwitchRow(
-    title: String,
-    subtitle: String,
-    checked: Boolean,
-    enabled: Boolean = true,
-    badgeText: String? = null,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Surface(
-        shape = RoundedCornerShape(10.dp),
-        color = Color(0xFF0E131D),
-        border = BorderStroke(1.dp, if (checked) Color(0xFF2563EB) else Color(0xFF202A3E)),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(end = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    if (badgeText != null) {
-                        StatusBadge(
-                            text = badgeText,
-                            containerColor = Color(0xFF14532D),
-                            contentColor = Color(0xFF86EFAC)
-                        )
-                    }
-                }
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Switch(
-                checked = checked,
-                enabled = enabled,
-                onCheckedChange = onCheckedChange
-            )
-        }
-    }
-}
-
-@Composable
-private fun ProDrawerHeader(
-    title: String,
-    badge: String,
-    expanded: Boolean,
-    onToggle: () -> Unit
-) {
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = if (expanded) Color(0xFF172238) else Color(0xFF121826),
-        border = BorderStroke(1.dp, if (expanded) Color(0xFF3B82F6) else Color(0xFF243047)),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onToggle() }
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "${if (expanded) "▾" else "▸"}  $title",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f)
-            )
-            StatusBadge(
-                text = badge,
-                containerColor = Color(0xFF1E293B),
-                contentColor = Color(0xFF93C5FD)
-            )
-        }
-    }
-}
-
-@Composable
-private fun StudioFaderRow(
-    title: String,
-    freqLabel: String,
-    value: Float,
-    valueRange: ClosedFloatingPointRange<Float>,
-    onValueChange: (Float) -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium
-                )
-                if (freqLabel.isNotEmpty()) {
-                    StatusBadge(text = freqLabel)
-                }
-            }
-            val boosted = abs(value) >= 0.05f
-            StatusBadge(
-                text = "${"%+.1f".format(value)} dB",
-                containerColor = if (boosted) Color(0xFF1E3A5F) else Color(0xFF1A2436),
-                contentColor = if (boosted) Color(0xFF93C5FD) else Color(0xFF94A3B8),
-                onClick = { onValueChange(0f) }
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = valueRange
-        )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val snackbarHostState = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
+    var showQrScanner by remember { mutableStateOf(false) }
+    var showToolsSheet by remember { mutableStateOf(false) }
+    var pendingEncryptedHost by remember { mutableStateOf<String?>(null) }
+    var promptPinInput by remember { mutableStateOf("") }
+    var vuPeakHold by remember { mutableFloatStateOf(0f) }
+
+    val cameraPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            showQrScanner = true
+        } else {
+            scope.launch {
+                snackbarHostState.showSnackbar("Camera permission needed to scan the PC QR code")
+            }
+        }
+    }
+    fun launchQrScanner() {
+        val granted = ContextCompat.checkSelfPermission(
+            context, Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) showQrScanner = true else cameraPermLauncher.launch(Manifest.permission.CAMERA)
+    }
     val prefs = remember {
         context.getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
     }
@@ -418,12 +241,28 @@ fun MainScreen() {
                         AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
                         false
                     )
+                } else if (intent?.action == AudioEngineService.ACTION_SLEEP_TIMER_STATE) {
+                    sleepTimerMinutes = intent.getIntExtra(
+                        AudioEngineService.EXTRA_SLEEP_REMAINING_MINS,
+                        0
+                    )
+                } else if (intent?.action == AudioEngineService.ACTION_STREAM_STATE) {
+                    isConnected = intent.getBooleanExtra(
+                        AudioEngineService.EXTRA_STREAM_ACTIVE,
+                        false
+                    )
+                    val err = intent.getStringExtra(AudioEngineService.EXTRA_STREAM_ERROR)
+                    if (!err.isNullOrBlank()) {
+                        scope.launch { snackbarHostState.showSnackbar(err) }
+                    }
                 }
             }
         }
         val filter = IntentFilter().apply {
             addAction(AudioEngineService.ACTION_PARTY_CAST_STATE)
             addAction(AudioEngineService.ACTION_PHONE_MIC_STATE)
+            addAction(AudioEngineService.ACTION_SLEEP_TIMER_STATE)
+            addAction(AudioEngineService.ACTION_STREAM_STATE)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -436,6 +275,27 @@ fun MainScreen() {
                 context.unregisterReceiver(receiver)
             } catch (_: Exception) {
             }
+        }
+    }
+
+    // Route every "connect" gesture through one place. True connection state
+    // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
+    fun connectToHost(addr: String, isUsb: Boolean, pin: String) {
+        hostAddress = addr
+        prefs.edit()
+            .putString("last_host_addr", addr)
+            .putString("pin_code", pin)
+            .apply()
+        val intent = Intent(context, AudioEngineService::class.java).apply {
+            putExtra("HOST_ADDR", addr)
+            putExtra("IS_USB", isUsb)
+            putExtra("GAIN_DB", preampGainDb)
+            putExtra("PIN", pin)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
         }
     }
 
@@ -561,18 +421,8 @@ fun MainScreen() {
         }
     }
 
-    // Sleep Timer Countdown Coroutine (Auto-stops stream after 15/30/60 minutes)
-    LaunchedEffect(sleepTimerMinutes, isConnected) {
-        if (sleepTimerMinutes > 0 && isConnected) {
-            delay(sleepTimerMinutes * 60_000L)
-            val stopIntent = Intent(context, AudioEngineService::class.java).apply {
-                action = "ACTION_STOP"
-            }
-            context.startService(stopIntent)
-            isConnected = false
-            sleepTimerMinutes = 0
-        }
-    }
+    // Sleep timer is now owned by AudioEngineService: the countdown survives
+    // screen-off and rotation, and publishes ACTION_SLEEP_TIMER_STATE here.
 
     // 1-Tap auto-discovery: the native UDP beacon scanner runs in the Rust JNI layer
     var discoveredHosts by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -622,11 +472,42 @@ fun MainScreen() {
             }
 
             btEarbudsDetected = telemetry.getOrElse(17) { 0L } > 0L
-            delay(250)
+            // Telemetry index 24 is the client's post-volume VU peak (0..100).
+            val vuNow = telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
+            vuPeakHold = if (vuNow >= vuPeakHold) {
+                vuNow.toFloat()
+            } else {
+                (vuPeakHold - 3.0f).coerceAtLeast(0f)
+            }
+            // ~16Hz refresh while connected keeps the hero visualizer fluid.
+            delay(if (isConnected) 60 else 250)
         }
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
+        bottomBar = {
+            NavigationBar(containerColor = Color(0xFF0E131D)) {
+                NavigationBarItem(
+                    selected = selectedTab == 0,
+                    onClick = { selectedTab = 0 },
+                    icon = { Icon(Icons.Rounded.Wifi, contentDescription = null) },
+                    label = { Text("Connect") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 1,
+                    onClick = { selectedTab = 1 },
+                    icon = { Icon(Icons.Rounded.Equalizer, contentDescription = null) },
+                    label = { Text("Audio & EQ") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    icon = { Icon(Icons.Rounded.Podcasts, contentDescription = null) },
+                    label = { Text("Mic & Party") }
+                )
+            }
+        },
         topBar = {
             TopAppBar(
                 title = {
@@ -677,9 +558,20 @@ fun MainScreen() {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // =====================================================================
-            // PERSISTENT HERO STATUS BANNER
+            // ATMOSPHERIC HERO AUDIO STAGE (single calm focal point)
             // =====================================================================
-            StudioCard {
+            val heroGlow = when {
+                castPhoneInternalAudio && !isConnected -> Color(0xFFA855F7)
+                sharePhoneMic && !isConnected -> StudioColors.Accent
+                !isConnected -> StudioColors.Muted
+                else -> StudioColors.LiveGlow
+            }
+            HeroAudioStage(
+                glowColor = heroGlow,
+                energyFraction = if (isConnected) {
+                    telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100) / 100f
+                } else 0f
+            ) {
                 val authErr = telemetry.getOrElse(5) { 0L }
                 val idleSecs = telemetry.getOrElse(6) { 0L }
                 val dtxSilent = telemetry.getOrElse(7) { 0L } == 1L
@@ -691,22 +583,31 @@ fun MainScreen() {
                 val partyCodec = (partyPacked shr 8) and 0xFFL
                 val partySyncMs = telemetry.getOrElse(23) { 0L }
 
-                val statusTitle = when {
+                val (statusTitle, dotColor) = when {
                     castPhoneInternalAudio && !isConnected ->
-                        "🟣 Party Broadcast Live — $partyListeners Peer(s) • ${codecModeName(partyCodec)} • Sync +${partySyncMs}ms"
+                        "Party Broadcast • $partyListeners Peer(s) • ${codecModeName(partyCodec)} • Sync +${partySyncMs}ms" to Color(0xFFA855F7)
                     sharePhoneMic && !isConnected ->
-                        "🎙️ Wireless Microphone Live — Streaming 48 kHz to $hostAddress"
-                    !isConnected -> "⚪ Ready to Connect — Select a host below or scan QR"
-                    authErr > 5 -> "🔴 Wrong Encryption PIN! ($authErr packets rejected)"
-                    idleSecs >= 3 -> "⚠️ Host Signal Lost (${idleSecs}s) — Reconnecting..."
-                    dtxSilent -> "🔋 Smart DTX Standby (-90 dBFS BT Keep-Alive)"
-                    else -> "🟢 Streaming 48 kHz • ${codecModeName(codecMode)}"
+                        "Wireless Mic Active -> $hostAddress" to StudioColors.Accent
+                    !isConnected ->
+                        "Ready to Connect" to StudioColors.Muted
+                    authErr > 5 ->
+                        "Wrong Encryption PIN ($authErr rejected)" to StudioColors.DangerSoft
+                    idleSecs >= 3 ->
+                        "Host Signal Lost (${idleSecs}s) — Waiting..." to StudioColors.WarnFg
+                    dtxSilent ->
+                        "Smart DTX Standby (-90 dBFS BT Keep-Alive)" to StudioColors.AccentSoft
+                    else ->
+                        "Streaming 48 kHz • ${codecModeName(codecMode)}" to StudioColors.OkFg
                 }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    PulsingStatusDot(
+                        active = isConnected || castPhoneInternalAudio || sharePhoneMic,
+                        color = dotColor
+                    )
                     Text(
                         text = statusTitle,
                         style = MaterialTheme.typography.titleSmall,
@@ -720,6 +621,18 @@ fun MainScreen() {
                             contentColor = Color(0xFF93C5FD)
                         )
                     }
+                    if (sleepTimerMinutes > 0) {
+                        StatusBadge(
+                            text = "${sleepTimerMinutes}m",
+                            containerColor = StudioColors.AccentDeep,
+                            contentColor = StudioColors.AccentSoft
+                        )
+                    }
+                }
+                if (isConnected) {
+                    val vuNow = telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
+                    StudioLedVuMeter(vuPct = vuNow, peakHoldPct = vuPeakHold)
+                    FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
                 }
                 if (isConnected) {
                     Row(
@@ -748,16 +661,7 @@ fun MainScreen() {
                 }
             }
 
-            // 3-Tab Material 3 Navigation Bar
-            TabRow(
-                selectedTabIndex = selectedTab,
-                containerColor = MaterialTheme.colorScheme.surface,
-                contentColor = MaterialTheme.colorScheme.primary
-            ) {
-                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Connect") })
-                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Audio & Tune") })
-                Tab(selected = selectedTab == 2, onClick = { selectedTab = 2 }, text = { Text("Mic & Party") })
-            }
+            // Tab navigation moved to the ergonomic bottom NavigationBar above.
 
             if (selectedTab == 0) {
                 // 0. 1-Tap OEM Battery / Doze Exemption Banner
@@ -768,11 +672,22 @@ fun MainScreen() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                "⚡ Disable Battery Throttling for 0-Jitter Screen-Off Audio",
+                            Row(
                                 modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.bodySmall
-                            )
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Bolt,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = StudioColors.WarnFg
+                                )
+                                Text(
+                                    "Disable Battery Throttling for 0-Jitter Screen-Off Audio",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
                             OutlinedButton(onClick = {
                                 try {
                                     val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
@@ -815,30 +730,39 @@ fun MainScreen() {
                             val name = parts.getOrNull(0) ?: entry
                             val addr = parts.getOrNull(1) ?: entry
                             val mode = parts.getOrNull(2) ?: "WiFi"
+                            // 4th JNI CSV field is the beacon's enc=0/1 flag.
+                            val encrypted = parts.getOrNull(3) == "1"
                             val kind = if (name.contains("Party")) "Party Phone" else "PC"
                             FilledTonalButton(
                                 onClick = {
-                                    hostAddress = addr
-                                    prefs.edit()
-                                        .putString("last_host_addr", hostAddress)
-                                        .putString("pin_code", pinCode)
-                                        .apply()
-                                    val intent = Intent(context, AudioEngineService::class.java).apply {
-                                        putExtra("HOST_ADDR", hostAddress)
-                                        putExtra("IS_USB", mode.equals("USB", ignoreCase = true))
-                                        putExtra("GAIN_DB", preampGainDb)
-                                        putExtra("PIN", pinCode)
-                                    }
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                        context.startForegroundService(intent)
+                                    if (encrypted && pinCode.isBlank()) {
+                                        pendingEncryptedHost = entry
+                                        promptPinInput = ""
                                     } else {
-                                        context.startService(intent)
+                                        connectToHost(
+                                            addr,
+                                            mode.equals("USB", ignoreCase = true),
+                                            pinCode
+                                        )
                                     }
-                                    isConnected = true
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("▶  [$mode] $kind: $name ($addr)")
+                                Icon(
+                                    if (mode.equals("USB", ignoreCase = true)) Icons.Rounded.Usb
+                                    else Icons.Rounded.Wifi,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text("$kind: $name ($addr)", modifier = Modifier.weight(1f))
+                                if (encrypted) {
+                                    Icon(
+                                        Icons.Rounded.Lock,
+                                        contentDescription = "Encrypted",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
                     } else {
@@ -869,7 +793,7 @@ fun MainScreen() {
                                 } else {
                                     context.startService(intent)
                                 }
-                                isConnected = true
+                                // Real result arrives via ACTION_STREAM_STATE.
                             }
                         },
                         modifier = Modifier
@@ -884,41 +808,49 @@ fun MainScreen() {
                             )
                         }
                     ) {
+                        Icon(
+                            if (isConnected) Icons.Rounded.Stop else Icons.Rounded.PlayArrow,
+                            contentDescription = null
+                        )
+                        Spacer(Modifier.width(8.dp))
                         Text(
-                            if (isConnected) "■  Disconnect Stream" else "▶  Connect Lossless Stream",
+                            if (isConnected) "Disconnect Stream" else "Connect Lossless Stream",
                             fontWeight = FontWeight.Bold
                         )
                     }
 
+                    // Sleek 3-pill quick action dock: secondary tools are in the
+                    // ModalBottomSheet below so the primary flow stays uncluttered.
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        OutlinedButton(
+                        FilledTonalButton(
                             onClick = { hostAddress = "127.0.0.1:65530" },
+                            shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("USB ADB")
+                            Icon(Icons.Rounded.Usb, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("USB", maxLines = 1)
                         }
-                        OutlinedButton(
-                            onClick = {
-                                try {
-                                    val qrIntent = Intent("com.google.zxing.client.android.SCAN")
-                                    context.startActivity(qrIntent)
-                                } catch (_: Exception) {
-                                    val camIntent = Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)
-                                    context.startActivity(camIntent)
-                                }
-                            },
+                        FilledTonalButton(
+                            onClick = { launchQrScanner() },
+                            shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Scan QR")
+                            Icon(Icons.Rounded.QrCodeScanner, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("QR", maxLines = 1)
                         }
-                        OutlinedButton(
-                            onClick = { showManualConnect = !showManualConnect },
+                        FilledTonalButton(
+                            onClick = { showToolsSheet = true },
+                            shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text(if (showManualConnect) "Hide IP" else "IP / PIN")
+                            Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Tools", maxLines = 1)
                         }
                     }
 
@@ -971,32 +903,64 @@ fun MainScreen() {
                         OutlinedButton(
                             onClick = { AudioEngineService.nativeSendMediaCommand(12) },
                             modifier = Modifier.weight(1f)
-                        ) { Text("⏮ Prev") }
+                        ) {
+                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
+                        }
                         FilledTonalButton(
                             onClick = { AudioEngineService.nativeSendMediaCommand(10) },
                             modifier = Modifier.weight(1.4f)
-                        ) { Text("⏯ Play / Pause") }
+                        ) {
+                            Icon(Icons.Rounded.PlayArrow, contentDescription = "Play / Pause")
+                            Spacer(Modifier.width(4.dp))
+                            Text("Play / Pause")
+                        }
                         OutlinedButton(
                             onClick = { AudioEngineService.nativeSendMediaCommand(11) },
                             modifier = Modifier.weight(1f)
-                        ) { Text("⏭ Next") }
+                        ) {
+                            Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
+                        }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Sleep Timer:", style = MaterialTheme.typography.labelMedium)
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
-                                FilterChip(
-                                    selected = sleepTimerMinutes == mins,
-                                    onClick = { sleepTimerMinutes = mins },
-                                    label = { Text(lbl) }
-                                )
-                            }
+                    Text("Sleep Timer:", style = MaterialTheme.typography.labelMedium)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
+                            FilterChip(
+                                selected = (mins == 0 && sleepTimerMinutes == 0) ||
+                                    (mins > 0 && sleepTimerMinutes > 0 && sleepTimerMinutes <= mins),
+                                onClick = {
+                                    runCatching {
+                                        context.startService(
+                                            Intent(context, AudioEngineService::class.java).apply {
+                                                action = AudioEngineService.ACTION_SET_SLEEP_TIMER
+                                                putExtra("MINUTES", mins)
+                                            }
+                                        )
+                                    }
+                                },
+                                label = { Text(lbl) }
+                            )
                         }
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                                .getOrDefault("Diagnostics unavailable")
+                            clipboard.setText(AnnotatedString(diag))
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Diagnostics copied to clipboard")
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(
+                            Icons.Rounded.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Copy Diagnostics Report")
                     }
                 }
 
@@ -1149,6 +1113,67 @@ fun MainScreen() {
             } // End Tab 0
 
             if (selectedTab == 1) {
+                // 4 intent-driven host quality cards, surfaced directly on the tab.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ModePresetCard(
+                        title = "Smart Auto",
+                        subtitle = "Lossless / Opus",
+                        badge = "Default",
+                        selected = qualityMode == 0,
+                        onClick = {
+                            qualityMode = 0
+                            prefs.edit().putInt("quality_mode", 0).apply()
+                            AudioEngineService.nativeSendMediaCommand(1)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ModePresetCard(
+                        title = "Studio Lossless",
+                        subtitle = "Bit-exact 0ms",
+                        badge = if (qualityMode == 4) "24-Bit" else "16-Bit",
+                        selected = qualityMode == 1 || qualityMode == 4,
+                        onClick = {
+                            qualityMode = 1
+                            prefs.edit().putInt("quality_mode", 1).apply()
+                            AudioEngineService.nativeSendMediaCommand(2)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ModePresetCard(
+                        title = "Smooth Wi-Fi",
+                        subtitle = "Best for 2.4G / BT",
+                        badge = "Opus ${compressedBitrateKbps}k",
+                        selected = qualityMode == 2,
+                        onClick = {
+                            qualityMode = 2
+                            prefs.edit().putInt("quality_mode", 2).apply()
+                            AudioEngineService.nativeSendMediaCommand(3)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ModePresetCard(
+                        title = "Max Range",
+                        subtitle = "Through walls",
+                        badge = "10 ms",
+                        selected = qualityMode == 3,
+                        onClick = {
+                            qualityMode = 3
+                            prefs.edit().putInt("quality_mode", 3).apply()
+                            AudioEngineService.nativeSendMediaCommand(4)
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                SectionEyebrow("Sound Profile")
+
                 // =====================================================================
                 // 1. SIMPLE SOUND PRESETS & MASTER PRE-AMP (Always Visible)
                 // =====================================================================
@@ -1174,11 +1199,10 @@ fun MainScreen() {
                         }
                     }
 
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         listOf(
                             Triple("Flat Studio", 0f, 0f) to 0f,
@@ -1310,11 +1334,10 @@ fun MainScreen() {
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             listOf(
                                 0 to "Stereo",
@@ -1361,11 +1384,10 @@ fun MainScreen() {
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             listOf(
                                 0 to "Smart Auto",
@@ -1391,11 +1413,10 @@ fun MainScreen() {
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             FilterChip(
                                 selected = !useOpus,
@@ -1431,11 +1452,10 @@ fun MainScreen() {
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 bitrateChoices.forEachIndexed { idx, kbps ->
                                     FilterChip(
@@ -1587,5 +1607,135 @@ fun MainScreen() {
                 }
             } // End Tab 2
         }
+    }
+
+    // Secondary Connect tools, tucked away from the primary flow.
+    if (showToolsSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showToolsSheet = false },
+            containerColor = StudioColors.CardBg
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+                    .navigationBarsPadding(),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                SectionEyebrow("Remote PC Playback")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { AudioEngineService.nativeSendMediaCommand(12) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
+                    }
+                    FilledTonalButton(
+                        onClick = { AudioEngineService.nativeSendMediaCommand(10) },
+                        modifier = Modifier.weight(1.4f)
+                    ) {
+                        Icon(Icons.Rounded.PlayArrow, contentDescription = "Play / Pause")
+                        Spacer(Modifier.width(4.dp))
+                        Text("Play / Pause")
+                    }
+                    OutlinedButton(
+                        onClick = { AudioEngineService.nativeSendMediaCommand(11) },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
+                    }
+                }
+                SectionEyebrow("Sleep Timer")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
+                        FilterChip(
+                            selected = (mins == 0 && sleepTimerMinutes == 0) ||
+                                (mins > 0 && sleepTimerMinutes > 0 && sleepTimerMinutes <= mins),
+                            onClick = {
+                                runCatching {
+                                    context.startService(
+                                        Intent(context, AudioEngineService::class.java).apply {
+                                            action = AudioEngineService.ACTION_SET_SLEEP_TIMER
+                                            putExtra("MINUTES", mins)
+                                        }
+                                    )
+                                }
+                            },
+                            label = { Text(lbl) }
+                        )
+                    }
+                }
+                SectionEyebrow("Manual Host IP & PIN")
+                OutlinedTextField(
+                    value = hostAddress,
+                    onValueChange = { hostAddress = it },
+                    label = { Text("Host IP:Port") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = pinCode,
+                    onValueChange = { pinCode = it },
+                    label = { Text("PIN (Optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+
+    if (showQrScanner) {
+        QrScannerDialog(
+            onDismiss = { showQrScanner = false },
+            onScanned = { host, pin ->
+                showQrScanner = false
+                connectToHost(host, false, pin)
+            }
+        )
+    }
+
+    // Tapping an encrypted host prompts for its PIN in one gesture.
+    pendingEncryptedHost?.let { entry ->
+        val parts = entry.split("|")
+        val encAddr = parts.getOrNull(1) ?: entry
+        AlertDialog(
+            onDismissRequest = { pendingEncryptedHost = null },
+            title = { Text("Encrypted Host") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Enter the pairing PIN for $encAddr")
+                    OutlinedTextField(
+                        value = promptPinInput,
+                        onValueChange = { promptPinInput = it },
+                        label = { Text("PIN") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val host = pendingEncryptedHost ?: return@TextButton
+                    val p = host.split("|")
+                    val addr = p.getOrNull(1) ?: host
+                    val isUsb = p.getOrNull(2).equals("USB", ignoreCase = true)
+                    pendingEncryptedHost = null
+                    if (promptPinInput.isBlank()) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("PIN is required for this host")
+                        }
+                    } else {
+                        connectToHost(addr, isUsb, promptPinInput)
+                    }
+                }) { Text("Connect") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingEncryptedHost = null }) { Text("Cancel") }
+            }
+        )
     }
 }

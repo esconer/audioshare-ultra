@@ -53,6 +53,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val EXTRA_PHONE_MIC_ACTIVE = "PHONE_MIC_ACTIVE"
         const val ACTION_SET_BT_OFFSET = "ACTION_SET_BT_OFFSET"
         const val ACTION_CLEAR_LOCAL_MUTE = "ACTION_CLEAR_LOCAL_MUTE"
+        // Service-owned sleep timer: the countdown lives here so screen-off and
+        // Activity recreation can no longer kill it.
+        const val ACTION_SET_SLEEP_TIMER = "ACTION_SET_SLEEP_TIMER"
+        const val ACTION_SLEEP_TIMER_STATE = "ACTION_SLEEP_TIMER_STATE"
+        const val EXTRA_SLEEP_REMAINING_MINS = "SLEEP_REMAINING_MINS"
+        // Stream connect result is broadcast so the UI can show a real error
+        // Snackbar instead of optimistically claiming a successful connection.
+        const val ACTION_STREAM_STATE = "ACTION_STREAM_STATE"
+        const val EXTRA_STREAM_ACTIVE = "STREAM_ACTIVE"
+        const val EXTRA_STREAM_ERROR = "STREAM_ERROR"
 
         @Volatile
         var isPartyCasting: Boolean = false
@@ -60,6 +70,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @Volatile
         var isPhoneMicActive: Boolean = false
+            private set
+
+        @Volatile
+        var sleepRemainingMinutes: Int = 0
             private set
 
         @JvmStatic
@@ -112,6 +126,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeGetRealtimeTids(): IntArray
+
+        @JvmStatic
+        external fun nativeGetDiagnostics(): String
     }
 
     private var wifiLock: WifiManager.WifiLock? = null
@@ -143,6 +160,18 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // next half-second without accumulating delayed callbacks.
     private val adpfHandler = Handler(Looper.getMainLooper())
     private val adpfRefreshRunnable = Runnable { refreshAdpfHintSession() }
+    private val sleepHandler = Handler(Looper.getMainLooper())
+    private val sleepTickRunnable = object : Runnable {
+        override fun run() {
+            if (sleepRemainingMinutes <= 1) {
+                broadcastSleepTimer(0)
+                stopStreamAndService()
+            } else {
+                broadcastSleepTimer(sleepRemainingMinutes - 1)
+                sleepHandler.postDelayed(this, 60_000L)
+            }
+        }
+    }
 
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
@@ -256,6 +285,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
             return START_STICKY
         }
+        if (intent?.action == ACTION_SET_SLEEP_TIMER) {
+            val mins = intent.getIntExtra("MINUTES", 0).coerceAtLeast(0)
+            sleepHandler.removeCallbacks(sleepTickRunnable)
+            broadcastSleepTimer(mins)
+            if (mins > 0) {
+                sleepHandler.postDelayed(sleepTickRunnable, 60_000L)
+            }
+            return START_STICKY
+        }
         if (intent?.action == "ACTION_START_CAST_GUARD") {
             // Standalone Mic / Party Host Mode: Hold ForegroundService + Low-Latency WifiLock + WakeLock
             // so Android never kills the microphone or Party Cast when the screen turns off!
@@ -321,10 +359,24 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
 
         isStreaming = nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
-        if (!isStreaming && !isPartyCasting && !micCaptureActive) {
-            stopStreamAndService()
-            return START_NOT_STICKY
+        if (!isStreaming) {
+            if (!isPartyCasting && !micCaptureActive) {
+                // stopStreamAndService() emits a clean false state; send the
+                // error AFTER teardown so the Snackbar text is not overwritten.
+                stopStreamAndService()
+                broadcastStreamState(
+                    false,
+                    "Unable to connect to $hostAddr (check IP, firewall, or USB)"
+                )
+                return START_NOT_STICKY
+            }
+            broadcastStreamState(
+                false,
+                "Unable to connect to $hostAddr (check IP, firewall, or USB)"
+            )
+            return START_STICKY
         }
+        broadcastStreamState(true, null)
         // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
         // Lock and the Dolby/system-effects preference automatically!
         applyDspFromPrefs()
@@ -833,6 +885,24 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         sendBroadcast(intent)
     }
 
+    private fun broadcastSleepTimer(minutes: Int) {
+        sleepRemainingMinutes = minutes
+        val intent = Intent(ACTION_SLEEP_TIMER_STATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_SLEEP_REMAINING_MINS, minutes)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastStreamState(active: Boolean, error: String?) {
+        val intent = Intent(ACTION_STREAM_STATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_STREAM_ACTIVE, active)
+            if (error != null) putExtra(EXTRA_STREAM_ERROR, error)
+        }
+        sendBroadcast(intent)
+    }
+
     private fun startForegroundNotification(
         hostAddr: String,
         isUsb: Boolean,
@@ -961,6 +1031,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeStopPhoneMic()
         nativeStopClient()
         isStreaming = false
+        sleepHandler.removeCallbacks(sleepTickRunnable)
+        broadcastSleepTimer(0)
+        broadcastStreamState(false, null)
         micCaptureActive = false
         broadcastPartyCastState(false)
         broadcastPhoneMicState(false)
