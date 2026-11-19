@@ -113,9 +113,18 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Build APK
+      - name: Decode release keystore (if configured) & build R8 APK
         working-directory: ./android
+        env:
+          AUDIOSHARE_KEYSTORE_BASE64: ${{ secrets.AUDIOSHARE_KEYSTORE_BASE64 }}
+          AUDIOSHARE_KEYSTORE_PASSWORD: ${{ secrets.AUDIOSHARE_KEYSTORE_PASSWORD }}
+          AUDIOSHARE_KEY_ALIAS: ${{ secrets.AUDIOSHARE_KEY_ALIAS }}
+          AUDIOSHARE_KEY_PASSWORD: ${{ secrets.AUDIOSHARE_KEY_PASSWORD }}
         run: |
+          if [ -n "$AUDIOSHARE_KEYSTORE_BASE64" ]; then
+            echo "$AUDIOSHARE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            export AUDIOSHARE_KEYSTORE_PATH="$RUNNER_TEMP/release.keystore"
+          fi
           gradle assembleRelease
           cp app/build/outputs/apk/release/app-release.apk ../audioshare-ultra-android.apk
 

@@ -19,11 +19,35 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            // Kept out of source control: CI injects these from secrets. When
+            // absent, release builds still fall back to the debug key below so
+            // local `assembleRelease` builds remain installable.
+            val ksPath = System.getenv("AUDIOSHARE_KEYSTORE_PATH")
+            if (!ksPath.isNullOrBlank()) {
+                storeFile = file(ksPath)
+                storePassword = System.getenv("AUDIOSHARE_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("AUDIOSHARE_KEY_ALIAS")
+                keyPassword = System.getenv("AUDIOSHARE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            isMinifyEnabled = false
-            // Sign release APK with debug key so you can install it directly from GitHub Releases!
-            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            val hasReleaseKey = !System.getenv("AUDIOSHARE_KEYSTORE_PATH").isNullOrBlank()
+            signingConfig = if (hasReleaseKey) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 

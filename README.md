@@ -11,12 +11,13 @@ Rust core across desktop and Android.
 ## Highlights
 
 - **Bit-perfect lossless audio** — causal 2nd-order LPC with zero codec lookahead,
-  typically 25–35% smaller than raw PCM16.
+  16-bit and true 24-bit studio master modes, typically 25–35% smaller than raw PCM16.
 - **Loss resilience** — `[N-1]`/`[N-2]` forward error correction plus pitch-period
-  WSOLA packet-loss concealment with raised-cosine crossfades.
-- **Clock-drift immunity** — windowed-minimum DLL and a 4-point Hermite cubic
-  fractional resampler; stable over multi-hour sessions.
-- **Low jitter** — 64-slot wait-free sequencer and lock-free burst-decoupler ring
+  WSOLA and Opus CELT packet-loss concealment with raised-cosine crossfades.
+- **Clock-drift immunity** — error-relative PI clock loop and an anti-aliased
+  4-point Hermite cubic fractional resampler (44.1 / 48 / 96 kHz); stable over
+  multi-hour sessions.
+- **Low jitter** — 128-slot wait-free sequencer and lock-free burst-decoupler ring
   decouple the network quantum from the audio device burst size.
 - **Smart DTX** — silence is not transmitted; a −90 dBFS keep-alive keeps
   Bluetooth earbuds awake without draining the battery.
@@ -25,6 +26,8 @@ Rust core across desktop and Android.
 - **Hitless USB/Wi-Fi failover** — active-active feedback and deduplication.
 - **Encrypted streaming** — optional 1-tap PIN pairing with ChaCha20 and MAC32
   authentication.
+- **Bluetooth Video Lip-Sync (Linux)** — automatic PipeWire/PulseAudio latency
+  compensation (`pw-cli` + `pactl`) paired with a live Android BT calibration slider.
 - **Cross-platform** — native Rust desktop GUI (egui), CLI, Windows/Linux host
   engine, and a Kotlin/Jetpack Compose Android app backed by a Rust JNI core.
 
@@ -138,10 +141,14 @@ cd android
 gradle assembleRelease
 ```
 
-The phone uses Android's native AAudio low-latency exclusive path. The release
-APK is signed with the debug signing key by the Gradle configuration so it can
-be installed directly from GitHub Releases; no CI secrets are required. See
-`.github/workflows/release.yml` for the full build pipeline.
+The phone uses Android's native AAudio low-latency exclusive path. Release
+builds enable R8 minification and resource shrinking, with JNI entry points kept
+by `proguard-rules.pro`. They are signed with an env-injected keystore
+(`AUDIOSHARE_KEYSTORE_PATH` / `PASSWORD` / `KEY_ALIAS` / `KEY_PASSWORD`) when
+those values are supplied; otherwise the Gradle config falls back to the debug
+key so local builds remain installable. `.github/workflows/release.yml` decodes
+the base64 keystore secret, builds all ABIs with `cargo-ndk`, gates on
+`cargo test --workspace`, and publishes the APK.
 
 ## License
 

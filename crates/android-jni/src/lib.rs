@@ -422,7 +422,16 @@ impl PhoneMicTransmitter {
                 let mut governed_loss_permille: u16 = 0;
                 let mut loss_hold_until = Instant::now();
                 let mut silent_subframes: u32 = 0;
-                let subframes_per_pkt: usize = if use_hardware_mic { 1 } else { 2 };
+                // Keep 2.5 ms (400 pps) single-subframe mic pacing only on USB;
+                // bundle 5.0 ms (200 pps) over Wi-Fi to avoid 802.11 TX saturation.
+                // A Wi-Fi target at 400 pps burns airtime and starves the
+                // client's receive path, so default to 200 pps unless every
+                // configured endpoint is a known USB/RNDIS/ADB-loopback subnet.
+                let all_targets_usb = !static_targets.is_empty()
+                    && static_targets
+                        .iter()
+                        .all(|addr| audioshare_host_engine::is_usb_subnet_ip(addr.ip()));
+                let subframes_per_pkt: usize = if use_hardware_mic && all_targets_usb { 1 } else { 2 };
                 let mut last_tx: Option<Instant> = None;
                 let mut last_party_dtx_heartbeat = Instant::now();
                 let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
@@ -781,7 +790,7 @@ pub fn android_start_stream(
         })
         .map_err(|e| format!("Invalid SocketAddr {}: {}", host_ip_port, e))?;
 
-    let existing = GLOBAL_ANDROID_CLIENT.lock().unwrap().take();
+    let existing = GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut existing) = existing {
         existing.stop();
     }
@@ -798,12 +807,12 @@ pub fn android_start_stream(
     };
 
     let client = ClientEngine::connect_with_pin(cfg, pin)?;
-    *GLOBAL_ANDROID_CLIENT.lock().unwrap() = Some(client);
+    *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(client);
     Ok(())
 }
 
 pub fn android_stop_client_only() {
-    let client = GLOBAL_ANDROID_CLIENT.lock().unwrap().take();
+    let client = GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut client) = client {
         client.stop();
     }
@@ -815,14 +824,14 @@ pub fn android_stop_stream() {
 }
 
 pub fn android_stop_phone_mic() {
-    let mic = GLOBAL_PHONE_MIC_TX.lock().unwrap().take();
+    let mic = GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut mic) = mic {
         mic.stop();
     }
 }
 
 pub fn android_set_gain_db(gain_db: f32) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .preamp_gain_db_tenths
@@ -831,7 +840,7 @@ pub fn android_set_gain_db(gain_db: f32) {
 }
 
 pub fn android_report_bt_delay_ms(delay_ms: u16) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .downstream_bt_delay_ms
@@ -840,7 +849,7 @@ pub fn android_report_bt_delay_ms(delay_ms: u16) {
 }
 
 pub fn android_send_media_command(cmd_code: u8) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
         // Quality/media, compressed bitrate and codec-backend commands each
         // have their own slot so a startup restore cannot overwrite a command
         // that has not reached the host yet.
@@ -873,7 +882,7 @@ pub fn android_configure_dsp(
     gaming_lock: bool,
     dolby_effects: bool,
 ) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .eq_bass_db_tenths
@@ -1050,7 +1059,7 @@ pub mod android_native {
     ) {
         let mut buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         if env.get_float_array_region(&pcm_float, 0, &mut buf).is_ok() {
-            if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+            if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
                 tx.mic_input_ring.push_samples(&buf);
             }
         }
@@ -1080,7 +1089,7 @@ pub mod android_native {
         };
         android_stop_phone_mic();
         if let Ok(tx) = PhoneMicTransmitter::start_with_pin(&ip_rust, use_hardware_mic != 0, pin_opt) {
-            *GLOBAL_PHONE_MIC_TX.lock().unwrap() = Some(tx);
+            *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
             1
         } else {
             0
@@ -1105,13 +1114,13 @@ pub mod android_native {
         _class: JClass,
     ) -> jintArray {
         let mut tids: Vec<jint> = Vec::with_capacity(2);
-        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
             let tid = client.telemetry.rt_thread_tid.load(Ordering::Relaxed);
             if tid > 0 && !tids.contains(&tid) {
                 tids.push(tid);
             }
         }
-        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
             let tid = tx.party_telemetry.rt_thread_tid.load(Ordering::Relaxed);
             if tid > 0 && !tids.contains(&tid) {
                 tids.push(tid);
@@ -1135,7 +1144,7 @@ pub mod android_native {
         // MainScreen.kt's `LongArray(24)` telemetry buffer:
         // 0..10 legacy counters, 11..21 live latency breakdown.
         let mut stats = [0i64; 24];
-        if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap() {
+        if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
             let latency = c.telemetry.latency_snapshot(0.0);
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
@@ -1163,7 +1172,7 @@ pub mod android_native {
             stats[20] = (latency.estimated_one_way_ms() * 10.0).round() as i64;
             stats[21] = (latency.codec_lookahead_ms * 10.0).round() as i64;
         }
-        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap() {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
             // Pack Party Host telemetry into slots 22 and 23:
             // stats[22]: (remote_cmd << 32) | (bound_port << 16) | (active_codec_mode << 8) | listener_count
             // stats[23]: party max_group_delay_ms

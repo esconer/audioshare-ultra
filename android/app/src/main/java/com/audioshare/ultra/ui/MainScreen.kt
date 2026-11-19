@@ -318,7 +318,12 @@ fun MainScreen() {
     // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
     // Sent to the host as feedback code 20/21; only affects compressed modes.
     var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", false)) }
-    var sharePhoneMic by remember { mutableStateOf(false) }
+    var btDelayOverrideMs by remember {
+        mutableIntStateOf(prefs.getInt("bt_delay_override_ms", 0))
+    }
+    // The service owns the phone-mic lifecycle (ACTION_START/STOP_PHONE_MIC).
+    // Mirror its broadcast-backed state so the switch survives UI recreation.
+    var sharePhoneMic by remember { mutableStateOf(AudioEngineService.isPhoneMicActive) }
     // The service owns the MediaProjection token and the caster. The UI only
     // mirrors the service's broadcast so a system-revoked projection turns
     // the switch off even if the app was backgrounded.
@@ -351,6 +356,16 @@ fun MainScreen() {
             .putInt("channel_role", channelRole)
             .apply()
         AudioEngineService.nativeSetGainDb(preampGainDb)
+        // Changing the preamp unmutes audio via nativeSetGainDb above. Clear
+        // the service's notification mute flag in the same gesture so the
+        // notification cannot stay stuck on "MUTED".
+        if (isConnected) {
+            context.startService(
+                Intent(context, AudioEngineService::class.java).apply {
+                    action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
+                }
+            )
+        }
         AudioEngineService.nativeConfigureDsp(
             bassDb, vocalDb, trebleDb, channelRole,
             crossfeed, nightMode, gamingLock, dolbyEffects
@@ -398,10 +413,18 @@ fun MainScreen() {
                     if (!active && muteHostSpeakerInParty) {
                         applyLocalPartySpeakerMute(false)
                     }
+                } else if (intent?.action == AudioEngineService.ACTION_PHONE_MIC_STATE) {
+                    sharePhoneMic = intent.getBooleanExtra(
+                        AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
+                        false
+                    )
                 }
             }
         }
-        val filter = IntentFilter(AudioEngineService.ACTION_PARTY_CAST_STATE)
+        val filter = IntentFilter().apply {
+            addAction(AudioEngineService.ACTION_PARTY_CAST_STATE)
+            addAction(AudioEngineService.ACTION_PHONE_MIC_STATE)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -454,13 +477,24 @@ fun MainScreen() {
         }
     }
 
+    fun startPhoneMicInService() {
+        val intent = Intent(context, AudioEngineService::class.java).apply {
+            action = AudioEngineService.ACTION_START_PHONE_MIC
+            putExtra("HOST_ADDR", hostAddress)
+            putExtra("PIN", pinCode)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    }
+
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            sharePhoneMic = true
-            enterCaptureForeground("PC Video-Call Mic Active")
-            AudioEngineService.nativeStartPhoneMic(hostAddress, true, pinCode)
+            startPhoneMicInService()
         } else {
             sharePhoneMic = false
         }
@@ -483,11 +517,10 @@ fun MainScreen() {
     ) { result ->
         val resultData = result.data
         if (result.resultCode == Activity.RESULT_OK && resultData != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // The native phone-mic transmitter is a single global. Release
-            // the hardware mic before the service hands it to the caster.
+            // The service releases the single global hardware-mic transmitter
+            // in startPartyCast() before handing the mic to the caster.
             if (sharePhoneMic) {
                 sharePhoneMic = false
-                AudioEngineService.nativeStopPhoneMic()
             }
             val svcIntent = Intent(context, AudioEngineService::class.java).apply {
                 action = AudioEngineService.ACTION_START_PARTY_CAST
@@ -1018,10 +1051,45 @@ fun MainScreen() {
                         }
 
                         if (btEarbudsDetected) {
+                            val activeBtMs = telemetry.getOrElse(17) { 185L }
+                                .toInt().coerceIn(40, 350)
                             StatusBadge(
-                                text = "Bluetooth Audio Active: Reporting +${telemetry.getOrElse(17) { 145L }}ms A/V Sync Offset to PC",
+                                text = "Bluetooth Audio Active: Reporting +${activeBtMs}ms A/V Sync Offset to PC",
                                 containerColor = Color(0xFF14532D),
                                 contentColor = Color(0xFF86EFAC)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "BT Lip-Sync Calibration: ${if (btDelayOverrideMs == 0) "Auto (${activeBtMs}ms)" else "${btDelayOverrideMs}ms"}",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                                TextButton(onClick = {
+                                    btDelayOverrideMs = 0
+                                    prefs.edit().putInt("bt_delay_override_ms", 0).apply()
+                                    context.startService(
+                                        Intent(context, AudioEngineService::class.java).apply {
+                                            action = AudioEngineService.ACTION_SET_BT_OFFSET
+                                        }
+                                    )
+                                }) { Text("Auto") }
+                            }
+                            Slider(
+                                value = (if (btDelayOverrideMs == 0) activeBtMs else btDelayOverrideMs).toFloat(),
+                                onValueChange = {
+                                    val v = it.toInt().coerceIn(40, 350)
+                                    btDelayOverrideMs = v
+                                    prefs.edit().putInt("bt_delay_override_ms", v).apply()
+                                    context.startService(
+                                        Intent(context, AudioEngineService::class.java).apply {
+                                            action = AudioEngineService.ACTION_SET_BT_OFFSET
+                                        }
+                                    )
+                                },
+                                valueRange = 40f..350f
                             )
                         }
 
@@ -1499,18 +1567,17 @@ fun MainScreen() {
                         badgeText = if (sharePhoneMic) "MIC LIVE" else null,
                         onCheckedChange = { enabled ->
                             if (!enabled) {
-                                sharePhoneMic = false
-                                AudioEngineService.nativeStopPhoneMic()
-                                exitCaptureForeground(castPhoneInternalAudio)
+                                val stopIntent = Intent(context, AudioEngineService::class.java).apply {
+                                    action = AudioEngineService.ACTION_STOP_PHONE_MIC
+                                }
+                                context.startService(stopIntent)
                             } else {
                                 val hasPerm = ContextCompat.checkSelfPermission(
                                     context,
                                     Manifest.permission.RECORD_AUDIO
                                 ) == PackageManager.PERMISSION_GRANTED
                                 if (hasPerm) {
-                                    sharePhoneMic = true
-                                    enterCaptureForeground("PC Video-Call Mic Active")
-                                    AudioEngineService.nativeStartPhoneMic(hostAddress, true, pinCode)
+                                    startPhoneMicInService()
                                 } else {
                                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 }

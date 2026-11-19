@@ -47,9 +47,19 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val ACTION_PARTY_CAST_STATE = "ACTION_PARTY_CAST_STATE"
         const val ACTION_STOP_CLIENT_ONLY = "ACTION_STOP_CLIENT_ONLY"
         const val EXTRA_PARTY_CAST_ACTIVE = "PARTY_CAST_ACTIVE"
+        const val ACTION_START_PHONE_MIC = "ACTION_START_PHONE_MIC"
+        const val ACTION_STOP_PHONE_MIC = "ACTION_STOP_PHONE_MIC"
+        const val ACTION_PHONE_MIC_STATE = "ACTION_PHONE_MIC_STATE"
+        const val EXTRA_PHONE_MIC_ACTIVE = "PHONE_MIC_ACTIVE"
+        const val ACTION_SET_BT_OFFSET = "ACTION_SET_BT_OFFSET"
+        const val ACTION_CLEAR_LOCAL_MUTE = "ACTION_CLEAR_LOCAL_MUTE"
 
         @Volatile
         var isPartyCasting: Boolean = false
+            private set
+
+        @Volatile
+        var isPhoneMicActive: Boolean = false
             private set
 
         @JvmStatic
@@ -189,6 +199,62 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_STOP_PARTY_CAST) {
             return stopPartyCast()
+        }
+        if (intent?.action == ACTION_START_PHONE_MIC) {
+            val target = intent.getStringExtra("HOST_ADDR").orEmpty()
+            val pin = intent.getStringExtra("PIN").orEmpty()
+            if (!isStreaming) {
+                currentHostAddr = "PC Video-Call Mic Active"
+                currentIsUsb = false
+            }
+            // targetSdk 34 requires the MICROPHONE foreground-service type to
+            // be active BEFORE AAudio opens the input. Own the mic lifecycle in
+            // the service (like ACTION_START_PARTY_CAST) instead of racing
+            // startForegroundService from the Compose UI thread.
+            micCaptureActive = true
+            startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
+            acquireRealtimeHardwareLocks()
+            val started = nativeStartPhoneMic(target, true, pin)
+            if (!started) {
+                micCaptureActive = false
+                broadcastPhoneMicState(false)
+                if (!isStreaming && !isPartyCasting) {
+                    stopStreamAndService()
+                    return START_NOT_STICKY
+                }
+                startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = false)
+                return START_STICKY
+            }
+            broadcastPhoneMicState(true)
+            refreshAdpfHintSession()
+            scheduleAdpfRefresh()
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_STOP_PHONE_MIC) {
+            nativeStopPhoneMic()
+            micCaptureActive = false
+            broadcastPhoneMicState(false)
+            if (!isStreaming && !isPartyCasting) {
+                stopStreamAndService()
+                return START_NOT_STICKY
+            }
+            startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = false)
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_SET_BT_OFFSET) {
+            reportBluetoothRoute()
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_CLEAR_LOCAL_MUTE) {
+            // The UI's preamp slider calls nativeSetGainDb(preampGainDb), which
+            // unmutes audio. Drop the stale notification flag too, otherwise
+            // the notification stays on "MUTED" and phone-call auto-mute stays
+            // disabled by `if (isLocallyMuted) return`.
+            if (isLocallyMuted) {
+                isLocallyMuted = false
+                if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
+            }
+            return START_STICKY
         }
         if (intent?.action == "ACTION_START_CAST_GUARD") {
             // Standalone Mic / Party Host Mode: Hold ForegroundService + Low-Latency WifiLock + WakeLock
@@ -358,7 +424,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     /// `MainScreen` polls the same route while it is visible, but playback can
     /// be started from the Quick Settings tile, the screen can be off, or
     /// another app can be in front. `AudioDeviceCallback` fires on every route
-    /// add/remove, so the 145 ms A2DP allowance stays correct without the UI.
+    /// add/remove, so the A2DP allowance stays correct without the UI.
     private fun startBluetoothRouteMonitoring() {
         if (audioDeviceCallback == null) {
             val callback = object : AudioDeviceCallback() {
@@ -419,13 +485,21 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
         }
         val reportedDelayMs = if (fallbackBtDelayMs == 145) {
-            // Query Android's live AVDTP v1.3 delay report via AudioManager.getOutputLatency
-            // so LDAC (~210 ms), AAC (~165 ms), and aptX LL (~70 ms) report their true delay.
-            val avdtpMs = runCatching {
-                val m = am.javaClass.getMethod("getOutputLatency", Int::class.javaPrimitiveType)
-                (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
-            }.getOrDefault(0)
-            if (avdtpMs in 35..350) avdtpMs else fallbackBtDelayMs
+            val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+            val manualOverride = prefs.getInt("bt_delay_override_ms", 0)
+            if (manualOverride in 40..350) {
+                // Live BT Lip-Sync Calibration slider value wins over the
+                // estimate so the user can dial their exact earbud delay.
+                manualOverride
+            } else {
+                // Android 10-14 blocks reflection on hidden getOutputLatency;
+                // real SBC/AAC/LDAC earbuds typically sit around 185-240 ms.
+                val avdtpMs = runCatching {
+                    val m = am.javaClass.getMethod("getOutputLatency", Int::class.javaPrimitiveType)
+                    (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
+                }.getOrDefault(0)
+                if (avdtpMs in 35..350) avdtpMs else 185
+            }
         } else {
             fallbackBtDelayMs
         }
@@ -627,8 +701,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
 
         // Playback capture is not microphone capture. A previous video-call
-        // session may still hold the MICROPHONE type; clear it before
-        // declaring mediaProjection.
+        // session may still hold the native hardware-mic transmitter; release
+        // it here so the service stays the single owner of phone-mic state.
+        nativeStopPhoneMic()
+        broadcastPhoneMicState(false)
         micCaptureActive = false
         projectionActive = true
         var projection: MediaProjection? = null
@@ -743,6 +819,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val intent = Intent(ACTION_PARTY_CAST_STATE).apply {
             setPackage(packageName)
             putExtra(EXTRA_PARTY_CAST_ACTIVE, active)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastPhoneMicState(active: Boolean) {
+        isPhoneMicActive = active
+        val intent = Intent(ACTION_PHONE_MIC_STATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_PHONE_MIC_ACTIVE, active)
         }
         sendBroadcast(intent)
     }
@@ -877,6 +962,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         isStreaming = false
         micCaptureActive = false
         broadcastPartyCastState(false)
+        broadcastPhoneMicState(false)
         foregroundStarted = false
         if (noisyReceiverRegistered) {
             try {

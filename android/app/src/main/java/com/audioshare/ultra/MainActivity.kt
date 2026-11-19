@@ -1,11 +1,14 @@
 package com.audioshare.ultra
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
@@ -33,9 +36,20 @@ private val StudioDarkColors = darkColorScheme(
 
 class MainActivity : ComponentActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
+    private val notificationPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* The foreground service still runs; granting just exposes its controls. */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // targetSdk 34: the FGS notification controls (Mute / Play-Pause /
+        // Disconnect) stay hidden until POST_NOTIFICATIONS is granted.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         // Allow Android Wi-Fi hardware filter to receive UDP Auto-Discovery Beacons (Port 65531)
         val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
