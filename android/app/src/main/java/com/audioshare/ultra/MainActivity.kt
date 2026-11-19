@@ -80,6 +80,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // Resume LAN discovery only while the UI is visible.
+        AudioEngineService.nativeSetScannerPaused(false)
+    }
+
+    override fun onStop() {
+        // Stop the background UDP scanner while the app is in the background.
+        AudioEngineService.nativeSetScannerPaused(true)
+        super.onStop()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)

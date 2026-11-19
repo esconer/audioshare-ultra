@@ -32,8 +32,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run Workspace Tests
-        run: cargo test --workspace
+      - name: Run Workspace Tests (release gate, locked)
+        run: cargo test --workspace --release --locked
 
       - name: Build Linux Release Binaries
         run: |
@@ -58,9 +58,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Windows Workspace Tests (locked)
+        run: cargo test --workspace --locked
+
       - name: Build Windows Release Binaries
         run: |
-          cargo build --release -p audioshare-desktop-gui -p audioshare-cli
+          cargo build --release --locked -p audioshare-desktop-gui -p audioshare-cli
           mkdir dist-win
           cp target/release/audioshare-gui.exe dist-win/
           cp target/release/as-ultra.exe dist-win/
@@ -106,7 +109,10 @@ jobs:
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
           export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME}"
-          cargo ndk --platform 26 -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./android/app/src/main/jniLibs build --release -p audioshare-android-jni
+          # Android 15/16 require 16 KB page-size alignment for native libs.
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+          cargo ndk --platform 26 -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./android/app/src/main/jniLibs build --release --locked -p audioshare-android-jni
 
       - name: Setup Gradle & Assemble Signed Release APK
         uses: gradle/actions/setup-gradle@v4
@@ -163,6 +169,17 @@ jobs:
             fi
           fi
           echo "Publishing release for tag: ${TAG}"
+          PRERELEASE_FLAG=""
+          if [[ "${TAG}" == *-rc* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+            echo "Release candidate tag detected: marking as pre-release"
+          fi
+
+          # Checksum every published artifact.
+          cd release-assets
+          find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
 
           # Ensure the tag exists locally and on remote
           git config user.name "github-actions[bot]"
@@ -174,10 +191,12 @@ jobs:
             release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
             release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
             release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
+            release-assets/SHA256SUMS.txt \
             --title "AudioShare Ultra ${TAG}" \
-            --generate-notes || \
+            --generate-notes ${PRERELEASE_FLAG} || \
           gh release upload "${TAG}" \
             release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
             release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
             release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
+            release-assets/SHA256SUMS.txt \
             --clobber

@@ -653,6 +653,30 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     Ok(())
 }
 
+/// RAII wrapper around `promote_thread_realtime()` that pairs the Windows
+/// `timeBeginPeriod(1)` with `timeEndPeriod(1)` when the audio thread exits.
+pub struct RealtimeThreadGuard;
+
+impl RealtimeThreadGuard {
+    pub fn enter() -> Self {
+        promote_thread_realtime();
+        Self
+    }
+}
+
+impl Drop for RealtimeThreadGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            #[link(name = "winmm")]
+            extern "system" {
+                fn timeEndPeriod(u_period: u32) -> u32;
+            }
+            timeEndPeriod(1);
+        }
+    }
+}
+
 pub fn promote_thread_realtime() {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -1205,6 +1229,8 @@ pub enum HostCaptureStream {
         uses_nonblocking_poll: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     },
+    #[cfg(target_os = "windows")]
+    WindowsProcess(app_routing::WindowsProcessLoopbackStream),
     Cpal(cpal::Stream),
 }
 
@@ -1327,7 +1353,7 @@ impl HostEngine {
         let worker_handle = std::thread::Builder::new()
             .name("as-ultra-host-tx".into())
             .spawn(move || {
-                promote_thread_realtime();
+                let _rt_guard = RealtimeThreadGuard::enter();
 
                 Self::realtime_tx_loop(
                     socket,
@@ -2028,6 +2054,8 @@ impl HostEngine {
         #[cfg(target_os = "windows")]
         let mut bound_output_name = current_default_output_name();
         #[cfg(target_os = "windows")]
+        let mut bound_target_pid: u32 = app_routing::windows_target_capture_pid();
+        #[cfg(target_os = "windows")]
         let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
@@ -2127,28 +2155,52 @@ impl HostEngine {
                 let now_ms = start_instant.elapsed().as_millis() as u64;
                 let latest_name = current_default_output_name();
                 let device_changed = latest_name.is_some() && latest_name != bound_output_name;
+                let target_pid = app_routing::windows_target_capture_pid();
+                let pid_changed = target_pid != bound_target_pid;
                 // Only rebind when the stream is missing, reported a device error,
-                // or the default output endpoint changed. WASAPI stops firing
-                // loopback callbacks during silence, so silence alone must not
-                // tear down and recreate a healthy stream every 2.5 seconds.
+                // the default output endpoint changed, or the isolated app changed.
                 if active_stream.is_none()
                     || capture_stream_error.load(Ordering::Acquire)
                     || device_changed
+                    || pid_changed
                 {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
                     // Drop the previous stream BEFORE creating a new SPSC
                     // producer on `ring` (Rust evaluates RHS first otherwise).
                     active_stream = None;
-                    active_stream = Self::spawn_loopback_capture(
-                        Arc::clone(&ring),
-                        Arc::clone(&capture_heartbeat_ms),
-                        Arc::clone(&capture_stream_error),
-                        Arc::clone(&running),
-                        start_instant,
-                    )
-                    .ok();
+                    active_stream = if target_pid != 0 {
+                        app_routing::spawn_windows_process_loopback(
+                            target_pid,
+                            Arc::clone(&ring),
+                            Arc::clone(&capture_heartbeat_ms),
+                            Arc::clone(&capture_stream_error),
+                            Arc::clone(&running),
+                            start_instant,
+                        )
+                        .map(HostCaptureStream::WindowsProcess)
+                        .or_else(|_| {
+                            Self::spawn_loopback_capture(
+                                Arc::clone(&ring),
+                                Arc::clone(&capture_heartbeat_ms),
+                                Arc::clone(&capture_stream_error),
+                                Arc::clone(&running),
+                                start_instant,
+                            )
+                        })
+                        .ok()
+                    } else {
+                        Self::spawn_loopback_capture(
+                            Arc::clone(&ring),
+                            Arc::clone(&capture_heartbeat_ms),
+                            Arc::clone(&capture_stream_error),
+                            Arc::clone(&running),
+                            start_instant,
+                        )
+                        .ok()
+                    };
                     if active_stream.is_some() {
                         bound_output_name = latest_name;
+                        bound_target_pid = target_pid;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
                     }
