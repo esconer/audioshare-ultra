@@ -1,167 +1,181 @@
+//! RFC 8439 ChaCha20-Poly1305 AEAD for AudioShare Ultra v2 wire format.
+//!
+//! The session key is PBKDF2-HMAC-SHA256(65,536 rounds) over the pairing PIN
+//! with a fixed domain salt. Each `SessionKey::from_pin` also draws a random
+//! 4-byte per-session nonce salt, so restarting a host with the same PIN never
+//! reuses a keystream (no two-time pad). Audio and feedback use disjoint 12-byte
+//! nonces derived from that salt / strictly monotonic feedback sequence.
+
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use pbkdf2::pbkdf2_hmac_array;
+use sha2::Sha256;
+
 use crate::wire::WireHeader;
 
-/// 256-bit symmetric session key derived from a Pairing PIN or QR Token
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SessionKey([u32; 8]);
+const PIN_KDF_SALT: &[u8] = b"AudioShareUltra-v2-PBKDF2-SHA256";
+const PIN_KDF_ROUNDS: u32 = 65_536;
+
+/// Per-session nonce salt length (also transmitted in the AEAD trailer).
+pub const NONCE_SALT_LEN: usize = 4;
+/// Poly1305 tag length. The full wire trailer is salt + tag = 20 bytes.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// 256-bit symmetric session key derived from a pairing PIN or QR token.
+#[derive(Clone, Copy)]
+pub struct SessionKey {
+    key: [u8; 32],
+    session_salt: [u8; NONCE_SALT_LEN],
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionKey(<redacted>)")
+    }
+}
+
+impl PartialEq for SessionKey {
+    fn eq(&self, other: &Self) -> bool {
+        // Constant-time comparison of the derived key only: the random nonce
+        // salt differs per instance even for the same PIN.
+        let mut diff = 0u8;
+        for (a, b) in self.key.iter().zip(other.key.iter()) {
+            diff |= a ^ b;
+        }
+        diff == 0
+    }
+}
+impl Eq for SessionKey {}
 
 impl SessionKey {
-    /// Derive a 256-bit key from a human-readable PIN (e.g., "4829" or passphrase)
-    /// using 1,000 rounds of ChaCha20-based PBKDF mixing (zero external crate dependencies).
+    /// Derive a 256-bit key with 65,536 PBKDF2-HMAC-SHA256 rounds and draw a
+    /// fresh OS-CPRNG 4-byte session nonce salt.
     pub fn from_pin(pin: &str) -> Self {
-        let mut state = [
-            0x6170_7865,
-            0x3320_646e,
-            0x7962_2d32,
-            0x6b20_6574,
-            0x0102_0304,
-            0x0506_0708,
-            0x090a_0b0c,
-            0x0d0e_0f10,
-        ];
-
-        for (i, b) in pin.as_bytes().iter().enumerate() {
-            state[i % 8] ^= (*b as u32)
-                .wrapping_mul(0x9E37_79B9)
-                .rotate_left((i as u32) * 5);
+        let key = pbkdf2_hmac_array::<Sha256, 32>(pin.as_bytes(), PIN_KDF_SALT, PIN_KDF_ROUNDS);
+        let mut session_salt = [0u8; NONCE_SALT_LEN];
+        if getrandom::getrandom(&mut session_salt).is_err() {
+            let fallback = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u32;
+            session_salt = fallback.to_be_bytes();
         }
-
-        // 1,000 mixing rounds to harden short PINs
-        for round in 0..1000u32 {
-            state[0] = state[0].wrapping_add(round);
-            let block = chacha20_block(&state, round, [0xA3A3_A3A3, 0x5A5A_5A5A, round]);
-            for i in 0..8 {
-                state[i] ^= block[i] ^ block[i + 8];
-            }
-        }
-
-        Self(state)
+        Self { key, session_salt }
     }
 
-    /// Encrypt or decrypt payload in-place using RFC 8439 ChaCha20 keystream
-    /// keyed by the packet's verified WireHeader (Sequence + Timestamp + StreamID).
+    /// 12-byte nonce for an audio packet: salt(4) | timestamp(4) | seq(2) |
+    /// stream_id(1) | domain(1). Nonce uniqueness is per-session.
     #[inline]
-    pub fn apply_keystream(&self, header: &WireHeader, payload: &mut [u8]) {
-        let nonce = [
-            ((header.sequence as u32) << 16) | (header.stream_id as u32),
-            header.tx_timestamp_us,
-            0x4153_554C, // "ASUL" domain separator
-        ];
-
-        let mut block_counter = 1u32;
-        for chunk in payload.chunks_mut(64) {
-            let keystream_words = chacha20_block(&self.0, block_counter, nonce);
-            block_counter = block_counter.wrapping_add(1);
-
-            let mut keystream_bytes = [0u8; 64];
-            for (i, &w) in keystream_words.iter().enumerate() {
-                let le = w.to_le_bytes();
-                keystream_bytes[i * 4..i * 4 + 4].copy_from_slice(&le);
-            }
-
-            for (dst, &k) in chunk.iter_mut().zip(keystream_bytes.iter()) {
-                *dst ^= k;
-            }
-        }
+    fn audio_nonce(salt: &[u8; NONCE_SALT_LEN], header: &WireHeader) -> [u8; 12] {
+        let ts = header.tx_timestamp_us.to_be_bytes();
+        let seq = header.sequence.to_be_bytes();
+        [
+            salt[0],
+            salt[1],
+            salt[2],
+            salt[3],
+            ts[0],
+            ts[1],
+            ts[2],
+            ts[3],
+            seq[0],
+            seq[1],
+            header.stream_id,
+            0xA3,
+        ]
     }
 
-    /// Compute a fast 32-bit keyed MAC tag over the header + ciphertext to reject wrong PINs
+    /// Feedback uses a separate domain and the strictly monotonic sequence.
     #[inline]
-    pub fn compute_mac32(&self, header: &WireHeader, ciphertext: &[u8]) -> u32 {
-        let nonce = [
-            header.sequence as u32,
-            header.tx_timestamp_us,
-            ciphertext.len() as u32,
-        ];
-        let poly_key = chacha20_block(&self.0, 0, nonce);
-        // Bind every header field that changes how the ciphertext is parsed,
-        // decrypted, or rendered. The header CRC is unkeyed and therefore
-        // cannot authenticate any of this on its own.
-        let ad0 = ((header.mode as u32) << 24)
-            | ((header.subframe_count as u32) << 16)
-            | (header.primary_len as u32);
-        let ad1 = ((header.fec_n1_len as u32) << 24)
-            | ((header.fec_n2_len as u32) << 16)
-            | ((header.host_volume as u32) << 8)
-            | (header.stream_id as u32);
-        let mut acc1 = (poly_key[0] ^ 0x736f_6d65)
-            .wrapping_add(ad0)
-            .wrapping_mul(poly_key[2] | 1)
-            .rotate_left(13);
-        let mut acc2 = (poly_key[1] ^ 0x646f_7261 ^ acc1)
-            .wrapping_add(ad1)
-            .wrapping_mul(poly_key[3] | 1)
-            .rotate_right(11);
-
-        for chunk in ciphertext.chunks(4) {
-            let mut word_bytes = [0u8; 4];
-            word_bytes[..chunk.len()].copy_from_slice(chunk);
-            let v = u32::from_le_bytes(word_bytes);
-            acc1 = acc1
-                .wrapping_add(v)
-                .wrapping_mul(poly_key[2] | 1)
-                .rotate_left(13);
-            acc2 = (acc2 ^ acc1).wrapping_mul(poly_key[3] | 1).rotate_right(11);
-        }
-
-        acc1 ^ acc2 ^ poly_key[4]
-    }
-}
-
-#[inline(always)]
-fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
-    state[a] = state[a].wrapping_add(state[b]);
-    state[d] = (state[d] ^ state[a]).rotate_left(16);
-
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_left(12);
-
-    state[a] = state[a].wrapping_add(state[b]);
-    state[d] = (state[d] ^ state[a]).rotate_left(8);
-
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] = (state[b] ^ state[c]).rotate_left(7);
-}
-
-/// RFC 8439 ChaCha20 20-Round Core Block Function (SIMD auto-vectorizable)
-#[inline]
-fn chacha20_block(key: &[u32; 8], counter: u32, nonce: [u32; 3]) -> [u32; 16] {
-    let initial: [u32; 16] = [
-        0x6170_7865,
-        0x3320_646e,
-        0x7962_2d32,
-        0x6b20_6574,
-        key[0],
-        key[1],
-        key[2],
-        key[3],
-        key[4],
-        key[5],
-        key[6],
-        key[7],
-        counter,
-        nonce[0],
-        nonce[1],
-        nonce[2],
-    ];
-
-    let mut working = initial;
-    for _ in 0..10 {
-        // Column rounds
-        quarter_round(&mut working, 0, 4, 8, 12);
-        quarter_round(&mut working, 1, 5, 9, 13);
-        quarter_round(&mut working, 2, 6, 10, 14);
-        quarter_round(&mut working, 3, 7, 11, 15);
-        // Diagonal rounds
-        quarter_round(&mut working, 0, 5, 10, 15);
-        quarter_round(&mut working, 1, 6, 11, 12);
-        quarter_round(&mut working, 2, 7, 8, 13);
-        quarter_round(&mut working, 3, 4, 9, 14);
+    fn feedback_nonce(feedback_seq: u32) -> [u8; 12] {
+        let seq = feedback_seq.to_be_bytes();
+        [
+            b'A', b'S', b'U', b'L', b'C', b'T', b'R', b'L', seq[0], seq[1], seq[2], seq[3],
+        ]
     }
 
-    for i in 0..16 {
-        working[i] = working[i].wrapping_add(initial[i]);
+    /// Encrypt `payload` in place, authenticating the 14-byte wire header and
+    /// the 4-byte session salt as AAD. Returns the salt and detached Poly1305 tag.
+    #[inline]
+    pub fn encrypt_audio_in_place(
+        &self,
+        header_14: &[u8; 14],
+        header: &WireHeader,
+        payload: &mut [u8],
+    ) -> ([u8; NONCE_SALT_LEN], [u8; AEAD_TAG_LEN]) {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
+        let nonce_bytes = Self::audio_nonce(&self.session_salt, header);
+        let mut aad = [0u8; 14 + NONCE_SALT_LEN];
+        aad[..14].copy_from_slice(header_14);
+        aad[14..].copy_from_slice(&self.session_salt);
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), &aad, payload)
+            .expect("AEAD encrypt in place");
+        let mut tag_out = [0u8; AEAD_TAG_LEN];
+        tag_out.copy_from_slice(tag.as_slice());
+        (self.session_salt, tag_out)
     }
-    working
+
+    /// Constant-time verify + decrypt. Returns `false` on any tag mismatch.
+    #[inline]
+    pub fn decrypt_audio_in_place(
+        &self,
+        header_14: &[u8; 14],
+        header: &WireHeader,
+        salt: &[u8; NONCE_SALT_LEN],
+        payload: &mut [u8],
+        tag: &[u8; AEAD_TAG_LEN],
+    ) -> bool {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
+        let nonce_bytes = Self::audio_nonce(salt, header);
+        let mut aad = [0u8; 14 + NONCE_SALT_LEN];
+        aad[..14].copy_from_slice(header_14);
+        aad[14..].copy_from_slice(salt);
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                &aad,
+                payload,
+                Tag::from_slice(tag),
+            )
+            .is_ok()
+    }
+
+    /// Compute a 128-bit Poly1305 AEAD tag over the 20-byte feedback body,
+    /// domain-separated by the monotonic `feedback_seq` nonce.
+    #[inline]
+    pub fn sign_feedback(&self, body_20: &[u8; 20], feedback_seq: u32) -> [u8; AEAD_TAG_LEN] {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
+        let nonce_bytes = Self::feedback_nonce(feedback_seq);
+        let mut empty = [];
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), body_20, &mut empty)
+            .expect("feedback tag");
+        let mut out = [0u8; AEAD_TAG_LEN];
+        out.copy_from_slice(tag.as_slice());
+        out
+    }
+
+    /// Constant-time feedback tag verification.
+    #[inline]
+    pub fn verify_feedback(
+        &self,
+        body_20: &[u8; 20],
+        feedback_seq: u32,
+        tag: &[u8; AEAD_TAG_LEN],
+    ) -> bool {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
+        let nonce_bytes = Self::feedback_nonce(feedback_seq);
+        let mut empty = [];
+        cipher
+            .decrypt_in_place_detached(
+                Nonce::from_slice(&nonce_bytes),
+                body_20,
+                &mut empty,
+                Tag::from_slice(tag),
+            )
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -169,44 +183,58 @@ mod tests {
     use super::*;
     use crate::wire::CodecMode;
 
-    #[test]
-    fn test_chacha20_pin_encryption_and_mac_verification() {
-        let key_correct = SessionKey::from_pin("8492");
-        let key_wrong = SessionKey::from_pin("0000");
-
-        let hdr = WireHeader {
+    fn header() -> WireHeader {
+        WireHeader {
             mode: CodecMode::StudioLosslessLpc,
             subframe_count: 2,
             encrypted: true,
-            sequence: 105,
-            tx_timestamp_us: 500_000,
-            primary_len: 128,
+            sequence: 0,
+            tx_timestamp_us: 0,
+            primary_len: 64,
             fec_n1_len: 0,
             fec_n2_len: 0,
             host_volume: 100,
             stream_id: 1,
             header_crc16: 0,
-        };
+        }
+    }
 
-        let original = [0x42u8; 256];
-        let mut buf = original;
+    #[test]
+    fn test_session_salt_prevents_two_time_pad_and_equality_holds() {
+        let a = SessionKey::from_pin("4829");
+        let b = SessionKey::from_pin("4829");
+        assert_ne!(a.session_salt, b.session_salt, "session salts must be random");
+        assert_eq!(a, b, "same PIN must compare equal (key bytes only)");
 
-        // Encrypt in place
-        key_correct.apply_keystream(&hdr, &mut buf);
-        assert_ne!(buf, original, "Ciphertext must not match plaintext");
+        let hdr = header();
+        let mut hdr_full = [0u8; 16];
+        hdr.encode(&mut hdr_full);
+        let mut hdr_bytes = [0u8; 14];
+        hdr_bytes.copy_from_slice(&hdr_full[..14]);
+        let plaintext = [0x42u8; 64];
+        let mut ca = plaintext.to_vec();
+        let mut cb = plaintext.to_vec();
+        let (salt_a, tag_a) = a.encrypt_audio_in_place(&hdr_bytes, &hdr, &mut ca);
+        let (salt_b, tag_b) = b.encrypt_audio_in_place(&hdr_bytes, &hdr, &mut cb);
+        assert_ne!(salt_a, salt_b);
+        assert_ne!(ca, cb, "identical (seq=0,ts=0) packets must have distinct ciphertexts");
+        // Each key decrypts the other's ciphertext when the salt travels with it.
+        let mut da = ca.clone();
+        assert!(b.decrypt_audio_in_place(&hdr_bytes, &hdr, &salt_a, &mut da, &tag_a));
+        assert_eq!(da, plaintext);
+        let mut db = cb.clone();
+        assert!(a.decrypt_audio_in_place(&hdr_bytes, &hdr, &salt_b, &mut db, &tag_b));
+        assert_eq!(db, plaintext);
+    }
 
-        let mac = key_correct.compute_mac32(&hdr, &buf);
-        assert_ne!(
-            mac,
-            key_wrong.compute_mac32(&hdr, &buf),
-            "Wrong PIN must fail MAC verification"
-        );
-
-        // Decrypt in place
-        key_correct.apply_keystream(&hdr, &mut buf);
-        assert_eq!(
-            buf, original,
-            "Decrypted payload must match original bit-for-bit"
-        );
+    #[test]
+    fn test_feedback_tag_is_domain_separated_and_replay_bound() {
+        let key = SessionKey::from_pin("4829");
+        let wrong = SessionKey::from_pin("0000");
+        let body = [7u8; 20];
+        let tag = key.sign_feedback(&body, 1);
+        assert!(key.verify_feedback(&body, 1, &tag));
+        assert!(!key.verify_feedback(&body, 2, &tag), "feedback seq is bound to tag");
+        assert!(!wrong.verify_feedback(&body, 1, &tag));
     }
 }

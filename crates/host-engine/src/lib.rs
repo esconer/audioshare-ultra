@@ -1997,6 +1997,8 @@ impl HostEngine {
         }
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
+        // Per-peer highest authenticated feedback sequence (anti-replay).
+        let mut last_feedback_seq: HashMap<SocketAddr, u32> = HashMap::new();
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
@@ -2107,6 +2109,18 @@ impl HostEngine {
                     if let Some(fb) =
                         ClientFeedbackPacket::decode_verified(&ctrl_buf[..len], active_key.as_ref())
                     {
+                        // Reject replayed authenticated feedback BEFORE any
+                        // command side effect. The sequence is nonce-bound, so
+                        // an attacker cannot simply bump it on a captured packet.
+                        let last = last_feedback_seq.get(&src_addr).copied().unwrap_or(0);
+                        if audioshare_protocol::wire::feedback_is_replay(
+                            active_key.is_some(),
+                            fb.feedback_seq,
+                            last,
+                        ) {
+                            continue;
+                        }
+                        last_feedback_seq.insert(src_addr, fb.feedback_seq);
                         let mut gaming_lock_update: Option<bool> = None;
 
                         // Compressed-codec backend selection from the phone UI:

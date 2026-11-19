@@ -418,6 +418,8 @@ impl PhoneMicTransmitter {
                 };
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
+                // Per-peer highest authenticated feedback sequence.
+                let mut last_feedback_seq: HashMap<SocketAddr, u32> = HashMap::new();
                 let mut last_sweep = Instant::now();
                 let mut governed_loss_permille: u16 = 0;
                 let mut loss_hold_until = Instant::now();
@@ -483,6 +485,16 @@ impl PhoneMicTransmitter {
                                     &ctrl_buf[..len],
                                     session_key.as_ref(),
                                 ) {
+                                    let last =
+                                        last_feedback_seq.get(&src_addr).copied().unwrap_or(0);
+                                    if audioshare_protocol::wire::feedback_is_replay(
+                                        session_key.is_some(),
+                                        fb.feedback_seq,
+                                        last,
+                                    ) {
+                                        continue;
+                                    }
+                                    last_feedback_seq.insert(src_addr, fb.feedback_seq);
                                     if (10..=12).contains(&fb.requested_mode) {
                                         party_telem_clone
                                             .pending_remote_media_cmd
@@ -1586,7 +1598,8 @@ mod tests {
             client_volume: 85,
             requested_mode: 0,
             hardware_delay_ms: 17,
-            auth_mac32: 0,
+            feedback_seq: 1,
+            auth_tag: [0u8; 16],
         };
         let mut bytes = [0u8; CONTROL_FEEDBACK_LEN];
         fb.encode(&mut bytes);

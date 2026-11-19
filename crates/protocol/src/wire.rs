@@ -1,12 +1,15 @@
-use crate::crypto::SessionKey;
+use crate::crypto::{SessionKey, AEAD_TAG_LEN, NONCE_SALT_LEN};
 use crate::MAX_SAFE_UDP_PAYLOAD;
 
-pub const WIRE_MAGIC: u8 = 0xA3;
+/// Protocol v2 magic. Bumped from 0xA3 so legacy 0.2.1 clients fail cleanly.
+pub const WIRE_MAGIC: u8 = 0xA4;
 pub const HEADER_LEN: usize = 16;
-pub const MAC_TAG_LEN: usize = 4;
+/// Encrypted trailer: 4-byte per-session salt + 16-byte Poly1305 tag.
+pub const MAC_TAG_LEN: usize = NONCE_SALT_LEN + AEAD_TAG_LEN;
 
-pub const CONTROL_FEEDBACK_MAGIC: &[u8; 8] = b"ASULCTRL";
-pub const CONTROL_FEEDBACK_LEN: usize = 20;
+/// Protocol v2 feedback magic (legacy "ASULCTRL" is rejected).
+pub const CONTROL_FEEDBACK_MAGIC: &[u8; 8] = b"ASULCTR2";
+pub const CONTROL_FEEDBACK_LEN: usize = 36;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +46,7 @@ impl CodecMode {
     }
 }
 
-/// 20-Byte Client -> Host Real-Time Telemetry & Control Feedback Packet (Sent every 500ms)
+/// 36-Byte Client -> Host Authenticated & Replay-Protected Feedback Packet
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientFeedbackPacket {
     /// Rolling FEC recovery rate in permille (0..=1000, where 50 = 5.0% packet loss)
@@ -65,8 +68,10 @@ pub struct ClientFeedbackPacket {
     /// it for multi-device acoustic alignment, while the Bluetooth UI/lip-sync
     /// path must only react to a genuine A2DP route.
     pub hardware_delay_ms: u16,
-    /// 32-bit authentication token derived from SessionKey (or 0 if unencrypted)
-    pub auth_mac32: u32,
+    /// Strictly monotonic per-client sequence number preventing command replay.
+    pub feedback_seq: u32,
+    /// 128-bit Poly1305 AEAD tag (zeros when unencrypted).
+    pub auth_tag: [u8; AEAD_TAG_LEN],
 }
 
 impl ClientFeedbackPacket {
@@ -77,76 +82,60 @@ impl ClientFeedbackPacket {
         out[12] = self.client_volume;
         out[13] = self.requested_mode;
         out[14..16].copy_from_slice(&self.hardware_delay_ms.to_be_bytes());
-        out[16..20].copy_from_slice(&self.auth_mac32.to_be_bytes());
+        out[16..20].copy_from_slice(&self.feedback_seq.to_be_bytes());
+        out[20..36].copy_from_slice(&self.auth_tag);
     }
 
-    /// Domain-separated MAC input for a feedback packet.
-    ///
-    /// `SessionKey::compute_mac32` only consumes the header sequence,
-    /// timestamp, body length and body bytes. These fixed fields keep feedback
-    /// authentication from colliding with an audio packet MAC. The complete
-    /// 16-byte feedback body (magic, loss, delays, volume, requested mode) is
-    /// covered, so a LAN attacker cannot forge codec switches, media keys or
-    /// group-sync delay reports while PIN encryption is active.
-    fn auth_header(&self) -> WireHeader {
-        WireHeader {
-            mode: CodecMode::SilenceHeartbeat,
-            subframe_count: 0,
-            encrypted: true,
-            sequence: self.fec_rate_permille,
-            tx_timestamp_us: ((self.bluetooth_delay_ms as u32) << 16)
-                | (self.hardware_delay_ms as u32),
-            primary_len: 16,
-            fec_n1_len: self.client_volume,
-            fec_n2_len: self.requested_mode,
-            host_volume: 0,
-            stream_id: 0,
-            header_crc16: 0,
-        }
-    }
-
-    /// Encode, signing the 16-byte body when a session key is active.
-    ///
-    /// Without a key the MAC field is explicitly zeroed, matching the legacy
-    /// unencrypted control plane.
+    /// Encode, signing the 20-byte body when a session key is active. Without
+    /// a key the tag is explicitly zeroed (legacy unencrypted LAN/party mode).
     pub fn encode_signed(&self, key: Option<&SessionKey>, out: &mut [u8; CONTROL_FEEDBACK_LEN]) {
         self.encode(out);
-        let mac = key
-            .map(|key| key.compute_mac32(&self.auth_header(), &out[..16]))
-            .unwrap_or(0);
-        out[16..20].copy_from_slice(&mac.to_be_bytes());
+        let tag = key
+            .map(|k| {
+                let body: &[u8; 20] = out[..20].try_into().expect("20-byte feedback body");
+                k.sign_feedback(body, self.feedback_seq)
+            })
+            .unwrap_or([0u8; AEAD_TAG_LEN]);
+        out[20..36].copy_from_slice(&tag);
     }
 
     pub fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < CONTROL_FEEDBACK_LEN || &buf[0..8] != CONTROL_FEEDBACK_MAGIC {
             return None;
         }
+        let mut auth_tag = [0u8; AEAD_TAG_LEN];
+        auth_tag.copy_from_slice(&buf[20..36]);
         Some(Self {
             fec_rate_permille: u16::from_be_bytes([buf[8], buf[9]]),
             bluetooth_delay_ms: u16::from_be_bytes([buf[10], buf[11]]),
             client_volume: buf[12],
             requested_mode: buf[13],
             hardware_delay_ms: u16::from_be_bytes([buf[14], buf[15]]),
-            auth_mac32: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            feedback_seq: u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            auth_tag,
         })
     }
 
-    /// Decode and verify the feedback MAC when the host has a session key.
-    ///
-    /// With `key == None` this is equivalent to [`Self::decode`], preserving
-    /// unencrypted LAN/party mode. With a key configured, unsigned or
-    /// tampered feedback is rejected before it can register a client or issue
-    /// a command.
+    /// Decode and verify the Poly1305 tag. The sequence is bound into the
+    /// nonce, so a captured packet cannot be replayed with a different seq.
     pub fn decode_verified(buf: &[u8], key: Option<&SessionKey>) -> Option<Self> {
         let packet = Self::decode(buf)?;
         if let Some(key) = key {
-            let expected = key.compute_mac32(&packet.auth_header(), &buf[..16]);
-            if packet.auth_mac32 != expected {
+            let body: &[u8; 20] = buf[..20].try_into().ok()?;
+            if !key.verify_feedback(body, packet.feedback_seq, &packet.auth_tag) {
                 return None;
             }
         }
         Some(packet)
     }
+}
+
+/// Replay gate for authenticated feedback. Unencrypted LAN/party feedback has
+/// no sequence guarantee, so the check applies only when a session key is
+/// active. Used by both HostEngine and PhoneMicTransmitter.
+#[inline]
+pub fn feedback_is_replay(authenticated: bool, seq: u32, last_seq: u32) -> bool {
+    authenticated && seq <= last_seq
 }
 
 /// 16-Byte Wire Header (64-bit aligned, big-endian network serialization)
@@ -315,7 +304,7 @@ impl<'a> ParsedPacket<'a> {
         })
     }
 
-    /// Parse and decrypt in-place if encrypted with ChaCha20 + MAC32
+    /// Parse and verify/decrypt in-place with ChaCha20-Poly1305 AEAD (v2).
     #[inline]
     pub fn parse_and_decrypt(
         datagram: &'a mut [u8],
@@ -329,16 +318,25 @@ impl<'a> ParsedPacket<'a> {
 
         if header.encrypted {
             let key = session_key.ok_or(WireError::AuthenticationFailed)?;
-            let tag_bytes: [u8; 4] = datagram[payload_end..payload_end + MAC_TAG_LEN]
+            let header_14: [u8; 14] = datagram[..14]
                 .try_into()
                 .map_err(|_| WireError::PacketTooShort)?;
-            let received_mac = u32::from_be_bytes(tag_bytes);
-            let expected_mac = key.compute_mac32(&header, &datagram[HEADER_LEN..payload_end]);
-
-            if received_mac != expected_mac {
+            let salt: [u8; NONCE_SALT_LEN] = datagram[payload_end..payload_end + NONCE_SALT_LEN]
+                .try_into()
+                .map_err(|_| WireError::PacketTooShort)?;
+            let tag: [u8; AEAD_TAG_LEN] = datagram
+                [payload_end + NONCE_SALT_LEN..payload_end + MAC_TAG_LEN]
+                .try_into()
+                .map_err(|_| WireError::PacketTooShort)?;
+            if !key.decrypt_audio_in_place(
+                &header_14,
+                &header,
+                &salt,
+                &mut datagram[HEADER_LEN..payload_end],
+                &tag,
+            ) {
                 return Err(WireError::AuthenticationFailed);
             }
-            key.apply_keystream(&header, &mut datagram[HEADER_LEN..payload_end]);
         } else if session_key.is_some() {
             return Err(WireError::AuthenticationFailed);
         }
@@ -379,7 +377,10 @@ pub fn pack_datagram_with_key(
     let mac_extra = if header.encrypted { MAC_TAG_LEN } else { 0 };
     let total_len = HEADER_LEN + primary.len() + fec_n1.len() + fec_n2.len() + mac_extra;
 
-    if total_len > MAX_SAFE_UDP_PAYLOAD {
+    if total_len > MAX_SAFE_UDP_PAYLOAD
+        || fec_n1.len() > u8::MAX as usize
+        || fec_n2.len() > u8::MAX as usize
+    {
         return Err(WireError::PacketExceedsMtu);
     }
 
@@ -402,9 +403,13 @@ pub fn pack_datagram_with_key(
     cursor += fec_n2.len();
 
     if let Some(key) = session_key {
-        key.apply_keystream(&header, &mut out_buf[HEADER_LEN..cursor]);
-        let mac = key.compute_mac32(&header, &out_buf[HEADER_LEN..cursor]);
-        out_buf[cursor..cursor + MAC_TAG_LEN].copy_from_slice(&mac.to_be_bytes());
+        let header_14: [u8; 14] = hdr_bytes[..14]
+            .try_into()
+            .expect("14-byte wire header prefix");
+        let (salt, tag) =
+            key.encrypt_audio_in_place(&header_14, &header, &mut out_buf[HEADER_LEN..cursor]);
+        out_buf[cursor..cursor + NONCE_SALT_LEN].copy_from_slice(&salt);
+        out_buf[cursor + NONCE_SALT_LEN..cursor + MAC_TAG_LEN].copy_from_slice(&tag);
         cursor += MAC_TAG_LEN;
     }
 
@@ -575,7 +580,8 @@ mod tests {
             hardware_delay_ms: 21,
             client_volume: 76,
             requested_mode: 20,
-            auth_mac32: 0,
+            feedback_seq: 1,
+            auth_tag: [0u8; AEAD_TAG_LEN],
         };
 
         packet.encode_signed(Some(&key), &mut buf);
@@ -589,7 +595,7 @@ mod tests {
         // be rejected while a key is configured.
         assert!(ClientFeedbackPacket::decode_verified(&buf, Some(&wrong_key)).is_none());
         let unsigned = ClientFeedbackPacket {
-            auth_mac32: 0,
+            auth_tag: [0u8; AEAD_TAG_LEN],
             ..decoded
         };
         unsigned.encode(&mut buf);
@@ -601,8 +607,105 @@ mod tests {
 
         // Without a key the control plane remains backward compatible.
         packet.encode_signed(None, &mut buf);
-        assert_eq!(&buf[16..20], &[0, 0, 0, 0]);
+        assert_eq!(&buf[20..36], &[0u8; AEAD_TAG_LEN]);
         assert!(ClientFeedbackPacket::decode_verified(&buf, None).is_some());
+    }
+
+    #[test]
+    fn test_tamper_any_byte_fails_authentication() {
+        let key = SessionKey::from_pin("4829");
+        let hdr = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 2,
+            encrypted: true,
+            sequence: 0x1234,
+            tx_timestamp_us: 0x0056_78AB,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 2,
+            header_crc16: 0,
+        };
+        let primary = [0x5Au8; 96];
+        let mut packed = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len = pack_datagram_with_key(hdr, &primary, &[], &[], Some(&key), &mut packed).unwrap();
+
+        // Header AAD bytes 0..14: repair the unkeyed CRC so decode succeeds,
+        // proving the AEAD tag (not the CRC) binds those fields.
+        // 8..12 are the length fields: changing them alters framing and is
+        // rejected structurally before the AEAD step (still a hard failure).
+        for offset in [1usize, 2, 3, 4, 5, 6, 7, 12, 13] {
+            let mut copy = packed;
+            copy[offset] ^= 0x01;
+            let crc = WireHeader::compute_crc16(copy[..14].try_into().unwrap()).to_be_bytes();
+            copy[14] = crc[0];
+            copy[15] = crc[1];
+            assert_eq!(
+                ParsedPacket::parse_and_decrypt(&mut copy[..len], Some(&key)).err(),
+                Some(WireError::AuthenticationFailed),
+                "header byte {offset} must be AEAD-authenticated"
+            );
+        }
+        for offset in [8usize, 9, 10, 11] {
+            let mut copy = packed;
+            copy[offset] ^= 0x01;
+            let crc = WireHeader::compute_crc16(copy[..14].try_into().unwrap()).to_be_bytes();
+            copy[14] = crc[0];
+            copy[15] = crc[1];
+            assert!(
+                ParsedPacket::parse_and_decrypt(&mut copy[..len], Some(&key)).is_err(),
+                "tampered length byte {offset} must be rejected"
+            );
+        }
+        // Salt, ciphertext and tag bits.
+        let payload_start = HEADER_LEN + primary.len();
+        for offset in [payload_start, payload_start + NONCE_SALT_LEN, payload_start + MAC_TAG_LEN - 1, HEADER_LEN] {
+            let mut copy = packed;
+            copy[offset] ^= 0x01;
+            assert_eq!(
+                ParsedPacket::parse_and_decrypt(&mut copy[..len], Some(&key)).err(),
+                Some(WireError::AuthenticationFailed),
+                "trailer/ciphertext byte {offset} must be AEAD-authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_authenticated_feedback_replay_is_rejected() {
+        // Acceptance: replaying a captured authenticated packet with
+        // feedback_seq <= last_feedback_seq is rejected; a fresh seq passes.
+        assert!(feedback_is_replay(true, 5, 5));
+        assert!(feedback_is_replay(true, 4, 5));
+        assert!(!feedback_is_replay(true, 6, 5));
+        // Unencrypted LAN/party feedback is intentionally not replay-checked.
+        assert!(!feedback_is_replay(false, 1, 5));
+    }
+
+    #[test]
+    fn test_v2_magic_rejects_legacy_peers() {
+        assert_eq!(WIRE_MAGIC, 0xA4);
+        assert_eq!(CONTROL_FEEDBACK_MAGIC, b"ASULCTR2");
+        let mut buf = [0u8; HEADER_LEN];
+        let hdr = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 1,
+            encrypted: false,
+            sequence: 1,
+            tx_timestamp_us: 0,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+        hdr.encode(&mut buf);
+        buf[0] = 0xA3; // legacy v1 magic
+        let crc = WireHeader::compute_crc16(buf[..14].try_into().unwrap()).to_be_bytes();
+        buf[14] = crc[0];
+        buf[15] = crc[1];
+        assert_eq!(WireHeader::decode(&buf).err(), Some(WireError::InvalidMagic));
     }
 
     #[test]

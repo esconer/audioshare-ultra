@@ -1203,6 +1203,9 @@ impl ClientEngine {
         let mut prev_tx_us: u32 = 0;
         let mut jitter_estimate_us: f32 = 2500.0;
         let mut last_clock_sample = Instant::now();
+        // Strictly monotonic feedback sequence: bound into the AEAD nonce so a
+        // captured authenticated feedback packet cannot be replayed.
+        let mut feedback_seq: u32 = 0;
         // Output at the device's native rate can be 44.1 kHz (A2DP) or more
         // than 48 kHz (USB DAC). Size for up to ~384 kHz so the resampler can
         // never truncate the tail of a subframe.
@@ -1389,13 +1392,15 @@ impl ClientEngine {
                     raw_hw_delay_ms.max(bt_delay_ms),
                 );
 
+                feedback_seq = feedback_seq.wrapping_add(1).max(1);
                 let fb = ClientFeedbackPacket {
                     fec_rate_permille: fec_permille,
                     bluetooth_delay_ms: bt_delay_ms,
                     hardware_delay_ms: effective_hw_delay_ms,
                     client_volume: client_vol,
                     requested_mode: media_cmd,
-                    auth_mac32: 0,
+                    feedback_seq,
+                    auth_tag: [0u8; 16],
                 };
                 let mut fb_bytes = [0u8; CONTROL_FEEDBACK_LEN];
                 fb.encode_signed(active_key.as_ref(), &mut fb_bytes);
