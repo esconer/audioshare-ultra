@@ -50,7 +50,7 @@ const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
 /// Keep compressed mode for this long after the last high-loss report. Without
 /// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
 /// encoder every 500 ms.
-const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(3);
+const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
 /// Release pace after the hold expires. The estimate steps down by this much
 /// at most once per interval, so a 130 permille report walks
 /// Tier 2 -> Tier 1 -> Tier 0 instead of jumping back to lossless in one
@@ -930,18 +930,6 @@ fn split_packet_fec<'a>(
     }
 }
 
-/// RFC 3550 timestamp for one subframe of a split bundle.
-///
-/// A split datagram carries exactly one 2.5 ms subframe, while the bundle's
-/// base timestamp describes its first subframe. Reusing that timestamp for
-/// every split datagram makes each later subframe look late by a multiple of
-/// 2.5 ms to the receiver's interarrival-jitter estimator, inflating the
-/// reported network jitter. Advance it by the real audio time instead.
-#[inline]
-fn split_tx_timestamp_us(base_timestamp_us: u32, split_idx: usize) -> u32 {
-    base_timestamp_us.wrapping_add((split_idx as u32).wrapping_mul(2_500))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn pack_and_send(
     socket: &UdpSocket,
@@ -1056,7 +1044,7 @@ impl Default for HostTelemetry {
             configured_subframes_per_packet: AtomicU8::new(1),
             active_codec_mode: AtomicU8::new(0),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
-            prefer_opus: AtomicBool::new(false),
+            prefer_opus: AtomicBool::new(true),
             client_gaming_lock: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(false),
             manual_group_sync_trim_ms: AtomicU16::new(0),
@@ -1080,6 +1068,26 @@ impl HostTelemetry {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Total estimated one-way audio delay (ms) reported to Linux
+    /// PipeWire/PulseAudio for browser/player video lip-sync when a
+    /// Bluetooth client is connected. Returns `0` when no BT earbuds are active.
+    pub fn video_lipsync_offset_ms(&self) -> u16 {
+        let bt = self.max_client_bt_delay_ms.load(Ordering::Relaxed);
+        if bt == 0 {
+            return 0;
+        }
+        let downstream = self
+            .max_client_downstream_delay_ms
+            .load(Ordering::Relaxed)
+            .max(bt);
+        let packet_ms = (self.tx_packet_interval_us.load(Ordering::Relaxed) / 1000) as u16;
+        // `downstream` already includes BT delay + excess FIFO above the 10 ms
+        // base floor. Add the base floor and this packet's framing interval.
+        downstream
+            .saturating_add(10)
+            .saturating_add(packet_ms)
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1088,6 +1096,7 @@ pub enum HostCaptureStream {
     Process {
         stream_active: Arc<AtomicBool>,
         child_pid: Arc<std::sync::atomic::AtomicU32>,
+        child_exited: Arc<AtomicBool>,
     },
     Cpal(cpal::Stream),
 }
@@ -1099,13 +1108,18 @@ impl Drop for HostCaptureStream {
         if let HostCaptureStream::Process {
             stream_active,
             child_pid,
+            child_exited,
         } = self
         {
             stream_active.store(false, Ordering::Release);
-            let pid = child_pid.load(Ordering::Relaxed);
-            if pid != 0 {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
+            // Never SIGTERM a PID that was already reaped: the OS may have
+            // recycled it for an unrelated process (stale-PID kill).
+            if !child_exited.load(Ordering::Acquire) {
+                let pid = child_pid.load(Ordering::Relaxed);
+                if pid != 0 {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
                 }
             }
         }
@@ -1133,7 +1147,7 @@ impl HostEngine {
             configured_subframes_per_packet: AtomicU8::new(config.subframes_per_packet.clamp(1, 4)),
             active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
-            prefer_opus: AtomicBool::new(false),
+            prefer_opus: AtomicBool::new(true),
             client_gaming_lock: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
@@ -1346,9 +1360,12 @@ impl HostEngine {
 
         let stream_active = Arc::new(AtomicBool::new(true));
         let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let child_exited = Arc::new(AtomicBool::new(false));
 
         let stream_active_clone = Arc::clone(&stream_active);
         let child_pid_clone = Arc::clone(&child_pid);
+        let child_exited_watch = Arc::clone(&child_exited);
+        let child_exited_wait = Arc::clone(&child_exited);
 
         std::thread::Builder::new()
             .name("as-ultra-linux-parec".into())
@@ -1437,14 +1454,14 @@ impl HostEngine {
 
                     // 2. Fallback to parec CLI if libpulse-simple.so.0 is unavailable
                     if let Ok(mut child) = Command::new("parec")
-                        .env("PIPEWIRE_LATENCY", "64/48000")
+                        .env("PIPEWIRE_LATENCY", "240/48000")
                         .args([
                             "--raw",
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=3",
-                            "--process-time-msec=2",
+                            "--latency-msec=5",
+                            "--process-time-msec=3",
                             &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())
@@ -1455,14 +1472,18 @@ impl HostEngine {
                         child_pid_clone.store(pid, Ordering::Relaxed);
                         let run_watch = Arc::clone(&running);
                         let stream_watch = Arc::clone(&stream_active_clone);
+                        let exited_watch = Arc::clone(&child_exited_watch);
                         std::thread::spawn(move || {
                             while run_watch.load(Ordering::Relaxed)
                                 && stream_watch.load(Ordering::Relaxed)
+                                && !exited_watch.load(Ordering::Acquire)
                             {
                                 std::thread::sleep(Duration::from_millis(100));
                             }
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGTERM);
+                            if !exited_watch.load(Ordering::Acquire) {
+                                unsafe {
+                                    libc::kill(pid as i32, libc::SIGTERM);
+                                }
                             }
                         });
                         if let Some(mut stdout) = child.stdout.take() {
@@ -1495,6 +1516,7 @@ impl HostEngine {
                         child_pid_clone.store(0, Ordering::Relaxed);
                         let _ = child.kill();
                         let _ = child.wait();
+                        child_exited_wait.store(true, Ordering::Release);
                     }
 
                     if stream_active_clone.load(Ordering::Relaxed)
@@ -1511,6 +1533,7 @@ impl HostEngine {
         Ok(HostCaptureStream::Process {
             stream_active,
             child_pid,
+            child_exited,
         })
     }
 
@@ -1698,7 +1721,9 @@ impl HostEngine {
 
         // Use our 4-Point Hermite Cubic Fractional Interpolator for alias-free 44.1k/96k -> 48k conversion
         let mut host_resampler = audioshare_protocol::dsp::ClockDriftResampler::new();
-        host_resampler.ratio = (src_rate as f64) / (SAMPLE_RATE as f64);
+        // Configure exact input->output rates so the anti-aliasing LPF engages
+        // automatically for 96/192 kHz capture endpoints.
+        host_resampler.set_sample_rates(src_rate, SAMPLE_RATE);
         // Ensure `chunk_frames` never produces more than 2000 output stereo
         // frames into the 4096-sample `resampled` buffer when `src_rate < 48kHz`.
         let ratio_cap = ((2000.0 * host_resampler.ratio).floor() as usize).max(1);
@@ -1986,8 +2011,14 @@ impl HostEngine {
                     start_instant,
                 )
                 .ok();
-            } else if use_test_tone && active_stream.is_some() {
-                active_stream = None;
+            } else if use_test_tone {
+                // Keep the capture thread alive (avoiding dual-producer SPSC
+                // UB on toggle) and silently drain incoming samples.
+                let mut discard = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                let mut dummy_rng = 1u32;
+                while ring.available_samples() >= SUBFRAME_STEREO_SAMPLES {
+                    ring.pop_exact_or_dither(&mut discard, &mut dummy_rng);
+                }
             }
 
             // 1. Hot-Plug Audio Device Watchdog (Solves Issues #173, #122, #103)
@@ -2007,6 +2038,9 @@ impl HostEngine {
                     || device_changed
                 {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
+                    // Drop the previous stream BEFORE creating a new SPSC
+                    // producer on `ring` (Rust evaluates RHS first otherwise).
+                    active_stream = None;
                     active_stream = Self::spawn_loopback_capture(
                         Arc::clone(&ring),
                         Arc::clone(&capture_heartbeat_ms),
@@ -2204,6 +2238,14 @@ impl HostEngine {
                 }
             }
 
+            // With no connected receivers the encoded bytes are discarded.
+            // Clear codec/FEC history so the next client never receives stale
+            // Opus lookahead or ADPCM backups from a previous session.
+            if cached_targets.is_empty() {
+                fec_hist_len = 0;
+                opus_encoder = None;
+            }
+
             // 2c. Evaluate the user-selected quality profile (re-evaluated every
             // packet so a UI change takes effect immediately, and so the
             // Smart Auto governor can adapt framing without restarting TX).
@@ -2374,8 +2416,16 @@ impl HostEngine {
             // per-subframe split path uses [i-1] and [i-2] as its N-1/N-2.
             let mut packet_fec = [[0u8; ADPCM_FEC_BYTES]; 4];
             let base_seq = seq;
+            // Clients unconditionally ignore ADPCM FEC on Opus packets (the
+            // 0 ms ADPCM backup jumps phase against the 2.5 ms Opus lookahead;
+            // Opus heals gaps with phase-aligned CELT PLC). Encoding and
+            // sending it wasted 248 B/packet ~= 397 kbps at 200 pps.
+            let suppress_adpcm_fec = dynamic_codec_mode == CodecMode::OpusRld;
+            if suppress_adpcm_fec {
+                fec_hist_len = 0;
+            }
             let prev_hist = fec_hist;
-            let prev_hist_len = fec_hist_len;
+            let prev_hist_len = if suppress_adpcm_fec { 0 } else { fec_hist_len };
             let send_n1 = prev_hist_len >= 1;
             let send_n2 = prev_hist_len >= 2;
             let mut packet_is_silent = true;
@@ -2418,17 +2468,26 @@ impl HostEngine {
                 let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
                 packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
-                if max_abs > 3 {
+                // Studio Master 24-bit must preserve -85..-100 dBFS reverb
+                // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
+                let active_audio = if profile == QualityProfile::StudioLossless24Bit {
+                    f32_subframe.iter().any(|s| s.abs() > 1.0e-5)
+                } else {
+                    max_abs > 3
+                };
+                if active_audio {
                     packet_is_silent = false;
                     silent_subframes = 0;
                 } else {
                     silent_subframes = silent_subframes.saturating_add(1);
                 }
 
-                fec_hist.copy_within(0..3, 1);
-                encode_fec_subframe(&i16_subframe, &mut fec_hist[0]);
-                fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
-                packet_fec[sub_idx] = fec_hist[0];
+                if !suppress_adpcm_fec {
+                    fec_hist.copy_within(0..3, 1);
+                    encode_fec_subframe(&i16_subframe, &mut fec_hist[0]);
+                    fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
+                    packet_fec[sub_idx] = fec_hist[0];
+                }
 
                 let entry_start = primary_cursor;
                 if matches!(
@@ -2618,13 +2677,17 @@ impl HostEngine {
                 let pair_fec = subframes_per_pkt == 4 && dynamic_codec_mode != CodecMode::OpusRld;
                 let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
                 let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
-                let (n1_len, n2_len) = pack_fec_history(
-                    pair_fec,
-                    &prev_hist,
-                    prev_hist_len,
-                    &mut fec_pair_1,
-                    &mut fec_pair_2,
-                );
+                let (n1_len, n2_len) = if suppress_adpcm_fec {
+                    (0, 0)
+                } else {
+                    pack_fec_history(
+                        pair_fec,
+                        &prev_hist,
+                        prev_hist_len,
+                        &mut fec_pair_1,
+                        &mut fec_pair_2,
+                    )
+                };
                 let full_n1 = &fec_pair_1[..n1_len];
                 let full_n2 = &fec_pair_2[..n2_len];
                 match plan_datagram_with_fec(
@@ -2658,8 +2721,10 @@ impl HostEngine {
                             let mut split_hdr = hdr;
                             split_hdr.subframe_count = 1;
                             split_hdr.sequence = base_seq.wrapping_add(split_idx as u16);
-                            split_hdr.tx_timestamp_us =
-                                split_tx_timestamp_us(tx_timestamp_us, split_idx);
+                            // Split datagrams are sent back-to-back (~20 us apart).
+                            // Stamping them +2500 us injected 2.5 ms of fake RFC
+                            // 3550 jitter; stamp the actual send wall clock.
+                            split_hdr.tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
 
                             let fec = split_packet_fec(
                                 split_idx,
@@ -2769,6 +2834,61 @@ impl Drop for HostEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_opus_packets_carry_no_dead_adpcm_fec() {
+        // BEFORE: up to 248 bytes of unused ADPCM FEC per Opus packet.
+        // P1-1: clients unconditionally ignore ADPCM FEC on Opus packets.
+        // HostEngine must not encode/transmit it (248 B/packet = ~397 kbps at 200 pps).
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let target = rx.local_addr().unwrap();
+        let mut engine = HostEngine::start(
+            HostConfig {
+                bind_port: 0,
+                use_test_tone: true,
+                subframes_per_packet: 2,
+                enable_smart_dtx: false,
+            },
+            vec![target],
+        )
+        .expect("start host engine");
+        engine.telemetry.quality_profile.store(
+            QualityProfile::LowLatencyCompressed as u8,
+            Ordering::Relaxed,
+        );
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        let mut buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut opus_packets = 0usize;
+        let mut max_fec_bytes = 0usize;
+        while Instant::now() < deadline && opus_packets < 8 {
+            if let Ok((len, _)) = rx.recv_from(&mut buf) {
+                if let Ok(hdr) = WireHeader::decode(&buf[..len]) {
+                    if hdr.mode == CodecMode::OpusRld {
+                        opus_packets += 1;
+                        max_fec_bytes = max_fec_bytes
+                            .max(hdr.fec_n1_len as usize + hdr.fec_n2_len as usize);
+                    }
+                }
+            }
+        }
+        engine.stop();
+        assert!(opus_packets >= 4, "only {opus_packets} Opus packets received");
+        assert_eq!(max_fec_bytes, 0, "Opus packets carried up to {max_fec_bytes} bytes of unused ADPCM FEC");
+    }
+
+    #[test]
+    fn test_video_lipsync_offset_includes_bt_fifo_and_packetization() {
+        let t = HostTelemetry::new();
+        assert_eq!(t.video_lipsync_offset_ms(), 0, "no BT client => no offset");
+        t.max_client_bt_delay_ms.store(185, Ordering::Relaxed);
+        t.max_client_downstream_delay_ms.store(185, Ordering::Relaxed);
+        t.tx_packet_interval_us.store(5_000, Ordering::Relaxed);
+        // 185 downstream + 10 ms base floor + 5 ms packetization.
+        assert_eq!(t.video_lipsync_offset_ms(), 200);
+    }
 
     #[test]
     fn test_i16_to_f32_conversion_and_downmix() {
@@ -3031,19 +3151,6 @@ mod tests {
             plan_datagram(primary_only + 1 + MAC_TAG_LEN, false, true, true),
             DatagramPlan::SplitPerSubframe
         );
-    }
-
-    #[test]
-    fn test_split_datagrams_advance_timestamp_per_subframe() {
-        // Each split datagram is one 2.5 ms subframe, so the RFC 3550
-        // timestamp must advance by 2,500 us per datagram. A shared
-        // timestamp makes later subframes look late to the jitter estimator.
-        assert_eq!(split_tx_timestamp_us(1_000, 0), 1_000);
-        assert_eq!(split_tx_timestamp_us(1_000, 1), 3_500);
-        assert_eq!(split_tx_timestamp_us(1_000, 3), 8_500);
-        // Wrapping is intentional: the wire field is a 32-bit microsecond
-        // clock that wraps roughly every 71 minutes.
-        assert_eq!(split_tx_timestamp_us(u32::MAX - 1_000, 1), 1_499);
     }
 
     #[test]
@@ -3349,27 +3456,27 @@ mod tests {
         assert_eq!(governor.update(50, base), 50);
         // The next 0% report cannot step back up while the hold is open.
         assert_eq!(governor.update(0, base + Duration::from_millis(500)), 50);
-        assert_eq!(governor.update(0, base + Duration::from_millis(2_999)), 50);
+        assert_eq!(governor.update(0, base + Duration::from_millis(4_999)), 50);
         // The hold expires: first 25-permille step instead of a cliff to 0.
-        assert_eq!(governor.update(0, base + Duration::from_millis(3_000)), 25);
+        assert_eq!(governor.update(0, base + Duration::from_millis(5_000)), 25);
         // Once below the 4.5% tier boundary the residual estimate no longer
         // changes the profile, so the next report snaps to the live value.
-        assert_eq!(governor.update(0, base + Duration::from_millis(3_001)), 0);
+        assert_eq!(governor.update(0, base + Duration::from_millis(5_001)), 0);
 
         // A high-loss burst re-arms the window and walks Tier 2 -> Tier 1 ->
         // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump.
-        let t = base + Duration::from_millis(3_500);
+        let t = base + Duration::from_millis(5_500);
         assert_eq!(governor.update(130, t), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(2_900)), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(3_000)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(4_900)), 130);
+        assert_eq!(governor.update(0, t + Duration::from_millis(5_000)), 105);
         // Several clients may report inside one 500 ms interval; the decay
         // must not run once per call.
-        assert_eq!(governor.update(0, t + Duration::from_millis(3_001)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(3_400)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(3_500)), 80);
-        assert_eq!(governor.update(0, t + Duration::from_millis(4_000)), 55);
-        assert_eq!(governor.update(0, t + Duration::from_millis(4_500)), 30);
-        assert_eq!(governor.update(0, t + Duration::from_millis(4_501)), 0);
+        assert_eq!(governor.update(0, t + Duration::from_millis(5_001)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(5_400)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(5_500)), 80);
+        assert_eq!(governor.update(0, t + Duration::from_millis(6_000)), 55);
+        assert_eq!(governor.update(0, t + Duration::from_millis(6_500)), 30);
+        assert_eq!(governor.update(0, t + Duration::from_millis(6_501)), 0);
 
         // Sub-threshold noise never arms the hold and does not linger.
         let mut governor = LossGovernor::new(base);
