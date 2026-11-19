@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
@@ -270,6 +271,7 @@ pub struct AdbUsbWatcher {
     running: Arc<AtomicBool>,
     pub usb_device_connected: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    tcp_bridge_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AdbUsbWatcher {
@@ -278,6 +280,7 @@ impl AdbUsbWatcher {
         let usb_device_connected = Arc::new(AtomicBool::new(false));
         let run_clone = Arc::clone(&running);
         let usb_clone = Arc::clone(&usb_device_connected);
+        let bridge_run = Arc::clone(&running);
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-adb-watcher".into())
@@ -304,18 +307,121 @@ impl AdbUsbWatcher {
             })
             .ok();
 
+        // Loopback-only TCP_NODELAY bridge for `adb reverse tcp:P tcp:P`.
+        // Bind synchronously: the GUI may create this watcher and immediately
+        // connect a client, so a listener bound inside the spawned thread
+        // would race that first connect. ADB tunnels TCP streams but has no
+        // UDP forwarding; this adapts loopback TCP to the host's UDP listener.
+        let tcp_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok();
+        let tcp_bridge_handle = tcp_listener.and_then(|listener| {
+            std::thread::Builder::new()
+            .name("as-ultra-adb-tcp-bridge".into())
+            .spawn(move || {
+                let _ = listener.set_nonblocking(true);
+                while bridge_run.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => spawn_host_adb_tcp_session(stream, port, Arc::clone(&bridge_run)),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                    }
+                }
+            })
+            .ok()
+        });
+
         Self {
             running,
             usb_device_connected,
             handle,
+            tcp_bridge_handle,
         }
     }
+}
+
+/// Bridge one `adb reverse` TCP connection to the local UDP `HostEngine`
+/// using `[u16_be len][datagram]` framing.
+fn spawn_host_adb_tcp_session(stream: TcpStream, host_udp_port: u16, host_running: Arc<AtomicBool>) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+    let Ok(mut tcp_writer) = stream.try_clone() else {
+        return;
+    };
+    let Ok(udp_rx) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
+        return;
+    };
+    if udp_rx.connect((Ipv4Addr::LOCALHOST, host_udp_port)).is_err() {
+        return;
+    }
+    let _ = udp_rx.set_read_timeout(Some(Duration::from_millis(200)));
+    let Ok(udp_tx) = udp_rx.try_clone() else {
+        return;
+    };
+    let alive = Arc::new(AtomicBool::new(true));
+
+    let alive_in = Arc::clone(&alive);
+    let run_in = Arc::clone(&host_running);
+    let mut tcp_reader = stream;
+    let _ = std::thread::Builder::new()
+        .name("as-ultra-adb-in".into())
+        .spawn(move || {
+            let mut len_buf = [0u8; 2];
+            let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
+            while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
+                match tcp_reader.read_exact(&mut len_buf) {
+                    Ok(()) => {
+                        let len = u16::from_be_bytes(len_buf) as usize;
+                        if len == 0 || len > pkt.len() {
+                            break;
+                        }
+                        if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
+                            break;
+                        }
+                        let _ = udp_tx.send(&pkt[..len]);
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+            alive_in.store(false, Ordering::Release);
+        });
+
+    let alive_out = Arc::clone(&alive);
+    let run_out = Arc::clone(&host_running);
+    let _ = std::thread::Builder::new()
+        .name("as-ultra-adb-out".into())
+        .spawn(move || {
+            let mut framed = [0u8; 2 + crate::MAX_SAFE_UDP_PAYLOAD];
+            while alive_out.load(Ordering::Relaxed) && run_out.load(Ordering::Relaxed) {
+                match udp_rx.recv(&mut framed[2..]) {
+                    Ok(len) if len > 0 && len <= crate::MAX_SAFE_UDP_PAYLOAD => {
+                        framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+                        if tcp_writer.write_all(&framed[..2 + len]).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+            }
+            alive_out.store(false, Ordering::Release);
+        });
 }
 
 impl Drop for AdbUsbWatcher {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.tcp_bridge_handle.take() {
             let _ = h.join();
         }
     }

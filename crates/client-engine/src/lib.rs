@@ -1,4 +1,5 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
@@ -714,10 +715,113 @@ impl ClientTelemetry {
     }
 }
 
+/// Loopback TCP↔UDP bridge for `adb reverse tcp:P tcp:P`. When the configured
+/// server is loopback and a TCP listener is reachable, ClientEngine's UDP
+/// datagrams are tunnelled over `TCP_NODELAY` to that listener instead of being
+/// sent as plain loopback UDP. Both directions use `[u16_be len][datagram]`.
+struct AdbTcpClientBridge {
+    running: Arc<AtomicBool>,
+    local_udp_addr: SocketAddr,
+    in_handle: Option<std::thread::JoinHandle<()>>,
+    out_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AdbTcpClientBridge {
+    fn try_connect(server_addr: SocketAddr, client_udp_port: u16) -> Option<Self> {
+        if !server_addr.ip().is_loopback() {
+            return None;
+        }
+        let stream = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+        let mut tcp_writer = stream.try_clone().ok()?;
+        let udp_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+        let local_udp_addr = udp_rx.local_addr().ok()?;
+        let _ = udp_rx.set_read_timeout(Some(Duration::from_millis(200)));
+        let udp_tx = udp_rx.try_clone().ok()?;
+        let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, client_udp_port));
+
+        let running = Arc::new(AtomicBool::new(true));
+        let run_in = Arc::clone(&running);
+        let mut tcp_reader = stream;
+        let in_handle = std::thread::Builder::new()
+            .name("as-ultra-adb-cli-in".into())
+            .spawn(move || {
+                let mut len_buf = [0u8; 2];
+                let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
+                while run_in.load(Ordering::Relaxed) {
+                    match tcp_reader.read_exact(&mut len_buf) {
+                        Ok(()) => {
+                            let len = u16::from_be_bytes(len_buf) as usize;
+                            if len == 0 || len > pkt.len() {
+                                break;
+                            }
+                            if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
+                                break;
+                            }
+                            let _ = udp_tx.send_to(&pkt[..len], client_addr);
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => break,
+                    }
+                }
+                run_in.store(false, Ordering::Release);
+            })
+            .ok();
+
+        let run_out = Arc::clone(&running);
+        let out_handle = std::thread::Builder::new()
+            .name("as-ultra-adb-cli-out".into())
+            .spawn(move || {
+                let mut framed = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
+                while run_out.load(Ordering::Relaxed) {
+                    match udp_rx.recv(&mut framed[2..]) {
+                        Ok(len) if len > 0 && len <= MAX_SAFE_UDP_PAYLOAD => {
+                            framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+                            if tcp_writer.write_all(&framed[..2 + len]).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => break,
+                    }
+                }
+                run_out.store(false, Ordering::Release);
+            })
+            .ok();
+
+        Some(Self {
+            running,
+            local_udp_addr,
+            in_handle,
+            out_handle,
+        })
+    }
+}
+
+impl Drop for AdbTcpClientBridge {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(h) = self.in_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.out_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct ClientEngine {
     running: Arc<AtomicBool>,
     pub telemetry: Arc<ClientTelemetry>,
     session_key: Arc<Mutex<Option<SessionKey>>>,
+    adb_bridge: Option<AdbTcpClientBridge>,
     rx_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -782,7 +886,21 @@ impl ClientEngine {
             .map_err(|e| format!("Failed to configure real-time client socket: {}", e))?;
         let _ = socket.set_read_timeout(Some(Duration::from_millis(5)));
 
-        let _ = socket.send_to(CONTROL_MAGIC_HELLO, config.server_addr);
+        // ADB USB mode: adb reverse forwards a loopback TCP stream, not UDP.
+        // Bridge it to our UDP socket when the server is loopback and a TCP
+        // listener is present; otherwise keep the normal UDP path unchanged.
+        let client_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let adb_bridge = if client_port != 0 {
+            AdbTcpClientBridge::try_connect(config.server_addr, client_port)
+        } else {
+            None
+        };
+        let mut effective_config = config;
+        if let Some(ref bridge) = adb_bridge {
+            effective_config.server_addr = bridge.local_udp_addr;
+        }
+
+        let _ = socket.send_to(CONTROL_MAGIC_HELLO, effective_config.server_addr);
 
         let burst_fifo = Arc::new(BurstDecouplerRing::new());
         let running_clone = Arc::clone(&running);
@@ -808,7 +926,7 @@ impl ClientEngine {
 
                 Self::realtime_rx_and_dsp_loop(
                     socket,
-                    config,
+                    effective_config,
                     burst_fifo,
                     #[cfg(not(target_os = "android"))]
                     &mut _audio_stream,
@@ -825,6 +943,7 @@ impl ClientEngine {
             running,
             telemetry,
             session_key,
+            adb_bridge,
             rx_handle: Some(rx_handle),
         })
     }
@@ -836,6 +955,7 @@ impl ClientEngine {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        self.adb_bridge = None;
         if let Some(h) = self.rx_handle.take() {
             let _ = h.join();
         }
@@ -1994,6 +2114,51 @@ impl Drop for ClientEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_adb_tcp_bridge_loopback_end_to_end() {
+        use audioshare_host_engine::discovery_and_os::AdbUsbWatcher;
+        use audioshare_host_engine::{HostConfig, HostEngine};
+
+        // Reserve then release an ephemeral port so host UDP + bridge TCP can
+        // both own it (different protocol spaces). No physical device needed:
+        // the TCP leg stands in for `adb reverse tcp:P tcp:P`.
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut host = HostEngine::start(
+            HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            },
+            vec![],
+        )
+        .expect("start host engine");
+        let _adb = AdbUsbWatcher::start(port);
+
+        let mut client = ClientEngine::connect(ClientConfig {
+            server_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            target_buffer_subframes: 4.0,
+            preamp_gain_db: 0.0,
+            dolby_effects: false,
+        })
+        .expect("client connect over ADB TCP bridge");
+        assert!(client.adb_bridge.is_some(), "loopback TCP bridge was not engaged");
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline
+            && client.telemetry.packets_received.load(Ordering::Relaxed) == 0
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let received = client.telemetry.packets_received.load(Ordering::Relaxed);
+        client.stop();
+        host.stop();
+        assert!(received > 0, "no packets crossed the ADB TCP<->UDP bridge");
+    }
 
     #[test]
     fn test_client_vu_peak_percent_math() {
