@@ -363,13 +363,21 @@ impl PhoneMicTransmitter {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(SessionKey::from_pin);
+        // The PIN is applied at transmitter start on Android, so seed the
+        // shared flag from the session key before launching the Party beacon.
+        let beacon_encrypted = Arc::new(AtomicBool::new(session_key.is_some()));
 
         // Party peers discover this phone through the beacon on the port the
         // transmitter actually bound. Advertising a hardcoded 65530 after a
         // fallback bind leaves every listener sending HELLO to a port nobody
         // reads.
-        let _party_beacon = party_beacon_port(use_hardware_mic, bound_port)
-            .map(|bound_port| DiscoveryBeacon::start(bound_port, "Android-Party-Host".into()));
+        let _party_beacon = party_beacon_port(use_hardware_mic, bound_port).map(|bound_port| {
+            DiscoveryBeacon::start_with_encryption_flag(
+                bound_port,
+                "Android-Party-Host".into(),
+                Arc::clone(&beacon_encrypted),
+            )
+        });
 
         let run_clone = Arc::clone(&running);
         let ring_clone = Arc::clone(&mic_input_ring);
@@ -966,6 +974,17 @@ pub mod android_native {
             Ok(value) => value.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
+    }
+
+    /// Pause or resume UDP discovery scanning (e.g. while switching networks).
+    /// Mirrors `nativeSetScannerPaused(paused: Boolean)` on the Kotlin side.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeSetScannerPaused(
+        _env: JNIEnv,
+        _class: JClass,
+        paused: jboolean,
+    ) {
+        get_or_start_scanner().set_paused(paused != 0);
     }
 
     #[no_mangle]

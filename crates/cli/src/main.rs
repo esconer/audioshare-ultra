@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
@@ -150,10 +151,18 @@ fn run_host(args: &[String]) {
     let mut os_guard = VirtualSpeakerAndRadioGuard::acquire(virtual_speaker);
     let host = HostEngine::start(cfg, vec![]).expect("Failed to start HostEngine");
     host.telemetry.prefer_opus.store(use_opus, Ordering::Relaxed);
+    let beacon_encrypted = Arc::new(AtomicBool::new(false));
     if let Some(pin) = pin {
         host.set_encryption_pin(Some(pin));
+        // Flip the shared flag when the PIN is applied so the beacon advertises
+        // `enc=1` on its very next interval.
+        beacon_encrypted.store(true, Ordering::Relaxed);
     }
-    let _beacon = DiscoveryBeacon::start(DEFAULT_PORT, "CLI-AudioShare-Ultra".into());
+    let _beacon = DiscoveryBeacon::start_with_encryption_flag(
+        DEFAULT_PORT,
+        "CLI-AudioShare-Ultra".into(),
+        Arc::clone(&beacon_encrypted),
+    );
     let _adb = AdbUsbWatcher::start(DEFAULT_PORT);
     println!(
         "\n[+] Pacing: {:.1} ms ({} subframe/pkt) | QoS: 802.11e WMM AC_VI (0xA0) | Smart DTX: ON",

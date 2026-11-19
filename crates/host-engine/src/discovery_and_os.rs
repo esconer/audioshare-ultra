@@ -163,6 +163,7 @@ impl Drop for DiscoveryBeacon {
 
 pub struct DiscoveryScanner {
     running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     hosts: Arc<Mutex<HashMap<SocketAddr, DiscoveredHost>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -170,8 +171,10 @@ pub struct DiscoveryScanner {
 impl DiscoveryScanner {
     pub fn start() -> Self {
         let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
         let hosts = Arc::new(Mutex::new(HashMap::new()));
         let run_clone = Arc::clone(&running);
+        let paused_clone = Arc::clone(&paused);
         let hosts_clone = Arc::clone(&hosts);
 
         let handle = std::thread::Builder::new()
@@ -214,7 +217,19 @@ impl DiscoveryScanner {
                             }
                         }
                     }
-                    if let Ok((len, src)) = sock.recv_from(&mut buf) {
+                    // While paused (e.g. the app is in the background or a
+                    // network switch is in progress) skip the receive entirely
+                    // so no stale or in-flight beacon can add a host. The
+                    // socket stays bound; datagrams queue in the kernel and are
+                    // processed as soon as scanning resumes.
+                    if paused_clone.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    } else if let Ok((len, src)) = sock.recv_from(&mut buf) {
+                        // The thread may have been blocked inside recv_from when
+                        // a pause was requested, so re-check before processing.
+                        if paused_clone.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
                             if let Some(rest) = msg.strip_prefix(BEACON_PREFIX) {
                                 if let Some((hostname, port, encrypted)) = parse_beacon_fields(rest)
@@ -246,9 +261,17 @@ impl DiscoveryScanner {
 
         Self {
             running,
+            paused,
             hosts,
             handle,
         }
+    }
+
+    /// Pause or resume UDP beacon reception. While paused the scanner keeps
+    /// its socket bound but does not drain or register any beacons; queued
+    /// datagrams are processed after `set_paused(false)`.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
     }
 
     pub fn discovered_hosts(&self) -> Vec<DiscoveredHost> {
@@ -1349,6 +1372,74 @@ mod tests {
             parse_beacon_fields(open.strip_prefix(BEACON_PREFIX).unwrap()),
             Some(("Open-PC", 65530, false))
         );
+    }
+
+    #[test]
+    fn test_beacon_enc_flag_zero_vs_one_roundtrip() {
+        // A `|1` beacon must advertise encryption; a `|0` beacon must not.
+        let enc = format!("{}{}|{}|1", BEACON_PREFIX, "Encrypted-Host", 41001);
+        let open = format!("{}{}|{}|0", BEACON_PREFIX, "Open-Host", 41002);
+        assert_eq!(
+            parse_beacon_fields(enc.strip_prefix(BEACON_PREFIX).unwrap()),
+            Some(("Encrypted-Host", 41001, true))
+        );
+        assert_eq!(
+            parse_beacon_fields(open.strip_prefix(BEACON_PREFIX).unwrap()),
+            Some(("Open-Host", 41002, false))
+        );
+
+        // The exact strings a DiscoveryScanner feeds through parse_beacon_fields.
+        let generated_enc = beacon_payload("Encrypted-Host", 41001, true);
+        let generated_open = beacon_payload("Open-Host", 41002, false);
+        assert_eq!(generated_enc, enc);
+        assert_eq!(generated_open, open);
+    }
+
+    #[test]
+    fn test_discovery_scanner_pause_resume() {
+        let scanner = DiscoveryScanner::start();
+        // Let the scanner thread bind the discovery socket before we send.
+        std::thread::sleep(Duration::from_millis(150));
+
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender.set_broadcast(true).unwrap();
+        let beacon = beacon_payload("PauseResume-Test-Host", 41234, false);
+
+        let dst = SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT));
+        let has_test_host = |scanner: &DiscoveryScanner| {
+            scanner
+                .discovered_hosts()
+                .iter()
+                .any(|h| h.hostname == "PauseResume-Test-Host")
+        };
+
+        // Pause first, then inject beacons (a real beacon repeats every 250 ms).
+        // While paused, recv_from is skipped (and any in-flight receive is
+        // discarded) so the host must never appear in discovered_hosts().
+        scanner.set_paused(true);
+        let paused_deadline = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < paused_deadline {
+            sender.send_to(beacon.as_bytes(), dst).unwrap();
+            assert!(
+                !has_test_host(&scanner),
+                "host was discovered while the scanner was paused"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Resume: the scanner drains queued beacons and the host shows up.
+        scanner.set_paused(false);
+        let resume_deadline = Instant::now() + Duration::from_secs(2);
+        let mut discovered = false;
+        while Instant::now() < resume_deadline {
+            sender.send_to(beacon.as_bytes(), dst).unwrap();
+            if has_test_host(&scanner) {
+                discovered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(discovered, "host was not discovered after the scanner resumed");
     }
 
     #[test]

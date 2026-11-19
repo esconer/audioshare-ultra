@@ -4,7 +4,8 @@ mod ui_widgets;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
@@ -247,6 +248,9 @@ struct AudioShareApp {
     // Host State
     host_engine: Option<HostEngine>,
     beacon: Option<DiscoveryBeacon>,
+    /// Shared with the live beacon so a PIN toggle immediately changes the
+    /// advertised `enc` bit without restarting the host.
+    beacon_encrypted: Arc<AtomicBool>,
     adb_watcher: Option<AdbUsbWatcher>,
     os_guard: Option<VirtualSpeakerAndRadioGuard>,
     quality_profile: QualityProfile,
@@ -404,6 +408,7 @@ impl AudioShareApp {
             hotspot_pass: "audioshare88".into(),
             hotspot_status: "Router LAN Mode (Standard)".into(),
             enable_pin_encryption: false,
+            beacon_encrypted: Arc::new(AtomicBool::new(false)),
             pairing_pin: "4829".into(),
             audio_apps: list_active_audio_apps(),
             selected_app_idx: None,
@@ -657,9 +662,16 @@ impl AudioShareApp {
                         .manual_group_sync_trim_ms
                         .store(self.group_sync_trim_ms, Ordering::Relaxed);
                     self.os_guard = Some(guard);
-                    self.beacon = Some(DiscoveryBeacon::start(
+                    // The beacon reads this atomic on every advertisement, so
+                    // apply_pin_now can flip `enc` live without a restart.
+                    self.beacon_encrypted.store(
+                        self.enable_pin_encryption && !self.pairing_pin.trim().is_empty(),
+                        Ordering::Relaxed,
+                    );
+                    self.beacon = Some(DiscoveryBeacon::start_with_encryption_flag(
                         DEFAULT_PORT,
                         "PC-AudioShare-Ultra".into(),
+                        Arc::clone(&self.beacon_encrypted),
                     ));
                     self.adb_watcher = Some(AdbUsbWatcher::start(DEFAULT_PORT));
                     self.host_engine = Some(engine);
@@ -756,6 +768,9 @@ impl AudioShareApp {
         if let Some(ref mic) = self.phone_mic_receiver {
             mic.set_encryption_pin(pin);
         }
+        // Advertise the new state on the very next beacon without restarting
+        // the host/beacon thread.
+        self.beacon_encrypted.store(pin.is_some(), Ordering::Relaxed);
         self.pin_dirty = false;
         self.save_persistent_config();
         self.show_toast(if pin.is_some() {
