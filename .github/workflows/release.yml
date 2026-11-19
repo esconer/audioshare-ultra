@@ -170,7 +170,7 @@ jobs:
           cargo ndk --platform 26 -t arm64-v8a -t armeabi-v7a -t x86_64 -o ./android/app/src/main/jniLibs build --release --locked -p audioshare-android-jni
 
       - name: Setup Gradle & Assemble Signed Release APK
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: "8.9"
 
