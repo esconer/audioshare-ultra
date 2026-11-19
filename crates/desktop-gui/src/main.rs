@@ -360,7 +360,7 @@ impl AudioShareApp {
             adb_watcher: None,
             os_guard: None,
             quality_profile: QualityProfile::SmartAuto,
-            prefer_opus: false,
+            prefer_opus: true,
             target_bitrate_kbps: 256,
             usb_low_latency_pacing: false,
             enable_smart_dtx: true,
@@ -521,7 +521,7 @@ impl AudioShareApp {
                             self.quality_profile = QualityProfile::from_u8(n);
                         }
                     }
-                    "prefer_opus" => self.prefer_opus = v.trim() == "true",
+                    "prefer_opus" => self.prefer_opus = v.trim() != "false",
                     "target_bitrate_kbps" => {
                         if let Ok(n) = v.trim().parse::<u16>() {
                             self.target_bitrate_kbps = n.clamp(96, 320);
@@ -590,6 +590,10 @@ impl AudioShareApp {
     fn toggle_host(&mut self) {
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
+            if self.last_applied_bt_delay != 0 {
+                apply_automatic_video_lipsync_offset_ms(0);
+                self.last_applied_bt_delay = 0;
+            }
             self.beacon = None;
             self.adb_watcher = None;
             self.os_guard = None;
@@ -1489,6 +1493,10 @@ impl eframe::App for AudioShareApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_persistent_config();
+        if self.direct_hotspot_active {
+            DirectHotspotController::stop_direct_hotspot();
+            self.direct_hotspot_active = false;
+        }
         if self.selected_app_idx.is_some() {
             let _ = restore_all_apps_to_default_sink();
         }
@@ -1772,6 +1780,7 @@ impl AudioShareApp {
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
                         if ui.button("Close Settings").clicked() {
+                            self.save_persistent_config();
                             self.show_settings_modal = false;
                         }
                     });
@@ -2118,7 +2127,7 @@ impl AudioShareApp {
                         ui,
                         dark,
                         !self.prefer_opus,
-                        "Pure-Rust VBR (Default, 0ms)",
+                        "Pure-Rust VBR (0ms Fallback)",
                     ) {
                         self.prefer_opus = false;
                         if let Some(ref host) = self.host_engine {
@@ -2129,7 +2138,7 @@ impl AudioShareApp {
                         ui,
                         dark,
                         self.prefer_opus,
-                        "Opus RLD (Pure Rust, 2.5ms lookahead)",
+                        "Opus RLD (Default, Pure Rust)",
                     ) {
                         self.prefer_opus = true;
                         if let Some(ref host) = self.host_engine {
@@ -3337,6 +3346,22 @@ phone_rx_mode=1
         assert!(app.latency_debug);
         assert!(app.gaming_hard_lock);
         assert_eq!(app.phone_rx_mode, PhoneRxRoutingMode::PlayOnPcSpeakers);
+    }
+
+    #[test]
+    fn test_prefer_opus_config_only_false_disables() {
+        let mut app = AudioShareApp::new();
+        // Explicit opt-out disables Opus.
+        app.parse_config_string("prefer_opus=false\n");
+        assert!(!app.prefer_opus);
+        // Legacy value "1", arbitrary text, and an empty value must all keep
+        // the Opus RLD default (regression: `== "true"` treated them as off).
+        app.parse_config_string("prefer_opus=1\n");
+        assert!(app.prefer_opus);
+        app.parse_config_string("prefer_opus=anything\n");
+        assert!(app.prefer_opus);
+        app.parse_config_string("prefer_opus=\n");
+        assert!(app.prefer_opus);
     }
 
     #[test]
