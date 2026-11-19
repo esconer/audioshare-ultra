@@ -27,6 +27,27 @@ fn beacon_port(raw: &str) -> u16 {
         .unwrap_or(crate::DEFAULT_PORT)
 }
 
+/// Build a discovery beacon payload. The trailing `enc` field is backward
+/// compatible: legacy clients still read the first two fields and ignore it.
+fn beacon_payload(host_label: &str, stream_port: u16, encrypted: bool) -> String {
+    format!(
+        "{}{}|{}|{}",
+        BEACON_PREFIX,
+        host_label,
+        stream_port,
+        u8::from(encrypted)
+    )
+}
+
+/// Parse the `[hostname]|[port]|[enc]` body of a discovery beacon.
+fn parse_beacon_fields(rest: &str) -> Option<(&str, u16, bool)> {
+    let mut parts = rest.split('|');
+    let hostname = parts.next()?;
+    let port = beacon_port(parts.next()?);
+    let encrypted = parts.next() == Some("1");
+    Some((hostname, port, encrypted))
+}
+
 
 
 #[cfg(target_os = "windows")]
@@ -52,6 +73,8 @@ pub struct DiscoveredHost {
     pub hostname: String,
     pub addr: SocketAddr,
     pub is_usb: bool,
+    /// Whether the advertising host requires a PIN (from the `enc` beacon bit).
+    pub encrypted: bool,
     pub last_seen: Instant,
 }
 
@@ -62,6 +85,16 @@ pub struct DiscoveryBeacon {
 
 impl DiscoveryBeacon {
     pub fn start(stream_port: u16, host_label: String) -> Self {
+        Self::start_with_encryption_flag(stream_port, host_label, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Advertise whether this host has a PIN configured so the phone can hide
+    /// the PIN box for open hosts and prompt cleanly for encrypted ones.
+    pub fn start_with_encryption_flag(
+        stream_port: u16,
+        host_label: String,
+        encrypted: Arc<AtomicBool>,
+    ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let run_clone = Arc::clone(&running);
 
@@ -74,9 +107,12 @@ impl DiscoveryBeacon {
                 let _ = sock.set_broadcast(true);
                 // Link-local scope: never leak discovery beacons past the LAN.
                 let _ = sock.set_multicast_ttl_v4(1);
-                let payload = format!("{}{}|{}", BEACON_PREFIX, host_label, stream_port);
-
                 while run_clone.load(Ordering::Relaxed) {
+                    let payload = beacon_payload(
+                        &host_label,
+                        stream_port,
+                        encrypted.load(Ordering::Relaxed),
+                    );
                     let _ = sock.send_to(
                         payload.as_bytes(),
                         SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
@@ -180,19 +216,18 @@ impl DiscoveryScanner {
                     if let Ok((len, src)) = sock.recv_from(&mut buf) {
                         if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
                             if let Some(rest) = msg.strip_prefix(BEACON_PREFIX) {
-                                let parts: Vec<&str> = rest.split('|').collect();
-                                if parts.len() >= 2 {
-                                    let hostname = parts[0].to_string();
-                                    let port = beacon_port(parts[1]);
+                                if let Some((hostname, port, encrypted)) = parse_beacon_fields(rest)
+                                {
                                     let host_addr = SocketAddr::new(src.ip(), port);
                                     let is_usb = crate::is_usb_subnet_ip(src.ip());
 
                                     hosts_clone.lock().unwrap().insert(
                                         host_addr,
                                         DiscoveredHost {
-                                            hostname,
+                                            hostname: hostname.to_string(),
                                             addr: host_addr,
                                             is_usb,
+                                            encrypted,
                                             last_seen: Instant::now(),
                                         },
                                     );
@@ -1176,6 +1211,23 @@ mod tests {
         assert!(DISCOVERY_MULTICAST_GROUP.is_multicast());
         assert!(DISCOVERY_MULTICAST_GROUP.octets()[0] >= 224);
         assert!(DISCOVERY_MULTICAST_GROUP.octets()[0] <= 239);
+    }
+
+    #[test]
+    fn test_beacon_encryption_flag_roundtrip_and_legacy_compat() {
+        let payload = beacon_payload("Studio-PC", 65530, true);
+        assert_eq!(payload, "ASULTRA_BEACON|Studio-PC|65530|1");
+        let rest = payload.strip_prefix(BEACON_PREFIX).unwrap();
+        assert_eq!(parse_beacon_fields(rest), Some(("Studio-PC", 65530, true)));
+
+        // Legacy two-field payloads still parse and default to open.
+        let legacy = "Studio-PC|65530";
+        assert_eq!(parse_beacon_fields(legacy), Some(("Studio-PC", 65530, false)));
+        let open = beacon_payload("Open-PC", 65530, false);
+        assert_eq!(
+            parse_beacon_fields(open.strip_prefix(BEACON_PREFIX).unwrap()),
+            Some(("Open-PC", 65530, false))
+        );
     }
 
     #[test]

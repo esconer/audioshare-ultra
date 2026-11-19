@@ -290,8 +290,8 @@ Sink #2
     #[test]
     fn test_synchronous_lipsync_reset_runs_without_panic() {
         // The exit path must complete synchronously (no detached thread
-        // killed by process exit) and reset the applied offset to 0.
+        // killed by process exit). Do not assert on the shared static: the
+        // parallel apply-offset test writes the same global concurrently.
         reset_video_lipsync_offset_blocking();
-        assert_eq!(LAST_LIPSYNC_REQUESTED.load(Ordering::Relaxed), 0);
     }
 }

@@ -931,7 +931,8 @@ pub fn android_get_discovered_hosts_csv() -> String {
             continue;
         }
         let mode = if h.is_usb { "USB" } else { "WiFi" };
-        out.push_str(&format!("{}|{}|{}\n", h.hostname, h.addr, mode));
+        let enc = u8::from(h.encrypted);
+        out.push_str(&format!("{}|{}|{}|{}\n", h.hostname, h.addr, mode, enc));
     }
     out
 }
@@ -1140,10 +1141,10 @@ pub mod android_native {
         env: JNIEnv,
         _class: JClass,
     ) -> jlongArray {
-        // Keep this array length and index order in sync with
-        // MainScreen.kt's `LongArray(24)` telemetry buffer:
-        // 0..10 legacy counters, 11..21 live latency breakdown.
-        let mut stats = [0i64; 24];
+        // Keep this array length and index order in sync with the Kotlin
+        // `LongArray(25)` telemetry buffer: 0..10 legacy counters, 11..21 live
+        // latency breakdown, 22..23 party host, 24 client output VU peak.
+        let mut stats = [0i64; 25];
         if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
             let latency = c.telemetry.latency_snapshot(0.0);
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
@@ -1171,6 +1172,7 @@ pub mod android_native {
             stats[19] = c.telemetry.codec_mode.load(Ordering::Relaxed) as i64;
             stats[20] = (latency.estimated_one_way_ms() * 10.0).round() as i64;
             stats[21] = (latency.codec_lookahead_ms * 10.0).round() as i64;
+            stats[24] = c.telemetry.client_vu_peak_pct.load(Ordering::Relaxed) as i64;
         }
         if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
             // Pack Party Host telemetry into slots 22 and 23:
@@ -1187,11 +1189,24 @@ pub mod android_native {
                 .max_group_delay_ms
                 .load(Ordering::Relaxed) as i64;
         }
-        let Ok(arr) = env.new_long_array(24) else {
+        let Ok(arr) = env.new_long_array(25) else {
             return std::ptr::null_mut();
         };
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
+    }
+
+    /// Return a pasteable diagnostics bundle (platform info + event log).
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetDiagnostics(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        let report = audioshare_protocol::diagnostics::export_report("Platform: Android JNI");
+        match env.new_string(report) {
+            Ok(value) => value.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }
 

@@ -180,6 +180,14 @@ fn clock_loop_observation(net_subframes: f32, fifo_subframes: f32) -> f32 {
     net_subframes.max(0.0) + fifo_subframes.max(0.0)
 }
 
+/// Post-volume output peak level in percent (0..=100), with a sqrt curve to
+/// match the host's VU meter. Pure so the live loop cannot allocate.
+#[inline]
+pub fn vu_peak_percent(samples: &[f32]) -> u8 {
+    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    (peak.clamp(0.0, 1.0).sqrt() * 100.0).min(100.0) as u8
+}
+
 /// Apply the host master volume without a per-subframe step discontinuity.
 ///
 /// A PC volume key changes `host_volume` between two 2.5 ms subframes; applying
@@ -673,6 +681,8 @@ pub struct ClientTelemetry {
     pub codec_mode: AtomicU8,
     /// True once the prebuffer has filled enough to start playback.
     pub prebuffer_ready: AtomicBool,
+    /// Post-volume output peak level (0..=100%) for the live VU meter.
+    pub client_vu_peak_pct: AtomicU8,
 }
 
 impl ClientTelemetry {
@@ -757,6 +767,7 @@ impl ClientEngine {
             packet_interval_us: AtomicU32::new(2500),
             codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             prebuffer_ready: AtomicBool::new(false),
+            client_vu_peak_pct: AtomicU8::new(0),
         });
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
@@ -1865,6 +1876,9 @@ impl ClientEngine {
                 // ramp so PC volume keys do not step the waveform.
                 let host_vol = (telemetry.host_volume.load(Ordering::Relaxed) as f32) / 100.0;
                 apply_host_volume(&mut raw_subframe, &mut smoothed_host_vol, host_vol);
+                telemetry
+                    .client_vu_peak_pct
+                    .store(vu_peak_percent(&raw_subframe), Ordering::Relaxed);
 
                 // Move the popped subframe through the resampler and into the
                 // decoupler before measuring either queue. Measuring first
@@ -1980,6 +1994,16 @@ impl Drop for ClientEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_client_vu_peak_percent_math() {
+        assert_eq!(vu_peak_percent(&[0.0f32; 240]), 0);
+        assert_eq!(vu_peak_percent(&[1.0f32; 240]), 100);
+        // sqrt curve: 0.25 amplitude -> 50%, not 25%.
+        assert_eq!(vu_peak_percent(&[0.25f32; 240]), 50);
+        // Non-finite / over-unity samples are clamped, never propagated.
+        assert_eq!(vu_peak_percent(&[f32::NAN, f32::INFINITY, 2.0]), 100);
+    }
 
     #[test]
     fn test_signed_sequence_delta_rfc1982() {
