@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ui_widgets;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
@@ -26,7 +28,7 @@ use audioshare_protocol::latency::{codec_mode_name, DESKTOP_OUTPUT_BUFFER_MS, SU
 use audioshare_protocol::lpc_lossless::QualityProfile;
 use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
-use qrcode::{Color as QrColor, QrCode};
+use ui_widgets as uw;
 
 fn main() -> eframe::Result<()> {
     // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
@@ -46,7 +48,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let app = AudioShareApp::new();
-            AudioShareApp::apply_studio_theme(&cc.egui_ctx, app.dark_mode);
+            uw::apply_studio_theme(&cc.egui_ctx, app.dark_mode);
             Ok(Box::new(app))
         }),
     )
@@ -209,6 +211,12 @@ enum AppTab {
     ClientReceiver,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SettingsTab {
+    NetworkAndSecurity,
+    GeneralAndDiagnostics,
+}
+
 struct AudioShareApp {
     tab: AppTab,
     interfaces: Vec<NetworkInterfaceInfo>,
@@ -218,6 +226,11 @@ struct AudioShareApp {
     selected_qr_iface_idx: usize,
     show_qr_modal: bool,
     show_settings_modal: bool,
+    settings_tab: SettingsTab,
+    pin_dirty: bool,
+    vu_peak_hold: f32,
+    /// Transient banner text plus the instant it was raised. Cleared after 2.5 s.
+    toast: Option<(String, Instant)>,
     dark_mode: bool,
     minimize_on_close: bool,
     autostart_stream_on_launch: bool,
@@ -350,6 +363,10 @@ impl AudioShareApp {
             selected_qr_iface_idx,
             show_qr_modal: false,
             show_settings_modal: false,
+            settings_tab: SettingsTab::NetworkAndSecurity,
+            pin_dirty: false,
+            vu_peak_hold: 0.0,
+            toast: None,
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
@@ -714,519 +731,64 @@ impl AudioShareApp {
             .store(self.gaming_hard_lock, Ordering::Relaxed);
     }
 
-    // =========================================================================
-    // STUDIO DESIGN SYSTEM & CUSTOM VECTOR WIDGETS (Zero Broken Tofu Glyphs)
-    // =========================================================================
+    // ---------------------------------------------------------------------
+    // Transient feedback + PIN plumbing (widget primitives live in
+    // `ui_widgets`).
+    // ---------------------------------------------------------------------
 
-    fn apply_studio_theme(ctx: &egui::Context, dark_mode: bool) {
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.window_margin = egui::Margin::same(16.0);
-        style.spacing.button_padding = egui::vec2(12.0, 7.0);
-        style.visuals = if dark_mode {
-            let mut v = egui::Visuals::dark();
-            v.panel_fill = egui::Color32::from_rgb(10, 13, 19);
-            v.window_fill = egui::Color32::from_rgb(16, 20, 29);
-            v.faint_bg_color = egui::Color32::from_rgb(20, 25, 36);
-            v.extreme_bg_color = egui::Color32::from_rgb(7, 9, 14);
-            v.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-            v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(147, 197, 253));
-            v.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(32, 40, 56));
-            v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(24, 30, 43);
-            v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(22, 28, 40);
-            v.widgets.inactive.bg_stroke =
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 52, 70));
-            v.widgets.inactive.rounding = egui::Rounding::same(7.0);
-            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 43, 62);
-            v.widgets.hovered.bg_stroke =
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 165, 250));
-            v.widgets.hovered.rounding = egui::Rounding::same(7.0);
-            v.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-            v.widgets.active.rounding = egui::Rounding::same(7.0);
-            v
-        } else {
-            let mut v = egui::Visuals::light();
-            v.panel_fill = egui::Color32::from_rgb(241, 245, 249);
-            v.window_fill = egui::Color32::from_rgb(255, 255, 255);
-            v.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-            v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-            v.widgets.inactive.rounding = egui::Rounding::same(7.0);
-            v.widgets.hovered.rounding = egui::Rounding::same(7.0);
-            v.widgets.active.rounding = egui::Rounding::same(7.0);
-            v
-        };
-        ctx.set_style(style);
+    fn show_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
     }
 
-    fn studio_card<R>(
-        ui: &mut egui::Ui,
-        dark_mode: bool,
-        add_contents: impl FnOnce(&mut egui::Ui) -> R,
-    ) -> egui::InnerResponse<R> {
-        let fill = if dark_mode {
-            egui::Color32::from_rgb(17, 22, 32)
+    /// Push the current PIN setting into every live engine at once.
+    fn apply_pin_now(&mut self) {
+        let pin = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
+            Some(self.pairing_pin.as_str())
         } else {
-            egui::Color32::from_rgb(255, 255, 255)
+            None
         };
-        let stroke = if dark_mode {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 42, 59))
-        } else {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 222, 234))
-        };
-        egui::Frame::none()
-            .fill(fill)
-            .stroke(stroke)
-            .rounding(egui::Rounding::same(12.0))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                add_contents(ui)
-            })
-    }
-
-    fn status_pill(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32) {
-        egui::Frame::none()
-            .fill(bg)
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::symmetric(9.0, 4.0))
-            .show(ui, |ui| {
-                ui.label(egui::RichText::new(text).color(fg).size(11.5).strong());
-            });
-    }
-
-    fn metric_tile(ui: &mut egui::Ui, dark_mode: bool, label: &str, value: &str) {
-        let fill = if dark_mode {
-            egui::Color32::from_rgb(12, 16, 24)
-        } else {
-            egui::Color32::from_rgb(244, 247, 251)
-        };
-        let stroke = if dark_mode {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(28, 36, 52))
-        } else {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 226, 236))
-        };
-        egui::Frame::none()
-            .fill(fill)
-            .stroke(stroke)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(11.0, 8.0))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(
-                        egui::RichText::new(label)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(130, 144, 168)),
-                    );
-                    ui.monospace(egui::RichText::new(value).size(13.0).strong());
-                });
-            });
-    }
-
-    /// Custom-painted iOS / Sonar style animated pill switch
-    fn pill_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-        let desired_size = egui::vec2(38.0, 20.0);
-        let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-        if response.clicked() {
-            *on = !*on;
-            response.mark_changed();
+        if let Some(ref host) = self.host_engine {
+            host.set_encryption_pin(pin);
         }
-        if ui.is_rect_visible(rect) {
-            let how_on = ui.ctx().animate_bool(response.id, *on);
-            let bg_off = egui::Color32::from_rgb(45, 55, 72);
-            let bg_on = egui::Color32::from_rgb(37, 99, 235);
-            let bg = egui::Color32::from_rgb(
-                (bg_off.r() as f32 + (bg_on.r() as f32 - bg_off.r() as f32) * how_on) as u8,
-                (bg_off.g() as f32 + (bg_on.g() as f32 - bg_off.g() as f32) * how_on) as u8,
-                (bg_off.b() as f32 + (bg_on.b() as f32 - bg_off.b() as f32) * how_on) as u8,
-            );
-            let radius = 0.5 * rect.height();
-            ui.painter().rect_filled(rect, radius, bg);
-            let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
-            let center = egui::pos2(circle_x, rect.center().y);
-            ui.painter()
-                .circle_filled(center, radius - 2.5, egui::Color32::WHITE);
+        if let Some(ref client) = self.client_engine {
+            client.set_encryption_pin(pin);
         }
-        response
-    }
-
-    /// Clean two-line setting row with title + subtitle on the left and a pill switch on the right
-    fn setting_switch_row(
-        ui: &mut egui::Ui,
-        dark_mode: bool,
-        title: &str,
-        subtitle: &str,
-        value: &mut bool,
-    ) -> bool {
-        let mut changed = false;
-        let row_bg = if dark_mode {
-            egui::Color32::from_rgb(13, 17, 25)
-        } else {
-            egui::Color32::from_rgb(246, 248, 252)
-        };
-        let row_stroke = if dark_mode {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(28, 35, 50))
-        } else {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(226, 232, 240))
-        };
-        egui::Frame::none()
-            .fill(row_bg)
-            .stroke(row_stroke)
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.5;
-                        ui.label(egui::RichText::new(title).size(13.0).strong());
-                        ui.label(
-                            egui::RichText::new(subtitle)
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(130, 144, 168)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if Self::pill_switch(ui, value).changed() {
-                            changed = true;
-                        }
-                    });
-                });
-            });
-        changed
-    }
-
-    /// Segmented capsule button with clear active/inactive borders and fills
-    fn pill_choice(ui: &mut egui::Ui, dark_mode: bool, selected: bool, label: &str) -> bool {
-        let (fill, stroke, text_col) = if selected {
-            (
-                egui::Color32::from_rgb(37, 99, 235),
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 165, 250)),
-                egui::Color32::WHITE,
-            )
-        } else if dark_mode {
-            (
-                egui::Color32::from_rgb(24, 30, 43),
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 54, 74)),
-                egui::Color32::from_rgb(203, 213, 225),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(238, 242, 248),
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(203, 213, 225)),
-                egui::Color32::from_rgb(30, 41, 59),
-            )
-        };
-        let btn = egui::Button::new(
-            egui::RichText::new(label)
-                .size(12.5)
-                .strong()
-                .color(text_col),
-        )
-        .fill(fill)
-        .stroke(stroke)
-        .rounding(egui::Rounding::same(7.0));
-        ui.add(btn).clicked()
-    }
-
-    /// Tactile Mode Card for the 4 "Simple First" hero presets
-    fn mode_preset_card(
-        ui: &mut egui::Ui,
-        dark_mode: bool,
-        selected: bool,
-        title: &str,
-        subtitle: &str,
-        badge: &str,
-    ) -> bool {
-        let (fill, stroke, title_col) = if selected {
-            (
-                if dark_mode {
-                    egui::Color32::from_rgb(23, 37, 68)
-                } else {
-                    egui::Color32::from_rgb(219, 234, 254)
-                },
-                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(59, 130, 246)),
-                if dark_mode {
-                    egui::Color32::WHITE
-                } else {
-                    egui::Color32::from_rgb(30, 58, 138)
-                },
-            )
-        } else if dark_mode {
-            (
-                egui::Color32::from_rgb(14, 18, 27),
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(34, 43, 60)),
-                egui::Color32::from_rgb(226, 232, 240),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(248, 250, 252),
-                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(203, 213, 225)),
-                egui::Color32::from_rgb(15, 23, 42),
-            )
-        };
-
-        let resp = egui::Frame::none()
-            .fill(fill)
-            .stroke(stroke)
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    ui.horizontal(|ui| {
-                        let (dot_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        let dot_col = if selected {
-                            egui::Color32::from_rgb(59, 130, 246)
-                        } else {
-                            egui::Color32::from_rgb(100, 116, 139)
-                        };
-                        ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
-                        ui.label(
-                            egui::RichText::new(title)
-                                .size(13.5)
-                                .strong()
-                                .color(title_col),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            Self::status_pill(
-                                ui,
-                                badge,
-                                if selected {
-                                    egui::Color32::from_rgb(37, 99, 235)
-                                } else {
-                                    egui::Color32::from_rgb(26, 33, 48)
-                                },
-                                if selected {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::from_rgb(148, 163, 184)
-                                },
-                            );
-                        });
-                    });
-                    ui.label(
-                        egui::RichText::new(subtitle)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(135, 149, 173)),
-                    );
-                });
-            })
-            .response;
-
-        ui.interact(resp.rect, resp.id.with("mode_click"), egui::Sense::click())
-            .clicked()
-    }
-
-    /// Clickable Progressive Disclosure Drawer Header with live summary pills on the right
-    fn drawer_header(
-        ui: &mut egui::Ui,
-        dark_mode: bool,
-        open: &mut bool,
-        title: &str,
-        summary_pills: &[&str],
-    ) {
-        let bg = if *open {
-            if dark_mode {
-                egui::Color32::from_rgb(22, 29, 44)
-            } else {
-                egui::Color32::from_rgb(235, 241, 250)
-            }
-        } else if dark_mode {
-            egui::Color32::from_rgb(16, 21, 31)
-        } else {
-            egui::Color32::from_rgb(248, 250, 252)
-        };
-        let stroke = if *open {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(59, 130, 246))
-        } else if dark_mode {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(33, 42, 59))
-        } else {
-            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(214, 222, 234))
-        };
-
-        let resp = egui::Frame::none()
-            .fill(bg)
-            .stroke(stroke)
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let arrow = if *open { "⏷" } else { "⏵" };
-                    ui.label(
-                        egui::RichText::new(format!("{}  {}", arrow, title))
-                            .size(13.5)
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for &pill in summary_pills.iter().rev() {
-                            Self::status_pill(
-                                ui,
-                                pill,
-                                egui::Color32::from_rgb(26, 34, 49),
-                                egui::Color32::from_rgb(147, 197, 253),
-                            );
-                        }
-                    });
-                });
-            })
-            .response;
-
-        if ui
-            .interact(
-                resp.rect,
-                resp.id.with("drawer_toggle"),
-                egui::Sense::click(),
-            )
-            .clicked()
-        {
-            *open = !*open;
+        if let Some(ref mic) = self.phone_mic_receiver {
+            mic.set_encryption_pin(pin);
         }
-    }
-
-    /// Custom 24-Segment Studio LED VU Peak Meter
-    fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8) {
-        let segments = 24usize;
-        let desired = egui::vec2(210.0, 16.0);
-        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 13, 20));
-
-        let gap = 2.0f32;
-        let seg_w = (rect.width() - gap * (segments as f32 + 1.0)) / (segments as f32);
-        let active_segs = ((vu_pct as usize) * segments).div_ceil(100);
-
-        for i in 0..segments {
-            let x = rect.left() + gap + (i as f32) * (seg_w + gap);
-            let seg_rect = egui::Rect::from_min_size(
-                egui::pos2(x, rect.top() + 2.5),
-                egui::vec2(seg_w, rect.height() - 5.0),
-            );
-            let color = if i < active_segs {
-                if i >= 21 {
-                    egui::Color32::from_rgb(239, 68, 68) // Red clip zone
-                } else if i >= 16 {
-                    egui::Color32::from_rgb(245, 158, 11) // Amber headroom zone
-                } else {
-                    egui::Color32::from_rgb(16, 185, 129) // Emerald nominal zone
-                }
-            } else {
-                egui::Color32::from_rgb(26, 33, 46)
-            };
-            painter.rect_filled(seg_rect, 1.5, color);
-        }
-    }
-
-    /// Studio Fader Row: Band title + frequency badge on left, clickable dB reset pill on right
-    fn studio_fader_row(
-        ui: &mut egui::Ui,
-        dark_mode: bool,
-        title: &str,
-        freq_badge: &str,
-        value: &mut f32,
-        range: std::ops::RangeInclusive<f32>,
-    ) -> bool {
-        let mut changed = false;
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(title).size(12.5).strong());
-                if !freq_badge.is_empty() {
-                    Self::status_pill(
-                        ui,
-                        freq_badge,
-                        if dark_mode {
-                            egui::Color32::from_rgb(24, 31, 46)
-                        } else {
-                            egui::Color32::from_rgb(230, 236, 245)
-                        },
-                        egui::Color32::from_rgb(130, 144, 168),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let is_boosted = value.abs() >= 0.05;
-                    let (bg, fg) = if is_boosted {
-                        (
-                            egui::Color32::from_rgb(30, 58, 138),
-                            egui::Color32::from_rgb(147, 197, 253),
-                        )
-                    } else {
-                        (
-                            egui::Color32::from_rgb(24, 30, 43),
-                            egui::Color32::from_rgb(148, 163, 184),
-                        )
-                    };
-                    let db_btn = egui::Button::new(
-                        egui::RichText::new(format!("{:+.1} dB", *value))
-                            .monospace()
-                            .size(11.5)
-                            .strong()
-                            .color(fg),
-                    )
-                    .fill(bg)
-                    .rounding(egui::Rounding::same(6.0));
-                    if ui
-                        .add(db_btn)
-                        .on_hover_text("Click to reset band to 0.0 dB")
-                        .clicked()
-                    {
-                        *value = 0.0;
-                        changed = true;
-                    }
-                });
-            });
-
-            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(140.0);
-            let slider = egui::Slider::new(value, range)
-                .show_value(false)
-                .trailing_fill(true);
-            if ui.add(slider).changed() {
-                changed = true;
-            }
+        self.pin_dirty = false;
+        self.save_persistent_config();
+        self.show_toast(if pin.is_some() {
+            "PIN encryption active"
+        } else {
+            "PIN encryption disabled"
         });
-        ui.add_space(2.0);
-        changed
-    }
-
-    /// Render a crisp, scannable ISO-18004 QR Code directly onto the egui canvas
-    fn draw_qr_code(ui: &mut egui::Ui, uri: &str) {
-        let Ok(code) = QrCode::new(uri.as_bytes()) else {
-            return;
-        };
-        let width = code.width();
-        let module_px = 5.0f32;
-        let quiet_zone = 4;
-        let total_modules = (width + quiet_zone * 2) as f32;
-        let size_px = total_modules * module_px;
-
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(size_px, size_px), egui::Sense::hover());
-        let painter = ui.painter();
-        painter.rect_filled(rect, 8.0, egui::Color32::WHITE);
-
-        for y in 0..width {
-            for x in 0..width {
-                if code[(x, y)] == QrColor::Dark {
-                    let min = rect.min
-                        + egui::vec2(
-                            ((x + quiet_zone) as f32) * module_px,
-                            ((y + quiet_zone) as f32) * module_px,
-                        );
-                    let cell = egui::Rect::from_min_size(min, egui::vec2(module_px, module_px));
-                    painter.rect_filled(cell, 0.0, egui::Color32::BLACK);
-                }
-            }
-        }
     }
 }
 
 impl eframe::App for AudioShareApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keyboard shortcuts: Esc closes modals, Ctrl+, toggles Settings,
+        // F12 toggles the latency HUD.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_qr_modal = false;
+            self.show_settings_modal = false;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+            self.interfaces = list_valid_host_interfaces();
+            self.show_settings_modal = !self.show_settings_modal;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            self.latency_debug = !self.latency_debug;
+        }
+
+        // Expire the transient toast banner after 2.5 seconds.
+        if let Some((_, created)) = &self.toast {
+            if created.elapsed() >= Duration::from_millis(2500) {
+                self.toast = None;
+            }
+        }
+
         if ctx.input(|i| i.viewport().close_requested())
             && !self.force_quit
             && self.minimize_on_close
@@ -1236,9 +798,21 @@ impl eframe::App for AudioShareApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
+        // Event-driven repaint: 0 Hz on the idle Host tab (no GPU/CPU burn),
+        // ~16 Hz while streaming for smooth VU/oscilloscope, 1 Hz while the
+        // Receive tab scans LAN beacons, 2 Hz while hidden/minimized, and
+        // 4 Hz while a toast is visible so it expires promptly.
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        if !is_minimized {
-            ctx.request_repaint_after(Duration::from_millis(100));
+        let streaming_active = self.host_engine.is_some()
+            || self.client_engine.is_some()
+            || self.phone_mic_receiver.is_some();
+        if streaming_active {
+            let interval_ms = if is_minimized { 500 } else { 60 };
+            ctx.request_repaint_after(Duration::from_millis(interval_ms));
+        } else if self.tab == AppTab::ClientReceiver && !is_minimized {
+            ctx.request_repaint_after(Duration::from_millis(1000));
+        } else if self.toast.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         if let Some(ref host) = self.host_engine {
@@ -1329,11 +903,11 @@ impl eframe::App for AudioShareApp {
                     ui.separator();
                     ui.add_space(6.0);
 
-                    if Self::pill_choice(ui, dark, self.tab == AppTab::HostSender, "Send PC Audio")
+                    if uw::pill_choice(ui, dark, self.tab == AppTab::HostSender, "Send PC Audio")
                     {
                         self.tab = AppTab::HostSender;
                     }
-                    if Self::pill_choice(
+                    if uw::pill_choice(
                         ui,
                         dark,
                         self.tab == AppTab::ClientReceiver,
@@ -1347,17 +921,48 @@ impl eframe::App for AudioShareApp {
                             self.force_quit = true;
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
-                        if Self::pill_choice(ui, dark, self.show_settings_modal, "Settings") {
+                        if uw::pill_choice(ui, dark, self.show_settings_modal, "Settings") {
                             self.interfaces = list_valid_host_interfaces();
                             self.show_settings_modal = !self.show_settings_modal;
                         }
-                        if Self::pill_choice(ui, dark, self.show_qr_modal, "Pair Phone QR") {
+                        if uw::pill_choice(ui, dark, self.show_qr_modal, "Pair Phone QR") {
                             self.interfaces = list_valid_host_interfaces();
                             self.selected_qr_iface_idx = refreshed_qr_iface_index(
                                 &self.interfaces,
                                 self.selected_qr_iface_idx,
                             );
                             self.show_qr_modal = !self.show_qr_modal;
+                        }
+                        // Clickable PIN ON indicator — jumps straight to Security.
+                        if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
+                            let p = uw::Palette::for_mode(dark);
+                            let resp = egui::Frame::none()
+                                .fill(p.ok_bg)
+                                .rounding(egui::Rounding::same(6.0))
+                                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (lock_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(10.0, 12.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        uw::paint_lock_icon(ui.painter(), lock_rect.center(), p.ok_fg);
+                                        ui.label(
+                                            egui::RichText::new("PIN ON")
+                                                .size(11.5)
+                                                .strong()
+                                                .color(p.ok_fg),
+                                        );
+                                    });
+                                })
+                                .response;
+                            if ui
+                                .interact(resp.rect, resp.id.with("pin_badge"), egui::Sense::click())
+                                .clicked()
+                            {
+                                self.settings_tab = SettingsTab::NetworkAndSecurity;
+                                self.show_settings_modal = true;
+                            }
                         }
                     });
                 });
@@ -1446,7 +1051,7 @@ impl eframe::App for AudioShareApp {
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if Self::pill_choice(
+                        if uw::pill_choice(
                             ui,
                             dark,
                             self.latency_debug,
@@ -1457,6 +1062,10 @@ impl eframe::App for AudioShareApp {
                             },
                         ) {
                             self.latency_debug = !self.latency_debug;
+                        }
+                        if let Some((ref msg, _)) = self.toast {
+                            let p = uw::Palette::for_mode(dark);
+                            uw::status_pill(ui, msg, p.ok_bg, p.ok_fg);
                         }
                     });
                 });
@@ -1528,12 +1137,14 @@ impl eframe::App for AudioShareApp {
 impl AudioShareApp {
     fn render_qr_modal(&mut self, ctx: &egui::Context) {
         let dark = self.dark_mode;
+        let mut open = self.show_qr_modal;
         egui::Window::new("Pair Android Phone via QR Code")
+            .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                Self::studio_card(ui, dark, |ui| {
+                uw::studio_card(ui, dark, |ui| {
                     let pin_opt = if self.enable_pin_encryption {
                         Some(self.pairing_pin.as_str())
                     } else {
@@ -1554,7 +1165,7 @@ impl AudioShareApp {
                                     } else {
                                         "[LAN]"
                                     };
-                                    if Self::pill_choice(
+                                    if uw::pill_choice(
                                         ui,
                                         dark,
                                         self.selected_qr_iface_idx == idx,
@@ -1575,9 +1186,9 @@ impl AudioShareApp {
                         let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
                         ui.label("Scan with your Android Camera or the AudioShare Ultra app:");
                         ui.add_space(8.0);
-                        Self::draw_qr_code(ui, &uri);
+                        uw::draw_qr_code(ui, &uri);
                         ui.add_space(8.0);
-                        Self::status_pill(
+                        uw::status_pill(
                             ui,
                             &uri,
                             egui::Color32::from_rgb(15, 23, 42),
@@ -1587,230 +1198,238 @@ impl AudioShareApp {
                         ui.horizontal(|ui| {
                             if ui.button("Copy Connection URI").clicked() {
                                 ui.ctx().copy_text(uri.clone());
-                            }
-                            if ui.button("Close").clicked() {
-                                self.show_qr_modal = false;
+                                // Disjoint field write: `pin_opt` still borrows
+                                // `self.pairing_pin` until the URI is built.
+                                self.toast =
+                                    Some(("Copied Connection URI".into(), Instant::now()));
                             }
                         });
                     });
                 });
             });
+        self.show_qr_modal = open;
     }
 
     fn render_settings_modal(&mut self, ctx: &egui::Context) {
         let dark = self.dark_mode;
-        egui::Window::new("System, Network, Hotspot & Security Settings")
+        let mut open = self.show_settings_modal;
+        egui::Window::new("Settings")
+            .open(&mut open)
             .collapsible(false)
             .resizable(true)
             .vscroll(true)
-            .default_width(540.0)
-            .max_height((ctx.screen_rect().height() - 48.0).max(240.0))
+            .default_width(560.0)
+            .max_height((ctx.screen_rect().height() - 64.0).max(260.0))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                Self::studio_card(ui, dark, |ui| {
-                    ui.label(
-                        egui::RichText::new("Active Network & USB Endpoints")
-                            .size(13.5)
-                            .strong(),
-                    );
-                    if self.interfaces.is_empty() {
-                        ui.label("Listening on 0.0.0.0:65530");
-                    } else {
-                        for iface in &self.interfaces {
-                            let badge = if iface.is_usb_tethering {
-                                "USB RNDIS"
-                            } else {
-                                "Wi-Fi / LAN"
-                            };
-                            ui.horizontal(|ui| {
-                                Self::status_pill(
-                                    ui,
-                                    badge,
-                                    egui::Color32::from_rgb(30, 41, 59),
-                                    egui::Color32::from_rgb(147, 197, 253),
-                                );
-                                let ep = format!("{}:{}", iface.ip, DEFAULT_PORT);
-                                ui.monospace(format!("{} ({})", ep, iface.name));
-                                if ui.small_button("Copy IP").clicked() {
-                                    ui.ctx().copy_text(ep);
-                                }
-                            });
-                        }
+                // Two-tab modal replaces the old single scrolling settings wall.
+                ui.horizontal(|ui| {
+                    if uw::pill_choice(
+                        ui,
+                        dark,
+                        self.settings_tab == SettingsTab::NetworkAndSecurity,
+                        "Network & Security",
+                    ) {
+                        self.settings_tab = SettingsTab::NetworkAndSecurity;
                     }
+                    if uw::pill_choice(
+                        ui,
+                        dark,
+                        self.settings_tab == SettingsTab::GeneralAndDiagnostics,
+                        "General & Diagnostics",
+                    ) {
+                        self.settings_tab = SettingsTab::GeneralAndDiagnostics;
+                    }
+                });
+                ui.add_space(6.0);
 
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("1-Hop 5 GHz Direct Hotspot & Firewall")
-                            .size(13.5)
-                            .strong(),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("SSID:");
-                        ui.add_sized(
-                            [120.0, 22.0],
-                            egui::TextEdit::singleline(&mut self.hotspot_ssid),
+                uw::studio_card(ui, dark, |ui| match self.settings_tab {
+                    SettingsTab::NetworkAndSecurity => {
+                        ui.label(
+                            egui::RichText::new("Active Network & USB Endpoints")
+                                .size(13.5)
+                                .strong(),
                         );
-                        ui.label("Password:");
-                        ui.add_sized(
-                            [110.0, 22.0],
-                            egui::TextEdit::singleline(&mut self.hotspot_pass),
-                        );
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        let hs_btn = if self.direct_hotspot_active {
-                            "Stop 1-Hop Direct Hotspot"
+                        if self.interfaces.is_empty() {
+                            ui.label("Listening on 0.0.0.0:65530");
                         } else {
-                            "Start 1-Hop 5GHz Link"
-                        };
-                        if ui.button(hs_btn).clicked() {
-                            if self.direct_hotspot_active {
-                                DirectHotspotController::stop_direct_hotspot();
-                                self.direct_hotspot_active = false;
-                                self.hotspot_status = "Router LAN Mode".into();
-                            } else {
-                                match DirectHotspotController::start_direct_5ghz_hotspot(
-                                    &self.hotspot_ssid,
-                                    &self.hotspot_pass,
-                                ) {
-                                    Ok(msg) => {
-                                        self.direct_hotspot_active = true;
-                                        self.hotspot_status = msg;
+                            for iface in &self.interfaces {
+                                let badge = if iface.is_usb_tethering {
+                                    "USB RNDIS"
+                                } else {
+                                    "Wi-Fi / LAN"
+                                };
+                                ui.horizontal(|ui| {
+                                    uw::status_pill(
+                                        ui,
+                                        badge,
+                                        egui::Color32::from_rgb(30, 41, 59),
+                                        egui::Color32::from_rgb(147, 197, 253),
+                                    );
+                                    let ep = format!("{}:{}", iface.ip, DEFAULT_PORT);
+                                    ui.monospace(format!("{} ({})", ep, iface.name));
+                                    if ui.small_button("Copy IP").clicked() {
+                                        ui.ctx().copy_text(ep);
                                     }
-                                    Err(e) => {
-                                        self.hotspot_status = format!("Hotspot notice: {}", e)
+                                });
+                            }
+                        }
+
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("1-Hop 5 GHz Direct Hotspot & Firewall")
+                                .size(13.5)
+                                .strong(),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("SSID:");
+                            ui.add_sized(
+                                [120.0, 22.0],
+                                egui::TextEdit::singleline(&mut self.hotspot_ssid),
+                            );
+                            ui.label("Password:");
+                            ui.add_sized(
+                                [110.0, 22.0],
+                                egui::TextEdit::singleline(&mut self.hotspot_pass),
+                            );
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let hs_btn = if self.direct_hotspot_active {
+                                "Stop 1-Hop Direct Hotspot"
+                            } else {
+                                "Start 1-Hop 5GHz Link"
+                            };
+                            if ui.button(hs_btn).clicked() {
+                                if self.direct_hotspot_active {
+                                    DirectHotspotController::stop_direct_hotspot();
+                                    self.direct_hotspot_active = false;
+                                    self.hotspot_status = "Router LAN Mode".into();
+                                } else {
+                                    match DirectHotspotController::start_direct_5ghz_hotspot(
+                                        &self.hotspot_ssid,
+                                        &self.hotspot_pass,
+                                    ) {
+                                        Ok(msg) => {
+                                            self.direct_hotspot_active = true;
+                                            self.hotspot_status = msg;
+                                        }
+                                        Err(e) => {
+                                            self.hotspot_status = format!("Hotspot notice: {}", e)
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
-                            self.hotspot_status = open_os_firewall_ports();
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(&self.hotspot_status)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(130, 144, 168)),
-                    );
-
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Stream Security (ChaCha20 + MAC32)")
-                            .size(13.5)
-                            .strong(),
-                    );
-                    if Self::setting_switch_row(
-                        ui,
-                        dark,
-                        "Require Pairing PIN Encryption",
-                        "Encrypts all audio and control packets with RFC 8439 ChaCha20",
-                        &mut self.enable_pin_encryption,
-                    ) {
-                        let pin = if self.enable_pin_encryption
-                            && !self.pairing_pin.trim().is_empty()
-                        {
-                            Some(self.pairing_pin.as_str())
-                        } else {
-                            None
-                        };
-                        if let Some(ref host) = self.host_engine {
-                            host.set_encryption_pin(pin);
-                        }
-                        if let Some(ref client) = self.client_engine {
-                            client.set_encryption_pin(pin);
-                        }
-                        if let Some(ref mic) = self.phone_mic_receiver {
-                            mic.set_encryption_pin(pin);
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label("Pairing PIN:");
-                        ui.add_sized(
-                            [90.0, 22.0],
-                            egui::TextEdit::singleline(&mut self.pairing_pin),
-                        );
-                        if ui.button("Apply PIN").clicked() {
-                            let pin = if self.enable_pin_encryption
-                                && !self.pairing_pin.trim().is_empty()
-                            {
-                                Some(self.pairing_pin.as_str())
-                            } else {
-                                None
-                            };
-                            if let Some(ref host) = self.host_engine {
-                                host.set_encryption_pin(pin);
-                            }
-                            if let Some(ref client) = self.client_engine {
-                                client.set_encryption_pin(pin);
-                            }
-                            if let Some(ref mic) = self.phone_mic_receiver {
-                                mic.set_encryption_pin(pin);
-                            }
-                        }
-                    });
-
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Application & OS Preferences")
-                            .size(13.5)
-                            .strong(),
-                    );
-                    Self::setting_switch_row(
-                        ui,
-                        dark,
-                        "Auto-Start Broadcast on App Launch",
-                        "Immediately start Host Server when AudioShare Ultra opens",
-                        &mut self.autostart_stream_on_launch,
-                    );
-                    if Self::setting_switch_row(
-                        ui,
-                        dark,
-                        "Start App on OS Login",
-                        "Register AudioShare Ultra in desktop session startup",
-                        &mut self.os_boot_autostart,
-                    ) {
-                        self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
-                    }
-                    Self::setting_switch_row(
-                        ui,
-                        dark,
-                        "Minimize on Window Close",
-                        "Keep active audio stream running in background when closing window",
-                        &mut self.minimize_on_close,
-                    );
-                    if Self::setting_switch_row(
-                        ui,
-                        dark,
-                        "Dark Studio Theme",
-                        "Use high-contrast obsidian slate palette",
-                        &mut self.dark_mode,
-                    ) {
-                        Self::apply_studio_theme(ctx, self.dark_mode);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.vertical_centered(|ui| {
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy Diagnostics").clicked() {
-                                let summary = format!(
-                                    "Host    : {}\nClient  : {}\nProfile : {:?} | Opus={} | Bitrate={}k",
-                                    self.host_status_msg,
-                                    self.client_status_msg,
-                                    self.quality_profile,
-                                    self.prefer_opus,
-                                    self.target_bitrate_kbps
-                                );
-                                ui.ctx().copy_text(
-                                    audioshare_protocol::diagnostics::export_report(&summary),
-                                );
-                            }
-                            if ui.button("Close Settings").clicked() {
-                                self.save_persistent_config();
-                                self.show_settings_modal = false;
+                            if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
+                                self.hotspot_status = open_os_firewall_ports();
                             }
                         });
-                    });
+                        ui.label(
+                            egui::RichText::new(&self.hotspot_status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(130, 144, 168)),
+                        );
+
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Stream Security (ChaCha20 + MAC32)")
+                                .size(13.5)
+                                .strong(),
+                        );
+                        if uw::setting_switch_row(
+                            ui,
+                            dark,
+                            "Require Pairing PIN Encryption",
+                            "Encrypts all audio and control packets with RFC 8439 ChaCha20",
+                            &mut self.enable_pin_encryption,
+                        ) {
+                            self.apply_pin_now();
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Pairing PIN:");
+                            let resp = ui.add_sized(
+                                [110.0, 24.0],
+                                egui::TextEdit::singleline(&mut self.pairing_pin),
+                            );
+                            if resp.changed() {
+                                self.pin_dirty = true;
+                            }
+                            let enter_pressed =
+                                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            let lbl = if self.pin_dirty {
+                                "Save & Apply PIN *"
+                            } else {
+                                "Apply PIN"
+                            };
+                            if ui.button(lbl).clicked() || enter_pressed {
+                                self.apply_pin_now();
+                            }
+                        });
+                    }
+                    SettingsTab::GeneralAndDiagnostics => {
+                        ui.label(
+                            egui::RichText::new("Application & OS Preferences")
+                                .size(13.5)
+                                .strong(),
+                        );
+                        uw::setting_switch_row(
+                            ui,
+                            dark,
+                            "Auto-Start Broadcast on App Launch",
+                            "Immediately start Host Server when AudioShare Ultra opens",
+                            &mut self.autostart_stream_on_launch,
+                        );
+                        if uw::setting_switch_row(
+                            ui,
+                            dark,
+                            "Start App on OS Login",
+                            "Register AudioShare Ultra in desktop session startup",
+                            &mut self.os_boot_autostart,
+                        ) {
+                            self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
+                        }
+                        uw::setting_switch_row(
+                            ui,
+                            dark,
+                            "Minimize on Window Close",
+                            "Keep active audio stream running in background when closing window",
+                            &mut self.minimize_on_close,
+                        );
+                        if uw::setting_switch_row(
+                            ui,
+                            dark,
+                            "Dark Studio Theme",
+                            "Use high-contrast obsidian slate palette",
+                            &mut self.dark_mode,
+                        ) {
+                            uw::apply_studio_theme(ctx, self.dark_mode);
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("Diagnostics").size(13.5).strong(),
+                        );
+                        if ui.button("Copy Diagnostics Report").clicked() {
+                            let summary = format!(
+                                "Host    : {}\nClient  : {}\nProfile : {:?} | Opus={} | Bitrate={}k",
+                                self.host_status_msg,
+                                self.client_status_msg,
+                                self.quality_profile,
+                                self.prefer_opus,
+                                self.target_bitrate_kbps
+                            );
+                            ui.ctx().copy_text(
+                                audioshare_protocol::diagnostics::export_report(&summary),
+                            );
+                            self.show_toast("Diagnostics copied to clipboard");
+                        }
+                    }
                 });
             });
+        if !open && self.show_settings_modal {
+            self.save_persistent_config();
+        }
+        self.show_settings_modal = open;
     }
 
     fn render_host_tab(&mut self, ui: &mut egui::Ui) {
@@ -1820,23 +1439,9 @@ impl AudioShareApp {
         // =========================================================================
         // 1. SIMPLE HERO CONSOLE: Start/Stop CTA, Peak LED Meter & Master Volume
         // =========================================================================
-        Self::studio_card(ui, dark, |ui| {
+        uw::studio_card(ui, dark, |ui| {
             ui.horizontal(|ui| {
-                let (btn_text, btn_fill) = if is_running {
-                    ("■  Stop Broadcast", egui::Color32::from_rgb(185, 28, 28))
-                } else {
-                    ("▶  Start Broadcast", egui::Color32::from_rgb(22, 163, 74))
-                };
-                let btn = egui::Button::new(
-                    egui::RichText::new(btn_text)
-                        .size(15.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(btn_fill)
-                .rounding(egui::Rounding::same(8.0));
-
-                if ui.add_sized([195.0, 42.0], btn).clicked() {
+                if uw::primary_cta_button(ui, is_running, "Start Broadcast", "Stop Broadcast") {
                     self.toggle_host();
                 }
 
@@ -1878,6 +1483,12 @@ impl AudioShareApp {
                 .as_ref()
                 .map(|h| h.telemetry.host_vu_peak_pct.load(Ordering::Relaxed))
                 .unwrap_or(0);
+            // Decaying studio peak-hold marker: snap up instantly, fall slowly.
+            if vu_pct as f32 >= self.vu_peak_hold {
+                self.vu_peak_hold = vu_pct as f32;
+            } else {
+                self.vu_peak_hold = (self.vu_peak_hold - 1.8).max(0.0);
+            }
             let bt_delay = self
                 .host_engine
                 .as_ref()
@@ -1892,7 +1503,7 @@ impl AudioShareApp {
             ui.columns(2, |cols| {
                 cols[0].horizontal(|ui| {
                     ui.label(egui::RichText::new("Audio Peak").size(12.5).strong());
-                    Self::draw_led_vu_meter(ui, vu_pct);
+                    uw::draw_led_vu_meter(ui, vu_pct, self.vu_peak_hold);
                     ui.monospace(format!("{:>3}%", vu_pct));
                 });
                 cols[1].horizontal(|ui| {
@@ -1911,9 +1522,27 @@ impl AudioShareApp {
                 });
             });
 
+            // Surface Virtual Speaker right on the Hero card to eliminate the
+            // first-run dual-speaker echo trap (no need to open a pro drawer).
+            ui.add_space(4.0);
+            if uw::setting_switch_row(
+                ui,
+                dark,
+                "Mute PC Speakers While Streaming (Virtual Speaker)",
+                "Routes PC audio exclusively to connected devices and restores speakers on disconnect",
+                &mut self.enable_virtual_speaker,
+            ) && self.host_engine.is_some()
+            {
+                let _ = self.os_guard.take();
+                self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
+                    self.enable_virtual_speaker,
+                ));
+                self.save_persistent_config();
+            }
+
             if bt_delay > 40 {
                 ui.add_space(2.0);
-                Self::status_pill(
+                uw::status_pill(
                     ui,
                     &format!(
                         "Phone Bluetooth Active (A2DP {} ms -> Total Video Offset +{} ms)",
@@ -1939,13 +1568,13 @@ impl AudioShareApp {
             let is_low_lat = self.quality_profile == QualityProfile::LowLatencyCompressed;
             let is_max_range = self.quality_profile == QualityProfile::MaxStability24Ghz;
 
-            if Self::mode_preset_card(
+            if uw::mode_preset_card(
                 &mut cols[0],
                 dark,
                 is_auto,
                 "Smart Auto",
-                "Adapts to Wi-Fi quality",
-                "Default",
+                "Adapts Lossless / Opus live",
+                "Recommended",
             ) {
                 self.quality_profile = QualityProfile::SmartAuto;
                 if let Some(ref host) = self.host_engine {
@@ -1960,12 +1589,12 @@ impl AudioShareApp {
             } else {
                 "16-Bit"
             };
-            if Self::mode_preset_card(
+            if uw::mode_preset_card(
                 &mut cols[1],
                 dark,
                 is_lossless,
-                "Lossless HD",
-                "100% bit-exact studio audio",
+                "Studio Lossless",
+                "Bit-exact zero-delay LPC",
                 lossless_badge,
             ) {
                 if !is_lossless {
@@ -1978,13 +1607,13 @@ impl AudioShareApp {
                 }
             }
 
-            if Self::mode_preset_card(
+            if uw::mode_preset_card(
                 &mut cols[2],
                 dark,
                 is_low_lat,
-                "Low-Latency VBR",
-                "Compact fast wireless stream",
-                &format!("{}k", self.target_bitrate_kbps),
+                "Smooth Wi-Fi",
+                "Best for 2.4 GHz & BT",
+                &format!("Opus {}k", self.target_bitrate_kbps),
             ) {
                 self.quality_profile = QualityProfile::LowLatencyCompressed;
                 if let Some(ref host) = self.host_engine {
@@ -1994,12 +1623,12 @@ impl AudioShareApp {
                 }
             }
 
-            if Self::mode_preset_card(
+            if uw::mode_preset_card(
                 &mut cols[3],
                 dark,
                 is_max_range,
-                "Max Range 2.4G",
-                "10 ms framing through walls",
+                "Max Range",
+                "10 ms packets through walls",
                 "10 ms",
             ) {
                 self.quality_profile = QualityProfile::MaxStability24Ghz;
@@ -2016,7 +1645,7 @@ impl AudioShareApp {
         // =========================================================================
         // 3. CONNECTED DEVICES CARD (Always Visible, Clean Empty State)
         // =========================================================================
-        Self::studio_card(ui, dark, |ui| {
+        uw::studio_card(ui, dark, |ui| {
             let clients = self
                 .host_engine
                 .as_ref()
@@ -2051,8 +1680,19 @@ impl AudioShareApp {
                 ui.separator();
                 for client in clients {
                     ui.horizontal(|ui| {
+                        // Link-health dot: green (<1% loss), amber (1-5%), red (>5%).
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        let health_col = if client.fec_rate_permille < 10 {
+                            egui::Color32::from_rgb(16, 185, 129)
+                        } else if client.fec_rate_permille < 50 {
+                            egui::Color32::from_rgb(245, 158, 11)
+                        } else {
+                            egui::Color32::from_rgb(239, 68, 68)
+                        };
+                        ui.painter().circle_filled(dot_rect.center(), 4.0, health_col);
                         let badge = if client.is_usb { "USB" } else { "Wi-Fi" };
-                        Self::status_pill(
+                        uw::status_pill(
                             ui,
                             badge,
                             egui::Color32::from_rgb(30, 58, 138),
@@ -2099,7 +1739,7 @@ impl AudioShareApp {
         } else {
             "5.0ms Wi-Fi"
         };
-        Self::drawer_header(
+        uw::drawer_header(
             ui,
             dark,
             &mut self.host_pro_codec_open,
@@ -2109,7 +1749,7 @@ impl AudioShareApp {
 
         if self.host_pro_codec_open {
             ui.add_space(4.0);
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.label(
                     egui::RichText::new("Exact Quality Profile & Bit Depth")
                         .size(12.0)
@@ -2135,7 +1775,7 @@ impl AudioShareApp {
                             "Max Stability (10ms 2.4GHz)",
                         ),
                     ] {
-                        if Self::pill_choice(ui, dark, self.quality_profile == profile, label) {
+                        if uw::pill_choice(ui, dark, self.quality_profile == profile, label) {
                             self.quality_profile = profile;
                             if let Some(ref host) = self.host_engine {
                                 host.telemetry
@@ -2153,7 +1793,7 @@ impl AudioShareApp {
                         .strong(),
                 );
                 ui.horizontal_wrapped(|ui| {
-                    if Self::pill_choice(
+                    if uw::pill_choice(
                         ui,
                         dark,
                         !self.prefer_opus,
@@ -2164,7 +1804,7 @@ impl AudioShareApp {
                             host.telemetry.prefer_opus.store(false, Ordering::Relaxed);
                         }
                     }
-                    if Self::pill_choice(
+                    if uw::pill_choice(
                         ui,
                         dark,
                         self.prefer_opus,
@@ -2203,7 +1843,7 @@ impl AudioShareApp {
                     );
                     ui.horizontal_wrapped(|ui| {
                         for &kbps in choices {
-                            if Self::pill_choice(
+                            if uw::pill_choice(
                                 ui,
                                 dark,
                                 effective == kbps,
@@ -2234,7 +1874,7 @@ impl AudioShareApp {
 
                 ui.columns(2, |cols| {
                     cols[0].vertical(|ui| {
-                        if Self::setting_switch_row(
+                        if uw::setting_switch_row(
                             ui,
                             dark,
                             "2.5 ms USB Frame Pacing",
@@ -2248,7 +1888,7 @@ impl AudioShareApp {
                                 );
                             }
                         }
-                        if Self::setting_switch_row(
+                        if uw::setting_switch_row(
                             ui,
                             dark,
                             "Smart DTX Silence Saver",
@@ -2261,7 +1901,7 @@ impl AudioShareApp {
                                     .store(self.enable_smart_dtx, Ordering::Relaxed);
                             }
                         }
-                        if Self::setting_switch_row(
+                        if uw::setting_switch_row(
                             ui,
                             dark,
                             "Auto Virtual Speaker & Scan Lock",
@@ -2280,14 +1920,14 @@ impl AudioShareApp {
                         }
                     });
                     cols[1].vertical(|ui| {
-                        Self::setting_switch_row(
+                        uw::setting_switch_row(
                             ui,
                             dark,
                             "Auto Bluetooth Video Lip-Sync",
                             "Applies PipeWire offset matching phone Bluetooth delay",
                             &mut self.auto_bt_video_lipsync,
                         );
-                        if Self::setting_switch_row(
+                        if uw::setting_switch_row(
                             ui,
                             dark,
                             "Multi-Device Acoustic Group Sync",
@@ -2300,7 +1940,7 @@ impl AudioShareApp {
                                     .store(self.enable_group_sync, Ordering::Relaxed);
                             }
                         }
-                        if Self::setting_switch_row(
+                        if uw::setting_switch_row(
                             ui,
                             dark,
                             "440 Hz / 554 Hz Test Chord",
@@ -2356,7 +1996,7 @@ impl AudioShareApp {
         } else {
             "Phone RX: Off"
         };
-        Self::drawer_header(
+        uw::drawer_header(
             ui,
             dark,
             &mut self.host_routing_mic_open,
@@ -2366,7 +2006,7 @@ impl AudioShareApp {
 
         if self.host_routing_mic_open {
             ui.add_space(4.0);
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.columns(2, |cols| {
                     // Left: Per-App Capture
                     cols[0].vertical(|ui| {
@@ -2376,7 +2016,7 @@ impl AudioShareApp {
                                 .strong(),
                         );
                         ui.horizontal_wrapped(|ui| {
-                            if Self::pill_choice(
+                            if uw::pill_choice(
                                 ui,
                                 dark,
                                 self.selected_app_idx.is_none(),
@@ -2399,7 +2039,7 @@ impl AudioShareApp {
                             ui.horizontal_wrapped(|ui| {
                                 for (idx, app) in self.audio_apps.iter().enumerate() {
                                     let selected = self.selected_app_idx == Some(idx);
-                                    if Self::pill_choice(
+                                    if uw::pill_choice(
                                         ui,
                                         dark,
                                         selected,
@@ -2430,7 +2070,7 @@ impl AudioShareApp {
                         );
                         let mut mode_changed = false;
                         ui.horizontal_wrapped(|ui| {
-                            if Self::pill_choice(
+                            if uw::pill_choice(
                                 ui,
                                 dark,
                                 self.phone_rx_mode == PhoneRxRoutingMode::VirtualMicForCalls,
@@ -2440,7 +2080,7 @@ impl AudioShareApp {
                                 self.phone_rx_mode = PhoneRxRoutingMode::VirtualMicForCalls;
                                 mode_changed = true;
                             }
-                            if Self::pill_choice(
+                            if uw::pill_choice(
                                 ui,
                                 dark,
                                 self.phone_rx_mode == PhoneRxRoutingMode::PlayOnPcSpeakers,
@@ -2516,7 +2156,7 @@ impl AudioShareApp {
                             if let Some(ref mic) = self.phone_mic_receiver {
                                 let pkts = mic.mic_packets_received.load(Ordering::Relaxed);
                                 let peak = mic.mic_peak_level_pct.load(Ordering::Relaxed);
-                                Self::status_pill(
+                                uw::status_pill(
                                     ui,
                                     &format!("RX: {} pkts • Peak: {}%", pkts, peak),
                                     egui::Color32::from_rgb(20, 83, 45),
@@ -2547,7 +2187,7 @@ impl AudioShareApp {
                                     .measured_sonar_at
                                     .map(|t| t.elapsed().as_secs())
                                     .unwrap_or(0);
-                                Self::status_pill(
+                                uw::status_pill(
                                     ui,
                                     &format!("Measured One-Way: {:.1} ms ({}s ago)", ms, age_s),
                                     egui::Color32::from_rgb(20, 83, 45),
@@ -2567,7 +2207,7 @@ impl AudioShareApp {
         // =========================================================================
         // 1. SIMPLE CONNECTION CONSOLE (Auto-Discovered Hosts + 1-Click Connect)
         // =========================================================================
-        Self::studio_card(ui, dark, |ui| {
+        uw::studio_card(ui, dark, |ui| {
             let discovered = self.scanner.discovered_hosts();
             ui.horizontal(|ui| {
                 ui.label(
@@ -2595,7 +2235,7 @@ impl AudioShareApp {
                     } else {
                         "Manual IP / USB"
                     };
-                    if Self::pill_choice(ui, dark, self.client_manual_ip_open, manual_lbl) {
+                    if uw::pill_choice(ui, dark, self.client_manual_ip_open, manual_lbl) {
                         self.client_manual_ip_open = !self.client_manual_ip_open;
                     }
                 });
@@ -2616,7 +2256,7 @@ impl AudioShareApp {
                 for host in &discovered {
                     ui.horizontal(|ui| {
                         let badge = if host.is_usb { "USB" } else { "Wi-Fi" };
-                        Self::status_pill(
+                        uw::status_pill(
                             ui,
                             badge,
                             egui::Color32::from_rgb(30, 58, 138),
@@ -2672,13 +2312,65 @@ impl AudioShareApp {
             }
         });
 
+        // =========================================================================
+        // 1b. REMOTE HOST CONTROL STRIP (feature parity with the Android Connect tab)
+        // =========================================================================
+        if let Some(ref client) = self.client_engine {
+            ui.add_space(8.0);
+            uw::studio_card(ui, dark, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("Remote Host Control:")
+                            .size(13.0)
+                            .strong(),
+                    );
+                    if ui.button("Prev").clicked() {
+                        client
+                            .telemetry
+                            .pending_media_command
+                            .store(12, Ordering::Relaxed);
+                    }
+                    if ui.button("Play / Pause").clicked() {
+                        client
+                            .telemetry
+                            .pending_media_command
+                            .store(10, Ordering::Relaxed);
+                    }
+                    if ui.button("Next").clicked() {
+                        client
+                            .telemetry
+                            .pending_media_command
+                            .store(11, Ordering::Relaxed);
+                    }
+                    ui.separator();
+                    for (cmd, lbl) in [
+                        (1u8, "Auto"),
+                        (2, "16-Bit"),
+                        (5, "24-Bit"),
+                        (3, "Smooth Wi-Fi"),
+                        (4, "Max Range"),
+                    ] {
+                        if ui.small_button(lbl).clicked() {
+                            client
+                                .telemetry
+                                .pending_media_command
+                                .store(cmd, Ordering::Relaxed);
+                            // Disjoint field write: `client` still borrows
+                            // `self.client_engine`.
+                            self.toast = Some((format!("Requested host mode: {lbl}"), Instant::now()));
+                        }
+                    }
+                });
+            });
+        }
+
         ui.add_space(8.0);
 
         // =========================================================================
         // 2. SIMPLE SOUND PROFILE & 3 ENHANCEMENT CARDS (Always Visible)
         // =========================================================================
         let mut dsp_changed = false;
-        Self::studio_card(ui, dark, |ui| {
+        uw::studio_card(ui, dark, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Sound Profile:").size(13.0).strong());
                 for (name, b, p, t) in [
@@ -2691,7 +2383,7 @@ impl AudioShareApp {
                     let is_preset = (self.eq_bass_db - b).abs() < 0.05
                         && (self.eq_presence_db - p).abs() < 0.05
                         && (self.eq_treble_db - t).abs() < 0.05;
-                    if Self::pill_choice(ui, dark, is_preset, name) {
+                    if uw::pill_choice(ui, dark, is_preset, name) {
                         self.eq_bass_db = b;
                         self.eq_presence_db = p;
                         self.eq_treble_db = t;
@@ -2709,21 +2401,21 @@ impl AudioShareApp {
 
             ui.separator();
             ui.columns(3, |cols| {
-                dsp_changed |= Self::setting_switch_row(
+                dsp_changed |= uw::setting_switch_row(
                     &mut cols[0],
                     dark,
                     "3D Headphone Stage",
                     "Binaural studio monitor crossfeed",
                     &mut self.binaural_crossfeed,
                 );
-                dsp_changed |= Self::setting_switch_row(
+                dsp_changed |= uw::setting_switch_row(
                     &mut cols[1],
                     dark,
                     "Night Mode DRC",
                     "Boost whispers & tame explosions",
                     &mut self.night_mode_drc,
                 );
-                dsp_changed |= Self::setting_switch_row(
+                dsp_changed |= uw::setting_switch_row(
                     &mut cols[2],
                     dark,
                     "5 ms Gaming Lock",
@@ -2746,7 +2438,7 @@ impl AudioShareApp {
             ChannelRole::CenterDialogue => "Role: Vocal",
             ChannelRole::SurroundAmbient => "Role: Surround",
         };
-        Self::drawer_header(
+        uw::drawer_header(
             ui,
             dark,
             &mut self.client_eq_drawer_open,
@@ -2756,9 +2448,9 @@ impl AudioShareApp {
 
         if self.client_eq_drawer_open {
             ui.add_space(4.0);
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.columns(2, |cols| {
-                    dsp_changed |= Self::studio_fader_row(
+                    dsp_changed |= uw::studio_fader_row(
                         &mut cols[0],
                         dark,
                         "Pre-Amp Gain",
@@ -2766,7 +2458,7 @@ impl AudioShareApp {
                         &mut self.preamp_gain_db,
                         -12.0..=24.0,
                     );
-                    dsp_changed |= Self::studio_fader_row(
+                    dsp_changed |= uw::studio_fader_row(
                         &mut cols[0],
                         dark,
                         "Sub-Bass",
@@ -2774,7 +2466,7 @@ impl AudioShareApp {
                         &mut self.eq_bass_db,
                         -12.0..=12.0,
                     );
-                    dsp_changed |= Self::studio_fader_row(
+                    dsp_changed |= uw::studio_fader_row(
                         &mut cols[1],
                         dark,
                         "Vocal Presence",
@@ -2782,7 +2474,7 @@ impl AudioShareApp {
                         &mut self.eq_presence_db,
                         -12.0..=12.0,
                     );
-                    dsp_changed |= Self::studio_fader_row(
+                    dsp_changed |= uw::studio_fader_row(
                         &mut cols[1],
                         dark,
                         "Treble Air",
@@ -2806,7 +2498,7 @@ impl AudioShareApp {
                         (ChannelRole::CenterDialogue, "Center Dialogue"),
                         (ChannelRole::SurroundAmbient, "Rear Surround"),
                     ] {
-                        if Self::pill_choice(ui, dark, self.channel_role == role, label) {
+                        if uw::pill_choice(ui, dark, self.channel_role == role, label) {
                             self.channel_role = role;
                             dsp_changed = true;
                         }
@@ -2858,7 +2550,7 @@ impl AudioShareApp {
 
         let drift_pill = format!("Drift: {:+} ppm", drift);
         let fec_pill = format!("FEC/PLC: {}/{}", fec, plc);
-        Self::drawer_header(
+        uw::drawer_header(
             ui,
             dark,
             &mut self.client_telemetry_drawer_open,
@@ -2868,9 +2560,9 @@ impl AudioShareApp {
 
         if self.client_telemetry_drawer_open {
             ui.add_space(4.0);
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 if self.client_engine.is_some() && idle_secs >= 3 {
-                    Self::status_pill(
+                    uw::status_pill(
                         ui,
                         &format!(
                             "No packets from Host for {}s — Waiting for automatic reconnect...",
@@ -2882,19 +2574,19 @@ impl AudioShareApp {
                 }
 
                 ui.columns(4, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "RX Packets / Lossless",
                         &format!("{} / {}", pkts, prim),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "FEC Healed / WSOLA PLC",
                         &format!("{} / {}", fec, plc),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[2],
                         dark,
                         "Clock Lock / Auth Err",
@@ -2907,7 +2599,7 @@ impl AudioShareApp {
                     } else {
                         "LIVE"
                     };
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[3],
                         dark,
                         "Host Vol / Group Sync",
@@ -2916,40 +2608,7 @@ impl AudioShareApp {
                 });
 
                 ui.add_space(4.0);
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), 52.0),
-                    egui::Sense::hover(),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(10, 13, 20));
-                painter.rect_stroke(
-                    rect,
-                    8.0,
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 38, 54)),
-                );
-                let mid_y = rect.center().y;
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.left(), mid_y),
-                        egui::pos2(rect.right(), mid_y),
-                    ],
-                    egui::Stroke::new(1.0f32, egui::Color32::from_rgb(38, 48, 66)),
-                );
-                let step_x = rect.width() / (self.drift_history.len().max(2) as f32 - 1.0);
-                let points: Vec<egui::Pos2> = self
-                    .drift_history
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &ppm)| {
-                        let x = rect.left() + (i as f32) * step_x;
-                        let norm_y = (ppm / 500.0).clamp(-1.0, 1.0);
-                        egui::pos2(x, mid_y - norm_y * (rect.height() * 0.42))
-                    })
-                    .collect();
-                painter.add(egui::Shape::line(
-                    points,
-                    egui::Stroke::new(1.75f32, egui::Color32::from_rgb(56, 189, 248)),
-                ));
+                uw::draw_drift_oscilloscope(ui, &self.drift_history);
             });
         }
     }
@@ -2971,7 +2630,7 @@ impl AudioShareApp {
 
         if let Some(ref host) = self.host_engine {
             any_engine = true;
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.label(
                     egui::RichText::new("Host Pipeline: Capture -> Wire")
                         .size(14.5)
@@ -3005,7 +2664,7 @@ impl AudioShareApp {
                 let rebinds = host.telemetry.hotplug_rebinds.load(Ordering::Relaxed);
 
                 ui.columns(3, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "Packetization",
@@ -3014,13 +2673,13 @@ impl AudioShareApp {
                             pacing_ms, subframes, SUBFRAME_MS
                         ),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "Capture Backlog",
                         &format!("{:.1} ms", capture_ms),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[2],
                         dark,
                         "Host Pipeline Total",
@@ -3029,13 +2688,13 @@ impl AudioShareApp {
                 });
 
                 ui.columns(4, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "Downstream Max",
                         &format!("{} ms (BT max {} ms)", downstream_max, bt_max),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "Room Trim",
@@ -3046,8 +2705,8 @@ impl AudioShareApp {
                         (Some(ms), None) => format!("{:.1} ms", ms),
                         _ => "not measured".to_string(),
                     };
-                    Self::metric_tile(&mut cols[2], dark, "Acoustic Sonar", &sonar_label);
-                    Self::metric_tile(
+                    uw::metric_tile(&mut cols[2], dark, "Acoustic Sonar", &sonar_label);
+                    uw::metric_tile(
                         &mut cols[3],
                         dark,
                         "Hotplug Rebinds",
@@ -3084,20 +2743,20 @@ impl AudioShareApp {
             any_engine = true;
             let snap = client.telemetry.latency_snapshot(DESKTOP_OUTPUT_BUFFER_MS);
 
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Client Pipeline: Ingress -> Speaker")
                             .size(14.5)
                             .strong(),
                     );
-                    Self::status_pill(
+                    uw::status_pill(
                         ui,
                         &format!("Estimated One-Way: {:.1} ms", snap.estimated_one_way_ms()),
                         egui::Color32::from_rgb(20, 83, 45),
                         egui::Color32::from_rgb(134, 239, 172),
                     );
-                    Self::status_pill(
+                    uw::status_pill(
                         ui,
                         if snap.prebuffer_ready {
                             "READY"
@@ -3111,19 +2770,19 @@ impl AudioShareApp {
                 ui.separator();
 
                 ui.columns(3, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "Sender Packetization",
                         &format!("{:.1} ms ({})", snap.packet_interval_ms, snap.codec_name()),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "Network Jitter",
                         &format!("{:.1} ms", snap.network_jitter_ms),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[2],
                         dark,
                         "Adaptive Cushion",
@@ -3132,7 +2791,7 @@ impl AudioShareApp {
                 });
 
                 ui.columns(3, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "Target FIFO",
@@ -3141,13 +2800,13 @@ impl AudioShareApp {
                             snap.target_buffer_ms, snap.group_sync_extra_ms
                         ),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "Buffered Now",
                         &format!("{:.1} ms", snap.buffered_audio_ms),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[2],
                         dark,
                         "Downstream + Lookahead",
@@ -3160,7 +2819,7 @@ impl AudioShareApp {
                 });
 
                 ui.columns(4, |cols| {
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[0],
                         dark,
                         "DAC Queue",
@@ -3170,7 +2829,7 @@ impl AudioShareApp {
                             "not measured".to_string()
                         },
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[1],
                         dark,
                         "Bluetooth Estimate",
@@ -3180,13 +2839,13 @@ impl AudioShareApp {
                             "not routed".to_string()
                         },
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[2],
                         dark,
                         "Desktop Output Buffer",
                         &format!("{:.1} ms", snap.output_buffer_ms),
                     );
-                    Self::metric_tile(
+                    uw::metric_tile(
                         &mut cols[3],
                         dark,
                         "Prebuffer / Codec",
@@ -3231,7 +2890,7 @@ impl AudioShareApp {
         }
 
         if !any_engine {
-            Self::studio_card(ui, dark, |ui| {
+            uw::studio_card(ui, dark, |ui| {
                 ui.label("Start the Host Server or connect to a Client to see live latency.");
             });
         }
