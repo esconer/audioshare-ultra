@@ -26,8 +26,21 @@ jobs:
 
       - name: Install Linux Audio & GUI Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          # GitHub-hosted runner mirrors can intermittently return 503.
+          # Retry both update and install (APT itself also retries per host).
+          APT_OPTS="-o Acquire::Retries=6 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          for attempt in 1 2 3; do
+            if sudo apt-get ${APT_OPTS} update; then break; fi
+            echo "apt-get update failed (attempt ${attempt}), retrying in 15s"
+            sleep 15
+          done
+          for attempt in 1 2 3; do
+            if sudo apt-get ${APT_OPTS} install -y --no-install-recommends \
+                libasound2-dev libxcb-render0-dev libxcb-shape0-dev \
+                libxcb-xfixes0-dev libxkbcommon-dev libssl-dev; then break; fi
+            echo "apt-get install failed (attempt ${attempt}), retrying in 15s"
+            sleep 15
+          done
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
