@@ -129,6 +129,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeGetDiagnostics(): String
+
+        @JvmStatic
+        external fun nativeSetScannerPaused(paused: Boolean)
     }
 
     private var wifiLock: WifiManager.WifiLock? = null

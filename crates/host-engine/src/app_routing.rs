@@ -1,10 +1,476 @@
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(target_os = "windows")]
 use crate::discovery_and_os::silent_command;
+
+/// Native Win32 CoreAudio endpoint switching via `IMMDeviceEnumerator` +
+/// `IPolicyConfig::SetDefaultEndpoint` (vtable slot 13). Works on stock
+/// Windows 10/11 with zero PowerShell / third-party AudioDeviceCmdlets.
+#[cfg(target_os = "windows")]
+mod windows_endpoint_switch {
+    use core::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Guid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PropertyKey {
+        fmtid: Guid,
+        pid: u32,
+    }
+
+    #[repr(C)]
+    struct PropVariant {
+        vt: u16,
+        r1: u16,
+        r2: u16,
+        r3: u16,
+        val: usize,
+        extra: usize,
+    }
+
+    #[repr(C)]
+    struct IUnknownVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+    }
+    #[repr(C)]
+    struct IMMDeviceEnumeratorVtbl {
+        unk: IUnknownVtbl,
+        enum_audio_endpoints:
+            unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> i32,
+        get_default_audio_endpoint:
+            unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) -> i32,
+    }
+    #[repr(C)]
+    struct IMMDeviceCollectionVtbl {
+        unk: IUnknownVtbl,
+        get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+        item: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+    }
+    #[repr(C)]
+    struct IMMDeviceVtbl {
+        unk: IUnknownVtbl,
+        activate: usize,
+        open_property_store:
+            unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+        get_id: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> i32,
+    }
+    #[repr(C)]
+    struct IPropertyStoreVtbl {
+        unk: IUnknownVtbl,
+        get_count: usize,
+        get_at: usize,
+        get_value:
+            unsafe extern "system" fn(*mut c_void, *const PropertyKey, *mut PropVariant) -> i32,
+    }
+    #[repr(C)]
+    struct IPolicyConfigVtbl {
+        unk: IUnknownVtbl,
+        _slots_3_to_12: [usize; 10],
+        set_default_endpoint:
+            unsafe extern "system" fn(*mut c_void, *const u16, u32) -> i32,
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
+        fn CoCreateInstance(
+            rclsid: *const Guid,
+            p_unk_outer: *mut c_void,
+            dw_cls_context: u32,
+            riid: *const Guid,
+            ppv: *mut *mut c_void,
+        ) -> i32;
+        fn CoTaskMemFree(pv: *mut c_void);
+        fn PropVariantClear(pvar: *mut PropVariant) -> i32;
+    }
+
+    struct ComInit(bool);
+    impl ComInit {
+        fn new() -> Self {
+            Self(unsafe { CoInitializeEx(core::ptr::null_mut(), 0) >= 0 })
+        }
+    }
+    impl Drop for ComInit {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xBCDE_0395, data2: 0xE52F, data3: 0x467C,
+        data4: [0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E],
+    };
+    const IID_IMMDEVICE_ENUMERATOR: Guid = Guid {
+        data1: 0xA956_64D2, data2: 0x9614, data3: 0x4F35,
+        data4: [0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6],
+    };
+    const CLSID_POLICY_CONFIG_CLIENT: Guid = Guid {
+        data1: 0x870A_F99C, data2: 0x171D, data3: 0x4F9E,
+        data4: [0xAF, 0x0D, 0xE6, 0x3D, 0xF4, 0x0C, 0x2B, 0xC9],
+    };
+    const IID_IPOLICY_CONFIG: Guid = Guid {
+        data1: 0xF867_9F50, data2: 0x850A, data3: 0x41CF,
+        data4: [0x9C, 0x72, 0x43, 0x0F, 0x29, 0x02, 0x90, 0xC8],
+    };
+    const PKEY_DEVICE_FRIENDLY_NAME: PropertyKey = PropertyKey {
+        fmtid: Guid {
+            data1: 0xA45C_254E, data2: 0xDF1C, data3: 0x4EFD,
+            data4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0],
+        },
+        pid: 14,
+    };
+
+    unsafe fn read_wide_z(ptr: *const u16) -> Vec<u16> {
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let mut v = Vec::with_capacity(len + 1);
+        v.extend_from_slice(core::slice::from_raw_parts(ptr, len));
+        v.push(0);
+        v
+    }
+
+    unsafe fn device_id(dev: *mut c_void) -> Option<Vec<u16>> {
+        let vtbl = *(dev as *const *const IMMDeviceVtbl);
+        let mut raw_id: *mut u16 = core::ptr::null_mut();
+        if ((*vtbl).get_id)(dev, &mut raw_id) < 0 || raw_id.is_null() {
+            return None;
+        }
+        let id = read_wide_z(raw_id);
+        CoTaskMemFree(raw_id as *mut c_void);
+        Some(id)
+    }
+
+    unsafe fn device_friendly_name(dev: *mut c_void) -> Option<String> {
+        let vtbl = *(dev as *const *const IMMDeviceVtbl);
+        let mut store: *mut c_void = core::ptr::null_mut();
+        if ((*vtbl).open_property_store)(dev, 0, &mut store) < 0 || store.is_null() {
+            return None;
+        }
+        let store_vtbl = *(store as *const *const IPropertyStoreVtbl);
+        let mut pv = PropVariant { vt: 0, r1: 0, r2: 0, r3: 0, val: 0, extra: 0 };
+        let hr = ((*store_vtbl).get_value)(store, &PKEY_DEVICE_FRIENDLY_NAME, &mut pv);
+        let result = if hr >= 0 && pv.vt == 31 && pv.val != 0 {
+            let wide = read_wide_z(pv.val as *const u16);
+            Some(String::from_utf16_lossy(&wide[..wide.len().saturating_sub(1)]))
+        } else {
+            None
+        };
+        let _ = PropVariantClear(&mut pv);
+        ((*store_vtbl).unk.release)(store);
+        result
+    }
+
+    pub fn default_playback_id() -> Option<Vec<u16>> {
+        unsafe {
+            let _com = ComInit::new();
+            let mut en: *mut c_void = core::ptr::null_mut();
+            if CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, core::ptr::null_mut(), 1, &IID_IMMDEVICE_ENUMERATOR, &mut en) < 0 || en.is_null() {
+                return None;
+            }
+            let en_vtbl = *(en as *const *const IMMDeviceEnumeratorVtbl);
+            let mut dev: *mut c_void = core::ptr::null_mut();
+            let hr = ((*en_vtbl).get_default_audio_endpoint)(en, 0, 0, &mut dev);
+            ((*en_vtbl).unk.release)(en);
+            if hr < 0 || dev.is_null() {
+                return None;
+            }
+            let id = device_id(dev);
+            let dev_vtbl = *(dev as *const *const IMMDeviceVtbl);
+            ((*dev_vtbl).unk.release)(dev);
+            id
+        }
+    }
+
+    pub fn find_virtual_playback_id() -> Option<Vec<u16>> {
+        unsafe {
+            let _com = ComInit::new();
+            let mut en: *mut c_void = core::ptr::null_mut();
+            if CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, core::ptr::null_mut(), 1, &IID_IMMDEVICE_ENUMERATOR, &mut en) < 0 || en.is_null() {
+                return None;
+            }
+            let en_vtbl = *(en as *const *const IMMDeviceEnumeratorVtbl);
+            let mut col: *mut c_void = core::ptr::null_mut();
+            let hr = ((*en_vtbl).enum_audio_endpoints)(en, 0, 1, &mut col);
+            ((*en_vtbl).unk.release)(en);
+            if hr < 0 || col.is_null() {
+                return None;
+            }
+            let col_vtbl = *(col as *const *const IMMDeviceCollectionVtbl);
+            let mut count = 0u32;
+            let _ = ((*col_vtbl).get_count)(col, &mut count);
+            let mut found = None;
+            for i in 0..count {
+                let mut dev: *mut c_void = core::ptr::null_mut();
+                if ((*col_vtbl).item)(col, i, &mut dev) >= 0 && !dev.is_null() {
+                    if let Some(name) = device_friendly_name(dev) {
+                        let lower = name.to_ascii_lowercase();
+                        if lower.contains("cable input")
+                            || lower.contains("audioshare")
+                            || lower.contains("virtual")
+                        {
+                            found = device_id(dev);
+                        }
+                    }
+                    let dev_vtbl = *(dev as *const *const IMMDeviceVtbl);
+                    ((*dev_vtbl).unk.release)(dev);
+                    if found.is_some() {
+                        break;
+                    }
+                }
+            }
+            ((*col_vtbl).unk.release)(col);
+            found
+        }
+    }
+
+    pub fn set_default_endpoint(device_id: &[u16]) {
+        if device_id.is_empty() {
+            return;
+        }
+        unsafe {
+            let _com = ComInit::new();
+            let mut policy: *mut c_void = core::ptr::null_mut();
+            if CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, core::ptr::null_mut(), 1, &IID_IPOLICY_CONFIG, &mut policy) < 0 || policy.is_null() {
+                return;
+            }
+            let vtbl = *(policy as *const *const IPolicyConfigVtbl);
+            for role in 0..3u32 {
+                let _ = ((*vtbl).set_default_endpoint)(policy, device_id.as_ptr(), role);
+            }
+            ((*vtbl).unk.release)(policy);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+static WINDOWS_TARGET_CAPTURE_PID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+pub fn windows_target_capture_pid() -> u32 {
+    WINDOWS_TARGET_CAPTURE_PID.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Owning handle for a WASAPI Process Loopback capture thread.
+#[cfg(target_os = "windows")]
+pub struct WindowsProcessLoopbackStream {
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsProcessLoopbackStream {
+    fn drop(&mut self) {
+        self.active.store(false, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_windows_process_loopback(
+    target_pid: u32,
+    ring: std::sync::Arc<audioshare_protocol::dsp::BurstDecouplerRing>,
+    heartbeat_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stream_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    start_epoch: std::time::Instant,
+) -> Result<WindowsProcessLoopbackStream, String> {
+    use windows::core::{implement, AsImpl, IUnknown, Interface};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Media::Audio::{
+        ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+        IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+        IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT,
+        AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+        AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDIOCLIENT_ACTIVATION_PARAMS,
+        AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
+    };
+    use windows::Win32::System::Com::StructuredStorage::InitPropVariantFromBuffer;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    struct CompletionHandler {
+        event: HANDLE,
+        result: std::sync::Mutex<Option<Result<IAudioClient, String>>>,
+    }
+
+    impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
+        fn ActivateCompleted(
+            &self,
+            op: Option<&IActivateAudioInterfaceAsyncOperation>,
+        ) -> windows::core::Result<()> {
+            let res = (|| -> Result<IAudioClient, String> {
+                let op = op.ok_or("Missing async operation")?;
+                let mut hr = windows::core::HRESULT(0);
+                let mut iface: Option<IUnknown> = None;
+                unsafe { op.GetActivateResult(&mut hr, &mut iface) }
+                    .map_err(|e| format!("GetActivateResult failed: {e}"))?;
+                hr.ok().map_err(|e| format!("Activation HRESULT failed: {e}"))?;
+                let unk = iface.ok_or("Null activated IAudioClient")?;
+                unk.cast::<IAudioClient>()
+                    .map_err(|e| format!("Cast to IAudioClient failed: {e}"))
+            })();
+            *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
+            unsafe { let _ = SetEvent(self.event); }
+            Ok(())
+        }
+    }
+
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let active_t = std::sync::Arc::clone(&active);
+    stream_error.store(false, std::sync::atomic::Ordering::Release);
+
+    let handle = std::thread::Builder::new()
+        .name("as-ultra-win-proc-loopback".into())
+        .spawn(move || {
+            let _rt = crate::RealtimeThreadGuard::enter();
+            unsafe {
+                let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                let res = (|| -> Result<(), String> {
+                    let done_evt = CreateEventW(None, true, false, None)
+                        .map_err(|e| format!("CreateEventW failed: {e}"))?;
+                    let handler_impl = CompletionHandler {
+                        event: done_evt,
+                        result: std::sync::Mutex::new(None),
+                    };
+                    let handler: IActivateAudioInterfaceCompletionHandler = handler_impl.into();
+
+                    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+                        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+                        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                                TargetProcessId: target_pid,
+                                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                            },
+                        },
+                    };
+                    let param_bytes = core::slice::from_raw_parts(
+                        &params as *const AUDIOCLIENT_ACTIVATION_PARAMS as *const u8,
+                        core::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>(),
+                    );
+                    let prop = InitPropVariantFromBuffer(
+                        param_bytes.as_ptr() as *const core::ffi::c_void,
+                        param_bytes.len() as u32,
+                    )
+                    .map_err(|e| format!("InitPropVariantFromBuffer failed: {e}"))?;
+
+                    let _op = ActivateAudioInterfaceAsync(
+                        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                        &IAudioClient::IID,
+                        Some(&prop),
+                        &handler,
+                    )
+                    .map_err(|e| format!("ActivateAudioInterfaceAsync failed: {e}"))?;
+
+                    if WaitForSingleObject(done_evt, 3000) != WAIT_OBJECT_0 {
+                        let _ = CloseHandle(done_evt);
+                        return Err("Process loopback activation timed out".into());
+                    }
+                    let _ = CloseHandle(done_evt);
+                    let client = handler.as_impl()
+                        .result
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .ok_or("No activation result")??;
+
+                    let fmt = WAVEFORMATEX {
+                        wFormatTag: 3,
+                        nChannels: 2,
+                        nSamplesPerSec: audioshare_protocol::SAMPLE_RATE,
+                        nAvgBytesPerSec: audioshare_protocol::SAMPLE_RATE * 8,
+                        nBlockAlign: 8,
+                        wBitsPerSample: 32,
+                        cbSize: 0,
+                    };
+                    let flags = AUDCLNT_STREAMFLAGS_LOOPBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+                        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                    client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None)
+                        .map_err(|e| format!("IAudioClient::Initialize failed: {e}"))?;
+                    let sample_evt = CreateEventW(None, false, false, None)
+                        .map_err(|e| format!("CreateEventW(sample) failed: {e}"))?;
+                    client.SetEventHandle(sample_evt)
+                        .map_err(|e| format!("SetEventHandle failed: {e}"))?;
+                    let capture: IAudioCaptureClient = client
+                        .GetService()
+                        .map_err(|e| format!("GetService(IAudioCaptureClient) failed: {e}"))?;
+                    client.Start().map_err(|e| format!("IAudioClient::Start failed: {e}"))?;
+
+                    let silence = [0.0f32; 2048];
+                    while active_t.load(std::sync::atomic::Ordering::Relaxed)
+                        && running.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let _ = WaitForSingleObject(sample_evt, 20);
+                        while let Ok(pkt_frames) = capture.GetNextPacketSize() {
+                            if pkt_frames == 0 { break; }
+                            let mut data_ptr = core::ptr::null_mut();
+                            let mut frames = 0u32;
+                            let mut buf_flags = 0u32;
+                            if capture.GetBuffer(&mut data_ptr, &mut frames, &mut buf_flags, None, None).is_err() {
+                                stream_error.store(true, std::sync::atomic::Ordering::Release);
+                                break;
+                            }
+                            heartbeat_ms.store(
+                                start_epoch.elapsed().as_millis() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            let total_samples = (frames as usize) * 2;
+                            if (buf_flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data_ptr.is_null() {
+                                let mut rem = total_samples;
+                                while rem > 0 {
+                                    let chunk = rem.min(silence.len());
+                                    ring.push_samples(&silence[..chunk]);
+                                    rem -= chunk;
+                                }
+                            } else {
+                                let slice = core::slice::from_raw_parts(data_ptr as *const f32, total_samples);
+                                ring.push_samples(slice);
+                            }
+                            let _ = capture.ReleaseBuffer(frames);
+                        }
+                    }
+                    let _ = client.Stop();
+                    let _ = CloseHandle(sample_evt);
+                    Ok(())
+                })();
+                if let Err(err) = res {
+                    audioshare_protocol::diagnostics::warn("win-proc-loopback", err);
+                    stream_error.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if com_ok { CoUninitialize(); }
+            }
+        })
+        .map_err(|e| format!("Failed to spawn process loopback thread: {e}"))?;
+
+    Ok(WindowsProcessLoopbackStream { active, handle: Some(handle) })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioAppEntry {
@@ -158,7 +624,19 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
     {
         #[cfg(target_os = "windows")]
         {
-            isolate_windows_audio_session(Some(app.pid));
+            // Capture only the chosen process tree via WASAPI Process Loopback
+            // instead of muting every other app (which could stay muted on a
+            // panic=abort crash). Keep the legacy mute path as a fallback when
+            // no virtual endpoint is installed.
+            WINDOWS_TARGET_CAPTURE_PID.store(
+                app.pid,
+                std::sync::atomic::Ordering::Release,
+            );
+            if let Some(virtual_id) = windows_endpoint_switch::find_virtual_playback_id() {
+                windows_endpoint_switch::set_default_endpoint(&virtual_id);
+            } else {
+                isolate_windows_audio_session(Some(app.pid));
+            }
         }
         Ok(format!(
             "Target Process Loopback locked to '{}' (PID {})",
@@ -190,6 +668,10 @@ pub fn restore_all_apps_to_default_sink() -> String {
     {
         #[cfg(target_os = "windows")]
         {
+            WINDOWS_TARGET_CAPTURE_PID.store(0, std::sync::atomic::Ordering::Release);
+            if let Some(previous) = windows_endpoint_switch::default_playback_id() {
+                windows_endpoint_switch::set_default_endpoint(&previous);
+            }
             isolate_windows_audio_session(None);
         }
         "Restored: Capturing Full System Audio (All Applications)".into()

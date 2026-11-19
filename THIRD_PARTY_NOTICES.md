@@ -1,7 +1,27 @@
 # Third-Party Notices
 
-AudioShare Ultra is licensed under GPL-3.0-only. It dynamically links the
-following third-party component, whose license is reproduced below.
+AudioShare Ultra is licensed under GPL-3.0-only. It bundles the following
+third-party components. Their licenses and project sources are listed below.
+
+## Crates added for v2 production build
+
+| Crate | Version | License | Project | Used by |
+|---|---|---|---|---|
+| `chacha20poly1305` | 0.10 | BSD-3-Clause OR Apache-2.0 | https://github.com/RustCrypto/AEADs | `audioshare-protocol` (RFC 8439 AEAD) |
+| `pbkdf2` | 0.12 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes | `audioshare-protocol` (PIN KDF) |
+| `sha2` | 0.10 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | `audioshare-protocol` (PBKDF2-HMAC-SHA256) |
+| `getrandom` | 0.2 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | `audioshare-protocol` (per-session salt) |
+
+These are pure-Rust crates with no C/NDK dependency. Full license texts are
+available in each crate's published source package on crates.io.
+
+## Android UI dependencies (FOSS, Apache-2.0)
+
+| Component | Version | License | Project |
+|---|---|---|---|
+| CameraX (camera-camera2 / lifecycle / view) | 1.3.4 | Apache-2.0 | https://developer.android.com/jetpack/androidx/releases/camera |
+| ZXing Core | 3.5.3 | Apache-2.0 | https://github.com/zxing/zxing |
+| material-icons-extended / lifecycle-viewmodel-compose | BOM 2024.06.00 / 2.8.4 | Apache-2.0 | https://developer.android.com/jetpack |
 
 ## opus-rs 0.1.42
 
