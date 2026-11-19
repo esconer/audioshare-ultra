@@ -1435,11 +1435,22 @@ impl AudioShareApp {
     fn render_host_tab(&mut self, ui: &mut egui::Ui) {
         let is_running = self.host_engine.is_some();
         let dark = self.dark_mode;
+        let vu_pct = self
+            .host_engine
+            .as_ref()
+            .map(|h| h.telemetry.host_vu_peak_pct.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        // Decaying studio peak-hold marker: snap up instantly, fall slowly.
+        if vu_pct as f32 >= self.vu_peak_hold {
+            self.vu_peak_hold = vu_pct as f32;
+        } else {
+            self.vu_peak_hold = (self.vu_peak_hold - 1.8).max(0.0);
+        }
 
         // =========================================================================
-        // 1. SIMPLE HERO CONSOLE: Start/Stop CTA, Peak LED Meter & Master Volume
+        // 1. ATMOSPHERIC HERO AUDIO STAGE: CTA, Peak LED Meter & Master Volume
         // =========================================================================
-        uw::studio_card(ui, dark, |ui| {
+        uw::hero_stage_card(ui, dark, is_running, vu_pct, |ui| {
             ui.horizontal(|ui| {
                 if uw::primary_cta_button(ui, is_running, "Start Broadcast", "Stop Broadcast") {
                     self.toggle_host();
@@ -1478,17 +1489,6 @@ impl AudioShareApp {
             ui.add_space(6.0);
             ui.separator();
 
-            let vu_pct = self
-                .host_engine
-                .as_ref()
-                .map(|h| h.telemetry.host_vu_peak_pct.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            // Decaying studio peak-hold marker: snap up instantly, fall slowly.
-            if vu_pct as f32 >= self.vu_peak_hold {
-                self.vu_peak_hold = vu_pct as f32;
-            } else {
-                self.vu_peak_hold = (self.vu_peak_hold - 1.8).max(0.0);
-            }
             let bt_delay = self
                 .host_engine
                 .as_ref()
@@ -1557,88 +1557,53 @@ impl AudioShareApp {
         ui.add_space(8.0);
 
         // =========================================================================
-        // 2. 4 SIMPLE MODE CARDS (Zero Jargon, 1-Click Priority Selection)
+        // 2. SLIDING SEGMENTED MODE BAR (zero-scroll "Simple First" view)
         // =========================================================================
-        ui.columns(4, |cols| {
-            let is_auto = self.quality_profile == QualityProfile::SmartAuto;
-            let is_lossless = matches!(
-                self.quality_profile,
-                QualityProfile::StudioLossless | QualityProfile::StudioLossless24Bit
-            );
-            let is_low_lat = self.quality_profile == QualityProfile::LowLatencyCompressed;
-            let is_max_range = self.quality_profile == QualityProfile::MaxStability24Ghz;
-
-            if uw::mode_preset_card(
-                &mut cols[0],
-                dark,
-                is_auto,
-                "Smart Auto",
-                "Adapts Lossless / Opus live",
-                "Recommended",
-            ) {
-                self.quality_profile = QualityProfile::SmartAuto;
-                if let Some(ref host) = self.host_engine {
-                    host.telemetry
-                        .quality_profile
-                        .store(self.quality_profile as u8, Ordering::Relaxed);
+        let is_lossless = matches!(
+            self.quality_profile,
+            QualityProfile::StudioLossless | QualityProfile::StudioLossless24Bit
+        );
+        let active_idx = match self.quality_profile {
+            QualityProfile::SmartAuto => 0,
+            QualityProfile::StudioLossless | QualityProfile::StudioLossless24Bit => 1,
+            QualityProfile::LowLatencyCompressed => 2,
+            QualityProfile::MaxStability24Ghz => 3,
+        };
+        let lossless_badge = if self.quality_profile == QualityProfile::StudioLossless24Bit {
+            "24-Bit"
+        } else {
+            "16-Bit"
+        };
+        let smooth_badge = format!("Opus {}k", self.target_bitrate_kbps);
+        if let Some(idx) = uw::segmented_mode_bar(
+            ui,
+            dark,
+            active_idx,
+            &[
+                ("Smart Auto", "Recommended"),
+                ("Studio Lossless", lossless_badge),
+                ("Smooth Wi-Fi", &smooth_badge),
+                ("Max Range", "10 ms Walls"),
+            ],
+        ) {
+            match idx {
+                0 => self.quality_profile = QualityProfile::SmartAuto,
+                1 => {
+                    // Preserve an explicit 24-bit master selection.
+                    if !is_lossless {
+                        self.quality_profile = QualityProfile::StudioLossless;
+                    }
                 }
+                2 => self.quality_profile = QualityProfile::LowLatencyCompressed,
+                3 => self.quality_profile = QualityProfile::MaxStability24Ghz,
+                _ => {}
             }
-
-            let lossless_badge = if self.quality_profile == QualityProfile::StudioLossless24Bit {
-                "24-Bit"
-            } else {
-                "16-Bit"
-            };
-            if uw::mode_preset_card(
-                &mut cols[1],
-                dark,
-                is_lossless,
-                "Studio Lossless",
-                "Bit-exact zero-delay LPC",
-                lossless_badge,
-            ) {
-                if !is_lossless {
-                    self.quality_profile = QualityProfile::StudioLossless;
-                }
-                if let Some(ref host) = self.host_engine {
-                    host.telemetry
-                        .quality_profile
-                        .store(self.quality_profile as u8, Ordering::Relaxed);
-                }
+            if let Some(ref host) = self.host_engine {
+                host.telemetry
+                    .quality_profile
+                    .store(self.quality_profile as u8, Ordering::Relaxed);
             }
-
-            if uw::mode_preset_card(
-                &mut cols[2],
-                dark,
-                is_low_lat,
-                "Smooth Wi-Fi",
-                "Best for 2.4 GHz & BT",
-                &format!("Opus {}k", self.target_bitrate_kbps),
-            ) {
-                self.quality_profile = QualityProfile::LowLatencyCompressed;
-                if let Some(ref host) = self.host_engine {
-                    host.telemetry
-                        .quality_profile
-                        .store(self.quality_profile as u8, Ordering::Relaxed);
-                }
-            }
-
-            if uw::mode_preset_card(
-                &mut cols[3],
-                dark,
-                is_max_range,
-                "Max Range",
-                "10 ms packets through walls",
-                "10 ms",
-            ) {
-                self.quality_profile = QualityProfile::MaxStability24Ghz;
-                if let Some(ref host) = self.host_engine {
-                    host.telemetry
-                        .quality_profile
-                        .store(self.quality_profile as u8, Ordering::Relaxed);
-                }
-            }
-        });
+        }
 
         ui.add_space(8.0);
 
