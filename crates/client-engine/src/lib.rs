@@ -2271,6 +2271,50 @@ mod tests {
         }
     }
 
+    /// Read exactly `buf.len()` bytes from a loopback TCP socket, retrying
+    /// Windows' `WouldBlock` (WSAEWOULDBLOCK / timeout mapping) until deadline.
+    fn read_exact_within(
+        stream: &mut std::net::TcpStream,
+        buf: &mut [u8],
+        timeout: Duration,
+        label: &str,
+    ) {
+        use std::io::Read;
+        let deadline = Instant::now() + timeout;
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match stream.read(&mut buf[filled..]) {
+                Ok(0) => panic!("EOF reading {label}"),
+                Ok(n) => filled += n,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(Instant::now() < deadline, "timed out reading {label}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("read {label} failed: {e}"),
+            }
+        }
+    }
+
+    /// Receive one UDP datagram, retrying Windows' `WouldBlock` on timeouts.
+    fn recv_udp_within(socket: &UdpSocket, buf: &mut [u8], label: &str) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match socket.recv_from(buf) {
+                Ok((n, _)) => return n,
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    assert!(Instant::now() < deadline, "timed out receiving {label}");
+                }
+                Err(e) => panic!("recv {label} failed: {e}"),
+            }
+        }
+    }
+
     #[test]
     fn test_adb_tcp_bridge_reconnects_after_server_yank() {
         use std::net::TcpListener;
@@ -2305,7 +2349,7 @@ mod tests {
         framed1.extend_from_slice(p1);
         server1.write_all(&framed1).unwrap();
         let mut udp_buf = [0u8; 256];
-        let (n, _) = client_udp.recv_from(&mut udp_buf).unwrap();
+        let n = recv_udp_within(&client_udp, &mut udp_buf, "first framed packet");
         assert_eq!(&udp_buf[..n], p1);
 
         // UDP -> TCP: send a plain datagram to the bridge's stable UDP address
@@ -2313,10 +2357,10 @@ mod tests {
         let reply1 = b"pong-over-adb";
         client_udp.send_to(reply1, bridge.local_udp_addr).unwrap();
         let mut len_buf = [0u8; 2];
-        server1.read_exact(&mut len_buf).unwrap();
+        read_exact_within(&mut server1, &mut len_buf, Duration::from_secs(2), "reply #1 length");
         let len = u16::from_be_bytes(len_buf) as usize;
         let mut pkt = vec![0u8; len];
-        server1.read_exact(&mut pkt).unwrap();
+        read_exact_within(&mut server1, &mut pkt, Duration::from_secs(2), "reply #1 body");
         assert_eq!(pkt, reply1);
 
         // --- Simulate a cable yank: drop server socket #1 --------------------
@@ -2335,15 +2379,15 @@ mod tests {
         framed2.extend_from_slice(&(p2.len() as u16).to_be_bytes());
         framed2.extend_from_slice(p2);
         server2.write_all(&framed2).unwrap();
-        let (n, _) = client_udp.recv_from(&mut udp_buf).unwrap();
+        let n = recv_udp_within(&client_udp, &mut udp_buf, "second framed packet");
         assert_eq!(&udp_buf[..n], p2);
 
         let reply2 = b"pong-after-yank";
         client_udp.send_to(reply2, bridge.local_udp_addr).unwrap();
-        server2.read_exact(&mut len_buf).unwrap();
+        read_exact_within(&mut server2, &mut len_buf, Duration::from_secs(2), "reply #2 length");
         let len = u16::from_be_bytes(len_buf) as usize;
         let mut pkt = vec![0u8; len];
-        server2.read_exact(&mut pkt).unwrap();
+        read_exact_within(&mut server2, &mut pkt, Duration::from_secs(2), "reply #2 body");
         assert_eq!(pkt, reply2);
 
         // Drop cleanly: the supervisor and its per-session I/O threads must
