@@ -511,7 +511,9 @@ impl TruePeakLimiter {
     #[inline]
     pub fn process_in_place(&mut self, stereo_samples: &mut [f32]) {
         const THRESHOLD: f32 = 0.85; // -1.4 dBFS soft-knee start
-        const CEILING: f32 = 0.988; // -0.1 dBFS hard true-peak ceiling
+        // -0.4 dBFS leaves headroom for 4-point Hermite inter-sample peaks
+        // when clock drift != 0 or 44.1 kHz Bluetooth resampling is active.
+        const CEILING: f32 = 0.955;
         const ATTACK: f32 = 0.25;
         const RELEASE: f32 = 0.0005;
 

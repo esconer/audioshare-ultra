@@ -2836,12 +2836,15 @@ mod tests {
             let status = sequencer.pop_next(96 + i as u16, &mut out);
             assert_eq!(status, STATUS_HEALED_BY_FEC, "slot {} not healed", 96 + i);
             let expected = *level as f32 / 32768.0;
+            // Sample past the sequencer's 32-frame start fade-in so this test
+            // checks the healed FEC level, not the intentional fade ramp.
+            let steady = out[SUBFRAME_STEREO_SAMPLES - 2];
             assert!(
-                (out[0] - expected).abs() < 0.02,
+                (steady - expected).abs() < 0.02,
                 "slot {} expected ~{}, got {}",
                 96 + i,
                 expected,
-                out[0]
+                steady
             );
         }
 

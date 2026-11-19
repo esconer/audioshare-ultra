@@ -38,6 +38,12 @@ pub struct ZeroJitterSequencer {
     /// reconstruction. The next bit-exact primary frame is joined to it with
     /// a short linear correction so the codec switch cannot click.
     last_pop_was_fec: bool,
+    /// Arm a short raised-cosine fade-in on the next rendered subframe
+    /// (stream start / DTX wake), preventing a full-scale step from dither.
+    pending_fade_in: bool,
+    /// Arm a short splice from the last played sample on the next subframe
+    /// (post-stall fast-forward / codec switch), preventing a discontinuity.
+    pending_declick: bool,
 }
 
 impl ZeroJitterSequencer {
@@ -51,6 +57,8 @@ impl ZeroJitterSequencer {
             plc_recovery_tail: [0.0; CROSSFADE_FRAMES * 2],
             consecutive_plc_count: 0,
             last_pop_was_fec: false,
+            pending_fade_in: true,
+            pending_declick: false,
         }
     }
 
@@ -69,6 +77,65 @@ impl ZeroJitterSequencer {
         self.plc_recovery_tail.fill(0.0);
         self.consecutive_plc_count = 0;
         self.last_pop_was_fec = false;
+        self.pending_fade_in = true;
+        self.pending_declick = false;
+    }
+
+    /// Arm a 0.66 ms raised-cosine fade-in on the next rendered subframe.
+    #[inline]
+    pub fn arm_fade_in(&mut self) {
+        self.pending_fade_in = true;
+    }
+
+    /// Arm a 0.33 ms linear splice from the last played sample on the next subframe.
+    #[inline]
+    pub fn arm_declick(&mut self) {
+        self.pending_declick = true;
+    }
+
+    #[inline]
+    fn apply_boundary_ramps(&mut self, out: &mut [f32; SUBFRAME_STEREO_SAMPLES]) {
+        if self.pending_fade_in {
+            for i in 0..CROSSFADE_FRAMES {
+                let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
+                let w = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                out[i * 2] *= w;
+                out[i * 2 + 1] *= w;
+            }
+            self.pending_fade_in = false;
+            self.pending_declick = false;
+        } else if self.pending_declick {
+            let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
+            let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+            let dl = last_l - out[0];
+            let dr = last_r - out[1];
+            const SPLICE_FRAMES: usize = 16;
+            for i in 0..SPLICE_FRAMES {
+                let w = 1.0 - (i as f32) / (SPLICE_FRAMES as f32);
+                out[i * 2] += dl * w;
+                out[i * 2 + 1] += dr * w;
+            }
+            self.pending_declick = false;
+        }
+    }
+
+    /// Smoothly integrate a frame decoded outside `ZeroJitterSequencer`
+    /// (decode-at-pop Opus / CELT PLC), keeping history and crossfades coherent.
+    #[inline]
+    pub fn finalize_external_frame(&mut self, out: &mut [f32; SUBFRAME_STEREO_SAMPLES], is_plc: bool) {
+        if !is_plc && self.consecutive_plc_count > 0 {
+            for i in 0..CROSSFADE_FRAMES {
+                let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
+                let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                out[i * 2] = out[i * 2] * w_in + self.plc_recovery_tail[i * 2] * (1.0 - w_in);
+                out[i * 2 + 1] =
+                    out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * (1.0 - w_in);
+            }
+            self.consecutive_plc_count = 0;
+        }
+        self.apply_boundary_ramps(out);
+        self.last_pop_was_fec = false;
+        self.append_to_history(out);
     }
 
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing
@@ -258,6 +325,7 @@ impl ZeroJitterSequencer {
                 }
 
                 self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;
+                self.apply_boundary_ramps(out);
                 self.append_to_history(out);
                 return cur_status;
             }
@@ -271,9 +339,16 @@ impl ZeroJitterSequencer {
         // the first CROSSFADE_FRAMES from the exact last output sample and
         // ramp the attenuation from the previous frame's value to this
         // frame's target instead of applying a constant per-frame step.
-        let prev_attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
         self.consecutive_plc_count += 1;
-        let target_attenuation = (0.90f32).powi(self.consecutive_plc_count as i32);
+        // `history` already holds the previously attenuated PLC frames, so a
+        // compounding 0.90^k collapses volume quadratically (0.90^(k(k+1)/2)).
+        // Apply a gentle single-step decay instead: frame 1 fades 1.0 -> 0.90,
+        // later frames hold a steady 0.92.
+        let (start_attenuation, target_attenuation) = if self.consecutive_plc_count == 1 {
+            (1.0f32, 0.90f32)
+        } else {
+            (0.92f32, 0.92f32)
+        };
         let pitch_lag = self.find_best_pitch_period();
         let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
         let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
@@ -281,18 +356,21 @@ impl ZeroJitterSequencer {
         let copy_start = HISTORY_FRAMES - pitch_lag;
         for i in 0..SUBFRAME_FRAMES {
             let frac = (i as f32) / ((SUBFRAME_FRAMES - 1) as f32);
-            let attenuation = prev_attenuation + (target_attenuation - prev_attenuation) * frac;
+            let attenuation = start_attenuation + (target_attenuation - start_attenuation) * frac;
             let src_frame = copy_start + (i % pitch_lag);
             let mut l = self.history[src_frame * 2] * attenuation;
             let mut r = self.history[src_frame * 2 + 1] * attenuation;
 
-            if self.consecutive_plc_count == 1 && i < CROSSFADE_FRAMES {
-                // Raised-cosine onset fade from the last real sample. At i=0
-                // the weight is exactly 0, so there is no step discontinuity.
+            if i < CROSSFADE_FRAMES {
                 let alpha = (i as f32) / ((CROSSFADE_FRAMES - 1) as f32);
                 let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
-                l = last_l * (1.0 - w_in) + l * w_in;
-                r = last_r * (1.0 - w_in) + r * w_in;
+                let (prev_l, prev_r) = if self.consecutive_plc_count == 1 {
+                    (last_l, last_r)
+                } else {
+                    (self.plc_recovery_tail[i * 2], self.plc_recovery_tail[i * 2 + 1])
+                };
+                l = prev_l * (1.0 - w_in) + l * w_in;
+                r = prev_r * (1.0 - w_in) + r * w_in;
             }
 
             out[i * 2] = l;
@@ -470,7 +548,9 @@ mod tests {
         assert!(seq.push_primary(0, &fresh));
         let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
-        assert_eq!(out[0], 0.25);
+        // The first 32 frames fade in from silence on a fresh stream; the
+        // steady-state sample must still be the exact primary value.
+        assert_eq!(out[CROSSFADE_FRAMES * 2], 0.25);
     }
 
     #[test]
