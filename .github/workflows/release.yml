@@ -35,18 +35,47 @@ jobs:
       - name: Run Workspace Tests (release gate, locked)
         run: cargo test --workspace --release --locked
 
-      - name: Build Linux Release Binaries
+      - name: Build Linux Release Binaries (.tar.gz + Debian .deb)
         run: |
-          cargo build --release -p audioshare-desktop-gui -p audioshare-cli
+          cargo build --release --locked -p audioshare-desktop-gui -p audioshare-cli
           mkdir -p dist-linux
           cp target/release/audioshare-gui dist-linux/
           cp target/release/as-ultra dist-linux/
           tar -czvf audioshare-ultra-linux-x86_64.tar.gz -C dist-linux .
 
+          # Debian versions cannot contain '-': 1.0.0-beta.1 -> 1.0.0~beta.1
+          # so dpkg/apt upgrade cleanly from the pre-release to final 1.0.0.
+          VER=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
+          DEB_VER="${VER//-/\~}"
+          PKG="dist-deb/audioshare-ultra_${DEB_VER}_amd64"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/applications"
+          cp target/release/audioshare-gui target/release/as-ultra "$PKG/usr/bin/"
+          cat > "$PKG/DEBIAN/control" <<EOF
+          Package: audioshare-ultra
+          Version: ${DEB_VER}
+          Section: sound
+          Priority: optional
+          Architecture: amd64
+          Depends: libasound2t64 | libasound2, pulseaudio-utils | pipewire-pulse
+          Maintainer: AudioShare Ultra Contributors
+          Description: Low-latency wireless and USB studio audio router
+          EOF
+          cat > "$PKG/usr/share/applications/audioshare-ultra.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=AudioShare Ultra
+          Exec=/usr/bin/audioshare-gui
+          Categories=AudioVideo;Audio;
+          Terminal=false
+          EOF
+          dpkg-deb --build "$PKG" "audioshare-ultra_${DEB_VER}_amd64.deb"
+
       - uses: actions/upload-artifact@v6
         with:
           name: audioshare-ultra-linux-x86_64
-          path: audioshare-ultra-linux-x86_64.tar.gz
+          path: |
+            audioshare-ultra-linux-x86_64.tar.gz
+            audioshare-ultra_*.deb
 
   # 2. Build Windows x86_64 GUI & CLI
   build-windows:
@@ -153,10 +182,9 @@ jobs:
         with:
           path: release-assets
 
-      - name: Create or Update GitHub Release via Native GH CLI
+      - name: Resolve release tag and checksum artifacts
+        id: release_meta
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
           INPUT_TAG: ${{ inputs.release_tag }}
         run: |
           TAG="${INPUT_TAG}"
@@ -168,35 +196,18 @@ jobs:
               TAG="v${VERSION}"
             fi
           fi
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "Publishing release for tag: ${TAG}"
-          PRERELEASE_FLAG=""
-          if [[ "${TAG}" == *-rc* ]]; then
-            PRERELEASE_FLAG="--prerelease"
-            echo "Release candidate tag detected: marking as pre-release"
-          fi
-
-          # Checksum every published artifact.
           cd release-assets
           find . -type f ! -name SHA256SUMS.txt -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
           cat SHA256SUMS.txt
-          cd ..
 
-          # Ensure the tag exists locally and on remote
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f "${TAG}" HEAD
-          git push origin "${TAG}" --force || true
-
-          gh release create "${TAG}" \
-            release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
-            release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
-            release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
-            release-assets/SHA256SUMS.txt \
-            --title "AudioShare Ultra ${TAG}" \
-            --generate-notes ${PRERELEASE_FLAG} || \
-          gh release upload "${TAG}" \
-            release-assets/audioshare-ultra-linux-x86_64/audioshare-ultra-linux-x86_64.tar.gz \
-            release-assets/audioshare-ultra-windows-x86_64/audioshare-ultra-windows-x86_64.zip \
-            release-assets/audioshare-ultra-android-apk/audioshare-ultra-android.apk \
-            release-assets/SHA256SUMS.txt \
-            --clobber
+      - name: Create pre-release / release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.release_tag }}
+          name: AudioShare Ultra ${{ steps.release_meta.outputs.release_tag }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            release-assets/**/*

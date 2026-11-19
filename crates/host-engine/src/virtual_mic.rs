@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 use std::io::Write;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,13 +9,17 @@ use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
+use audioshare_protocol::latency::DESKTOP_OUTPUT_BUFFER_MS;
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, TAG_VBR_BFP,
 };
 use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
-use audioshare_protocol::sequencer::ZeroJitterSequencer;
-use audioshare_protocol::wire::{CodecMode, ParsedPacket};
+use audioshare_protocol::sequencer::{ZeroJitterSequencer, STATUS_PRIMARY_LOSSLESS};
+use audioshare_protocol::sync_and_eq::GroupSyncEstimator;
+use audioshare_protocol::wire::{
+    ClientFeedbackPacket, CodecMode, ParsedPacket, CONTROL_FEEDBACK_LEN,
+};
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
 use crate::{configure_realtime_udp_socket, promote_thread_realtime};
@@ -40,6 +44,69 @@ const MIC_FIFO_MAX_TARGET_SUBFRAMES: f32 = 20.0;
 fn mic_fifo_target_subframes(observed_cb_frames: usize) -> f32 {
     let cb_subframes = observed_cb_frames as f32 / SUBFRAME_FRAMES as f32;
     (cb_subframes + 3.0).clamp(MIC_FIFO_MIN_TARGET_SUBFRAMES, MIC_FIFO_MAX_TARGET_SUBFRAMES)
+}
+
+/// Unaligned local delay reported back to a Party Host phone in
+/// `PlayOnPcSpeakers` mode so PC speakers and peer phones lock in phase.
+/// `VirtualMicForCalls` always reports 0 ms and never adds room-alignment
+/// delay to a video call.
+#[inline]
+fn pc_receiver_effective_delay_ms(mode: PhoneRxRoutingMode, base_target_subframes: f32) -> u16 {
+    if mode != PhoneRxRoutingMode::PlayOnPcSpeakers {
+        return 0;
+    }
+    // Each subframe beyond the 4-subframe (10 ms) base cushion adds 2.5 ms of
+    // FIFO delay; the desktop output backend contributes a fixed buffer.
+    let excess_fifo_ms = ((base_target_subframes.ceil() as u32).saturating_sub(4) * 5) / 2;
+    let output_ms = DESKTOP_OUTPUT_BUFFER_MS.round() as u32;
+    (excess_fifo_ms + output_ms).min(255) as u16
+}
+
+/// Apply Party Host group-sync alignment (`stream_id * 2` ms) for PC speaker
+/// playback while keeping the video-call Virtual Mic latency untouched.
+#[inline]
+fn aligned_pc_receiver_target_subframes(
+    mode: PhoneRxRoutingMode,
+    base_target: f32,
+    max_group_delay_ms: u16,
+    local_delay_ms: u16,
+) -> f32 {
+    if mode != PhoneRxRoutingMode::PlayOnPcSpeakers || max_group_delay_ms == 0 {
+        return base_target;
+    }
+    let sync = GroupSyncEstimator::new();
+    sync.aligned_target_subframes(base_target, max_group_delay_ms, local_delay_ms)
+        .clamp(MIC_FIFO_MIN_TARGET_SUBFRAMES, 64.0)
+}
+
+/// Rolling FEC/loss rate in permille for one feedback window. Recovered or
+/// lost subframes count against the total number of played subframes.
+#[inline]
+fn fb_fec_rate_permille(primary_frames: u32, recovered_or_lost: u32) -> u16 {
+    let total = (primary_frames + recovered_or_lost).max(1);
+    ((recovered_or_lost * 1000) / total).min(1000) as u16
+}
+
+/// Build the signed AEAD v2 feedback datagram a PC `PlayOnPcSpeakers` receiver
+/// sends back to the Party Host. Shared by the RX loop and the loopback test so
+/// the wire encoding under test is exactly the one used in production.
+fn build_pc_feedback(
+    key: Option<&SessionKey>,
+    feedback_seq: u32,
+    fec_rate_permille: u16,
+    hardware_delay_ms: u16,
+    out: &mut [u8; CONTROL_FEEDBACK_LEN],
+) {
+    let packet = ClientFeedbackPacket {
+        fec_rate_permille,
+        bluetooth_delay_ms: 0,
+        client_volume: 100,
+        requested_mode: 0,
+        hardware_delay_ms,
+        feedback_seq,
+        auth_tag: [0u8; 16],
+    };
+    packet.encode_signed(key, out);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +273,7 @@ fn push_one_subframe(
     resampler: &mut ClockDriftResampler,
     resampled_out: &mut [f32],
     mic_fifo: &BurstDecouplerRing,
-) {
+) -> u32 {
     let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
     let status = sequencer.pop_next(*next_seq, &mut frame);
     if should_advance_mic_playhead(status, latest_seq, *next_seq) {
@@ -221,6 +288,9 @@ fn push_one_subframe(
     if frames > 0 {
         mic_fifo.push_samples(&resampled_out[..frames * 2]);
     }
+    // Reported so the caller can tally primary vs. recovered/lost subframes
+    // for the periodic Party Host loss-feedback packet.
+    status
 }
 
 /// Feeds the received phone-mic PCM into a PulseAudio/PipeWire null sink with
@@ -521,6 +591,15 @@ impl PhoneMicReceiver {
                 let mut resampler = ClockDriftResampler::new();
                 let mut opus_decoder: Option<OpusStreamDecoder> = None;
                 let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
+                // Party Host feedback: remember where audio came from, the
+                // group delay advertised in its stream_id, and the per-window
+                // loss counters reported back every 500 ms.
+                let mut last_sender_addr: Option<SocketAddr> = None;
+                let mut max_group_delay_ms: u16 = 0;
+                let mut last_feedback_sent = Instant::now();
+                let mut feedback_seq: u32 = 0;
+                let mut fb_primary_frames: u32 = 0;
+                let mut fb_recovered_or_lost: u32 = 0;
 
                 while run_clone.load(Ordering::Relaxed) {
                     // PIN edits from the UI land between batches; snapshot once
@@ -534,17 +613,29 @@ impl PhoneMicReceiver {
                     // callback size, so a 1024/2048-frame desktop callback
                     // automatically gets a deeper cushion than 5 ms AAudio.
                     let cb_frames = observed_cb_frames.load(Ordering::Relaxed);
-                    let target_subframes = mic_fifo_target_subframes(cb_frames);
+                    let base_target_subframes = mic_fifo_target_subframes(cb_frames);
+                    let local_delay_ms =
+                        pc_receiver_effective_delay_ms(mode, base_target_subframes);
+                    // PC speakers phase-align with the slowest peer phone;
+                    // the call virtual mic keeps its fixed low-latency target.
+                    let target_subframes = aligned_pc_receiver_target_subframes(
+                        mode,
+                        base_target_subframes,
+                        max_group_delay_ms,
+                        local_delay_ms,
+                    );
                     let target_depth = target_subframes.ceil() as i16;
                     let fifo_watermark = resampler
                         .subframes_to_samples(target_subframes.ceil() as usize)
                         .min(mic_fifo_thread.capacity_samples());
 
-                    while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
+                    while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
                         if let Ok(parsed) = ParsedPacket::parse_and_decrypt(
                             &mut recv_buf[..len],
                             key_for_batch.as_ref(),
                         ) {
+                            last_sender_addr = Some(src_addr);
+                            max_group_delay_ms = (parsed.header.stream_id as u16) * 2;
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
                             let base_seq = parsed.header.sequence;
                             if !initialized {
@@ -677,6 +768,34 @@ impl PhoneMicReceiver {
                         }
                     }
 
+                    // Report PC speaker delay & link loss back to the Party Host
+                    // phone every 500 ms so PC speakers stay phase-locked with
+                    // peer phones and trigger adaptive bitrate/10 ms framing if
+                    // Wi-Fi drops packets. The call virtual mic never sends it.
+                    if mode == PhoneRxRoutingMode::PlayOnPcSpeakers
+                        && initialized
+                        && !dtx_silent
+                        && last_feedback_sent.elapsed() >= Duration::from_millis(500)
+                    {
+                        last_feedback_sent = Instant::now();
+                        if let Some(sender) = last_sender_addr {
+                            let fec_permille =
+                                fb_fec_rate_permille(fb_primary_frames, fb_recovered_or_lost);
+                            fb_primary_frames = 0;
+                            fb_recovered_or_lost = 0;
+                            feedback_seq = feedback_seq.wrapping_add(1);
+                            let mut fb_bytes = [0u8; CONTROL_FEEDBACK_LEN];
+                            build_pc_feedback(
+                                key_for_batch.as_ref(),
+                                feedback_seq,
+                                fec_permille,
+                                local_delay_ms,
+                                &mut fb_bytes,
+                            );
+                            let _ = socket.send_to(&fb_bytes, sender);
+                        }
+                    }
+
                     let now = Instant::now();
                     // Do not let `next_tick` accumulate while the receiver is
                     // still prebuffering. Otherwise the first ready loop can
@@ -694,7 +813,7 @@ impl PhoneMicReceiver {
                         while mic_fifo_thread.available_samples() < fifo_watermark
                             && !sequencer.is_slot_missing(next_seq)
                         {
-                            push_one_subframe(
+                            let st = push_one_subframe(
                                 &mut next_seq,
                                 latest_seq,
                                 mode,
@@ -705,6 +824,11 @@ impl PhoneMicReceiver {
                                 &mut resampled_out,
                                 &mic_fifo_thread,
                             );
+                            if st == STATUS_PRIMARY_LOSSLESS {
+                                fb_primary_frames += 1;
+                            } else {
+                                fb_recovered_or_lost += 1;
+                            }
                             let planned_cushion =
                                 buffered_subframes(latest_seq, next_seq) as f32 + target_subframes;
                             resampler.update_clock_loop(planned_cushion, target_subframes);
@@ -732,7 +856,7 @@ impl PhoneMicReceiver {
                                 next_tick = now + Duration::from_micros(2500);
                                 break;
                             }
-                            push_one_subframe(
+                            let st = push_one_subframe(
                                 &mut next_seq,
                                 latest_seq,
                                 mode,
@@ -743,6 +867,11 @@ impl PhoneMicReceiver {
                                 &mut resampled_out,
                                 &mic_fifo_thread,
                             );
+                            if st == STATUS_PRIMARY_LOSSLESS {
+                                fb_primary_frames += 1;
+                            } else {
+                                fb_recovered_or_lost += 1;
+                            }
                             let planned_cushion = if pull_sink_active {
                                 buffered_subframes(latest_seq, next_seq) as f32 + target_subframes
                             } else {
@@ -1337,5 +1466,130 @@ mod tests {
         assert_eq!(next_seq, 180);
         assert_eq!(latest_seq, 180);
         assert!(!prebuffer_ready);
+    }
+
+    #[test]
+    fn test_pc_party_speaker_group_sync_aligns_while_call_mic_stays_zero_delay() {
+        // 240-frame callback -> 6-subframe floor (excess 2.5 ms) + 5 ms output
+        // buffer -> 10 ms of unaligned local delay.
+        let local_ms = pc_receiver_effective_delay_ms(PhoneRxRoutingMode::PlayOnPcSpeakers, 6.0);
+        assert_eq!(local_ms, 10);
+        assert_eq!(
+            pc_receiver_effective_delay_ms(PhoneRxRoutingMode::VirtualMicForCalls, 6.0),
+            0
+        );
+        // Delay is capped at 255 ms for a pathologically deep FIFO.
+        assert_eq!(
+            pc_receiver_effective_delay_ms(PhoneRxRoutingMode::PlayOnPcSpeakers, 104.0),
+            255
+        );
+
+        // A Bluetooth peer reports 150 ms via stream_id*2: the PC adds
+        // (150 - 10) / 2.5 = 56 subframes on top of its 6-subframe base.
+        let aligned = aligned_pc_receiver_target_subframes(
+            PhoneRxRoutingMode::PlayOnPcSpeakers,
+            6.0,
+            150,
+            local_ms,
+        );
+        assert!(
+            (aligned - 62.0).abs() < 0.01,
+            "expected 62 subframes, got {aligned}"
+        );
+
+        // With no group delay advertised the base target is unchanged.
+        assert_eq!(
+            aligned_pc_receiver_target_subframes(
+                PhoneRxRoutingMode::PlayOnPcSpeakers,
+                6.0,
+                0,
+                local_ms,
+            ),
+            6.0
+        );
+
+        // Video-call virtual mic must NEVER add room-sync delay.
+        let call_target = aligned_pc_receiver_target_subframes(
+            PhoneRxRoutingMode::VirtualMicForCalls,
+            6.0,
+            150,
+            0,
+        );
+        assert_eq!(call_target, 6.0);
+        assert_eq!(
+            pc_receiver_effective_delay_ms(PhoneRxRoutingMode::VirtualMicForCalls, 64.0),
+            0
+        );
+
+        // Per-window loss counters feed the FEC permille field.
+        assert_eq!(fb_fec_rate_permille(95, 5), 50);
+        assert_eq!(fb_fec_rate_permille(0, 0), 0);
+        assert_eq!(fb_fec_rate_permille(0, 1), 1000);
+    }
+
+    #[test]
+    fn test_pc_feedback_loopback_is_signed_and_replay_protected() {
+        use audioshare_protocol::wire::{feedback_is_replay, ClientFeedbackPacket};
+
+        // "Host phone" socket receives feedback; "PC receiver" socket sends it.
+        let host = UdpSocket::bind("127.0.0.1:0").expect("bind loopback host socket");
+        let pc = UdpSocket::bind("127.0.0.1:0").expect("bind loopback pc socket");
+        host.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let host_addr = host.local_addr().expect("host local addr");
+
+        // A single SessionKey instance is shared by signer and verifier: the
+        // per-session nonce salt is drawn once at derivation time.
+        let key = SessionKey::from_pin("4829");
+        let feedback_seq = 7u32;
+        let hardware_delay_ms =
+            pc_receiver_effective_delay_ms(PhoneRxRoutingMode::PlayOnPcSpeakers, 6.0);
+
+        let mut fb_bytes = [0u8; CONTROL_FEEDBACK_LEN];
+        build_pc_feedback(
+            Some(&key),
+            feedback_seq,
+            50,
+            hardware_delay_ms,
+            &mut fb_bytes,
+        );
+        pc.send_to(&fb_bytes, host_addr).expect("send feedback");
+
+        let mut buf = [0u8; 64];
+        let (len, from) = host.recv_from(&mut buf).expect("receive feedback");
+        assert_eq!(from, pc.local_addr().expect("pc local addr"));
+        assert_eq!(len, CONTROL_FEEDBACK_LEN);
+
+        let decoded = ClientFeedbackPacket::decode_verified(&buf[..len], Some(&key))
+            .expect("signed AEAD v2 feedback must verify");
+        assert_eq!(decoded.feedback_seq, feedback_seq);
+        assert_eq!(decoded.hardware_delay_ms, hardware_delay_ms);
+        assert_eq!(decoded.fec_rate_permille, 50);
+        assert_eq!(decoded.client_volume, 100);
+        assert_eq!(decoded.bluetooth_delay_ms, 0);
+        assert_eq!(decoded.requested_mode, 0);
+
+        // A different PIN cannot forge/verify the tag.
+        let wrong_key = SessionKey::from_pin("0000");
+        assert!(ClientFeedbackPacket::decode_verified(&buf[..len], Some(&wrong_key)).is_none());
+
+        // Replay gate: authenticated seq <= last_seq is rejected.
+        assert!(!feedback_is_replay(
+            true,
+            decoded.feedback_seq,
+            decoded.feedback_seq - 1
+        ));
+        assert!(feedback_is_replay(
+            true,
+            decoded.feedback_seq,
+            decoded.feedback_seq
+        ));
+        assert!(feedback_is_replay(
+            true,
+            decoded.feedback_seq - 1,
+            decoded.feedback_seq
+        ));
+        // Unencrypted LAN feedback carries no sequence guarantee.
+        assert!(!feedback_is_replay(false, 1, 5));
     }
 }
