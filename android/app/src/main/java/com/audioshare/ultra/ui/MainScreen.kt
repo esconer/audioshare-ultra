@@ -68,6 +68,8 @@ fun MainScreen() {
     val scope = rememberCoroutineScope()
     var showQrScanner by remember { mutableStateOf(false) }
     var showToolsSheet by remember { mutableStateOf(false) }
+    var showPartyQrDialog by remember { mutableStateOf(false) }
+    var partySilentTicks by remember { mutableIntStateOf(0) }
     var pendingEncryptedHost by remember { mutableStateOf<String?>(null) }
     var promptPinInput by remember { mutableStateOf("") }
     var vuPeakHold by remember { mutableFloatStateOf(0f) }
@@ -152,8 +154,8 @@ fun MainScreen() {
     // the switch off even if the app was backgrounded.
     var castPhoneInternalAudio by remember { mutableStateOf(AudioEngineService.isPartyCasting) }
     var forwardPartyToPc by remember { mutableStateOf(prefs.getBoolean("party_forward_pc", false)) }
-    var muteHostSpeakerInParty by remember { mutableStateOf(prefs.getBoolean("party_mute_local", false)) }
-    var savedMusicVolume by remember { mutableIntStateOf(-1) }
+    // Default ON to eliminate the ~60 ms same-room speaker slapback echo.
+    var muteHostSpeakerInParty by remember { mutableStateOf(prefs.getBoolean("party_mute_local", true)) }
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
     // 0..10 legacy counters, 11..21 live latency breakdown.
@@ -209,18 +211,6 @@ fun MainScreen() {
         }
     }
 
-    fun applyLocalPartySpeakerMute(mute: Boolean) {
-        val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        if (mute) {
-            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            if (cur > 0) savedMusicVolume = cur
-            am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
-        } else if (savedMusicVolume > 0) {
-            am.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0)
-            savedMusicVolume = -1
-        }
-    }
-
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
     // switch back even when this screen was not the caller.
@@ -232,10 +222,9 @@ fun MainScreen() {
                         AudioEngineService.EXTRA_PARTY_CAST_ACTIVE,
                         false
                     )
+                    // The service restores the saved music volume on every
+                    // stop path, so the UI must not touch it here.
                     castPhoneInternalAudio = active
-                    if (!active && muteHostSpeakerInParty) {
-                        applyLocalPartySpeakerMute(false)
-                    }
                 } else if (intent?.action == AudioEngineService.ACTION_PHONE_MIC_STATE) {
                     sharePhoneMic = intent.getBooleanExtra(
                         AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
@@ -394,10 +383,9 @@ fun MainScreen() {
                 } else {
                     context.startService(svcIntent)
                 }
+                // Service applies the local speaker mute from party_mute_local
+                // once the caster is live; do not manage volume from the UI.
                 castPhoneInternalAudio = true
-                if (muteHostSpeakerInParty) {
-                    applyLocalPartySpeakerMute(true)
-                }
             } catch (_: Exception) {
                 castPhoneInternalAudio = false
             }
@@ -1514,9 +1502,6 @@ fun MainScreen() {
                                     }
                                 } else {
                                     castPhoneInternalAudio = false
-                                    if (muteHostSpeakerInParty) {
-                                        applyLocalPartySpeakerMute(false)
-                                    }
                                     val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_STOP_PARTY_CAST
                                     }
@@ -1527,13 +1512,18 @@ fun MainScreen() {
 
                         SettingSwitchRow(
                             title = "Mute This Phone's Speaker During Party Cast",
-                            subtitle = "Silences local speaker so all room audio comes from synced peer phones/PCs without echo",
+                            subtitle = "Keeps the room echo-free — use peers/PCs as synced speakers",
                             checked = muteHostSpeakerInParty,
                             onCheckedChange = { mute ->
                                 muteHostSpeakerInParty = mute
                                 prefs.edit().putBoolean("party_mute_local", mute).apply()
                                 if (castPhoneInternalAudio) {
-                                    applyLocalPartySpeakerMute(mute)
+                                    context.startService(
+                                        Intent(context, AudioEngineService::class.java).apply {
+                                            action = AudioEngineService.ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE
+                                            putExtra("MUTE_LOCAL", mute)
+                                        }
+                                    )
                                 }
                             }
                         )
@@ -1554,6 +1544,14 @@ fun MainScreen() {
                             val partyCodec = (partyPacked shr 8) and 0xFFL
                             val partyPort = ((partyPacked shr 16) and 0xFFFFL).let { if (it > 0) it else 65530L }
                             val partySyncMs = telemetry.getOrElse(23) { 0L }
+                            // stats[22] bits 40..47 carry the live capture VU peak
+                            // from PhoneMicTransmitter. Zero for ~12 polls (~3 s)
+                            // means DRM/OEM mute is feeding silence to peers.
+                            val partyVu = ((partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
+
+                            LaunchedEffect(partyVu) {
+                                partySilentTicks = if (partyVu == 0) (partySilentTicks + 1).coerceAtMost(100) else 0
+                            }
 
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 HorizontalDivider(color = Color(0xFF243047))
@@ -1562,6 +1560,19 @@ fun MainScreen() {
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MaterialTheme.colorScheme.secondary
                                 )
+                                Text(
+                                    "Captured Audio Level",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = StudioColors.Muted
+                                )
+                                FluidAudioVisualizer(vuPct = partyVu, isLive = partyVu > 0)
+                                if (partySilentTicks >= 12) {
+                                    StatusBadge(
+                                        text = "No app audio detected — start music or check DRM/mute",
+                                        containerColor = StudioColors.WarnBg,
+                                        contentColor = StudioColors.WarnFg
+                                    )
+                                }
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1570,10 +1581,30 @@ fun MainScreen() {
                                     MetricTile("Party Codec", codecModeName(partyCodec), Modifier.weight(1f))
                                     MetricTile("Group Sync", "+${partySyncMs} ms", Modifier.weight(1f))
                                 }
+                                FilledTonalButton(
+                                    onClick = { showPartyQrDialog = true },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Rounded.QrCode, null, Modifier.size(18.dp))
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Show Party QR Code (Port $partyPort)")
+                                }
                                 Text(
-                                    "Other phones & PCs can join by tapping 'Party Phone: Android-Party-Host' on their Connect tab.",
+                                    "Tip: For 3+ peers or outdoors, enable this phone's Mobile Hotspot for a 1-hop direct link with half the Wi-Fi lag.",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = StudioColors.Muted
+                                )
+                            }
+                            if (showPartyQrDialog) {
+                                PartyQrDialog(
+                                    partyPort = partyPort.toInt(),
+                                    pinCode = pinCode,
+                                    onDismiss = { showPartyQrDialog = false },
+                                    onCopied = {
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar("Party link copied")
+                                        }
+                                    }
                                 )
                             }
                         }

@@ -63,6 +63,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val ACTION_STREAM_STATE = "ACTION_STREAM_STATE"
         const val EXTRA_STREAM_ACTIVE = "STREAM_ACTIVE"
         const val EXTRA_STREAM_ERROR = "STREAM_ERROR"
+        // Party Host actions are handled by the service so they work from the
+        // foreground notification even when the Compose UI is not running.
+        const val ACTION_TOGGLE_PARTY_MUTE = "ACTION_TOGGLE_PARTY_MUTE"
+        const val ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE = "ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE"
 
         @Volatile
         var isPartyCasting: Boolean = false
@@ -122,6 +126,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativeStopPhoneMic()
 
         @JvmStatic
+        external fun nativeSetPartyCastMuted(muted: Boolean)
+
+        @JvmStatic
         external fun nativeGetDiscoveredHosts(): String
 
         @JvmStatic
@@ -158,6 +165,32 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var projectionActive: Boolean = false
     private var activeCaster: PhoneAudioCaster? = null
     private var foregroundStarted: Boolean = false
+    // Party-only state owned here (not in Compose) so a screen-off / background
+    // host never leaves the phone speaker stuck at volume 0 and peer media keys
+    // keep working. Default local-speaker mute is ON (party_mute_local = true).
+    private var isPartyCastMuted: Boolean = false
+    private var savedPartyMusicVolume: Int = -1
+    private val partyMediaHandler = Handler(Looper.getMainLooper())
+    // Polls peer remote media commands (10..12) in the Service so friends can
+    // control playback even when the Party Host screen is off.
+    private val partyMediaPollRunnable = object : Runnable {
+        override fun run() {
+            if (!isPartyCasting) return
+            val telem = runCatching { nativeGetTelemetry() }.getOrNull()
+            val cmd = ((telem?.getOrElse(22) { 0L } ?: 0L) ushr 32 and 0xFFL).toInt()
+            if (cmd in 10..12) {
+                val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val keyCode = when (cmd) {
+                    10 -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                    11 -> KeyEvent.KEYCODE_MEDIA_NEXT
+                    else -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+                }
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+                am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            }
+            partyMediaHandler.postDelayed(this, 250L)
+        }
+    }
     // The native RX/TX threads publish their TIDs shortly after start, so the
     // first ADPF query can race them. Refresh once immediately and once on the
     // next half-second without accumulating delayed callbacks.
@@ -231,6 +264,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_STOP_PARTY_CAST) {
             return stopPartyCast()
+        }
+        if (intent?.action == ACTION_TOGGLE_PARTY_MUTE) {
+            isPartyCastMuted = !isPartyCastMuted
+            runCatching { nativeSetPartyCastMuted(isPartyCastMuted) }
+            if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
+            return START_STICKY
+        }
+        if (intent?.action == ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE) {
+            applyLocalPartySpeakerMute(intent.getBooleanExtra("MUTE_LOCAL", false))
+            return START_STICKY
         }
         if (intent?.action == ACTION_START_PHONE_MIC) {
             val target = intent.getStringExtra("HOST_ADDR").orEmpty()
@@ -796,7 +839,23 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 return failPartyCastStart()
             }
             activeCaster = caster
+            isPartyCastMuted = false
+            runCatching { nativeSetPartyCastMuted(false) }
+            // Default ON: mute this phone's speaker to avoid the ~60 ms
+            // same-room slapback echo; peers/PCs become the synced speakers.
+            if (prefs.getBoolean("party_mute_local", true)) {
+                applyLocalPartySpeakerMute(true)
+            }
             broadcastPartyCastState(true)
+            // Re-publish the notification now isPartyCasting is true so the
+            // Party Host actions (Mute Cast / Stop Party) replace Pause PC.
+            startForegroundNotification(
+                currentHostAddr,
+                currentIsUsb,
+                includeProjectionType = true
+            )
+            partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+            partyMediaHandler.postDelayed(partyMediaPollRunnable, 250L)
             refreshAdpfHintSession()
             scheduleAdpfRefresh()
             // A projection token cannot be resumed after process death, so a
@@ -815,6 +874,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         activeCaster = null
         caster?.stopCasting()
         projectionActive = false
+        isPartyCastMuted = false
+        runCatching { nativeSetPartyCastMuted(false) }
+        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+        applyLocalPartySpeakerMute(false)
         micCaptureActive = false
         AudioEngineService.nativeStopPhoneMic()
         broadcastPartyCastState(false)
@@ -836,6 +899,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val caster = activeCaster
         activeCaster = null
         projectionActive = false
+        isPartyCastMuted = false
+        runCatching { nativeSetPartyCastMuted(false) }
+        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+        applyLocalPartySpeakerMute(false)
         caster?.stopCasting()
         AudioEngineService.nativeStopPhoneMic()
         broadcastPartyCastState(false)
@@ -855,6 +922,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun handlePartyCastStopped() {
         projectionActive = false
+        isPartyCastMuted = false
+        runCatching { nativeSetPartyCastMuted(false) }
+        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+        applyLocalPartySpeakerMute(false)
         AudioEngineService.nativeStopPhoneMic()
         broadcastPartyCastState(false)
         if (isStreaming && foregroundStarted) {
@@ -867,6 +938,25 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
         } else {
             stopStreamAndService()
+        }
+    }
+
+    /**
+     * Service-owned local speaker mute. The saved volume lives here (not in
+     * Compose state) so volume is restored on every teardown path, including
+     * screen-off notification stops and system projection revocation.
+     */
+    private fun applyLocalPartySpeakerMute(mute: Boolean) {
+        runCatching {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (mute) {
+                val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+                if (cur > 0) savedPartyMusicVolume = cur
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+            } else if (savedPartyMusicVolume > 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, savedPartyMusicVolume, 0)
+                savedPartyMusicVolume = -1
+            }
         }
     }
 
@@ -956,19 +1046,56 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } else {
             android.R.drawable.ic_media_play
         }
-        val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
-        val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
-        val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("AudioShare Ultra • $badge")
-            .setContentText(statusText)
+        val builder = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_qs_tile_audio)
             .setContentIntent(openAppPending)
             .setOngoing(true)
-            .addAction(playPauseIcon, playPauseLabel, playPausePending)
-            .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPending)
-            .build()
+
+        if (isPartyCasting && !isStreaming) {
+            // Pause PC / gain Mute are no-ops for a pure Party Host. Expose
+            // actions that actually control the phone-hosted broadcast.
+            val partyMuteIntent = Intent(this, AudioEngineService::class.java).apply {
+                action = ACTION_TOGGLE_PARTY_MUTE
+            }
+            val partyMutePending = PendingIntent.getService(
+                this, 4, partyMuteIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val stopPartyIntent = Intent(this, AudioEngineService::class.java).apply {
+                action = ACTION_STOP_PARTY_CAST
+            }
+            val stopPartyPending = PendingIntent.getService(
+                this, 5, stopPartyIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder
+                .setContentTitle("AudioShare Ultra • Party Broadcast")
+                .setContentText(
+                    if (isPartyCastMuted) "CAST MUTED • Peers on standby"
+                    else "ON AIR • Synced multi-device stream"
+                )
+                .addAction(
+                    android.R.drawable.ic_lock_silent_mode,
+                    if (isPartyCastMuted) "Unmute Cast" else "Mute Cast",
+                    partyMutePending
+                )
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Stop Party",
+                    stopPartyPending
+                )
+        } else {
+            val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
+            val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
+            val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
+            builder
+                .setContentTitle("AudioShare Ultra • $badge")
+                .setContentText(statusText)
+                .addAction(playPauseIcon, playPauseLabel, playPausePending)
+                .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPending)
+        }
+        val notification = builder.build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Declare MICROPHONE only while a mic capture actually runs and
@@ -1020,6 +1147,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val caster = activeCaster
         activeCaster = null
         projectionActive = false
+        isPartyCastMuted = false
+        runCatching { nativeSetPartyCastMuted(false) }
+        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+        applyLocalPartySpeakerMute(false)
         caster?.stopCasting()
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
