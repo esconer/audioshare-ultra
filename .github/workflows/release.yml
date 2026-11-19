@@ -237,5 +237,6 @@ jobs:
           name: AudioShare Ultra ${{ steps.release_meta.outputs.release_tag }}
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
+          overwrite_files: true
           files: |
             release-assets/**/*
