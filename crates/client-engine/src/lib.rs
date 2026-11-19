@@ -4114,6 +4114,11 @@ pub mod android_aaudio {
     struct InputContext {
         fifo: Arc<BurstDecouplerRing>,
         disconnected: AtomicBool,
+        /// True when the granted mic rate differs from the 48 kHz network rate
+        /// (e.g. a BT HFP headset mic opens at 16 kHz or 44.1 kHz).
+        needs_resample: bool,
+        /// Accessed exclusively on the single AAudio input callback thread.
+        resampler: core::cell::UnsafeCell<ClockDriftResampler>,
     }
 
     extern "C" fn aaudio_input_callback(
@@ -4129,19 +4134,16 @@ pub mod android_aaudio {
             let ctx = &*(user_data as *const InputContext);
             let frames = num_frames as usize;
             let mono = core::slice::from_raw_parts(audio_data as *const f32, frames);
-            // The ring is interleaved stereo; expand the mono capture stream.
-            let mut stereo = [0.0f32; 2048];
-            let mut offset = 0usize;
-            while offset < frames {
-                let chunk = (frames - offset).min(stereo.len() / 2);
-                for i in 0..chunk {
-                    let sample = mono[offset + i];
-                    stereo[i * 2] = sample;
-                    stereo[i * 2 + 1] = sample;
-                }
-                ctx.fifo.push_samples(&stereo[..chunk * 2]);
-                offset += chunk;
-            }
+            // Expand mono to interleaved stereo and resample when the granted
+            // rate is not 48 kHz (BT HFP 16 kHz / A2DP 44.1 kHz mic paths).
+            let mut scratch = [0.0f32; 4096];
+            audioshare_protocol::dsp::push_mono_mic_chunk(
+                &ctx.fifo,
+                mono,
+                &mut *ctx.resampler.get(),
+                ctx.needs_resample,
+                &mut scratch,
+            );
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
@@ -4192,6 +4194,8 @@ pub mod android_aaudio {
                 let ctx = Box::new(InputContext {
                     fifo,
                     disconnected: AtomicBool::new(false),
+                    needs_resample: false,
+                    resampler: core::cell::UnsafeCell::new(ClockDriftResampler::new()),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
 
@@ -4222,6 +4226,16 @@ pub mod android_aaudio {
                 if res != 0 || stream.is_null() {
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
+                }
+
+                // A BT HFP headset mic may be granted 16 kHz (or 44.1 kHz)
+                // even though the network stream is fixed at 48 kHz. Verify
+                // the granted rate and resample on the callback path.
+                let granted_rate = AAudioStream_getSampleRate(stream);
+                if granted_rate >= 8_000 && granted_rate as u32 != SAMPLE_RATE {
+                    (*ctx_ptr).needs_resample = true;
+                    (*(*ctx_ptr).resampler.get())
+                        .set_sample_rates(granted_rate as u32, SAMPLE_RATE);
                 }
 
                 // Use 3 * hardware burst (minimum 256 frames = ~5.3ms) to prevent HAL DMA XRuns
