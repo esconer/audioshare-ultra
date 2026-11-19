@@ -715,15 +715,23 @@ impl ClientTelemetry {
     }
 }
 
+/// Interval between ADB reverse-tunnel reconnect attempts after the TCP stream
+/// hits EOF or an error (a USB cable yank silently kills `adb reverse`).
+const ADB_TCP_RECONNECT_INTERVAL: Duration = Duration::from_millis(400);
+
 /// Loopback TCP↔UDP bridge for `adb reverse tcp:P tcp:P`. When the configured
 /// server is loopback and a TCP listener is reachable, ClientEngine's UDP
 /// datagrams are tunnelled over `TCP_NODELAY` to that listener instead of being
 /// sent as plain loopback UDP. Both directions use `[u16_be len][datagram]`.
+///
+/// The initial connect is synchronous and bounded to 150 ms so plain loopback
+/// UDP (no ADB tunnel) falls through immediately. From then on a supervisor
+/// thread owns the TCP stream and reconnects every 400 ms on EOF/error until
+/// the bridge is dropped.
 struct AdbTcpClientBridge {
     running: Arc<AtomicBool>,
     local_udp_addr: SocketAddr,
-    in_handle: Option<std::thread::JoinHandle<()>>,
-    out_handle: Option<std::thread::JoinHandle<()>>,
+    supervisor_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AdbTcpClientBridge {
@@ -731,76 +739,154 @@ impl AdbTcpClientBridge {
         if !server_addr.ip().is_loopback() {
             return None;
         }
-        let stream = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?;
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
-        let mut tcp_writer = stream.try_clone().ok()?;
-        let udp_rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
-        let local_udp_addr = udp_rx.local_addr().ok()?;
-        let _ = udp_rx.set_read_timeout(Some(Duration::from_millis(200)));
-        let udp_tx = udp_rx.try_clone().ok()?;
-        let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, client_udp_port));
+        // Fast probe: fail immediately when no ADB reverse listener exists so
+        // normal localhost UDP clients do not pay a reconnect-loop penalty.
+        let probe = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?;
+
+        // Stable UDP endpoint handed to ClientEngine. It survives TCP
+        // reconnects, so the caller's effective server address never changes.
+        let udp_base = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+        let local_udp_addr = udp_base.local_addr().ok()?;
+        // A bounded read lets the supervisor join the per-session out thread
+        // promptly on yank/shutdown instead of blocking forever in recv().
+        let _ = udp_base.set_read_timeout(Some(Duration::from_millis(200)));
 
         let running = Arc::new(AtomicBool::new(true));
-        let run_in = Arc::clone(&running);
-        let mut tcp_reader = stream;
-        let in_handle = std::thread::Builder::new()
-            .name("as-ultra-adb-cli-in".into())
+        let run_supervisor = Arc::clone(&running);
+        let server_addr_clone = server_addr;
+        let supervisor_handle = std::thread::Builder::new()
+            .name("as-ultra-adb-cli-supervisor".into())
             .spawn(move || {
-                let mut len_buf = [0u8; 2];
-                let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
-                while run_in.load(Ordering::Relaxed) {
-                    match tcp_reader.read_exact(&mut len_buf) {
-                        Ok(()) => {
-                            let len = u16::from_be_bytes(len_buf) as usize;
-                            if len == 0 || len > pkt.len() {
-                                break;
-                            }
-                            if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
-                                break;
-                            }
-                            let _ = udp_tx.send_to(&pkt[..len], client_addr);
-                        }
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(_) => break,
-                    }
-                }
-                run_in.store(false, Ordering::Release);
-            })
-            .ok();
+                let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, client_udp_port));
+                // Reuse the probe as the first session so our exchange starts
+                // on the very socket the listener already accepted.
+                let mut pending_stream = Some(probe);
+                let mut next_connect = Instant::now();
 
-        let run_out = Arc::clone(&running);
-        let out_handle = std::thread::Builder::new()
-            .name("as-ultra-adb-cli-out".into())
-            .spawn(move || {
-                let mut framed = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
-                while run_out.load(Ordering::Relaxed) {
-                    match udp_rx.recv(&mut framed[2..]) {
-                        Ok(len) if len > 0 && len <= MAX_SAFE_UDP_PAYLOAD => {
-                            framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
-                            if tcp_writer.write_all(&framed[..2 + len]).is_err() {
-                                break;
+                while run_supervisor.load(Ordering::Relaxed) {
+                    let mut tcp_reader = if let Some(stream) = pending_stream.take() {
+                        stream
+                    } else {
+                        if Instant::now() < next_connect {
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                        match TcpStream::connect_timeout(
+                            &server_addr_clone,
+                            Duration::from_millis(150),
+                        ) {
+                            Ok(stream) => stream,
+                            Err(_) => {
+                                next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
+                                continue;
                             }
                         }
-                        Ok(_) => {}
-                        Err(ref e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut => {}
-                        Err(_) => break,
+                    };
+                    let _ = tcp_reader.set_nodelay(true);
+                    let _ = tcp_reader.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = tcp_reader.set_write_timeout(Some(Duration::from_millis(50)));
+                    let mut tcp_writer = match tcp_reader.try_clone() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
+                            continue;
+                        }
+                    };
+                    let udp_tx = match udp_base.try_clone() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
+                            continue;
+                        }
+                    };
+                    let udp_rx = match udp_base.try_clone() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
+                            continue;
+                        }
+                    };
+
+                    // One TCP session: two short-lived I/O threads. Either
+                    // side ending the session (EOF/error) drops `session_alive`
+                    // so the supervisor can join them and reconnect.
+                    let session_alive = Arc::new(AtomicBool::new(true));
+                    let alive_in = Arc::clone(&session_alive);
+                    let run_in = Arc::clone(&run_supervisor);
+                    let in_handle = std::thread::Builder::new()
+                        .name("as-ultra-adb-cli-in".into())
+                        .spawn(move || {
+                            let mut len_buf = [0u8; 2];
+                            let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
+                            while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed)
+                            {
+                                match tcp_reader.read_exact(&mut len_buf) {
+                                    Ok(()) => {
+                                        let len = u16::from_be_bytes(len_buf) as usize;
+                                        if len == 0 || len > pkt.len() {
+                                            break;
+                                        }
+                                        if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
+                                            break;
+                                        }
+                                        let _ = udp_tx.send_to(&pkt[..len], client_addr);
+                                    }
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            alive_in.store(false, Ordering::Release);
+                        })
+                        .ok();
+
+                    let alive_out = Arc::clone(&session_alive);
+                    let run_out = Arc::clone(&run_supervisor);
+                    let out_handle = std::thread::Builder::new()
+                        .name("as-ultra-adb-cli-out".into())
+                        .spawn(move || {
+                            let mut framed = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
+                            while alive_out.load(Ordering::Relaxed) && run_out.load(Ordering::Relaxed)
+                            {
+                                match udp_rx.recv(&mut framed[2..]) {
+                                    Ok(len) if len > 0 && len <= MAX_SAFE_UDP_PAYLOAD => {
+                                        framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+                                        if tcp_writer.write_all(&framed[..2 + len]).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(ref e)
+                                        if e.kind() == std::io::ErrorKind::WouldBlock
+                                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            alive_out.store(false, Ordering::Release);
+                        })
+                        .ok();
+
+                    while session_alive.load(Ordering::Relaxed) && run_supervisor.load(Ordering::Relaxed)
+                    {
+                        std::thread::sleep(Duration::from_millis(20));
                     }
+                    session_alive.store(false, Ordering::Release);
+                    if let Some(h) = in_handle {
+                        let _ = h.join();
+                    }
+                    if let Some(h) = out_handle {
+                        let _ = h.join();
+                    }
+                    next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
                 }
-                run_out.store(false, Ordering::Release);
             })
             .ok();
 
         Some(Self {
             running,
             local_udp_addr,
-            in_handle,
-            out_handle,
+            supervisor_handle,
         })
     }
 }
@@ -808,10 +894,7 @@ impl AdbTcpClientBridge {
 impl Drop for AdbTcpClientBridge {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.in_handle.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.out_handle.take() {
+        if let Some(h) = self.supervisor_handle.take() {
             let _ = h.join();
         }
     }
@@ -2163,6 +2246,109 @@ mod tests {
         client.stop();
         host.stop();
         assert!(received > 0, "no packets crossed the ADB TCP<->UDP bridge");
+    }
+
+    /// Accept a connection from a non-blocking listener within `timeout`.
+    fn accept_within(
+        listener: &std::net::TcpListener,
+        timeout: Duration,
+        label: &str,
+    ) -> (TcpStream, SocketAddr) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok(pair) => return pair,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for connection: {}",
+                        label
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("listener.accept failed: {}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_adb_tcp_bridge_reconnects_after_server_yank() {
+        use std::net::TcpListener;
+
+        // Stand-in for `adb reverse tcp:P tcp:P`: a loopback TCP listener.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        // The UDP side of the client: receives datagrams decapsulated from TCP
+        // and sends datagrams that should be tunnelled out over TCP.
+        let client_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client_udp
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let client_udp_port = client_udp.local_addr().unwrap().port();
+
+        let bridge = AdbTcpClientBridge::try_connect(server_addr, client_udp_port)
+            .expect("loopback TCP bridge must engage");
+
+        // --- Socket #1: initial connection (the synchronous probe) -----------
+        let (mut server1, _) = accept_within(&listener, Duration::from_secs(2), "socket #1");
+        server1
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        // TCP -> UDP: send a framed datagram on socket #1, read the plain
+        // datagram back on the client UDP socket.
+        let p1 = b"hello-over-adb";
+        let mut framed1 = Vec::with_capacity(2 + p1.len());
+        framed1.extend_from_slice(&(p1.len() as u16).to_be_bytes());
+        framed1.extend_from_slice(p1);
+        server1.write_all(&framed1).unwrap();
+        let mut udp_buf = [0u8; 256];
+        let (n, _) = client_udp.recv_from(&mut udp_buf).unwrap();
+        assert_eq!(&udp_buf[..n], p1);
+
+        // UDP -> TCP: send a plain datagram to the bridge's stable UDP address
+        // and read the framed packet back on socket #1.
+        let reply1 = b"pong-over-adb";
+        client_udp.send_to(reply1, bridge.local_udp_addr).unwrap();
+        let mut len_buf = [0u8; 2];
+        server1.read_exact(&mut len_buf).unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut pkt = vec![0u8; len];
+        server1.read_exact(&mut pkt).unwrap();
+        assert_eq!(pkt, reply1);
+
+        // --- Simulate a cable yank: drop server socket #1 --------------------
+        drop(server1);
+
+        // The supervisor must notice EOF and reconnect every 400 ms with a
+        // fresh TCP connection (socket #2) within 2 s.
+        let (mut server2, _) = accept_within(&listener, Duration::from_secs(2), "socket #2 reconnect");
+        server2
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        // Exchange a second framed packet on the reconnected socket.
+        let p2 = b"second-packet-after-yank";
+        let mut framed2 = Vec::with_capacity(2 + p2.len());
+        framed2.extend_from_slice(&(p2.len() as u16).to_be_bytes());
+        framed2.extend_from_slice(p2);
+        server2.write_all(&framed2).unwrap();
+        let (n, _) = client_udp.recv_from(&mut udp_buf).unwrap();
+        assert_eq!(&udp_buf[..n], p2);
+
+        let reply2 = b"pong-after-yank";
+        client_udp.send_to(reply2, bridge.local_udp_addr).unwrap();
+        server2.read_exact(&mut len_buf).unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut pkt = vec![0u8; len];
+        server2.read_exact(&mut pkt).unwrap();
+        assert_eq!(pkt, reply2);
+
+        // Drop cleanly: the supervisor and its per-session I/O threads must
+        // all join without hanging.
+        drop(bridge);
     }
 
     #[test]

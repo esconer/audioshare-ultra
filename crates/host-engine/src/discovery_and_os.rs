@@ -286,6 +286,7 @@ impl AdbUsbWatcher {
             .name("as-ultra-adb-watcher".into())
             .spawn(move || {
                 let mut was_connected = false;
+                let mut last_reverse: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
                     let has_device = silent_command("adb")
                         .args(["get-state"])
@@ -295,11 +296,25 @@ impl AdbUsbWatcher {
 
                     usb_clone.store(has_device, Ordering::Relaxed);
 
-                    if has_device && !was_connected {
-                        let port_spec = format!("tcp:{}", port);
-                        let _ = silent_command("adb")
-                            .args(["reverse", &port_spec, &port_spec])
-                            .output();
+                    // `adb reverse` is not durable across a USB cable yank or
+                    // an ADB daemon restart: the tunnel silently disappears
+                    // while `adb get-state` still reports a device. Re-arm it
+                    // on the initial attach (fast path) and then every 10 s
+                    // for as long as the device stays attached.
+                    if has_device {
+                        let initial_attach = !was_connected;
+                        let periodic = last_reverse
+                            .map(|t| t.elapsed() >= Duration::from_secs(10))
+                            .unwrap_or(false);
+                        if initial_attach || periodic {
+                            let port_spec = format!("tcp:{}", port);
+                            let _ = silent_command("adb")
+                                .args(["reverse", &port_spec, &port_spec])
+                                .output();
+                            last_reverse = Some(Instant::now());
+                        }
+                    } else {
+                        last_reverse = None;
                     }
                     was_connected = has_device;
                     std::thread::sleep(Duration::from_secs(2));
