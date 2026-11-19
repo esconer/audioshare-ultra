@@ -767,21 +767,8 @@ impl AudioShareApp {
 }
 
 impl eframe::App for AudioShareApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keyboard shortcuts: Esc closes modals, Ctrl+, toggles Settings,
-        // F12 toggles the latency HUD.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_qr_modal = false;
-            self.show_settings_modal = false;
-        }
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
-            self.interfaces = list_valid_host_interfaces();
-            self.show_settings_modal = !self.show_settings_modal;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
-            self.latency_debug = !self.latency_debug;
-        }
-
+    /// Runs every frame AND while the window is hidden in the tray (no GPU pass).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Expire the transient toast banner after 2.5 seconds.
         if let Some((_, created)) = &self.toast {
             if created.elapsed() >= Duration::from_millis(2500) {
@@ -861,21 +848,38 @@ impl eframe::App for AudioShareApp {
                 }
             }
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        // Keyboard shortcuts: Esc closes modals, Ctrl+, toggles Settings,
+        // F12 toggles the latency HUD.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_qr_modal = false;
+            self.show_settings_modal = false;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
+            self.interfaces = list_valid_host_interfaces();
+            self.show_settings_modal = !self.show_settings_modal;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            self.latency_debug = !self.latency_debug;
+        }
 
         let dark = self.dark_mode;
 
         // =========================================================================
         // 1. TOP NAVIGATION BAR (Minimalist & Intent-Driven)
         // =========================================================================
-        egui::TopBottomPanel::top("top_nav")
+        egui::Panel::top("top_nav")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(if dark {
                         egui::Color32::from_rgb(14, 18, 27)
                     } else {
                         egui::Color32::from_rgb(255, 255, 255)
                     })
-                    .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                    .inner_margin(egui::Margin::symmetric(18, 10))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -885,7 +889,7 @@ impl eframe::App for AudioShareApp {
                         },
                     )),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let (dot_rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -936,10 +940,10 @@ impl eframe::App for AudioShareApp {
                         // Clickable PIN ON indicator — jumps straight to Security.
                         if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
                             let p = uw::Palette::for_mode(dark);
-                            let resp = egui::Frame::none()
+                            let resp = egui::Frame::NONE
                                 .fill(p.ok_bg)
-                                .rounding(egui::Rounding::same(6.0))
-                                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         let (lock_rect, _) = ui.allocate_exact_size(
@@ -971,15 +975,15 @@ impl eframe::App for AudioShareApp {
         // =========================================================================
         // 2. BOTTOM STATUS & TELEMETRY BAR (Quiet 1-Line Summary + HUD Trigger)
         // =========================================================================
-        egui::TopBottomPanel::bottom("bottom_status")
+        egui::Panel::bottom("bottom_status")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(if dark {
                         egui::Color32::from_rgb(13, 17, 25)
                     } else {
                         egui::Color32::from_rgb(248, 250, 252)
                     })
-                    .inner_margin(egui::Margin::symmetric(18.0, 7.0))
+                    .inner_margin(egui::Margin::symmetric(18, 7))
                     .stroke(egui::Stroke::new(
                         1.0_f32,
                         if dark {
@@ -989,7 +993,7 @@ impl eframe::App for AudioShareApp {
                         },
                     )),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(ref host) = self.host_engine {
                         let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
@@ -1075,11 +1079,11 @@ impl eframe::App for AudioShareApp {
         // 3. MODAL WINDOWS: QR Pairing, System/Network Settings, and Latency HUD
         // =========================================================================
         if self.show_qr_modal {
-            self.render_qr_modal(ctx);
+            self.render_qr_modal(&ctx);
         }
 
         if self.show_settings_modal {
-            self.render_settings_modal(ctx);
+            self.render_settings_modal(&ctx);
         }
 
         if self.latency_debug {
@@ -1087,10 +1091,10 @@ impl eframe::App for AudioShareApp {
                 .default_width(600.0)
                 .default_height(460.0)
                 .resizable(true)
-                .show(ctx, |ui| self.render_latency_debug(ui));
+                .show(&ctx, |ui| self.render_latency_debug(ui));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
@@ -1104,7 +1108,9 @@ impl eframe::App for AudioShareApp {
         });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    /// eframe 0.37 defaults to the wgpu backend (no `glow` feature), so
+    /// `on_exit` no longer receives a glow context.
+    fn on_exit(&mut self) {
         self.save_persistent_config();
         if self.last_applied_bt_delay != 0 {
             // Synchronous reset: a detached thread would be killed by process
@@ -1143,7 +1149,7 @@ impl AudioShareApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 uw::studio_card(ui, dark, |ui| {
                     let pin_opt = if self.enable_pin_encryption {
                         Some(self.pairing_pin.as_str())
@@ -1219,9 +1225,9 @@ impl AudioShareApp {
             .resizable(true)
             .vscroll(true)
             .default_width(560.0)
-            .max_height((ctx.screen_rect().height() - 64.0).max(260.0))
+            .max_height((ctx.content_rect().height() - 64.0).max(260.0))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 // Two-tab modal replaces the old single scrolling settings wall.
                 ui.horizontal(|ui| {
                     if uw::pill_choice(

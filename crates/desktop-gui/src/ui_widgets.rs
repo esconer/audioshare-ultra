@@ -66,9 +66,9 @@ impl Palette {
 }
 
 pub fn apply_studio_theme(ctx: &egui::Context, dark_mode: bool) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.window_margin = egui::Margin::same(16);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
     style.visuals = if dark_mode {
         let mut v = egui::Visuals::dark();
@@ -80,29 +80,29 @@ pub fn apply_studio_theme(ctx: &egui::Context, dark_mode: bool) {
         v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(147, 197, 253));
         v.widgets.noninteractive.bg_stroke =
             egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(32, 40, 56));
-        v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
+        v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
         v.widgets.inactive.bg_fill = egui::Color32::from_rgb(24, 30, 43);
         v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(22, 28, 40);
         v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(42, 52, 70));
-        v.widgets.inactive.rounding = egui::Rounding::same(7.0);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
         v.widgets.hovered.bg_fill = egui::Color32::from_rgb(34, 43, 62);
         v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(96, 165, 250));
-        v.widgets.hovered.rounding = egui::Rounding::same(7.0);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
         v.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-        v.widgets.active.rounding = egui::Rounding::same(7.0);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(7);
         v
     } else {
         let mut v = egui::Visuals::light();
         v.panel_fill = egui::Color32::from_rgb(241, 245, 249);
         v.window_fill = egui::Color32::WHITE;
         v.selection.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-        v.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-        v.widgets.inactive.rounding = egui::Rounding::same(7.0);
-        v.widgets.hovered.rounding = egui::Rounding::same(7.0);
-        v.widgets.active.rounding = egui::Rounding::same(7.0);
+        v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+        v.widgets.inactive.corner_radius = egui::CornerRadius::same(7);
+        v.widgets.hovered.corner_radius = egui::CornerRadius::same(7);
+        v.widgets.active.corner_radius = egui::CornerRadius::same(7);
         v
     };
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ pub fn paint_play_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, c
 
 pub fn paint_stop_icon(painter: &egui::Painter, center: egui::Pos2, size: f32, color: egui::Color32) {
     let rect = egui::Rect::from_center_size(center, egui::vec2(size * 0.78, size * 0.78));
-    painter.rect_filled(rect, 2.0, color);
+    painter.rect_filled(rect, egui::CornerRadius::same(2), color);
 }
 
 pub fn paint_chevron(painter: &egui::Painter, center: egui::Pos2, open: bool, color: egui::Color32) {
@@ -164,7 +164,7 @@ pub fn paint_lock_icon(painter: &egui::Painter, center: egui::Pos2, color: egui:
         egui::pos2(center.x, center.y + 2.0),
         egui::vec2(8.5, 6.5),
     );
-    painter.rect_filled(body, 1.5, color);
+    painter.rect_filled(body, egui::CornerRadius::same(2), color);
     let shackle = egui::Stroke::new(1.5_f32, color);
     painter.line_segment(
         [
@@ -210,7 +210,7 @@ pub fn primary_cta_button(ui: &mut egui::Ui, is_active: bool, start_lbl: &str, s
         base
     };
     let painter = ui.painter();
-    painter.rect_filled(rect, 9.0, fill);
+    painter.rect_filled(rect, egui::CornerRadius::same(9), fill);
     let icon_center = egui::pos2(rect.left() + 24.0, rect.center().y);
     if is_active {
         paint_stop_icon(painter, icon_center, 11.0, egui::Color32::WHITE);
@@ -238,11 +238,11 @@ pub fn studio_card<R>(
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let p = Palette::for_mode(dark_mode);
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.card_fill)
         .stroke(egui::Stroke::new(1.0_f32, p.card_stroke))
-        .rounding(egui::Rounding::same(16.0))
-        .inner_margin(egui::Margin::same(18.0))
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(18))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             add_contents(ui)
@@ -260,7 +260,7 @@ pub fn hero_stage_card<R>(
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let p = Palette::for_mode(dark_mode);
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.card_fill)
         .stroke(egui::Stroke::new(
             1.0_f32,
@@ -270,8 +270,8 @@ pub fn hero_stage_card<R>(
                 p.card_stroke
             },
         ))
-        .rounding(egui::Rounding::same(18.0))
-        .inner_margin(egui::Margin::same(20.0))
+        .corner_radius(egui::CornerRadius::same(18))
+        .inner_margin(egui::Margin::same(20))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if dark_mode && is_live {
@@ -301,11 +301,11 @@ pub fn segmented_mode_bar(
 ) -> Option<usize> {
     let p = Palette::for_mode(dark_mode);
     let mut clicked = None;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.inner_fill)
         .stroke(egui::Stroke::new(1.0_f32, p.inner_stroke))
-        .rounding(egui::Rounding::same(12.0))
-        .inner_margin(egui::Margin::same(4.0))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
             let total_w = ui.available_width();
             let seg_w = total_w / (items.len().max(1) as f32);
@@ -322,7 +322,7 @@ pub fn segmented_mode_bar(
             );
             ui.painter().rect_filled(
                 pill_rect.shrink(2.0),
-                9.0,
+                egui::CornerRadius::same(9),
                 if dark_mode {
                     egui::Color32::from_rgb(30, 58, 138)
                 } else {
@@ -335,7 +335,7 @@ pub fn segmented_mode_bar(
                     egui::vec2(seg_w, full_rect.height()),
                 );
                 if ui
-                    .interact(r, ui.id().with(("seg", idx)), egui::Sense::click())
+                    .interact(r, ui.scope_id().with(("seg", idx)), egui::Sense::click())
                     .clicked()
                 {
                     clicked = Some(idx);
@@ -376,10 +376,10 @@ pub fn segmented_mode_bar(
 }
 
 pub fn status_pill(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(bg)
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(9, 4))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).color(fg).size(11.5).strong());
         });
@@ -387,11 +387,11 @@ pub fn status_pill(ui: &mut egui::Ui, text: &str, bg: egui::Color32, fg: egui::C
 
 pub fn metric_tile(ui: &mut egui::Ui, dark_mode: bool, label: &str, value: &str) {
     let p = Palette::for_mode(dark_mode);
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.inner_fill)
         .stroke(egui::Stroke::new(1.0_f32, p.inner_stroke))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(11.0, 8.0))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(11, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
@@ -419,8 +419,9 @@ pub fn pill_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
             (bg_off.b() as f32 + (bg_on.b() as f32 - bg_off.b() as f32) * how_on) as u8,
         );
         let radius = 0.5 * rect.height();
-        ui.painter().rect_filled(rect, radius, bg);
-        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(radius.round() as u8), bg);
+        let circle_x = (rect.left() + radius) + (rect.width() - rect.height()) * how_on;
         ui.painter().circle_filled(
             egui::pos2(circle_x, rect.center().y),
             radius - 2.5,
@@ -439,11 +440,11 @@ pub fn setting_switch_row(
 ) -> bool {
     let p = Palette::for_mode(dark_mode);
     let mut changed = false;
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(p.inner_fill)
         .stroke(egui::Stroke::new(1.0_f32, p.inner_stroke))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -486,7 +487,7 @@ pub fn pill_choice(ui: &mut egui::Ui, dark_mode: bool, selected: bool, label: &s
         egui::Button::new(egui::RichText::new(label).size(12.5).strong().color(text_col))
             .fill(fill)
             .stroke(stroke)
-            .rounding(egui::Rounding::same(7.0)),
+            .corner_radius(egui::CornerRadius::same(7)),
     )
     .clicked()
 }
@@ -527,11 +528,11 @@ pub fn mode_preset_card(
         )
     };
 
-    let resp = egui::Frame::none()
+    let resp = egui::Frame::NONE
         .fill(fill)
         .stroke(stroke)
-        .rounding(egui::Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
@@ -595,11 +596,11 @@ pub fn drawer_header(
         egui::Stroke::new(1.0_f32, p.card_stroke)
     };
 
-    let resp = egui::Frame::none()
+    let resp = egui::Frame::NONE
         .fill(bg)
         .stroke(stroke)
-        .rounding(egui::Rounding::same(10.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -640,7 +641,11 @@ pub fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8, peak_hold_pct: f32) {
     let desired = egui::vec2(216.0, 16.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 13, 20));
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(4),
+        egui::Color32::from_rgb(10, 13, 20),
+    );
 
     let gap = 2.0f32;
     let seg_w = (rect.width() - gap * (segments as f32 + 1.0)) / (segments as f32);
@@ -675,7 +680,7 @@ pub fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8, peak_hold_pct: f32) {
         } else {
             egui::Color32::from_rgb(26, 33, 46)
         };
-        painter.rect_filled(seg_rect, 1.5, color);
+        painter.rect_filled(seg_rect, egui::CornerRadius::same(2), color);
     }
 }
 
@@ -725,7 +730,7 @@ pub fn studio_fader_row(
                         .color(fg),
                 )
                 .fill(bg)
-                .rounding(egui::Rounding::same(6.0));
+                .corner_radius(egui::CornerRadius::same(6));
                 if ui
                     .add(db_btn)
                     .on_hover_text("Click to reset band to 0.0 dB")
@@ -753,11 +758,16 @@ pub fn draw_drift_oscilloscope(ui: &mut egui::Ui, history: &VecDeque<f32>) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(10, 13, 20));
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(8),
+        egui::Color32::from_rgb(10, 13, 20),
+    );
     painter.rect_stroke(
         rect,
-        8.0,
+        egui::CornerRadius::same(8),
         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 38, 54)),
+        egui::StrokeKind::Inside,
     );
 
     let mid_y = rect.center().y;
@@ -814,7 +824,7 @@ pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str) {
     let size_px = (width + quiet_zone * 2) as f32 * module_px;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size_px, size_px), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 8.0, egui::Color32::WHITE);
+    painter.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::WHITE);
     for y in 0..width {
         for x in 0..width {
             if code[(x, y)] == QrColor::Dark {
@@ -825,7 +835,7 @@ pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str) {
                     );
                 painter.rect_filled(
                     egui::Rect::from_min_size(min, egui::vec2(module_px, module_px)),
-                    0.0,
+                    egui::CornerRadius::ZERO,
                     egui::Color32::BLACK,
                 );
             }
