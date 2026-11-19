@@ -317,7 +317,7 @@ fun MainScreen() {
     }
     // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
     // Sent to the host as feedback code 20/21; only affects compressed modes.
-    var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", false)) }
+    var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", true)) }
     var btDelayOverrideMs by remember {
         mutableIntStateOf(prefs.getInt("bt_delay_override_ms", 0))
     }

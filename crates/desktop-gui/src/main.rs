@@ -10,7 +10,9 @@ use audioshare_host_engine::app_routing::{
     list_active_audio_apps, restore_all_apps_to_default_sink, route_single_app_to_audioshare,
     AudioAppEntry,
 };
-use audioshare_host_engine::bt_optimization::apply_automatic_video_lipsync_offset_ms;
+use audioshare_host_engine::bt_optimization::{
+    apply_automatic_video_lipsync_offset_ms, reset_video_lipsync_offset_blocking,
+};
 use audioshare_host_engine::discovery_and_os::{
     open_os_firewall_ports, set_os_boot_autostart, AdbUsbWatcher, DirectHotspotController,
     DiscoveryBeacon, DiscoveryScanner, VirtualSpeakerAndRadioGuard,
@@ -27,6 +29,9 @@ use eframe::egui;
 use qrcode::{Color as QrColor, QrCode};
 
 fn main() -> eframe::Result<()> {
+    // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
+    let crash_path = AudioShareApp::config_file_path().with_file_name("audioshare-ultra-crash.log");
+    audioshare_protocol::diagnostics::install_crash_hook(crash_path);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 740.0])
@@ -1250,10 +1255,9 @@ impl eframe::App for AudioShareApp {
 
             let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
             let bytes_now = host.telemetry.bytes_sent.load(Ordering::Relaxed);
-            let bt_delay = host
-                .telemetry
-                .max_client_bt_delay_ms
-                .load(Ordering::Relaxed);
+            // Include Wi-Fi FIFO and packetization, not just the raw A2DP
+            // estimate, so video lands in sync with the audible stream.
+            let total_lipsync_ms = host.telemetry.video_lipsync_offset_ms();
 
             if self.last_rate_calc.elapsed() >= Duration::from_secs(1) {
                 let dt = self.last_rate_calc.elapsed().as_secs_f32().max(0.1);
@@ -1267,7 +1271,7 @@ impl eframe::App for AudioShareApp {
 
             let lipsync = lipsync_offset_to_apply(
                 self.auto_bt_video_lipsync,
-                bt_delay,
+                total_lipsync_ms,
                 self.last_applied_bt_delay,
             );
             if let Some(offset) = lipsync {
@@ -1493,6 +1497,12 @@ impl eframe::App for AudioShareApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_persistent_config();
+        if self.last_applied_bt_delay != 0 {
+            // Synchronous reset: a detached thread would be killed by process
+            // exit and leave the system speaker with a stale +Nms offset.
+            reset_video_lipsync_offset_blocking();
+            self.last_applied_bt_delay = 0;
+        }
         if self.direct_hotspot_active {
             DirectHotspotController::stop_direct_hotspot();
             self.direct_hotspot_active = false;
@@ -1779,10 +1789,25 @@ impl AudioShareApp {
 
                     ui.add_space(6.0);
                     ui.vertical_centered(|ui| {
-                        if ui.button("Close Settings").clicked() {
-                            self.save_persistent_config();
-                            self.show_settings_modal = false;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy Diagnostics").clicked() {
+                                let summary = format!(
+                                    "Host    : {}\nClient  : {}\nProfile : {:?} | Opus={} | Bitrate={}k",
+                                    self.host_status_msg,
+                                    self.client_status_msg,
+                                    self.quality_profile,
+                                    self.prefer_opus,
+                                    self.target_bitrate_kbps
+                                );
+                                ui.ctx().copy_text(
+                                    audioshare_protocol::diagnostics::export_report(&summary),
+                                );
+                            }
+                            if ui.button("Close Settings").clicked() {
+                                self.save_persistent_config();
+                                self.show_settings_modal = false;
+                            }
+                        });
                     });
                 });
             });
@@ -1858,6 +1883,11 @@ impl AudioShareApp {
                 .as_ref()
                 .map(|h| h.telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed))
                 .unwrap_or(0);
+            let total_lipsync = self
+                .host_engine
+                .as_ref()
+                .map(|h| h.telemetry.video_lipsync_offset_ms())
+                .unwrap_or(0);
 
             ui.columns(2, |cols| {
                 cols[0].horizontal(|ui| {
@@ -1886,8 +1916,8 @@ impl AudioShareApp {
                 Self::status_pill(
                     ui,
                     &format!(
-                        "Phone Bluetooth Earbuds Active (+{} ms A2DP) — Auto Video Lip-Sync Applied",
-                        bt_delay
+                        "Phone Bluetooth Active (A2DP {} ms -> Total Video Offset +{} ms)",
+                        bt_delay, total_lipsync
                     ),
                     egui::Color32::from_rgb(66, 32, 6),
                     egui::Color32::from_rgb(253, 224, 71),

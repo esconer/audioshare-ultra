@@ -343,7 +343,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             else -> 32
         }
         nativeSendMediaCommand(savedBitrateCmd)
-        nativeSendMediaCommand(if (prefs.getBoolean("use_opus", false)) 21 else 20)
+        // Default compressed codec is Opus RLD (matches HostEngine's default).
+        nativeSendMediaCommand(if (prefs.getBoolean("use_opus", true)) 21 else 20)
         refreshAdpfHintSession()
         scheduleAdpfRefresh()
         return START_STICKY

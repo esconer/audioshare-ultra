@@ -72,59 +72,89 @@ fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
     parse_default_sink_card_and_port(&text, &default_sink)
 }
 
-/// Automatically informs Linux PipeWire/PulseAudio of the phone's downstream Bluetooth earbud delay
-/// so web browsers (YouTube/Netflix) and video players (MPV/VLC) automatically delay video to match!
+#[cfg(target_os = "linux")]
+static LAST_LIPSYNC_REQUESTED: AtomicU16 = AtomicU16::new(u16::MAX);
+#[cfg(target_os = "linux")]
+static LIPSYNC_APPLY_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(target_os = "linux")]
+static LIPSYNC_APPLIED_TARGETS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+/// Apply the offset synchronously. Used by both the async normal path and the
+/// exit-time synchronous reset (which must finish before the process dies).
+#[cfg(target_os = "linux")]
+fn apply_linux_lipsync_now(bt_delay_ms: u16) {
+    let _guard = LIPSYNC_APPLY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if LAST_LIPSYNC_REQUESTED.load(Ordering::Relaxed) != bt_delay_ms {
+        return;
+    }
+    let offset_us = (bt_delay_ms as u64) * 1_000;
+    let offset_ns = offset_us * 1_000;
+    let mut targets: Vec<String> = Vec::new();
+    if let Ok(def) = Command::new("pactl").arg("get-default-sink").output() {
+        let sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
+        if !sink.is_empty() {
+            targets.push(sink);
+        }
+    }
+    let sinks = Command::new("pactl")
+        .args(["list", "sinks"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    if sinks.contains("Name: AudioShare_Ultra") {
+        targets.push("AudioShare_Ultra".to_string());
+    }
+    let history = LIPSYNC_APPLIED_TARGETS.get_or_init(|| Mutex::new(Vec::new()));
+    if bt_delay_ms == 0 {
+        // Reset any sink we previously offset even if the default sink changed.
+        for old in history.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            if !targets.contains(&old) {
+                targets.push(old);
+            }
+        }
+    } else {
+        *history.lock().unwrap_or_else(|e| e.into_inner()) = targets.clone();
+    }
+    let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
+    let us_str = offset_us.to_string();
+    for sink in &targets {
+        let _ = Command::new("pw-cli")
+            .args(["s", sink, "Props", &prop])
+            .output();
+        if let Some((card, port)) = resolve_default_sink_card_and_port() {
+            let _ = Command::new("pactl")
+                .args(["set-port-latency-offset", &card, &port, &us_str])
+                .output();
+        }
+    }
+}
+
+/// Automatically informs Linux PipeWire/PulseAudio of the phone's downstream
+/// Bluetooth earbud delay so web browsers and video players delay video to match.
 pub fn apply_automatic_video_lipsync_offset_ms(bt_delay_ms: u16) {
     #[cfg(target_os = "linux")]
     {
-        // The GUI calls this from its update loop whenever the reported BT
-        // delay changes. `pactl` can take tens of milliseconds to talk to
-        // PipeWire/PulseAudio, so never run it on the render thread.
-        static LAST_REQUESTED: AtomicU16 = AtomicU16::new(u16::MAX);
-        static APPLY_LOCK: Mutex<()> = Mutex::new(());
-
-        // Coalesce repeated requests for the same delay (the GUI already
-        // filters, but this function is public).
-        if LAST_REQUESTED.swap(bt_delay_ms, Ordering::Relaxed) == bt_delay_ms {
+        // Coalesce repeated requests for the same delay.
+        if LAST_LIPSYNC_REQUESTED.swap(bt_delay_ms, Ordering::Relaxed) == bt_delay_ms {
             return;
         }
-
-        // PipeWire/PulseAudio latency offset is specified in microseconds.
-        let offset_us = (bt_delay_ms as u64) * 1_000;
-        let offset_ns = offset_us * 1_000;
         let _ = std::thread::Builder::new()
             .name("as-ultra-bt-lipsync".into())
-            .spawn(move || {
-                // Serialize invocations and drop a request that was
-                // superseded while waiting, so an older slow invocation can
-                // never overwrite the newest delay.
-                let _guard = APPLY_LOCK.lock().unwrap();
-                if LAST_REQUESTED.load(Ordering::Relaxed) != bt_delay_ms {
-                    return;
-                }
-                // 1. PipeWire native node latency offset (works on virtual
-                //    `AudioShare_Ultra` null-sink as well as physical sinks).
-                let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
-                let _ = Command::new("pw-cli")
-                    .args(["s", "AudioShare_Ultra", "Props", &prop])
-                    .output();
-                // 2. PulseAudio / PipeWire card port latency offset on the
-                //    active physical card + port.
-                if let Some((card, port)) = resolve_default_sink_card_and_port() {
-                    let _ = Command::new("pactl")
-                        .args([
-                            "set-port-latency-offset",
-                            &card,
-                            &port,
-                            &offset_us.to_string(),
-                        ])
-                        .output();
-                }
-            });
+            .spawn(move || apply_linux_lipsync_now(bt_delay_ms));
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = bt_delay_ms;
+    }
+}
+
+/// Synchronously reset any applied PipeWire/PulseAudio latency offset to 0 ms.
+/// Call during process shutdown so the OS cannot kill a detached reset thread.
+pub fn reset_video_lipsync_offset_blocking() {
+    #[cfg(target_os = "linux")]
+    {
+        LAST_LIPSYNC_REQUESTED.store(0, Ordering::Relaxed);
+        apply_linux_lipsync_now(0);
     }
 }
 
@@ -254,5 +284,14 @@ Sink #2
     fn test_apply_automatic_video_lipsync_offset_ms_runs_without_panic() {
         apply_automatic_video_lipsync_offset_ms(0);
         apply_automatic_video_lipsync_offset_ms(145);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_synchronous_lipsync_reset_runs_without_panic() {
+        // The exit path must complete synchronously (no detached thread
+        // killed by process exit) and reset the applied offset to 0.
+        reset_video_lipsync_offset_blocking();
+        assert_eq!(LAST_LIPSYNC_REQUESTED.load(Ordering::Relaxed), 0);
     }
 }

@@ -85,11 +85,18 @@ as-ultra host --test-tone
 as-ultra host --latency-debug
 as-ultra client <host-ip> --latency-debug
 
-# Optional Opus backend for compressed quality profiles
-as-ultra host --libopus
+# Optional zero-lookahead VBR fallback (Opus RLD is the default compressed codec)
+as-ultra host --vbr
+
+# Encrypted session + automatic virtual speaker routing
+as-ultra host --virtual-speaker --pin 4829
+as-ultra client <host-ip> --pin 4829
 
 # Run the built-in packet-loss/latency benchmark
 as-ultra benchmark
+
+# Deterministic network-emulator soak test (+-200 ppm drift + jitter + loss)
+as-ultra soak --seconds 60 --drift-ppm -200 --loss-pct 3 --opus
 ```
 
 `--latency-debug` (or `--debug`) shows the live packetization, jitter, FIFO,
@@ -104,11 +111,11 @@ the host supports two interchangeable backends:
 
 | Backend | Wire tag | Lookahead | Notes |
 | --- | --- | --- | --- |
-| Pure-Rust VBR | `0x7E` | 0 ms | Default and automatic fallback |
-| Opus RLD (`opus-rs`) | `0x7F` | 2.5 ms | Opt-in, bundled pure Rust |
+| Opus RLD (`opus-rs`) | `0x7F` | 2.5 ms | Default for compressed profiles (bundled pure Rust) |
+| Pure-Rust VBR | `0x7E` | 0 ms | Zero-lookahead fallback (`--vbr`) |
 
-The default is the pure-Rust VBR codec. Enable Opus with
-`as-ultra host --libopus`, the desktop GUI's **Compressed codec** selector, or
+The default is the pure-Rust Opus RLD codec. Select VBR with
+`as-ultra host --vbr`, the desktop GUI's **Compressed codec** selector, or
 the Android **Compressed Codec Module** switch (feedback codes `20`/`21`). The
 choice is persisted and can be changed while streaming: every packet is
 self-identifying, so the receiver switches decoders without a restart. If the
