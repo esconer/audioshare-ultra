@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
 use audioshare_protocol::crypto::SessionKey;
-use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter};
+use audioshare_protocol::dsp::{
+    soft_limit_post_resample, BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter,
+};
 use audioshare_protocol::latency::ClientLatencySnapshot;
 #[cfg(not(target_os = "android"))]
 use audioshare_protocol::latency::DESKTOP_OUTPUT_BUFFER_MS;
@@ -15,9 +17,11 @@ use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
 };
-use audioshare_protocol::opus_codec::{OpusStreamDecoder, OPUS_LOOKAHEAD_MS, TAG_OPUS_RLD};
+use audioshare_protocol::opus_codec::{
+    OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, OPUS_LOOKAHEAD_MS, TAG_OPUS_RLD,
+};
 use audioshare_protocol::sequencer::{
-    ZeroJitterSequencer, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
+    ZeroJitterSequencer, RING_SLOTS, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
 };
 use audioshare_protocol::wire::{
     ClientFeedbackPacket, CodecMode, ParsedPacket, WireError, CONTROL_FEEDBACK_LEN,
@@ -96,24 +100,15 @@ fn in_flight_wait_subframes(pkt_subframes: u8) -> i16 {
     ((pkt_subframes.max(1) as i16) * 2).max(3)
 }
 
-/// How long a missing slot at the live edge is assumed to be in flight rather
-/// than lost. One sender packet interval plus 10 ms of scheduling/network
-/// jitter: 15 ms for 5 ms framing, 30 ms for a 20 ms Bluetooth bundle.
-#[inline]
-fn live_edge_grace(pkt_subframes: u8) -> Duration {
-    Duration::from_micros(pkt_subframes.max(1) as u64 * 2_500 + 10_000)
-}
-
 /// Decide whether the refill loop must wait instead of concealing the slot at
 /// `next_play_seq`.
 ///
-/// `missing_delta < 0` means the playhead has reached the live edge: every
-/// packet the host has sent is already queued ahead of it, so the slot is not
-/// lost, it simply has not been captured yet. Concealing it walks
-/// `next_play_seq` into the future and makes the on-time packet that follows
-/// fail the `s < next_play_seq` acceptance check, so a real subframe is thrown
-/// away and replaced with PLC. Only conceal at the live edge once the sender
-/// has actually gone quiet for a full packet interval plus jitter allowance.
+/// Both at the live edge (`missing_delta < 0`) and inside the reordering/FEC
+/// window, never synthesize PLC while the decoupler still holds at least
+/// `plc_emergency_watermark` of real audio. Once the FIFO dips below that
+/// watermark, emitting one PLC subframe refills it above the watermark and
+/// paces concealment at exact 1.0x DAC speed instead of walking `next_play_seq`
+/// ahead at the 1 ms socket-timeout rate (the 2.5x-speed runaway cascade).
 #[inline]
 fn should_hold_missing_slot(
     slot_missing: bool,
@@ -121,19 +116,8 @@ fn should_hold_missing_slot(
     plc_emergency_watermark: usize,
     missing_delta: i16,
     in_flight_wait: i16,
-    since_last_packet: Duration,
-    live_edge_grace: Duration,
 ) -> bool {
-    if !slot_missing {
-        return false;
-    }
-    if missing_delta < 0 {
-        return since_last_packet < live_edge_grace;
-    }
-    // A newer packet arrived out of order, leaving a hole at the playhead.
-    // Wait for the in-flight packet or [N-1]/[N-2] FEC while the FIFO still
-    // has emergency headroom.
-    fifo_samples >= plc_emergency_watermark && missing_delta < in_flight_wait
+    slot_missing && fifo_samples >= plc_emergency_watermark && missing_delta < in_flight_wait
 }
 
 /// Gaming hard-lock never adds group-sync delay. The target must stay above
@@ -192,8 +176,8 @@ fn decay_adaptive_cushion(adaptive: f32, floor: f32, fec_permille: u16) -> f32 {
 /// starvation is signalled by `STATUS_EMPTY`/FEC and grows the adaptive target;
 /// slowing the resampler by a few hundred ppm cannot replace the missing audio.
 #[inline]
-fn clock_loop_observation(net_subframes: f32, target_buf: f32) -> f32 {
-    net_subframes.max(0.0) + target_buf.max(0.0)
+fn clock_loop_observation(net_subframes: f32, fifo_subframes: f32) -> f32 {
+    net_subframes.max(0.0) + fifo_subframes.max(0.0)
 }
 
 /// Apply the host master volume without a per-subframe step discontinuity.
@@ -303,11 +287,11 @@ fn trim_post_stall_backlog(
     fifo_subframes: f32,
     target_buf: f32,
     pkt_subframes: u8,
-) {
+) -> bool {
     let max_over = max_backlog_over_target_subframes(pkt_subframes);
     let combined = *net_subframes + fifo_subframes;
     if combined <= target_buf + max_over {
-        return;
+        return false;
     }
 
     let max_net = (target_buf + max_over - fifo_subframes)
@@ -319,10 +303,11 @@ fn trim_post_stall_backlog(
     // already guaranteed, but the FIFO estimate is fractional and a defensive
     // check is cheaper than replaying audio.
     if (new_next.wrapping_sub(*next_play_seq) as i16) <= 0 {
-        return;
+        return false;
     }
     *next_play_seq = new_next;
     *net_subframes = keep as f32;
+    true
 }
 
 /// Take at most one pending control command for this feedback packet.
@@ -408,6 +393,7 @@ const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 48;
 const STREAM_RESYNC_BEHIND_SUBFRAMES: i16 = -32;
 
 #[inline]
+#[cfg(test)]
 fn needs_stream_resync(seq_delta: i16) -> bool {
     seq_delta > STREAM_RESYNC_AHEAD_SUBFRAMES || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
 }
@@ -598,13 +584,17 @@ fn pending_hardware_delay_ms(
 /// speaker/USB bursts, where it costs only a few milliseconds.
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn aaudio_buffer_frames_for_burst(burst: i32) -> Option<i32> {
+fn aaudio_buffer_frames_for_burst(burst: i32, capacity: i32) -> Option<i32> {
     if burst <= 0 {
         None
+    } else if burst >= 480 {
+        Some(burst.min(capacity.max(burst)))
     } else if burst >= 240 {
-        Some(burst)
+        // Double-buffer speaker/USB bursts so HAL DMA never runs
+        // single-buffered (XRuns on 240/256-frame Android devices).
+        Some((burst * 2).min(capacity.max(burst)))
     } else {
-        Some((burst * 3).max(256))
+        Some((burst * 3).max(256).min(capacity.max(burst)))
     }
 }
 
@@ -771,29 +761,12 @@ impl ClientEngine {
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
 
-        // Bind port 65530 with SO_REUSEADDR first (enables receiving 1-Phone-to-Multi-Phone broadcasts!),
-        // falling back to an ephemeral port (0.0.0.0:0) if HostEngine is running on the same device.
-        let socket = {
-            let mut bound = None;
-            if let Ok(raw) = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            ) {
-                let _ = raw.set_reuse_address(true);
-                #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
-                let _ = raw.set_reuse_port(true);
-                let addr = SocketAddr::from(([0, 0, 0, 0], 65530));
-                if raw.bind(&addr.into()).is_ok() {
-                    bound = Some(UdpSocket::from(raw));
-                }
-            }
-            match bound {
-                Some(s) => s,
-                None => UdpSocket::bind("0.0.0.0:0")
-                    .map_err(|e| format!("Failed to bind client UDP socket: {}", e))?,
-            }
-        };
+        // Ephemeral source port avoids hijacking HostEngine on Windows
+        // (SO_REUSEADDR let the client bind 65530 while the host was already
+        // bound there) and EADDRINUSE on Linux. Both PC and Party hosts unicast
+        // replies to our real source port, so the fixed bind is unnecessary.
+        let socket = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| format!("Failed to bind client UDP socket: {}", e))?;
         configure_realtime_udp_socket(&socket)
             .map_err(|e| format!("Failed to configure real-time client socket: {}", e))?;
         let _ = socket.set_read_timeout(Some(Duration::from_millis(5)));
@@ -1039,6 +1012,25 @@ impl ClientEngine {
         // Created lazily on the first Opus packet. Dropped on DTX/resync and
         // whenever the host switches back to VBR.
         let mut opus_decoder: Option<OpusStreamDecoder> = None;
+        // Raw Opus payloads are buffered here and decoded at playhead pop
+        // time, so a single reordered Wi-Fi packet (<15 ms before playback)
+        // is decoded in strict stream order instead of being permanently
+        // discarded by the stateful CELT decoder.
+        #[derive(Clone)]
+        struct OpusPacketSlot {
+            seq: Option<u16>,
+            len: u16,
+            data: [u8; MAX_OPUS_SUBFRAME_BYTES],
+        }
+        let mut opus_ring = vec![
+            OpusPacketSlot {
+                seq: None,
+                len: 0,
+                data: [0u8; MAX_OPUS_SUBFRAME_BYTES],
+            };
+            RING_SLOTS
+        ];
+        let mut last_audio_codec_mode: Option<CodecMode> = None;
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
@@ -1079,6 +1071,7 @@ impl ClientEngine {
         let mut prev_rx_us: Option<u32> = None;
         let mut prev_tx_us: u32 = 0;
         let mut jitter_estimate_us: f32 = 2500.0;
+        let mut last_clock_sample = Instant::now();
         // Output at the device's native rate can be 44.1 kHz (A2DP) or more
         // than 48 kHz (USB DAC). Size for up to ~384 kHz so the resampler can
         // never truncate the tail of a subframe.
@@ -1286,11 +1279,23 @@ impl ClientEngine {
             // network. Also poll non-blocking whenever the decoupler is at or
             // below the emergency PLC watermark to avoid sleeping 1-2 ms.
             let fifo_avail_now = burst_fifo.available_samples();
+            let opus_ready_now =
+                opus_ring[(next_play_seq as usize) & (RING_SLOTS - 1)].seq == Some(next_play_seq);
+            // Drive the non-blocking poll from the EXACT same predicate the
+            // refill loop uses to decide whether it can make progress. If the
+            // loop will immediately `break` (slot genuinely in flight with
+            // real audio still queued), blocking is correct and spinning is not.
+            let can_refill_now = !should_hold_missing_slot(
+                sequencer.is_slot_missing(next_play_seq) && !opus_ready_now,
+                fifo_avail_now,
+                last_plc_watermark,
+                latest_rx_seq.wrapping_sub(next_play_seq) as i16,
+                in_flight_wait_subframes(last_pkt_subframe_count),
+            );
             let refill_poll = stream_initialized
                 && prebuffer_ready
                 && fifo_avail_now < last_fifo_watermark
-                && (!sequencer.is_slot_missing(next_play_seq)
-                    || fifo_avail_now <= last_plc_watermark);
+                && can_refill_now;
             if refill_poll {
                 let _ = socket.set_nonblocking(true);
             }
@@ -1362,8 +1367,21 @@ impl ClientEngine {
                             // replay stale payloads.
                             sequencer.reset();
                             opus_decoder = None;
+                            for slot in &mut opus_ring {
+                                slot.seq = None;
+                            }
                             continue;
                         }
+
+                        // A codec switch (Lossless <-> Opus in SmartAuto) joins
+                        // two different waveform predictors; splice the new
+                        // mode in from the last played sample to avoid a click.
+                        if let Some(prev_mode) = last_audio_codec_mode {
+                            if prev_mode != parsed.header.mode {
+                                sequencer.arm_declick();
+                            }
+                        }
+                        last_audio_codec_mode = Some(parsed.header.mode);
 
                         // RFC 3550 Inter-Arrival Jitter calculation using sender `tx_timestamp_us`.
                         // Sample only the first audio packet per drain: packets
@@ -1380,9 +1398,14 @@ impl ClientEngine {
                                 jitter_estimate_us +=
                                     (transit_delta - jitter_estimate_us) * (1.0 / 16.0);
                             }
-                            prev_rx_us = Some(rx_now_us);
-                            prev_tx_us = tx_now_us;
                         }
+                        // Advance the reference on EVERY audio packet in the
+                        // drain. A Wi-Fi A-MPDU delivers packets 2..4 only µs
+                        // after packet 1; leaving prev_* at packet 1 made the
+                        // next on-time packet compare a 5 ms receive gap
+                        // against a 20 ms sender gap (+15 ms fake jitter).
+                        prev_rx_us = Some(rx_now_us);
+                        prev_tx_us = tx_now_us;
                         telemetry
                             .network_jitter_us
                             .store(jitter_estimate_us.max(0.0) as u32, Ordering::Relaxed);
@@ -1414,8 +1437,16 @@ impl ClientEngine {
 
                         // Signed 16-bit sequence delta (RFC 1982): >0 means future, <0 means past/late duplicate
                         let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
+                        // Allow the sequencer backlog to absorb a draining
+                        // group-sync FIFO without misclassifying it as a host
+                        // restart (which used to drop 120 ms of audio).
+                        let fifo_now_subframes =
+                            resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
+                        let resync_ahead =
+                            STREAM_RESYNC_AHEAD_SUBFRAMES.max(fifo_now_subframes + 16);
                         if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
-                            || needs_stream_resync(seq_delta)
+                            || seq_delta > resync_ahead
+                            || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
                         {
                             // The playhead is jumping to a new base sequence.
                             // Clear old slots so a wrapped/reused sequence
@@ -1428,6 +1459,9 @@ impl ClientEngine {
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             prev_rx_us = None;
                             opus_decoder = None;
+                            for slot in &mut opus_ring {
+                                slot.seq = None;
+                            }
                         }
 
                         // Lazy FEC Decoding: only decode the backup frames that
@@ -1479,6 +1513,29 @@ impl ClientEngine {
                             if (s.wrapping_sub(next_play_seq) as i16) < 0
                                 || sequencer.has_primary(s)
                             {
+                                cursor += sub_len;
+                                continue;
+                            }
+
+                            let payload = &prim[cursor..cursor + sub_len];
+                            // Decode-at-pop for Opus: buffer the raw bytes so
+                            // reordered Wi-Fi packets decode losslessly in
+                            // strict stream order at the playhead. The stateful
+                            // CELT decoder must never see out-of-order frames.
+                            if payload.first() == Some(&TAG_OPUS_RLD)
+                                && sub_len <= MAX_OPUS_SUBFRAME_BYTES
+                            {
+                                if (s.wrapping_sub(next_play_seq) as i16) >= 0 {
+                                    let slot = &mut opus_ring[(s as usize) & (RING_SLOTS - 1)];
+                                    if slot.seq != Some(s) {
+                                        slot.data[..sub_len].copy_from_slice(payload);
+                                        slot.len = sub_len as u16;
+                                        slot.seq = Some(s);
+                                    }
+                                    if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
+                                        latest_rx_seq = s;
+                                    }
+                                }
                                 cursor += sub_len;
                                 continue;
                             }
@@ -1587,6 +1644,7 @@ impl ClientEngine {
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
+                    sequencer.arm_fade_in();
                 }
 
                 // If Group Sync requires a deeper cushion (e.g. wired client aligning to
@@ -1656,21 +1714,62 @@ impl ClientEngine {
                 // hold it for one packet interval instead of walking the
                 // playhead past the next on-time packet.
                 let missing_delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
+                let opus_slot_idx = (next_play_seq as usize) & (RING_SLOTS - 1);
+                let has_opus_slot = opus_ring[opus_slot_idx].seq == Some(next_play_seq);
                 if should_hold_missing_slot(
-                    sequencer.is_slot_missing(next_play_seq),
+                    sequencer.is_slot_missing(next_play_seq) && !has_opus_slot,
                     burst_fifo.available_samples(),
                     plc_emergency_watermark,
                     missing_delta,
                     in_flight_wait_subframes(last_pkt_subframe_count),
-                    last_packet_instant.elapsed(),
-                    live_edge_grace(last_pkt_subframe_count),
                 ) {
                     // Wait for the in-flight packet or [N-1]/[N-2] FEC before
                     // triggering WSOLA PLC!
                     break;
                 }
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                let status = sequencer.pop_next(next_play_seq, &mut raw_subframe);
+                let status = if has_opus_slot {
+                    let slot = &mut opus_ring[opus_slot_idx];
+                    let len = slot.len as usize;
+                    slot.seq = None;
+                    if opus_decoder.is_none() {
+                        opus_decoder = OpusStreamDecoder::new();
+                    }
+                    let decoded_ok = opus_decoder
+                        .as_mut()
+                        .map(|d| {
+                            d.decode_subframe_at_seq(
+                                next_play_seq,
+                                &slot.data[..len],
+                                &mut raw_subframe,
+                            )
+                        })
+                        .unwrap_or(false);
+                    if decoded_ok {
+                        sequencer.finalize_external_frame(&mut raw_subframe, false);
+                        STATUS_PRIMARY_LOSSLESS
+                    } else {
+                        sequencer.pop_next(next_play_seq, &mut raw_subframe)
+                    }
+                } else if sequencer.is_slot_missing(next_play_seq)
+                    && last_audio_codec_mode == Some(CodecMode::OpusRld)
+                    && opus_decoder.is_some()
+                {
+                    // Phase-locked CELT PLC right at the playhead instead of
+                    // falling back to WSOLA (timbre jump on Opus streams).
+                    if opus_decoder
+                        .as_mut()
+                        .map(|d| d.decode_plc(next_play_seq, &mut raw_subframe))
+                        .unwrap_or(false)
+                    {
+                        sequencer.finalize_external_frame(&mut raw_subframe, true);
+                        STATUS_EMPTY
+                    } else {
+                        sequencer.pop_next(next_play_seq, &mut raw_subframe)
+                    }
+                } else {
+                    sequencer.pop_next(next_play_seq, &mut raw_subframe)
+                };
 
                 match status {
                     STATUS_PRIMARY_LOSSLESS => {
@@ -1715,6 +1814,15 @@ impl ClientEngine {
                             stream_initialized = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             sequencer.reset();
+                            // A restarted host re-anchors at a low base_seq, so
+                            // needs_stream_resync never runs and a stale Opus
+                            // decoder would reject every frame (delta <= 0)
+                            // until the 16-bit sequence wraps (~82 s silence).
+                            opus_decoder = None;
+                            prev_rx_us = None;
+                            for slot in &mut opus_ring {
+                                slot.seq = None;
+                            }
                             consecutive_empty_ticks = 0;
                         }
                     }
@@ -1765,6 +1873,10 @@ impl ClientEngine {
                 // pushed yet), leaving a permanent -1 subframe bias that the
                 // clock loop then "corrected" with negative drift.
                 let written_frames = resampler.process(&raw_subframe, &mut resampled_out);
+                // Hermite cubic interpolation can overshoot the limiter's
+                // ceiling by up to +1.8 dBFS under drift/44.1 kHz conversion;
+                // round the inter-sample peaks off before the DAC.
+                soft_limit_post_resample(&mut resampled_out[..written_frames * 2]);
                 burst_fifo.push_samples(&resampled_out[..written_frames * 2]);
 
                 // Measure true network sequencer queue depth (Host Clock vs Client DAC Clock).
@@ -1780,14 +1892,18 @@ impl ClientEngine {
                 // 2.4GHz streams never accumulate permanent latency after a
                 // Wi-Fi stall. Only the sequencer share can be shortened; the
                 // decoupler is already feeding the DAC.
-                trim_post_stall_backlog(
+                if trim_post_stall_backlog(
                     latest_rx_seq,
                     &mut next_play_seq,
                     &mut net_subframes,
                     fifo_subframes,
                     target_buf,
                     last_pkt_subframe_count,
-                );
+                ) {
+                    // Fast-forward skipped real audio; splice the next frame
+                    // from the last played sample instead of clicking.
+                    sequencer.arm_declick();
+                }
 
                 // Never synthesize more than one PLC subframe per loop pass
                 // without first polling the socket again. The previous code
@@ -1811,16 +1927,35 @@ impl ClientEngine {
                 let net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
+                // One hardware callback drain: 240 frames (480 interleaved
+                // samples) on desktop CPAL, and the common 240-frame AAudio
+                // burst on Android. The clock setpoint compensates for the
+                // half-burst structural sawtooth this drain creates.
+                let hal_burst_samples = 480usize;
                 telemetry.buffered_audio_us.store(
                     ((net_subframes + fifo_subframes).max(0.0) * 2500.0) as u32,
                     Ordering::Relaxed,
                 );
-                resampler.update_clock_loop(
-                    clock_loop_observation(net_subframes, target_buf),
-                    target_buf,
-                );
-                let ppm = (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
-                telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
+                // Sample on a fixed 2.5 ms cadence. Polling at the socket
+                // timeout rate injected fake error spikes; the windowed-mean
+                // controller assumes evenly spaced observations.
+                if last_clock_sample.elapsed() >= Duration::from_micros(2_500) {
+                    last_clock_sample = Instant::now();
+                    // The FIFO is refilled to `fifo_watermark` and drained in
+                    // whole HAL bursts, so its time-averaged depth sits half a
+                    // burst below the watermark. Use that as the setpoint to
+                    // avoid +2..+10 ms of permanent latency bias.
+                    let wm_subframes = resampler.samples_to_subframes(fifo_watermark);
+                    let burst_subframes = resampler.samples_to_subframes(hal_burst_samples);
+                    let clock_setpoint = (wm_subframes - 0.5 * burst_subframes).max(1.0);
+                    resampler.update_clock_loop(
+                        clock_loop_observation(net_subframes, fifo_subframes),
+                        clock_setpoint,
+                    );
+                    let ppm =
+                        (((resampler.ratio / resampler.base_ratio) - 1.0) * 1_000_000.0) as i32;
+                    telemetry.clock_drift_ppm.store(ppm, Ordering::Relaxed);
+                }
             }
 
             // Publish the adaptive cushion and prebuffer state for the live
@@ -2193,73 +2328,42 @@ mod tests {
 
     #[test]
     fn test_live_edge_holds_instead_of_walking_the_playhead() {
-        // 2-subframe (5 ms) framing: one packet interval plus 10 ms jitter.
-        let grace = live_edge_grace(2);
-        assert_eq!(grace, Duration::from_millis(15));
-        assert_eq!(live_edge_grace(8), Duration::from_millis(30));
-
-        // The playhead has caught up with the newest packet
-        // (`latest_rx_seq = 100`, `next_play_seq = 101`) and the audio
-        // callback just drained the decoupler below the 2.5 ms emergency
-        // watermark. The old predicate concealed the slot immediately, walked
-        // `next_play_seq` to 102, and then dropped the real packet 101 as
-        // "past". At a 0%-loss link the slot is merely still in the sender's
-        // capture pipeline, so the refill loop must wait.
-        let fifo_below_watermark = 0usize;
-        let emergency = 240usize;
-        let old_hold = fifo_below_watermark >= emergency && (-1i16) < in_flight_wait_subframes(2);
-        assert!(!old_hold, "the old guard concealed this on-time live-edge slot");
-        assert!(should_hold_missing_slot(
-            true,
-            fifo_below_watermark,
-            emergency,
-            -1,
-            in_flight_wait_subframes(2),
-            Duration::from_millis(1),
-            grace,
-        ));
-        // A live-edge slot is still held while the packet interval has not
-        // elapsed, even with an otherwise comfortable FIFO.
+        // Both at the live edge and inside the FEC window, concealment is
+        // paced by FIFO headroom alone -- not by a wall-clock grace period that
+        // let a 1 ms socket timeout synthesize PLC 2.5x faster than the DAC.
+        let emergency = 480usize; // 2 subframes / 1 HAL burst
+        // Live edge with real audio still queued: hold (does not walk playhead).
         assert!(should_hold_missing_slot(
             true,
             emergency,
             emergency,
             -1,
             in_flight_wait_subframes(2),
-            Duration::from_millis(14),
-            grace,
         ));
-        // Once the sender has been quiet for a full interval plus jitter
-        // allowance, the slot is genuinely missing and real PLC is required.
+        // Live edge when the FIFO actually dips below emergency headroom: emit
+        // one PLC subframe, which refills above emergency -> exact 1.0x pacing.
         assert!(!should_hold_missing_slot(
             true,
-            fifo_below_watermark,
+            emergency - 2,
             emergency,
             -1,
             in_flight_wait_subframes(2),
-            Duration::from_millis(16),
-            grace,
         ));
-
-        // An out-of-order hole is unchanged: wait only while real audio
-        // remains for the DAC.
+        // Out-of-order hole within FEC window holds while headroom remains.
         assert!(should_hold_missing_slot(
             true,
             emergency,
             emergency,
-            7,
-            in_flight_wait_subframes(4),
-            Duration::from_millis(1),
-            grace,
+            3,
+            in_flight_wait_subframes(2),
         ));
+        // Irrecoverable hole past FEC window conceals immediately.
         assert!(!should_hold_missing_slot(
             true,
-            fifo_below_watermark,
             emergency,
-            7,
-            in_flight_wait_subframes(4),
-            Duration::from_millis(1),
-            grace,
+            emergency,
+            4,
+            in_flight_wait_subframes(2),
         ));
         // A present slot never blocks the refill loop.
         assert!(!should_hold_missing_slot(
@@ -2268,8 +2372,6 @@ mod tests {
             emergency,
             0,
             in_flight_wait_subframes(2),
-            Duration::from_millis(0),
-            grace,
         ));
     }
 
@@ -2560,16 +2662,15 @@ mod tests {
     #[test]
     fn test_aaudio_large_bluetooth_bursts_are_not_tripled() {
         // Speaker/USB bursts keep the verified 3x cushion, minimum 256.
-        assert_eq!(aaudio_buffer_frames_for_burst(48), Some(256));
-        assert_eq!(aaudio_buffer_frames_for_burst(96), Some(288));
-        assert_eq!(aaudio_buffer_frames_for_burst(192), Some(576));
-        // A2DP bursts are already 5-20 ms; one burst is the minimum AAudio
-        // can use, and multiplying it would add 10-40 ms of dead latency.
-        assert_eq!(aaudio_buffer_frames_for_burst(240), Some(240));
-        assert_eq!(aaudio_buffer_frames_for_burst(480), Some(480));
-        assert_eq!(aaudio_buffer_frames_for_burst(960), Some(960));
-        assert_eq!(aaudio_buffer_frames_for_burst(0), None);
-        assert_eq!(aaudio_buffer_frames_for_burst(-1), None);
+        assert_eq!(aaudio_buffer_frames_for_burst(48, 960), Some(256));
+        assert_eq!(aaudio_buffer_frames_for_burst(96, 960), Some(288));
+        assert_eq!(aaudio_buffer_frames_for_burst(192, 960), Some(576));
+        // 240-frame speaker/USB bursts must double-buffer to avoid HAL XRuns.
+        assert_eq!(aaudio_buffer_frames_for_burst(240, 960), Some(480));
+        assert_eq!(aaudio_buffer_frames_for_burst(480, 960), Some(480));
+        assert_eq!(aaudio_buffer_frames_for_burst(960, 960), Some(960));
+        assert_eq!(aaudio_buffer_frames_for_burst(0, 960), None);
+        assert_eq!(aaudio_buffer_frames_for_burst(-1, 960), None);
     }
 
     #[test]
@@ -2690,6 +2791,46 @@ mod tests {
         let mut healed = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert_eq!(sequencer.pop_next(101, &mut healed), STATUS_HEALED_BY_FEC);
         assert!(healed.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn test_opus_raw_buffer_recovers_reordered_wifi_frames() {
+        use audioshare_protocol::lpc_lossless::MAX_LOSSLESS_SUBFRAME_BYTES;
+        use audioshare_protocol::opus_codec::OpusStreamEncoder;
+        use audioshare_protocol::SUBFRAME_FRAMES;
+
+        let mut enc = OpusStreamEncoder::new(128).expect("opus encoder");
+        let mut pcm_a = [0i16; SUBFRAME_STEREO_SAMPLES];
+        let mut pcm_b = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let ta = (i as f32) * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32;
+            let tb = (i as f32) * 660.0 * std::f32::consts::TAU / SAMPLE_RATE as f32;
+            pcm_a[i * 2] = (ta.sin() * 8000.0) as i16;
+            pcm_b[i * 2] = (tb.sin() * 8000.0) as i16;
+        }
+        let mut raw_a = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let mut raw_b = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let len_a = enc.encode_subframe(&pcm_a, 128, &mut raw_a).unwrap();
+        let len_b = enc.encode_subframe(&pcm_b, 128, &mut raw_b).unwrap();
+
+        // BEFORE: decode at arrival. Frame N+1 (11) arrives before N (10);
+        // the stateful CELT decoder rejects the late real frame 10 forever.
+        let mut arrival_decoder = OpusStreamDecoder::new().unwrap();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(arrival_decoder.decode_subframe_at_seq(11, &raw_b[..len_b], &mut out));
+        assert!(!arrival_decoder.decode_subframe_at_seq(10, &raw_a[..len_a], &mut out));
+
+        // AFTER: buffer raw bytes and decode in strict playhead order.
+        let mut buffered = vec![(11u16, raw_b[..len_b].to_vec()), (10u16, raw_a[..len_a].to_vec())];
+        buffered.sort_by_key(|&(seq, _)| seq);
+        let mut pop_decoder = OpusStreamDecoder::new().unwrap();
+        for (seq, data) in buffered {
+            assert!(
+                pop_decoder.decode_subframe_at_seq(seq, &data, &mut out),
+                "buffered frame {seq} must decode in stream order"
+            );
+        }
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 
     #[test]
@@ -3146,6 +3287,38 @@ mod tests {
         }
         assert!(prebuf, "base floor must engage prebuffer_ready to prevent >48 subframe resync loop");
     }
+
+    #[test]
+    fn repro_live_edge_hold_spins_with_empty_fifo() {
+        // P0-1 regression: at the live edge with an EMPTY decoupler, the slot
+        // is genuinely missing and must be concealed so the refill loop makes
+        // progress. The old time-based guard held anyway while refill_poll had
+        // already switched the socket to nonblocking -> 100% CPU busy-spin.
+        assert!(!should_hold_missing_slot(
+            true,
+            0, // empty FIFO
+            240,
+            -1,
+            in_flight_wait_subframes(2),
+        ));
+    }
+
+    #[test]
+    fn repro_clock_observation_is_blind_to_drained_fifo() {
+        // P0-2: negative drift drains the decoupler. The old observation adds
+        // target_buf instead of the real FIFO depth, so it can NEVER report a
+        // queue below the setpoint -> the resampler never slows down.
+        let target = 6.0f32;
+        let drained_fifo = 2.0f32;
+        // BEFORE: the second argument was `target_buf`, so observation was
+        // always >= target and a drained FIFO was invisible (6 > 2).
+        // AFTER: the second argument is the real FIFO depth (2 < target 6).
+        let observation = clock_loop_observation(0.0, drained_fifo);
+        assert!(
+            observation < target,
+            "observation {observation} must fall below setpoint {target} when the FIFO drains"
+        );
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -3523,9 +3696,10 @@ pub mod android_aaudio {
                 // A2DP bursts are already 10-20 ms. Use one burst there and
                 // keep the 3x speaker/USB cushion, otherwise the old code
                 // stacked another 30-60 ms of AAudio buffer on Bluetooth.
-                if let Some(target_frames) =
-                    aaudio_buffer_frames_for_burst(AAudioStream_getFramesPerBurst(stream))
-                {
+                if let Some(target_frames) = aaudio_buffer_frames_for_burst(
+                    AAudioStream_getFramesPerBurst(stream),
+                    capacity_frames,
+                ) {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
 
