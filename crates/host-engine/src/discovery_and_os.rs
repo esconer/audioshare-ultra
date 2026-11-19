@@ -86,14 +86,24 @@ impl DiscoveryBeacon {
                         SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT)),
                     );
 
-                    for iface in crate::list_valid_host_interfaces() {
-                        if let IpAddr::V4(ipv4) = iface.ip {
-                            let octets = ipv4.octets();
-                            let subnet_bcast = SocketAddr::from((
-                                [octets[0], octets[1], octets[2], 255],
-                                DISCOVERY_PORT,
-                            ));
-                            let _ = sock.send_to(payload.as_bytes(), subnet_bcast);
+                    // Use the OS-reported broadcast address (correct for /16,
+                    // /23, point-to-point and USB-tethering links) instead of
+                    // assuming /24. Fall back to the legacy x.y.z.255 form.
+                    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+                        for iface in ifaces {
+                            if iface.is_loopback() {
+                                continue;
+                            }
+                            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                                let bcast = v4.broadcast.unwrap_or_else(|| {
+                                    let o = v4.ip.octets();
+                                    Ipv4Addr::new(o[0], o[1], o[2], 255)
+                                });
+                                let _ = sock.send_to(
+                                    payload.as_bytes(),
+                                    SocketAddr::from((bcast, DISCOVERY_PORT)),
+                                );
+                            }
                         }
                     }
                     std::thread::sleep(Duration::from_millis(250));

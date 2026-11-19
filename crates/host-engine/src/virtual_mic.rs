@@ -244,7 +244,7 @@ impl LinuxVirtualMicOutput {
                 "--rate=48000",
                 "--channels=2",
                 "--raw",
-                "--latency-msec=20",
+                "--latency-msec=8",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
