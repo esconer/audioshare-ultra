@@ -1090,6 +1090,108 @@ impl HostTelemetry {
     }
 }
 
+/// Drain a non-blocking PCM fd into `ring`.
+///
+/// One 2.5 ms stereo f32 subframe is 960 bytes. Partial reads are
+/// reassembled across loop iterations before the samples are pushed. The
+/// 50 ms `poll` timeout is deliberately short: it rechecks `stream_active`,
+/// `running` and `sink_generation` even when the sink is completely silent,
+/// which is the fix for the old blocking `read_exact` loop hanging forever
+/// on a source that never produced a full subframe.
+#[cfg(target_os = "linux")]
+fn pump_pcm_fd_nonblocking(
+    fd: std::os::fd::RawFd,
+    ring: &BurstDecouplerRing,
+    heartbeat_ms: &AtomicU64,
+    running: &AtomicBool,
+    stream_active: &AtomicBool,
+    sink_generation: &AtomicU64,
+    generation: u64,
+    start_epoch: Instant,
+) {
+    const SUBFRAME_BYTES: usize = SUBFRAME_STEREO_SAMPLES * 4; // 960
+    let mut byte_buf = [0u8; SUBFRAME_BYTES];
+    let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+    let mut filled = 0usize;
+
+    // Make the descriptor non-blocking for callers that did not set it.
+    // An already non-blocking fd is left as-is.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+
+    while stream_active.load(Ordering::Relaxed)
+        && running.load(Ordering::Relaxed)
+        && sink_generation.load(Ordering::Acquire) == generation
+    {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if rc == 0 {
+            // Timeout: recheck the stop/generation flags (silent sink).
+            continue;
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+            && pfd.revents & libc::POLLIN == 0
+        {
+            break;
+        }
+        if pfd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+
+        // `read` never blocks here, so a short read simply means "more
+        // bytes are still in flight". Accumulate until a whole subframe
+        // is available.
+        let n = unsafe {
+            libc::read(
+                fd,
+                byte_buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                byte_buf.len() - filled,
+            )
+        };
+        if n > 0 {
+            filled += n as usize;
+            if filled < SUBFRAME_BYTES {
+                continue;
+            }
+            debug_assert_eq!(filled, SUBFRAME_BYTES);
+            filled = 0;
+            heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+            for (dst, chunk) in f32_buf.iter_mut().zip(byte_buf.chunks_exact(4)) {
+                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            ring.push_samples(&f32_buf);
+            continue;
+        }
+        if n == 0 {
+            // EOF: writer closed the pipe.
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted
+            || err.kind() == std::io::ErrorKind::WouldBlock
+        {
+            continue;
+        }
+        break;
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub enum HostCaptureStream {
     #[cfg(target_os = "linux")]
@@ -1097,6 +1199,11 @@ pub enum HostCaptureStream {
         stream_active: Arc<AtomicBool>,
         child_pid: Arc<std::sync::atomic::AtomicU32>,
         child_exited: Arc<AtomicBool>,
+        /// True when the capture thread drives a non-blocking `poll` reader.
+        /// In that mode the thread owns the child and is joined on drop, so no
+        /// detached stale-PID SIGTERM thread is needed.
+        uses_nonblocking_poll: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
     },
     Cpal(cpal::Stream),
 }
@@ -1109,12 +1216,21 @@ impl Drop for HostCaptureStream {
             stream_active,
             child_pid,
             child_exited,
+            uses_nonblocking_poll,
+            handle,
         } = self
         {
             stream_active.store(false, Ordering::Release);
-            // Never SIGTERM a PID that was already reaped: the OS may have
-            // recycled it for an unrelated process (stale-PID kill).
-            if !child_exited.load(Ordering::Acquire) {
+            if uses_nonblocking_poll.load(Ordering::Acquire) {
+                // The capture loop rechecks the stop flag every 50 ms poll
+                // timeout, so this join is bounded. The loop kills/waits its
+                // own child before returning.
+                if let Some(handle) = handle.take() {
+                    let _ = handle.join();
+                }
+            } else if !child_exited.load(Ordering::Acquire) {
+                // Legacy path: Never SIGTERM a PID that was already reaped:
+                // the OS may have recycled it for an unrelated process.
                 let pid = child_pid.load(Ordering::Relaxed);
                 if pid != 0 {
                     unsafe {
@@ -1355,24 +1471,24 @@ impl HostEngine {
         running: Arc<AtomicBool>,
         start_epoch: Instant,
     ) -> Result<HostCaptureStream, String> {
-        use std::io::Read;
         use std::process::{Command, Stdio};
 
         let stream_active = Arc::new(AtomicBool::new(true));
         let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let child_exited = Arc::new(AtomicBool::new(false));
+        let uses_nonblocking_poll = Arc::new(AtomicBool::new(true));
 
-        let stream_active_clone = Arc::clone(&stream_active);
-        let child_pid_clone = Arc::clone(&child_pid);
-        let child_exited_watch = Arc::clone(&child_exited);
-        let child_exited_wait = Arc::clone(&child_exited);
+        let capture_active = Arc::clone(&stream_active);
+        let capture_pid = Arc::clone(&child_pid);
+        let capture_exited = Arc::clone(&child_exited);
+        let capture_running = Arc::clone(&running);
+        let capture_ring = Arc::clone(&ring);
+        let capture_heartbeat = Arc::clone(&heartbeat_ms);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("as-ultra-linux-parec".into())
             .spawn(move || {
                 promote_thread_realtime();
-                let mut byte_buf = [0u8; SUBFRAME_STEREO_SAMPLES * 4]; // 960 bytes = 2.5ms stereo f32
-                let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
 
                 fn query_default_monitor() -> Option<String> {
                     if let Ok(out) = Command::new("pactl").arg("get-default-source").output() {
@@ -1405,8 +1521,8 @@ impl HostEngine {
                 ));
                 let sink_generation = Arc::new(AtomicU64::new(0));
                 {
-                    let watcher_running = Arc::clone(&running);
-                    let watcher_active = Arc::clone(&stream_active_clone);
+                    let watcher_running = Arc::clone(&capture_running);
+                    let watcher_active = Arc::clone(&capture_active);
                     let watcher_latest = Arc::clone(&latest_monitor);
                     let watcher_generation = Arc::clone(&sink_generation);
                     let _ = std::thread::Builder::new()
@@ -1428,32 +1544,17 @@ impl HostEngine {
                         });
                 }
 
-                while stream_active_clone.load(Ordering::Relaxed) && running.load(Ordering::Relaxed)
+                while capture_active.load(Ordering::Relaxed)
+                    && capture_running.load(Ordering::Relaxed)
                 {
                     let generation = sink_generation.load(Ordering::Acquire);
                     let current_monitor = latest_monitor.lock().unwrap().clone();
+                    capture_exited.store(false, Ordering::Release);
 
-                    // 1. Try direct in-process libpulse-simple.so.0 (2.5ms hardware fragsize, zero pipe buffering!)
-                    if Self::try_inprocess_pulse_simple_capture(
-                        &current_monitor,
-                        &ring,
-                        &heartbeat_ms,
-                        &running,
-                        &stream_active_clone,
-                        start_epoch,
-                        &sink_generation,
-                        generation,
-                    ) {
-                        if stream_active_clone.load(Ordering::Relaxed)
-                            && running.load(Ordering::Relaxed)
-                        {
-                            std::thread::sleep(Duration::from_millis(50));
-                        }
-                        continue;
-                    }
-
-                    // 2. Fallback to parec CLI if libpulse-simple.so.0 is unavailable
-                    if let Ok(mut child) = Command::new("parec")
+                    // 1. Preferred: PipeWire/PulseAudio `parec` captured at
+                    //    low latency. A non-blocking poll reader drains its
+                    //    stdout so a silent sink cannot wedge the thread.
+                    let child = Command::new("parec")
                         .env("PIPEWIRE_LATENCY", "240/48000")
                         .args([
                             "--raw",
@@ -1466,67 +1567,60 @@ impl HostEngine {
                         ])
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
-                        .spawn()
-                    {
-                        let pid = child.id();
-                        child_pid_clone.store(pid, Ordering::Relaxed);
-                        let run_watch = Arc::clone(&running);
-                        let stream_watch = Arc::clone(&stream_active_clone);
-                        let exited_watch = Arc::clone(&child_exited_watch);
-                        std::thread::spawn(move || {
-                            while run_watch.load(Ordering::Relaxed)
-                                && stream_watch.load(Ordering::Relaxed)
-                                && !exited_watch.load(Ordering::Acquire)
-                            {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            if !exited_watch.load(Ordering::Acquire) {
-                                unsafe {
-                                    libc::kill(pid as i32, libc::SIGTERM);
-                                }
-                            }
-                        });
-                        if let Some(mut stdout) = child.stdout.take() {
-                            while stream_active_clone.load(Ordering::Relaxed)
-                                && running.load(Ordering::Relaxed)
-                            {
-                                if stdout.read_exact(&mut byte_buf).is_ok() {
-                                    heartbeat_ms.store(
-                                        start_epoch.elapsed().as_millis() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                    for (i, chunk) in byte_buf.chunks_exact(4).enumerate() {
-                                        f32_buf[i] = f32::from_le_bytes([
-                                            chunk[0], chunk[1], chunk[2], chunk[3],
-                                        ]);
-                                    }
-                                    ring.push_samples(&f32_buf);
+                        .spawn();
 
-                                    // The watcher thread already resolved the
-                                    // new sink; just reopen without blocking
-                                    // this real-time loop on `pactl`.
-                                    if sink_generation.load(Ordering::Acquire) != generation {
-                                        break;
-                                    }
-                                } else {
-                                    break;
-                                }
+                    match child {
+                        Ok(mut child) => {
+                            capture_pid.store(child.id(), Ordering::Relaxed);
+                            if let Some(stdout) = child.stdout.take() {
+                                use std::os::fd::AsRawFd;
+                                pump_pcm_fd_nonblocking(
+                                    stdout.as_raw_fd(),
+                                    &capture_ring,
+                                    &capture_heartbeat,
+                                    &capture_running,
+                                    &capture_active,
+                                    &sink_generation,
+                                    generation,
+                                    start_epoch,
+                                );
+                            }
+                            capture_pid.store(0, Ordering::Relaxed);
+                            // The capture thread owns the child: no detached
+                            // stale-PID kill thread is needed.
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            capture_exited.store(true, Ordering::Release);
+                        }
+                        Err(_) => {
+                            // 2. Fallback: direct in-process
+                            //    libpulse-simple.so.0 only when `parec` could
+                            //    not be spawned at all.
+                            if Self::try_inprocess_pulse_simple_capture(
+                                &current_monitor,
+                                &capture_ring,
+                                &capture_heartbeat,
+                                &capture_running,
+                                &capture_active,
+                                start_epoch,
+                                &sink_generation,
+                                generation,
+                            ) && capture_active.load(Ordering::Relaxed)
+                                && capture_running.load(Ordering::Relaxed)
+                            {
+                                std::thread::sleep(Duration::from_millis(50));
                             }
                         }
-                        child_pid_clone.store(0, Ordering::Relaxed);
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        child_exited_wait.store(true, Ordering::Release);
                     }
 
-                    if stream_active_clone.load(Ordering::Relaxed)
-                        && running.load(Ordering::Relaxed)
+                    if capture_active.load(Ordering::Relaxed)
+                        && capture_running.load(Ordering::Relaxed)
                     {
-                        std::thread::sleep(Duration::from_millis(150));
+                        std::thread::sleep(Duration::from_millis(50));
                     }
                 }
 
-                stream_active_clone.store(false, Ordering::Release);
+                capture_active.store(false, Ordering::Release);
             })
             .map_err(|e| format!("Failed to spawn parec reader thread: {}", e))?;
 
@@ -1534,6 +1628,8 @@ impl HostEngine {
             stream_active,
             child_pid,
             child_exited,
+            uses_nonblocking_poll,
+            handle: Some(handle),
         })
     }
 
@@ -3832,5 +3928,197 @@ mod tests {
                 "At rate {src_rate}, max_chunk_frames={max_chunk_frames} produces {est_out_frames} > 2048 frames"
             );
         }
+    }
+
+    // ---- p8-1: non-blocking pipe capture reader (no PipeWire needed) ----
+
+    #[cfg(target_os = "linux")]
+    fn pipe_pair() -> (std::os::fd::RawFd, std::os::fd::RawFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) },
+            0,
+            "libc::pipe failed"
+        );
+        (fds[0], fds[1])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn close_fd(fd: std::os::fd::RawFd) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_fd_all(fd: std::os::fd::RawFd, mut data: &[u8]) {
+        while !data.is_empty() {
+            let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
+            assert!(n > 0, "libc::write failed");
+            data = &data[n as usize..];
+        }
+    }
+
+    /// Shared harness for the two silent-sink exit cases. The write end stays
+    /// open with zero bytes, so only a flag change can make the reader return.
+    #[cfg(target_os = "linux")]
+    fn assert_silent_sink_exits<F>(mut trip: F)
+    where
+        F: FnMut(&Arc<AtomicU64>, &Arc<AtomicBool>),
+    {
+        let (read_fd, write_fd) = pipe_pair();
+        let ring = BurstDecouplerRing::new();
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let stream_active = Arc::new(AtomicBool::new(true));
+        let sink_generation = Arc::new(AtomicU64::new(0));
+        let generation = sink_generation.load(Ordering::Acquire);
+        let epoch = Instant::now();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let pump_ring = ring;
+        let hb = Arc::clone(&heartbeat);
+        let run = Arc::clone(&running);
+        let active = Arc::clone(&stream_active);
+        let gen = Arc::clone(&sink_generation);
+        let thread = std::thread::spawn(move || {
+            pump_pcm_fd_nonblocking(
+                read_fd, &pump_ring, &hb, &run, &active, &gen, generation, epoch,
+            );
+            let _ = done_tx.send(());
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        let started = Instant::now();
+        trip(&sink_generation, &stream_active);
+
+        done_rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("pump_pcm_fd_nonblocking hung on a silent sink");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "silent-sink exit took {:?} (>= 150 ms)",
+            started.elapsed()
+        );
+        thread.join().expect("pump thread panicked");
+        close_fd(read_fd);
+        close_fd(write_fd);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pump_pcm_fd_nonblocking_silent_sink_generation_exit() {
+        // Silent sink + sink change: the 50 ms poll timeout must recheck the
+        // generation so the capture loop can reopen on the new monitor.
+        assert_silent_sink_exits(|sink_generation, _| {
+            sink_generation.fetch_add(1, Ordering::Release);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pump_pcm_fd_nonblocking_silent_sink_stream_active_exit() {
+        // Same silent-sink case, tripped by the stop flag instead (this is
+        // what HostCaptureStream::Drop relies on when joining the thread).
+        assert_silent_sink_exits(|_, stream_active| {
+            stream_active.store(false, Ordering::Release);
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pump_pcm_fd_nonblocking_fragmented_reassembly() {
+        let (read_fd, write_fd) = pipe_pair();
+        let ring = Arc::new(BurstDecouplerRing::new());
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let stream_active = Arc::new(AtomicBool::new(true));
+        let sink_generation = Arc::new(AtomicU64::new(0));
+        let epoch = Instant::now();
+
+        let mut expected = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut wire = Vec::with_capacity(SUBFRAME_STEREO_SAMPLES * 4);
+        for (i, sample) in expected.iter_mut().enumerate() {
+            // Distinctive values so a single misplaced byte is detectable.
+            let value = (i as f32) * 0.001 - 0.125 + ((i % 7) as f32) * 0.01;
+            *sample = value;
+            wire.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(wire.len(), SUBFRAME_STEREO_SAMPLES * 4); // 960
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let pump_ring = Arc::clone(&ring);
+        let hb = Arc::clone(&heartbeat);
+        let run = Arc::clone(&running);
+        let active = Arc::clone(&stream_active);
+        let gen = Arc::clone(&sink_generation);
+        let thread = std::thread::spawn(move || {
+            pump_pcm_fd_nonblocking(read_fd, &pump_ring, &hb, &run, &active, &gen, 0, epoch);
+            let _ = done_tx.send(());
+        });
+
+        // Uneven chunks, each separated by more than the 50 ms poll timeout so
+        // the reader really observes partial reads across loop iterations.
+        let mut offset = 0usize;
+        for chunk_len in [17usize, 333, 610] {
+            write_fd_all(write_fd, &wire[offset..offset + chunk_len]);
+            offset += chunk_len;
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert_eq!(offset, wire.len());
+        close_fd(write_fd); // EOF: reader can exit after the final subframe.
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pump did not exit after fragmented input + EOF");
+        thread.join().expect("pump thread panicked");
+        close_fd(read_fd);
+
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut rng = 12_345u32;
+        assert!(
+            ring.pop_exact_or_dither(&mut out, &mut rng),
+            "ring did not receive a full 240-sample subframe"
+        );
+        for (i, (got, want)) in out.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "sample {i} was not reassembled bit-for-bit"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pump_pcm_fd_nonblocking_eof_cleanup() {
+        let (read_fd, write_fd) = pipe_pair();
+        close_fd(write_fd); // writer gone before the reader starts
+
+        let ring = BurstDecouplerRing::new();
+        let heartbeat = AtomicU64::new(0);
+        let running = AtomicBool::new(true);
+        let stream_active = AtomicBool::new(true);
+        let sink_generation = AtomicU64::new(0);
+        let started = Instant::now();
+
+        pump_pcm_fd_nonblocking(
+            read_fd,
+            &ring,
+            &heartbeat,
+            &running,
+            &stream_active,
+            &sink_generation,
+            0,
+            started,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "EOF cleanup took {:?} (>= 100 ms)",
+            started.elapsed()
+        );
+        assert_eq!(ring.available_samples(), 0);
+        close_fd(read_fd);
     }
 }
