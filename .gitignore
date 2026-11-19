@@ -36,3 +36,8 @@ Thumbs.db
 *.db-journal
 *.sqlite
 *.sqlite3
+*.keystore
+*.jks
+*.p12
+android/app/src/main/jniLibs/
+android/local.properties
