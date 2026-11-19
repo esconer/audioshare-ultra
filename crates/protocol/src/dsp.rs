@@ -641,9 +641,113 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
     }
 }
 
+/// Expand a mono microphone capture into the interleaved stereo ring that the
+/// transmitter consumes, optionally resampling the capture rate to the ring's
+/// native 48 kHz rate first.
+///
+/// This is the pure, platform-independent extraction of the AAudio mono input
+/// callback: Android delivers a mono `f32` buffer whose device capture rate may
+/// differ from 48 kHz, while the downstream decoupler ring is always
+/// interleaved stereo at 48 kHz. Keeping the expand + resample + push logic
+/// here (instead of inside the JNI callback) lets it be unit-tested on any host.
+///
+/// * `mono` - mono capture samples, one `f32` per frame.
+/// * `resampler` - carries phase/history across successive chunks; configure it
+///   with [`ClockDriftResampler::set_sample_rates`] before the first call. It is
+///   only touched when `needs_resample` is true.
+/// * `out_scratch` - caller-owned destination for `resampler.process`; never
+///   heap-allocated here. It also bounds how much output one resampler call may
+///   emit. The function re-feeds any input the resampler could not consume in a
+///   call, so a small scratch simply costs more loop iterations, not samples.
+///
+/// No heap allocation occurs: the stereo expansion uses a bounded stack array,
+/// and input chunks larger than that array are processed in a loop.
+#[inline]
+pub fn push_mono_mic_chunk(
+    ring: &BurstDecouplerRing,
+    mono: &[f32],
+    resampler: &mut ClockDriftResampler,
+    needs_resample: bool,
+    out_scratch: &mut [f32],
+) {
+    if mono.is_empty() {
+        return;
+    }
+
+    // Bounded stack scratch for mono -> interleaved stereo expansion. A single
+    // AAudio callback burst is at most a few hundred frames, so 256 leaves
+    // margin while keeping the frame well inside real-time stack budgets.
+    const EXPAND_FRAMES: usize = 256;
+    let mut stereo = [0.0f32; EXPAND_FRAMES * 2];
+
+    if !needs_resample {
+        // Bypass: exact bit-for-bit `[s, s]` duplication, looping over chunks
+        // larger than the expansion buffer. `out_scratch` is deliberately
+        // unused on this path.
+        let mut offset = 0usize;
+        while offset < mono.len() {
+            let frames = (mono.len() - offset).min(EXPAND_FRAMES);
+            for (i, &sample) in mono[offset..offset + frames].iter().enumerate() {
+                stereo[i * 2] = sample;
+                stereo[i * 2 + 1] = sample;
+            }
+            ring.push_samples(&stereo[..frames * 2]);
+            offset += frames;
+        }
+        return;
+    }
+
+    if out_scratch.len() < 2 {
+        return; // no room for even one stereo output frame
+    }
+
+    // Resample path. Feed bounded mono chunks to `process`, then re-feed any
+    // frames it could not consume because the output scratch filled up. The
+    // exact consumed count is derived from the resampler's phase invariant
+    // `phase_after = phase_before + produced * ratio - consumed`, so no input
+    // is dropped regardless of how small `out_scratch` is.
+    let mut offset = 0usize;
+    while offset < mono.len() {
+        let frames = (mono.len() - offset).min(EXPAND_FRAMES);
+        for (i, &sample) in mono[offset..offset + frames].iter().enumerate() {
+            stereo[i * 2] = sample;
+            stereo[i * 2 + 1] = sample;
+        }
+
+        let phase_before = resampler.phase;
+        let produced = resampler.process(&stereo[..frames * 2], out_scratch);
+        if produced > 0 {
+            ring.push_samples(&out_scratch[..produced * 2]);
+        }
+
+        let consumed_f64 =
+            phase_before + produced as f64 * resampler.ratio - resampler.phase;
+        let consumed = consumed_f64.round().max(0.0) as usize;
+        if consumed == 0 {
+            if produced == 0 {
+                break; // no output capacity and no phase progress possible
+            }
+            // Output was produced but the phase never reached 1.0, so no input
+            // frame was shifted into history yet. Retry the same chunk; phase
+            // advances on every call, so the next iterations make progress.
+            continue;
+        }
+        offset += consumed.min(frames);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pull every sample currently queued in the ring as interleaved stereo.
+    fn drain_ring(ring: &BurstDecouplerRing) -> Vec<f32> {
+        let samples = ring.available_samples();
+        let mut out = vec![0.0f32; samples];
+        let mut rng = 0x1234_5678u32;
+        ring.pop_exact_or_dither(&mut out, &mut rng);
+        out
+    }
 
     #[test]
     fn test_burst_decoupler_with_android_192_frame_burst() {
@@ -1134,5 +1238,131 @@ mod tests {
                 assert!(output.iter().all(|s| s.is_finite()));
             }
         }
+    }
+
+    // ---- p9-3c: pure mono microphone expand + optional resample helper ----
+
+    #[test]
+    fn test_push_mono_mic_chunk_resamples_16k_to_48k() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(16_000, 48_000);
+        assert!((resampler.ratio - 1.0 / 3.0).abs() < 1e-12);
+
+        let input_frames = 4096usize;
+        let mono: Vec<f32> = (0..input_frames)
+            .map(|i| {
+                let t = i as f32 / 16_000.0;
+                (std::f32::consts::TAU * 1_000.0 * t).sin() * 0.5
+            })
+            .collect();
+
+        // Scratch comfortably larger than one 256-frame expansion block.
+        let mut scratch = vec![0.0f32; 2048];
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, true, &mut scratch);
+
+        let out = drain_ring(&ring);
+        let out_frames = out.len() / 2;
+        let expected = input_frames * 3; // 48 kHz / 16 kHz = 3x
+        assert!(
+            (out_frames as i64 - expected as i64).abs() <= 16,
+            "16k->48k: ring received {} frames, expected ~{}",
+            out_frames,
+            expected
+        );
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "16k->48k resampling produced a non-finite sample"
+        );
+        // Mono expands to identical L/R; the same filter/interpolation is
+        // applied to both channels, so they must stay equal after resampling.
+        for pair in out.chunks_exact(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 1e-6,
+                "L/R drifted apart after mono resampling: {} vs {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_mono_mic_chunk_resamples_44k1_to_48k() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(44_100, 48_000);
+        let expected_ratio = 48_000.0 / 44_100.0;
+
+        let input_frames = 4096usize;
+        let mono: Vec<f32> = (0..input_frames)
+            .map(|i| (i as f32 * 0.05).sin() * 0.4)
+            .collect();
+
+        let mut scratch = vec![0.0f32; 2048];
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, true, &mut scratch);
+
+        let out = drain_ring(&ring);
+        let out_frames = out.len() / 2;
+        let expected = (input_frames as f64 * expected_ratio).round() as usize;
+        assert!(
+            (out_frames as i64 - expected as i64).abs() <= 16,
+            "44.1k->48k: ring received {} frames, expected ~{}",
+            out_frames,
+            expected
+        );
+        assert!(
+            out.iter().all(|s| s.is_finite()),
+            "44.1k->48k resampling produced a non-finite sample"
+        );
+    }
+
+    #[test]
+    fn test_push_mono_mic_chunk_bypass_is_bit_exact_stereo_duplicate() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new(); // untouched on bypass
+        // Tiny scratch (< mono length) proves the bypass path never depends on
+        // resampler scratch space, and a >256-frame mono input proves looping.
+        let mut scratch = [0.0f32; 16];
+        let mono: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.017) - 8.0).collect();
+
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, false, &mut scratch);
+
+        let out = drain_ring(&ring);
+        assert_eq!(out.len(), mono.len() * 2);
+        for (i, &sample) in mono.iter().enumerate() {
+            assert_eq!(out[i * 2], sample, "L sample {} modified on bypass", i);
+            assert_eq!(out[i * 2 + 1], sample, "R sample {} modified on bypass", i);
+        }
+        // Bypass must not advance resampler state.
+        assert_eq!(resampler.phase, 0.0);
+    }
+
+    #[test]
+    fn test_push_mono_mic_chunk_resample_loops_when_mono_exceeds_scratch() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(16_000, 48_000);
+
+        let input_frames = 4096usize;
+        let mono = vec![0.25f32; input_frames];
+        // Only 64 output frames of scratch: the 4096-frame mono input must be
+        // split across many process() calls without losing any samples.
+        let mut scratch = vec![0.0f32; 128];
+
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, true, &mut scratch);
+
+        let out = drain_ring(&ring);
+        let out_frames = out.len() / 2;
+        let expected = input_frames * 3;
+        assert!(
+            (out_frames as i64 - expected as i64).abs() <= 16,
+            "looped 16k->48k: ring received {} frames, expected ~{}",
+            out_frames,
+            expected
+        );
+        assert!(out.iter().all(|s| s.is_finite()));
+        // A constant mono level must survive the loop as a constant stereo DC.
+        let tail = &out[out.len().saturating_sub(200)..];
+        assert!(tail.iter().all(|s| (s - 0.25).abs() < 1e-4));
     }
 }
