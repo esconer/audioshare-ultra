@@ -1,6 +1,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod crypto;
+pub mod diagnostics;
 pub mod dsp;
 pub mod latency;
 pub mod lpc_lossless;
