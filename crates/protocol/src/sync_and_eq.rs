@@ -100,8 +100,8 @@ impl BauerCrossfeedFilter {
         const ITD_SAMPLES: usize = 7; // 146 us ITD (+/-30 deg studio monitor angle, no 1.8kHz notch)
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0] + ANTI_DENORMAL;
-            let in_r = frame[1] + ANTI_DENORMAL;
+            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
 
             // Low-pass filter current samples (head shadow simulation)
             self.lp_l += ALPHA_700HZ * (in_l - self.lp_l);
@@ -244,13 +244,13 @@ impl StereoBiquad {
     pub fn process_stereo_in_place(&mut self, stereo: &mut [f32]) {
         const ANTI_DENORMAL: f32 = 1.0e-25;
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0] + ANTI_DENORMAL;
+            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
             let out_l = self.b0 * in_l + self.z1_l;
             self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
             self.z2_l = self.b2 * in_l - self.a2 * out_l;
             frame[0] = out_l;
 
-            let in_r = frame[1] + ANTI_DENORMAL;
+            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
             let out_r = self.b0 * in_r + self.z1_r;
             self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
             self.z2_r = self.b2 * in_r - self.a2 * out_r;
@@ -377,8 +377,8 @@ impl NightModeCompressor {
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
         for frame in stereo.chunks_exact_mut(2) {
-            let l = frame[0];
-            let r = frame[1];
+            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
+            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
             let peak = l.abs().max(r.abs()) + 1.0e-25;
 
             // 1.5 ms attack, 100 ms release. The old 93 us attack / 26 ms
@@ -579,8 +579,8 @@ impl MicRumbleAndNoiseGate {
         const GATE_THRESH: f32 = 0.0056; // -45 dBFS noise gate threshold
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = frame[0] + 1.0e-25;
-            let in_r = frame[1] + 1.0e-25;
+            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + 1.0e-25;
+            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + 1.0e-25;
             let hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
             let hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
             self.hp_x1_l = in_l;
@@ -600,12 +600,37 @@ impl MicRumbleAndNoiseGate {
 }
 
 /// 10. QR Code Connection URI Builder (`asultra://connect?host=...&pin=...`)
+fn percent_encode_query_value(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
 pub fn build_qr_connect_uri(host_ip: &str, port: u16, pin: Option<&str>) -> String {
+    let host_part = if host_ip.contains(':') && !host_ip.starts_with('[') {
+        format!("[{}]", host_ip)
+    } else {
+        host_ip.to_string()
+    };
     match pin {
         Some(p) if !p.is_empty() => {
-            format!("asultra://connect?host={}:{}&pin={}", host_ip, port, p)
+            format!(
+                "asultra://connect?host={}:{}&pin={}",
+                host_part,
+                port,
+                percent_encode_query_value(p)
+            )
         }
-        _ => format!("asultra://connect?host={}:{}", host_ip, port),
+        _ => format!("asultra://connect?host={}:{}", host_part, port),
     }
 }
 
@@ -1171,5 +1196,44 @@ mod tests {
         eq.update_if_changed(0, 0, 0);
         eq.process(&mut flat_signal);
         assert_eq!(flat_signal, original, "0dB EQ must be bit-identical");
+    }
+
+    #[test]
+    fn test_all_upstream_dsp_filters_recover_from_nan() {
+        let mut eq = StudioEqualizer::new();
+        eq.update_if_changed(60, 40, -30);
+        let mut xfeed = BauerCrossfeedFilter::new();
+        let mut night = NightModeCompressor::new();
+        let mut mic = MicRumbleAndNoiseGate::new();
+
+        let mut bad = [f32::NAN, f32::INFINITY, 0.25, -0.25];
+        eq.process(&mut bad);
+        xfeed.process_in_place(&mut bad);
+        night.process_in_place(&mut bad);
+        mic.process_in_place(&mut bad);
+        assert!(bad.iter().all(|s| s.is_finite()));
+
+        let mut good = [0.25f32, -0.25, 0.25, -0.25];
+        eq.process(&mut good);
+        xfeed.process_in_place(&mut good);
+        night.process_in_place(&mut good);
+        mic.process_in_place(&mut good);
+        assert!(good.iter().all(|s| s.is_finite()));
+        assert!(
+            good[2].abs() > 0.01,
+            "DSP chain stayed permanently muted after NaN"
+        );
+    }
+
+    #[test]
+    fn test_qr_uri_percent_encodes_special_pins_and_brackets_ipv6() {
+        assert_eq!(
+            build_qr_connect_uri("192.168.1.50", 65530, Some("a&b#c+1 2")),
+            "asultra://connect?host=192.168.1.50:65530&pin=a%26b%23c%2B1%202"
+        );
+        assert_eq!(
+            build_qr_connect_uri("fe80::1", 65530, Some("4829")),
+            "asultra://connect?host=[fe80::1]:65530&pin=4829"
+        );
     }
 }
