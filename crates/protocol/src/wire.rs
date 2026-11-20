@@ -70,7 +70,7 @@ pub struct ClientFeedbackPacket {
     pub hardware_delay_ms: u16,
     /// Strictly monotonic per-client sequence number preventing command replay.
     pub feedback_seq: u32,
-    /// 128-bit Poly1305 AEAD tag (zeros when unencrypted).
+    /// 128-bit truncated HMAC-SHA256 tag (zeros when unencrypted).
     pub auth_tag: [u8; AEAD_TAG_LEN],
 }
 
@@ -116,8 +116,8 @@ impl ClientFeedbackPacket {
         })
     }
 
-    /// Decode and verify the Poly1305 tag. The sequence is bound into the
-    /// nonce, so a captured packet cannot be replayed with a different seq.
+    /// Decode and verify the 128-bit HMAC-SHA256 tag. The sequence is bound
+    /// into the MAC input so a captured packet cannot be replayed with a new seq.
     pub fn decode_verified(buf: &[u8], key: Option<&SessionKey>) -> Option<Self> {
         let packet = Self::decode(buf)?;
         if let Some(key) = key {

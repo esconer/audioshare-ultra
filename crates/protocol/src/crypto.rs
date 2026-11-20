@@ -41,11 +41,7 @@ impl PartialEq for SessionKey {
     fn eq(&self, other: &Self) -> bool {
         // Constant-time comparison of the derived key only: the random nonce
         // salt differs per instance even for the same PIN.
-        let mut diff = 0u8;
-        for (a, b) in self.key.iter().zip(other.key.iter()) {
-            diff |= a ^ b;
-        }
-        diff == 0
+        bool::from(self.key.ct_eq(&other.key))
     }
 }
 impl Eq for SessionKey {}

@@ -436,8 +436,6 @@ impl BurstDecouplerRing {
             let fade_samples = fade_frames * 2;
             let fade_start = safe_avail - fade_samples;
             let buf_ptr = self.buf.get() as *const f32;
-            let mut last_l = 0.0f32;
-            let mut last_r = 0.0f32;
             for i in 0..safe_avail {
                 let mut s = unsafe { *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK) };
                 if i >= fade_start {
@@ -453,22 +451,10 @@ impl BurstDecouplerRing {
                     s *= gain;
                 }
                 out[i] = s;
-                if i & 1 == 0 {
-                    last_l = s;
-                } else {
-                    last_r = s;
-                }
             }
             self.read_idx.0
                 .store(r.wrapping_add(safe_avail), Ordering::Release);
-            for i in (safe_avail..out.len()).step_by(2) {
-                last_l *= 0.985;
-                last_r *= 0.985;
-                out[i] = last_l;
-                if i + 1 < out.len() {
-                    out[i + 1] = last_r;
-                }
-            }
+            out[safe_avail..].fill(0.0);
             true
         } else {
             // Inject -90 dBFS TPDF comfort dither so Bluetooth earbuds never sleep during DTX silence
@@ -547,10 +533,11 @@ impl TruePeakLimiter {
             // knee starting at UNITY_THRESHOLD = 0.92: <= 0.92 stays bit-exact,
             // 0.92 -> 0.955 is monotonic with slope 1.0 at the knee start
             // (zero step), and the ceiling is still honoured.
-            let unity_gain = (self.current_gain_linear - 1.0).abs() <= 1e-4
-                && (self.target_gain_linear - 1.0).abs() <= 1e-4;
+            // Blend the knee smoothly over 1.0..=1.05 (+0.42 dB) so sweeping
+            // the preamp slider through 0 dB produces no gain step.
             const UNITY_THRESHOLD: f32 = 0.92;
-            let knee_start = if unity_gain { UNITY_THRESHOLD } else { THRESHOLD };
+            let boost_blend = ((self.current_gain_linear - 1.0) / 0.05).clamp(0.0, 1.0);
+            let knee_start = UNITY_THRESHOLD - (UNITY_THRESHOLD - THRESHOLD) * boost_blend;
             let det = self.envelope.max(peak);
             if det > knee_start {
                 let over = det - knee_start;
