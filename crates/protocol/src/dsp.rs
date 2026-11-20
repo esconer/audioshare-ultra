@@ -177,23 +177,19 @@ impl ClockDriftResampler {
             // +/-500 ppm steady-state integral authority for real crystals.
             if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
                 let step = err.clamp(-1.0, 1.0) * 0.6;
-                self.integral_err = (self.integral_err + step).clamp(-100.0, 100.0);
+                self.integral_err = (self.integral_err + step).clamp(-80.0, 80.0);
             }
 
-            // Dual-slope catch-up: +/- 500 ppm for normal drift, up to +2500 ppm after a Wi-Fi burst spike
-            let (kp, max_clamp) = if err > 2.0 {
-                (0.00025, 0.0025)
-            } else {
-                (0.00012, 0.0005)
-            };
-            let corr = (kp * err + 0.000005 * self.integral_err).clamp(-0.0005, max_clamp);
+            // Symmetric +/- 400 ppm crystal-drift authority with smooth slewing.
+            // Removes the +2500 ppm spike jump that caused audible pitch warble
+            // after Wi-Fi bursts; large backlogs are trimmed with a declick splice.
+            const KP: f64 = 0.00012;
+            const MAX_DRIFT_RATIO: f64 = 0.0004;
+            let corr = (KP * err + 0.000005 * self.integral_err)
+                .clamp(-MAX_DRIFT_RATIO, MAX_DRIFT_RATIO);
             let target_ratio = self.base_ratio * (1.0 + corr);
 
-            if err > 2.0 {
-                self.ratio = target_ratio;
-            } else {
-                self.ratio = 0.3 * self.ratio + 0.7 * target_ratio;
-            }
+            self.ratio = 0.3 * self.ratio + 0.7 * target_ratio;
             self.err_sum_window = 0.0;
             self.window_ticks = 0;
         }
@@ -406,7 +402,7 @@ impl ClockDriftResampler {
 }
 
 /// 2. Wait-Free SPSC Sample FIFO (Decouples 120-frame network quantum from Android SoC getFramesPerBurst())
-const FIFO_CAPACITY: usize = 32768; // Power of 2 (16384 stereo frames = 341 ms @ 48 kHz for full BT Group Sync)
+const FIFO_CAPACITY: usize = 65536; // Power of 2 (32768 stereo frames = 682 ms @ 48 kHz / 341 ms @ 96 kHz)
 const FIFO_MASK: usize = FIFO_CAPACITY - 1;
 
 #[repr(align(64))]
@@ -415,17 +411,22 @@ struct CachePadded<T>(T);
 pub struct BurstDecouplerRing {
     write_idx: CachePadded<AtomicUsize>,
     read_idx: CachePadded<AtomicUsize>,
-    buf: UnsafeCell<[f32; FIFO_CAPACITY]>,
+    // Heap-boxed to avoid a 256 KB stack frame during `new()` on Android threads.
+    buf: Box<[UnsafeCell<f32>]>,
 }
 
 unsafe impl Sync for BurstDecouplerRing {}
 
 impl BurstDecouplerRing {
     pub fn new() -> Self {
+        let buf = (0..FIFO_CAPACITY)
+            .map(|_| UnsafeCell::new(0.0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             write_idx: CachePadded(AtomicUsize::new(0)),
-            read_idx: CachePadded(AtomicUsize::new(0)),
-            buf: UnsafeCell::new([0.0; FIFO_CAPACITY]),
+            read_idx: CachePadded<AtomicUsize::new(0)),
+            buf,
         }
     }
 
@@ -458,7 +459,7 @@ impl BurstDecouplerRing {
         // the buffer, then the wrapped remainder at the start. This replaces a
         // per-element RMW loop with two memcpy-class operations while keeping
         // the Release store below as the single publication point.
-        let buf_ptr = self.buf.get() as *mut f32;
+        let buf_ptr = self.buf.as_ptr() as *mut f32;
         let first_off = w & FIFO_MASK;
         let first_len = to_write.min(FIFO_CAPACITY - first_off);
         unsafe {
@@ -492,7 +493,7 @@ impl BurstDecouplerRing {
             // Mirror `push_samples`: two contiguous runs instead of a
             // per-element read loop, published by the Release store below
             // after the copy has completed.
-            let buf_ptr = self.buf.get() as *const f32;
+            let buf_ptr = self.buf.as_ptr() as *const f32;
             let first_off = r & FIFO_MASK;
             let first_len = req_even.min(FIFO_CAPACITY - first_off);
             unsafe {
@@ -527,7 +528,7 @@ impl BurstDecouplerRing {
             let fade_frames = (safe_avail / 2).min(16);
             let fade_samples = fade_frames * 2;
             let fade_start = safe_avail - fade_samples;
-            let buf_ptr = self.buf.get() as *const f32;
+            let buf_ptr = self.buf.as_ptr() as *const f32;
             for i in 0..safe_avail {
                 let mut s = unsafe { *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK) };
                 if i >= fade_start {
@@ -879,10 +880,10 @@ mod tests {
 
     #[test]
     fn test_fifo_capacity_holds_64_subframes_at_96khz() {
-        assert_eq!(FIFO_CAPACITY, 32_768);
+        assert_eq!(FIFO_CAPACITY, 65_536);
         assert!(FIFO_CAPACITY.is_power_of_two());
         let ring = BurstDecouplerRing::new();
-        assert_eq!(ring.capacity_samples(), 32_768);
+        assert_eq!(ring.capacity_samples(), 65_536);
 
         let mut resampler = ClockDriftResampler::new();
 
@@ -890,17 +891,17 @@ mod tests {
         resampler.set_output_sample_rate(48_000);
         assert_eq!(resampler.base_ratio, 1.0);
         assert_eq!(resampler.subframes_to_samples(64), 15_360);
-        assert!((resampler.samples_to_subframes(32_768) - 136.533_33).abs() < 1e-3);
+        assert!((resampler.samples_to_subframes(65_536) - 273.066_67).abs() < 1e-3);
         assert!(resampler.subframes_to_samples(64) + 240 <= ring.capacity_samples());
 
         // 96 kHz output: base_ratio 0.5, so 64 subframes are 30,720 output
-        // samples and the ring holds 68.27 subframe equivalents. 69
-        // subframes (33,120 samples) would overflow.
+        // samples and the ring holds 136.53 subframe equivalents. 137
+        // subframes (65,760 samples) would overflow.
         resampler.set_output_sample_rate(96_000);
         assert_eq!(resampler.base_ratio, 0.5);
         assert_eq!(resampler.subframes_to_samples(64), 30_720);
-        assert!((resampler.samples_to_subframes(32_768) - 68.266_67).abs() < 1e-3);
-        assert!(resampler.subframes_to_samples(69) > ring.capacity_samples());
+        assert!((resampler.samples_to_subframes(65_536) - 136.533_33).abs() < 1e-3);
+        assert!(resampler.subframes_to_samples(137) > ring.capacity_samples());
 
         // Simulate the client refill loop: push one output subframe at a
         // time until the 64-subframe watermark is reached. Every push must
@@ -1106,24 +1107,23 @@ mod tests {
     }
 
     #[test]
-    fn test_dual_slope_clock_controller_accelerates_on_spikes() {
+    fn test_clock_controller_bounds_correction_to_400ppm() {
         let mut resampler = ClockDriftResampler::new();
-        // Normal drift: err = 1.0 (<= 2.0 subframes)
+        // Normal drift: err = 1.0 subframe
         for _ in 0..200 {
             resampler.update_clock_loop(3.0, 2.0);
         }
         let normal_corr = resampler.ratio - 1.0;
-        assert!(normal_corr > 0.0 && normal_corr <= 0.0005);
+        assert!(normal_corr > 0.0 && normal_corr <= 0.0004);
 
-        // Burst spike: err = 6.0 (> 2.0 subframes)
         let mut spike_resampler = ClockDriftResampler::new();
         for _ in 0..200 {
             spike_resampler.update_clock_loop(8.0, 2.0);
         }
         let spike_corr = spike_resampler.ratio - 1.0;
         assert!(
-            spike_corr > 0.0005 && spike_corr <= 0.0025,
-            "Spike correction must accelerate up to +2500 ppm: {}",
+            spike_corr > 0.0 && spike_corr <= 0.0004 + 1e-9,
+            "Spike correction must stay within +/-400 ppm to prevent pitch warble: {}",
             spike_corr
         );
     }
