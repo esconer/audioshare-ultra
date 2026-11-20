@@ -147,7 +147,10 @@ fun PartyQrDialog(
                     .padding(vertical = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
-                if (qrBitmap != null) {
+                // Delegate-backed State properties have a custom getter, so
+                // Kotlin cannot smart-cast them; capture into a local first.
+                val bitmap = qrBitmap
+                if (bitmap != null) {
                     Box(
                         modifier = Modifier
                             .size(224.dp)
@@ -156,7 +159,7 @@ fun PartyQrDialog(
                             .padding(10.dp)
                     ) {
                         Image(
-                            bitmap = qrBitmap.asImageBitmap(),
+                            bitmap = bitmap.asImageBitmap(),
                             contentDescription = "Party Pairing QR Code",
                             modifier = Modifier.fillMaxSize()
                         )
