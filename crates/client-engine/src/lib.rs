@@ -6,6 +6,9 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::fd::AsRawFd;
+
 use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{
@@ -407,6 +410,19 @@ fn needs_stream_resync(seq_delta: i16) -> bool {
     seq_delta > STREAM_RESYNC_AHEAD_SUBFRAMES || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
 }
 
+/// Maximum forward re-sync jump, bounded by the sequencer ring.
+///
+/// A decoupler holding a long group-sync cushion used to push the adaptive
+/// allowance past `RING_SLOTS`, so a resync jumped to a sequence that aliases
+/// an existing slot and stale audio resurfaced. Keep at least four slots of
+/// separation from the ring wrap.
+#[inline]
+fn resync_ahead_subframes(fifo_now_subframes: i16) -> i16 {
+    STREAM_RESYNC_AHEAD_SUBFRAMES
+        .max(fifo_now_subframes.saturating_add(16))
+        .min((RING_SLOTS as i16) - 4)
+}
+
 /// Decode a `CodecMode::RawPcm16` payload.
 ///
 /// The lossless encoder's raw fallback is a tagged 481-byte frame
@@ -748,7 +764,8 @@ fn read_exact_interruptible<T: Read>(
             Ok(n) => filled += n,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 if Instant::now() >= deadline {
                     return Err(std::io::Error::new(
@@ -960,7 +977,12 @@ impl Drop for AdbTcpClientBridge {
 pub struct ClientEngine {
     running: Arc<AtomicBool>,
     pub telemetry: Arc<ClientTelemetry>,
+    /// Kept only for the rare key swap. The real-time loop caches the key and
+    /// reloads it lazily when `key_version` changes, so no mutex is taken on
+    /// the per-packet hot path.
     session_key: Arc<Mutex<Option<SessionKey>>>,
+    /// Bumped on every key swap so the RX loop knows to refresh its cache.
+    key_version: Arc<AtomicU64>,
     adb_bridge: Option<AdbTcpClientBridge>,
     rx_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1015,6 +1037,7 @@ impl ClientEngine {
         });
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
+        let key_version = Arc::new(AtomicU64::new(0));
 
         // Ephemeral source port avoids hijacking HostEngine on Windows
         // (SO_REUSEADDR let the client bind 65530 while the host was already
@@ -1045,7 +1068,7 @@ impl ClientEngine {
         // packet on its first pass (last_gaming_lock_state = None), so a bare
         // HELLO would be rejected by the host and bump `rejected_handshakes`
         // on every legitimate encrypted connection.
-        if session_key.lock().unwrap().is_none() {
+        if session_key.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
             let _ = socket.send_to(CONTROL_MAGIC_HELLO, effective_config.server_addr);
         }
 
@@ -1053,6 +1076,7 @@ impl ClientEngine {
         let running_clone = Arc::clone(&running);
         let telemetry_clone = Arc::clone(&telemetry);
         let key_clone = Arc::clone(&session_key);
+        let key_version_clone = Arc::clone(&key_version);
 
         let rx_handle = std::thread::Builder::new()
             .name("as-ultra-client-rx".into())
@@ -1066,7 +1090,12 @@ impl ClientEngine {
                 }
 
                 #[cfg(not(target_os = "android"))]
-                let mut _audio_stream: Option<(cpal::Stream, u32, Arc<AtomicBool>)> = None;
+                let mut _audio_stream: Option<(
+                    cpal::Stream,
+                    u32,
+                    Arc<AtomicBool>,
+                    Arc<AtomicUsize>,
+                )> = None;
 
                 #[cfg(target_os = "android")]
                 let mut _android_aaudio: Option<android_aaudio::AAudioOutputGuard> = None;
@@ -1083,6 +1112,7 @@ impl ClientEngine {
                     running_clone,
                     telemetry_clone,
                     key_clone,
+                    key_version_clone,
                 );
             })
             .map_err(|e| format!("Failed to spawn client RX thread: {}", e))?;
@@ -1091,14 +1121,25 @@ impl ClientEngine {
             running,
             telemetry,
             session_key,
+            key_version,
             adb_bridge,
             rx_handle: Some(rx_handle),
         })
     }
 
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
-        let mut guard = self.session_key.lock().unwrap();
-        *guard = pin.map(SessionKey::from_pin);
+        self.set_session_key(pin.map(SessionKey::from_pin));
+    }
+
+    /// Swap the AEAD key used for feedback and audio without a lock on the
+    /// real-time path. A pre-derived key (e.g. from a QR token) is passed here
+    /// so both engines converge on the exact same 32-byte key + salt.
+    pub fn set_session_key(&self, key: Option<SessionKey>) {
+        *self
+            .session_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = key;
+        self.key_version.fetch_add(1, Ordering::Release);
     }
 
     pub fn stop(&mut self) {
@@ -1154,7 +1195,7 @@ impl ClientEngine {
     #[cfg(not(target_os = "android"))]
     fn spawn_desktop_output_sink(
         burst_fifo: Arc<BurstDecouplerRing>,
-    ) -> Result<(cpal::Stream, u32, Arc<AtomicBool>), String> {
+    ) -> Result<(cpal::Stream, u32, Arc<AtomicBool>, Arc<AtomicUsize>), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -1166,6 +1207,10 @@ impl ClientEngine {
         let dev_rate = default_cfg.sample_rate().0.max(8_000);
         let dev_channels = default_cfg.channels().max(1);
         let stream_error = Arc::new(AtomicBool::new(false));
+        // The real observed callback period replaces the hardcoded 480-sample
+        // fallback used to size the decoupler watermark. Some devices deliver
+        // 1024+ frames per callback; assuming 480 starved the refill loop.
+        let observed_frames = Arc::new(AtomicUsize::new(0));
 
         // Prefer a 5 ms fixed callback buffer to cut desktop output latency.
         // Many ALSA/PulseAudio backends reject an unsupported period size, so
@@ -1189,6 +1234,7 @@ impl ClientEngine {
         let build_for_cfg = |cfg: &cpal::StreamConfig| -> Result<(cpal::Stream, u32), cpal::BuildStreamError> {
             let fifo = Arc::clone(&burst_fifo);
             let err_flag = Arc::clone(&stream_error);
+            let frames_seen = Arc::clone(&observed_frames);
             let ch = cfg.channels.max(1) as usize;
             let rate = cfg.sample_rate.0;
             let mut dither_rng = 0x9E37_79B9u32;
@@ -1201,6 +1247,7 @@ impl ClientEngine {
                     cfg,
                     move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
+                        frames_seen.store(frames, Ordering::Relaxed);
                         Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
                         });
@@ -1212,6 +1259,7 @@ impl ClientEngine {
                     cfg,
                     move |out: &mut [u16], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
+                        frames_seen.store(frames, Ordering::Relaxed);
                         Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = ((s.clamp(-1.0, 1.0) * 32768.0 + 32768.0).round()).clamp(0.0, 65535.0) as u16;
                         });
@@ -1223,6 +1271,7 @@ impl ClientEngine {
                     cfg,
                     move |out: &mut [i32], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
+                        frames_seen.store(frames, Ordering::Relaxed);
                         Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = (f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32;
                         });
@@ -1234,6 +1283,7 @@ impl ClientEngine {
                     cfg,
                     move |out: &mut [f64], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
+                        frames_seen.store(frames, Ordering::Relaxed);
                         Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = f64::from(s.clamp(-1.0, 1.0));
                         });
@@ -1244,10 +1294,11 @@ impl ClientEngine {
                 _ => device.build_output_stream(
                     cfg,
                     move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        let frames = out.len() / ch;
+                        frames_seen.store(frames, Ordering::Relaxed);
                         if ch == 2 {
                             fifo.pop_exact_or_dither(out, &mut dither_rng);
                         } else {
-                            let frames = out.len() / ch;
                             Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                                 out[idx] = s;
                             });
@@ -1260,6 +1311,9 @@ impl ClientEngine {
             Ok((stream, rate))
         };
 
+        // Hoist the frame counter out of `build_for_cfg` so every attempt
+        // publishes to the same atomic the RX loop reads.
+
         let (stream, actual_rate) = build_for_cfg(&low_lat_cfg)
             .or_else(|_| build_for_cfg(&default_stream_cfg))
             .or_else(|_| build_for_cfg(&native_stream_cfg))
@@ -1268,7 +1322,7 @@ impl ClientEngine {
         stream
             .play()
             .map_err(|e| format!("Failed to start audio output: {}", e))?;
-        Ok((stream, actual_rate, stream_error))
+        Ok((stream, actual_rate, stream_error, observed_frames))
     }
 
     fn realtime_rx_and_dsp_loop(
@@ -1276,11 +1330,18 @@ impl ClientEngine {
         config: ClientConfig,
         effective_server_addr: SocketAddr,
         burst_fifo: Arc<BurstDecouplerRing>,
-        #[cfg(not(target_os = "android"))] desktop_stream: &mut Option<(cpal::Stream, u32, Arc<AtomicBool>)>,
+        #[cfg(not(target_os = "android"))]
+        desktop_stream: &mut Option<(
+            cpal::Stream,
+            u32,
+            Arc<AtomicBool>,
+            Arc<AtomicUsize>,
+        )>,
         #[cfg(target_os = "android")] aaudio_guard: &mut Option<android_aaudio::AAudioOutputGuard>,
         running: Arc<AtomicBool>,
         telemetry: Arc<ClientTelemetry>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
+        key_version: Arc<AtomicU64>,
     ) {
         let mut sequencer = ZeroJitterSequencer::new();
         let mut resampler = ClockDriftResampler::new();
@@ -1360,7 +1421,12 @@ impl ClientEngine {
         // never truncate the tail of a subframe.
         let mut resampled_out = vec![0.0f32; 4096];
         let start_instant = Instant::now();
-        let _ = socket.set_nonblocking(false);
+        // Keep the RX socket permanently non-blocking. Toggling O_NONBLOCK
+        // per packet required an fcntl pair on every pass and, more importantly,
+        // made the first `recv_from` of a pass block for up to 1 ms before the
+        // decoupler could be refilled. A short `poll` below provides the wait
+        // when the pipeline is idle instead.
+        let _ = socket.set_nonblocking(true);
         let _ = socket.set_read_timeout(Some(Duration::from_micros(1000)));
         // Send the current gaming-lock state on the first pass, then refresh it
         // every two seconds so a restarted host converges even if the client
@@ -1368,12 +1434,28 @@ impl ClientEngine {
         let mut last_gaming_lock_state: Option<bool> = None;
         let mut last_gaming_feedback = Instant::now();
 
+        // Cache the AEAD key outside the loop. `key_version` is the only
+        // hot-path read; the mutex is touched solely when a key actually
+        // changed (PIN/QR swap), which keeps the per-packet path lock-free.
+        let mut active_key = *session_key
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cached_key_version = key_version.load(Ordering::Acquire);
+
         while running.load(Ordering::Relaxed) {
+            let current_key_version = key_version.load(Ordering::Acquire);
+            if current_key_version != cached_key_version {
+                cached_key_version = current_key_version;
+                active_key = *session_key
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+
             #[cfg(not(target_os = "android"))]
             {
                 let failed = desktop_stream
                     .as_ref()
-                    .map(|(_, _, err)| err.load(Ordering::Acquire))
+                    .map(|(_, _, err, _)| err.load(Ordering::Acquire))
                     .unwrap_or(false);
                 let retry_due = desktop_stream.is_none()
                     && last_desktop_open_attempt
@@ -1382,11 +1464,11 @@ impl ClientEngine {
                 if failed || retry_due {
                     last_desktop_open_attempt = Some(Instant::now());
                     *desktop_stream = None;
-                    if let Ok((stream, rate, err)) =
+                    if let Ok((stream, rate, err, observed_frames)) =
                         Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo))
                     {
                         resampler.set_output_sample_rate(rate);
-                        *desktop_stream = Some((stream, rate, err));
+                        *desktop_stream = Some((stream, rate, err, observed_frames));
                     }
                 }
             }
@@ -1404,13 +1486,24 @@ impl ClientEngine {
                     && last_aaudio_open_attempt
                         .map(|attempt| attempt.elapsed() >= Duration::from_millis(500))
                         .unwrap_or(true);
-                let reopen = aaudio_guard
+                let hard_reason = aaudio_guard
                     .as_ref()
                     .map(|g| g.needs_reopen())
                     .unwrap_or(false)
                     || want_dolby != last_dolby_state
-                    || bt_active != last_bt_active
                     || retry_due;
+                // A BT route handoff flips `downstream_bt_delay_ms` twice in
+                // quick succession (legacy A2DP estimate arrives, then the
+                // hardware timestamp replaces it). Reopening on both flips
+                // raced two callback threads on the SPSC ring. Debounce only
+                // the route-only reason; a disconnect or user toggle is still
+                // handled immediately.
+                let route_change = bt_active != last_bt_active;
+                let reopen = hard_reason
+                    || (route_change
+                        && last_aaudio_open_attempt
+                            .map(|attempt| attempt.elapsed() >= Duration::from_millis(300))
+                            .unwrap_or(true));
                 if reopen {
                     last_dolby_state = want_dolby;
                     last_bt_active = bt_active;
@@ -1451,7 +1544,8 @@ impl ClientEngine {
                 }
             }
 
-            let active_key = *session_key.lock().unwrap();
+            // `active_key` is cached at the top of the loop and only reloaded
+            // when `key_version` changed; never take the mutex here.
 
             // Tell the host whenever 5 ms hard-lock changes, and refresh the
             // state every two seconds so a host restart or client reconnect
@@ -1557,12 +1651,10 @@ impl ClientEngine {
                 let _ = socket.send_to(&fb_bytes, config.server_addr);
             }
 
-            // A blocking recv_from (up to 1 ms, often longer under Windows or
-            // Android power-save) can starve the decoupler even when the
-            // sequencer already holds the next playable subframe. Poll
-            // non-blocking in that case so refill runs before waiting on the
-            // network. Also poll non-blocking whenever the decoupler is at or
-            // below the emergency PLC watermark to avoid sleeping 1-2 ms.
+            // The socket is permanently non-blocking. When the sequencer
+            // already holds the next playable subframe (or the decoupler is at
+            // the emergency PLC watermark), skip the 1 ms wait below so the
+            // refill loop runs before the next network poll.
             let fifo_avail_now = burst_fifo.available_samples();
             let opus_ready_now =
                 opus_ring[(next_play_seq as usize) & (RING_SLOTS - 1)].seq == Some(next_play_seq);
@@ -1581,8 +1673,29 @@ impl ClientEngine {
                 && prebuffer_ready
                 && fifo_avail_now < last_fifo_watermark
                 && can_refill_now;
-            if refill_poll {
-                let _ = socket.set_nonblocking(true);
+
+            // When refill does not need the CPU, wait at most 1 ms for the
+            // socket to become readable instead of spinning on non-blocking
+            // recv. Reuse libc's poll binding (already used by host-engine)
+            // so no new dependency is needed. Platforms without libc here
+            // fall back to a 1 ms sleep; the socket stays non-blocking either
+            // way, so a spurious wake never stalls the decoupler.
+            if !refill_poll {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                {
+                    let mut pfd = libc::pollfd {
+                        fd: socket.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    unsafe {
+                        let _ = libc::poll(&mut pfd, 1, 1);
+                    }
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
 
             let mut packets_drained = 0u8;
@@ -1600,9 +1713,6 @@ impl ClientEngine {
                 // every tunneled packet.
                 if src_addr != effective_server_addr {
                     continue;
-                }
-                if packets_drained == 0 {
-                    let _ = socket.set_nonblocking(true);
                 }
                 packets_drained = packets_drained.saturating_add(1);
 
@@ -1734,8 +1844,7 @@ impl ClientEngine {
                         // restart (which used to drop 120 ms of audio).
                         let fifo_now_subframes =
                             resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
-                        let resync_ahead =
-                            STREAM_RESYNC_AHEAD_SUBFRAMES.max(fifo_now_subframes + 16);
+                        let resync_ahead = resync_ahead_subframes(fifo_now_subframes);
                         if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
                             || seq_delta > resync_ahead
                             || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
@@ -1797,12 +1906,16 @@ impl ClientEngine {
                             }
 
                             let s = base_seq.wrapping_add(sub_idx);
+                            let seq_delta_to_playhead = s.wrapping_sub(next_play_seq) as i16;
                             // Skip redundant work before touching any decoder.
                             // Party-mode broadcast and USB+Wi-Fi active-active
                             // delivery send the same subframe twice, and a
                             // packet that arrives after its playhead has
-                            // passed cannot be heard at all.
-                            if (s.wrapping_sub(next_play_seq) as i16) < 0
+                            // passed cannot be heard at all. Slots at or past
+                            // RING_SLOTS ahead would alias a live slot in the
+                            // sequencer/Opus ring and overwrite its payload.
+                            if seq_delta_to_playhead < 0
+                                || seq_delta_to_playhead >= RING_SLOTS as i16
                                 || sequencer.has_primary(s)
                             {
                                 cursor += sub_len;
@@ -1810,6 +1923,16 @@ impl ClientEngine {
                             }
 
                             let payload = &prim[cursor..cursor + sub_len];
+                            // A corrupt or truncated Opus frame can carry a
+                            // length beyond the decoder's fixed scratch buffer.
+                            // Drop it rather than slicing past the ring slot or
+                            // feeding an oversized payload to the CELT decoder.
+                            if payload.first() == Some(&TAG_OPUS_RLD)
+                                && sub_len > MAX_OPUS_SUBFRAME_BYTES
+                            {
+                                cursor += sub_len;
+                                continue;
+                            }
                             // Decode-at-pop for Opus: buffer the raw bytes so
                             // reordered Wi-Fi packets decode losslessly in
                             // strict stream order at the playhead. The stateful
@@ -1889,10 +2012,6 @@ impl ClientEngine {
                     break;
                 }
             }
-            if packets_drained > 0 || refill_poll {
-                let _ = socket.set_nonblocking(false);
-            }
-
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
             let base_target = if gaming_lock {
@@ -1962,8 +2081,20 @@ impl ClientEngine {
                             &mut pad_chunk[..step],
                             &mut dither_rng,
                         );
-                        burst_fifo.push_samples(&pad_chunk[..step]);
-                        remaining -= step;
+                        let pushed = burst_fifo.push_samples(&pad_chunk[..step]);
+                        remaining = remaining.saturating_sub(pushed);
+                        if pushed < step {
+                            // Ring filled before the whole cushion was
+                            // injected. Stop rather than looping forever on a
+                            // chunk that can no longer be accepted.
+                            break;
+                        }
+                    }
+                    if remaining < pad_samples {
+                        // Dither padding is not real audio; fade the first real
+                        // subframe in so the sequencer does not click at the
+                        // padding/audio boundary.
+                        sequencer.arm_fade_in();
                     }
                 }
 
@@ -1989,7 +2120,17 @@ impl ClientEngine {
                 .filter(|&s| s > 0)
                 .unwrap_or(480);
             #[cfg(not(target_os = "android"))]
-            let hal_burst_samples = 480usize;
+            let hal_burst_samples = desktop_stream
+                .as_ref()
+                .and_then(|(_, _, _, observed)| {
+                    let frames = observed.load(Ordering::Relaxed);
+                    if frames > 0 {
+                        Some(frames * 2)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(480usize);
             let one_subframe_samples = resampler.subframes_to_samples(1);
             let fifo_watermark = resampler
                 .subframes_to_samples(target_fifo_subframes)
@@ -2247,7 +2388,14 @@ impl ClientEngine {
                 // timeout rate injected fake error spikes; the windowed-mean
                 // controller assumes evenly spaced observations.
                 if last_clock_sample.elapsed() >= Duration::from_micros(2_500) {
-                    last_clock_sample = Instant::now();
+                    // Advance the deadline instead of resetting to "now" so a
+                    // few late passes do not accumulate into a slower sample
+                    // cadence. After a long stall (suspend/route change) the
+                    // accumulated debt is meaningless, so re-anchor once.
+                    last_clock_sample += Duration::from_micros(2_500);
+                    if last_clock_sample.elapsed() > Duration::from_millis(25) {
+                        last_clock_sample = Instant::now();
+                    }
                     // The FIFO is refilled to `fifo_watermark` and drained in
                     // whole HAL bursts, so its time-averaged depth sits half a
                     // burst below the watermark. Use that as the setpoint to
@@ -3416,6 +3564,69 @@ mod tests {
         assert!(!needs_stream_resync(delta));
     }
 
+    /// A length prefix split by a timeout (or EINTR) must resume at the byte
+    /// already consumed, not restart at offset 0 and corrupt the frame length.
+    #[test]
+    fn test_adb_bridge_handles_split_length_prefix_across_timeout() {
+        enum Step {
+            Data(&'static [u8]),
+            Err(std::io::ErrorKind),
+        }
+        struct ScriptedReader {
+            steps: std::vec::IntoIter<Step>,
+        }
+        impl Read for ScriptedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.steps.next() {
+                    Some(Step::Data(data)) => {
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok(n)
+                    }
+                    Some(Step::Err(kind)) => Err(std::io::Error::new(kind, "simulated")),
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let mut reader = ScriptedReader {
+            steps: vec![
+                Step::Data(&[0x00]),
+                Step::Err(std::io::ErrorKind::TimedOut),
+                Step::Err(std::io::ErrorKind::Interrupted),
+                Step::Data(&[0x05]),
+                Step::Err(std::io::ErrorKind::WouldBlock),
+                Step::Data(&[0x01, 0x02]),
+                Step::Data(&[0x03, 0x04, 0x05]),
+            ]
+            .into_iter(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut len_buf = [0u8; 2];
+        read_exact_interruptible(&mut reader, &mut len_buf, deadline).unwrap();
+        assert_eq!(u16::from_be_bytes(len_buf), 5);
+
+        let mut body = [0u8; 5];
+        read_exact_interruptible(&mut reader, &mut body, deadline).unwrap();
+        assert_eq!(body, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_resync_ahead_never_exceeds_ring_slots() {
+        let hard_cap = (RING_SLOTS as i16) - 4;
+        assert_eq!(resync_ahead_subframes(0), STREAM_RESYNC_AHEAD_SUBFRAMES);
+        assert_eq!(resync_ahead_subframes(16), STREAM_RESYNC_AHEAD_SUBFRAMES);
+        assert_eq!(resync_ahead_subframes(40), 56);
+        assert_eq!(resync_ahead_subframes(200), hard_cap);
+        assert_eq!(resync_ahead_subframes(i16::MAX), hard_cap);
+        for fifo in 0i16..=i16::MAX {
+            assert!(
+                resync_ahead_subframes(fifo) <= hard_cap,
+                "fifo={fifo} produced an aliasing resync jump"
+            );
+        }
+    }
+
     #[test]
     fn test_raw_pcm16_accepts_tagged_and_untagged_frames() {
         let mut raw = [0u8; SUBFRAME_STEREO_SAMPLES * 2];
@@ -4041,6 +4252,7 @@ pub mod android_aaudio {
         fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_getFormat(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getBufferCapacityInFrames(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
         fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
         fn AAudioStream_getTimestamp(
@@ -4271,11 +4483,19 @@ pub mod android_aaudio {
                 // A2DP bursts are already 10-20 ms. Use one burst there and
                 // keep the 3x speaker/USB cushion, otherwise the old code
                 // stacked another 30-60 ms of AAudio buffer on Bluetooth.
+                // Use the capacity the HAL actually granted, not just the
+                // requested one: a device that grants less than `capacity_frames`
+                // cannot honour the larger buffer size and rejects it.
                 let raw_burst = AAudioStream_getFramesPerBurst(stream);
-                if let Some(target_frames) = aaudio_buffer_frames_for_burst(
-                    raw_burst,
-                    capacity_frames,
-                ) {
+                let granted_cap = AAudioStream_getBufferCapacityInFrames(stream);
+                let cap_for_burst = if granted_cap > 0 {
+                    granted_cap
+                } else {
+                    capacity_frames
+                };
+                if let Some(target_frames) =
+                    aaudio_buffer_frames_for_burst(raw_burst, cap_for_burst)
+                {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
 
@@ -4316,6 +4536,11 @@ pub mod android_aaudio {
         needs_resample: bool,
         /// Accessed exclusively on the single AAudio input callback thread.
         resampler: core::cell::UnsafeCell<ClockDriftResampler>,
+        /// Mono->stereo/resample scratch, moved off the callback stack. An
+        /// RT audio callback must not reserve 16 KB of stack per invocation;
+        /// keeping it in the heap-allocated context also makes the buffer
+        /// lifetime explicit for AAudio's callback thread.
+        scratch: core::cell::UnsafeCell<[f32; 4096]>,
     }
 
     extern "C" fn aaudio_input_callback(
@@ -4333,13 +4558,14 @@ pub mod android_aaudio {
             let mono = core::slice::from_raw_parts(audio_data as *const f32, frames);
             // Expand mono to interleaved stereo and resample when the granted
             // rate is not 48 kHz (BT HFP 16 kHz / A2DP 44.1 kHz mic paths).
-            let mut scratch = [0.0f32; 4096];
+            // The scratch lives in the heap-allocated context, not on this
+            // real-time callback's stack.
             audioshare_protocol::dsp::push_mono_mic_chunk(
                 &ctx.fifo,
                 mono,
                 &mut *ctx.resampler.get(),
                 ctx.needs_resample,
-                &mut scratch,
+                &mut *ctx.scratch.get(),
             );
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
@@ -4393,6 +4619,7 @@ pub mod android_aaudio {
                     disconnected: AtomicBool::new(false),
                     needs_resample: false,
                     resampler: core::cell::UnsafeCell::new(ClockDriftResampler::new()),
+                    scratch: core::cell::UnsafeCell::new([0.0f32; 4096]),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
 
@@ -4451,10 +4678,23 @@ pub mod android_aaudio {
                         .set_sample_rates(granted_rate as u32, SAMPLE_RATE);
                 }
 
-                // Use 3 * hardware burst (minimum 256 frames = ~5.3ms) to prevent HAL DMA XRuns
+                // Speaker/USB mics keep the verified 3x burst cushion, but a
+                // BT HFP mic can be granted a 480+ frame burst already; tripling
+                // that added 20-40 ms of capture latency. Size from the granted
+                // capacity when available and fall back to the old formula.
                 let burst = AAudioStream_getFramesPerBurst(stream);
                 if burst > 0 {
-                    AAudioStream_setBufferSizeInFrames(stream, (burst * 3).max(256));
+                    let granted_cap = AAudioStream_getBufferCapacityInFrames(stream);
+                    let cap_for_burst = if granted_cap > 0 {
+                        granted_cap
+                    } else {
+                        burst.saturating_mul(3).max(256)
+                    };
+                    if let Some(target_frames) =
+                        aaudio_buffer_frames_for_burst(burst, cap_for_burst)
+                    {
+                        AAudioStream_setBufferSizeInFrames(stream, target_frames);
+                    }
                 }
 
                 if AAudioStream_requestStart(stream) != 0 {
