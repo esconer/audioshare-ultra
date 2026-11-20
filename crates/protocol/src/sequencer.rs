@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
-pub const RING_SLOTS: usize = 128; // 128 * 2.5ms = 320ms capacity for Wired + Bluetooth Group Sync!
+pub const RING_SLOTS: usize = 256; // 256 * 2.5ms = 640ms capacity (absorbs stock-OS Wi-Fi scan bursts)
 const RING_MASK: usize = RING_SLOTS - 1;
 
 pub const STATUS_EMPTY: u32 = 0;
@@ -363,8 +363,16 @@ impl ZeroJitterSequencer {
         // later frames hold a steady 0.92.
         let (start_attenuation, target_attenuation) = if self.consecutive_plc_count == 1 {
             (1.0f32, 0.90f32)
+        } else if self.consecutive_plc_count <= 16 {
+            (0.85f32, 0.85f32)
+        } else if self.consecutive_plc_count <= 24 {
+            // Fade smoothly to digital silence between 40 ms and 60 ms so long
+            // stock-OS Wi-Fi scan freezes never loop as metallic buzz.
+            let prev_frac = ((self.consecutive_plc_count - 17) as f32) / 8.0;
+            let next_frac = ((self.consecutive_plc_count - 16) as f32) / 8.0;
+            ((1.0 - prev_frac) * 0.85, (1.0 - next_frac) * 0.85)
         } else {
-            (0.92f32, 0.92f32)
+            (0.0f32, 0.0f32)
         };
         let pitch_lag = self.find_best_pitch_period();
         let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
@@ -651,5 +659,28 @@ mod tests {
         let mut real_silent = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         seq.finalize_external_frame(&mut real_silent, false);
         assert!(real_silent[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_wsola_plc_fades_to_silence_after_40ms() {
+        let mut seq = ZeroJitterSequencer::new();
+        for s in 0..3u16 {
+            let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let n = s as usize * SUBFRAME_FRAMES + i;
+                let v = ((n as f32) * std::f32::consts::TAU * 300.0 / 48_000.0).sin() * 0.5;
+                frame[i * 2] = v;
+                frame[i * 2 + 1] = v;
+            }
+            assert!(seq.push_primary(s, &frame));
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for miss in 3..30u16 {
+            assert_eq!(seq.pop_next(miss, &mut out), STATUS_EMPTY);
+        }
+        let tail_peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(tail_peak < 1e-6, "PLC must fade to silence after 60 ms, got {tail_peak}");
     }
 }
