@@ -2809,14 +2809,10 @@ impl HostEngine {
                     // producer on `ring` (Rust evaluates RHS first otherwise).
                     active_stream = None;
                     active_stream = if target_pid != 0 {
-                        // NOTE (B1 scope): this producer lives in
-                        // `app_routing.rs` and pushes straight into `ring`.
-                        // It cannot receive `capture_wakeup` without a
-                        // signature change in that module; until then this
-                        // path relies on `wait_bounded`'s 1500 us fallback.
                         app_routing::spawn_windows_process_loopback(
                             target_pid,
                             Arc::clone(&ring),
+                            Arc::clone(&capture_wakeup),
                             Arc::clone(&capture_heartbeat_ms),
                             Arc::clone(&capture_stream_error),
                             Arc::clone(&running),

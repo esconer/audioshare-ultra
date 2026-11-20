@@ -295,6 +295,7 @@ impl Drop for WindowsProcessLoopbackStream {
 pub fn spawn_windows_process_loopback(
     target_pid: u32,
     ring: std::sync::Arc<audioshare_protocol::dsp::BurstDecouplerRing>,
+    wakeup: std::sync::Arc<crate::CaptureWakeup>,
     heartbeat_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stream_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -494,6 +495,9 @@ pub fn spawn_windows_process_loopback(
                                 let slice = core::slice::from_raw_parts(data_ptr as *const f32, total_samples);
                                 ring.push_samples(slice);
                             }
+                            // Never block the RT capture thread; wake the TX
+                            // loop after publishing samples into the ring.
+                            wakeup.notify();
                             let _ = capture.ReleaseBuffer(frames);
                         }
                     }
