@@ -66,7 +66,6 @@ class MainActivity : ComponentActivity() {
         val wifiMgr = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
         multicastLock = wifiMgr?.createMulticastLock("AudioShareUltra::DiscoveryBroadcastLock")?.apply {
             setReferenceCounted(false)
-            if (!isHeld) acquire()
         }
 
         if (savedInstanceState == null) {
@@ -82,6 +81,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        // Acquire the multicast lock only while the UI is visible.
+        multicastLock?.let { if (!it.isHeld) it.acquire() }
         // Resume LAN discovery only while the UI is visible.
         AudioEngineService.nativeSetScannerPaused(false)
     }
@@ -89,6 +90,8 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         // Stop the background UDP scanner while the app is in the background.
         AudioEngineService.nativeSetScannerPaused(true)
+        // Release the multicast lock once the UI is no longer visible.
+        multicastLock?.let { if (it.isHeld) it.release() }
         super.onStop()
     }
 
@@ -102,18 +105,27 @@ class MainActivity : ComponentActivity() {
         // Check if launched via 1-Scan QR Code (asultra://connect?host=IP:PORT&pin=PIN)
         intent?.data?.let { uri ->
             if (uri.scheme == "asultra" && uri.host == "connect") {
-                val scannedHost = uri.getQueryParameter("host")
-                val scannedPin = uri.getQueryParameter("pin") ?: ""
-                if (!scannedHost.isNullOrBlank()) {
-                    getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
-                        .edit()
-                        .putString("last_host_addr", scannedHost)
-                        .putString("pin_code", scannedPin)
-                        .apply()
+                val scannedHost = uri.getQueryParameter("host")?.trim()
+                if (!scannedHost.isNullOrEmpty() &&
+                    scannedHost.length <= 64 &&
+                    scannedHost.matches(Regex("^[0-9a-fA-F.:\\[\\]]+$"))
+                ) {
+                    val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+                    val pinExplicitlyPresent = uri.queryParameterNames.contains("pin")
+                    val savedPin = prefs.getString("pin_code", "") ?: ""
+                    val effectivePin = if (pinExplicitlyPresent) {
+                        uri.getQueryParameter("pin") ?: ""
+                    } else {
+                        savedPin
+                    }
+
+                    val editor = prefs.edit().putString("last_host_addr", scannedHost)
+                    if (pinExplicitlyPresent) editor.putString("pin_code", effectivePin)
+                    editor.apply()
 
                     val svcIntent = Intent(this, AudioEngineService::class.java).apply {
                         putExtra("HOST_ADDR", scannedHost)
-                        putExtra("PIN", scannedPin)
+                        putExtra("PIN", effectivePin)
                     }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         startForegroundService(svcIntent)
