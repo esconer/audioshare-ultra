@@ -2114,7 +2114,7 @@ mod tests {
         let peer: SocketAddr = "192.168.1.70:40000".parse().unwrap();
         let static_targets: [SocketAddr; 0] = [];
         let mut peers = initial_party_peers(&static_targets, now);
-        let fb = |seq, auth| {
+        let mut fb = |seq, auth| {
             update_party_peer_feedback(&mut peers, peer, 120, 80, seq, auth, &static_targets, now)
         };
 
