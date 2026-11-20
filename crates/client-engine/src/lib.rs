@@ -398,8 +398,9 @@ impl LossWindow {
 }
 
 /// A packet this far ahead of the playhead means the sequence tracker was
-/// lost or the sender restarted. 48 subframes = 120 ms.
-const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 48;
+/// lost or the sender restarted. 88 subframes = 220 ms, still inside the
+/// 128-slot sequencer ring (which clamps the actual jump to 124 subframes).
+const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 88;
 
 /// A packet this far behind the playhead is outside the 35 ms maximum jitter
 /// buffer. Treat it as a new stream instead of discarding hundreds of
@@ -604,14 +605,38 @@ fn pending_hardware_delay_ms(
     Some(delay_ms)
 }
 
-/// AAudio's output ring must hold at least one HAL burst. A2DP/Bluetooth
-/// bursts are commonly 480-960 frames (10-20 ms), so the old unconditional
-/// `burst * 3` turned them into 30-60 ms of output latency. Use one burst for
-/// large bursts and keep the verified 3x cushion (minimum 256 frames) for
-/// speaker/USB bursts, where it costs only a few milliseconds.
+/// AAudio buffer size for a granted profile. The raw low-latency path uses the
+/// burst policy below; the normal mixer (`PERFORMANCE_MODE_NONE`) gets exactly
+/// two bursts so its DMA never runs single-buffered on Dolby/A2DP routes.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_buffer_frames_for_profile(burst: i32, capacity: i32, normal_mixer: bool) -> Option<i32> {
+    if normal_mixer {
+        // AAudio grants PERFORMANCE_MODE_NONE on the Dolby/shared-mixer path,
+        // where the normal mixer's HAL burst is already 20-40 ms. One burst is
+        // not enough for DMA, so give it exactly two bursts; the granted
+        // capacity still caps the result. The raw low-latency path keeps the
+        // verified burst/capacity policy below unchanged.
+        Some((burst * 2).min(capacity.max(burst)))
+    } else {
+        aaudio_buffer_frames_for_raw_burst(burst, capacity)
+    }
+}
+
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn aaudio_buffer_frames_for_burst(burst: i32, capacity: i32) -> Option<i32> {
+    aaudio_buffer_frames_for_profile(burst, capacity, false)
+}
+
+/// Raw low-latency sizing policy, kept as the `normal_mixer = false` branch of
+/// [`aaudio_buffer_frames_for_profile`]. A2DP/Bluetooth bursts are commonly
+/// 480-960 frames (10-20 ms), so the old unconditional `burst * 3` turned them
+/// into 30-60 ms of output latency. Use one burst for large bursts and keep the
+/// verified 3x cushion (minimum 256 frames) for speaker/USB bursts.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_buffer_frames_for_raw_burst(burst: i32, capacity: i32) -> Option<i32> {
     if burst <= 0 {
         None
     } else if burst >= 480 {
@@ -1508,6 +1533,11 @@ impl ClientEngine {
         // never toggles again.
         let mut last_gaming_lock_state: Option<bool> = None;
         let mut last_gaming_feedback = Instant::now();
+        // Wall-clock pacing for emergency PLC. A concealed subframe advances
+        // the playhead in DAC time, so emitting more than one per 2.5 ms slot
+        // makes the playhead race ahead of the network at CPU/socket speed.
+        // `None` means no concealment is pending (real/FEC audio or resync).
+        let mut last_plc_emit: Option<Instant> = None;
 
         // Cache the AEAD key outside the loop. `key_version` is the only
         // hot-path read; the mutex is touched solely when a key actually
@@ -1574,11 +1604,17 @@ impl ClientEngine {
                 // the route-only reason; a disconnect or user toggle is still
                 // handled immediately.
                 let route_change = bt_active != last_bt_active;
-                let reopen = hard_reason
-                    || (route_change
-                        && last_aaudio_open_attempt
-                            .map(|attempt| attempt.elapsed() >= Duration::from_millis(300))
-                            .unwrap_or(true));
+                let recent_open = last_aaudio_open_attempt
+                    .map(|attempt| attempt.elapsed() < Duration::from_millis(300))
+                    .unwrap_or(false);
+                // Consume a route flip that lands inside the 300 ms debounce
+                // window. Without this the trailing A2DP/hardware-timestamp
+                // flip kept `route_change` true and reopened anyway as soon
+                // as the timer expired, racing two callback threads.
+                if route_change && recent_open {
+                    last_bt_active = bt_active;
+                }
+                let reopen = hard_reason || (route_change && !recent_open);
                 if reopen {
                     // Edge-triggered: reopen is rare, so the one formatted log
                     // line here never touches the 2.5 ms audio hot path.
@@ -1618,6 +1654,17 @@ impl ClientEngine {
                     );
                     if let Some(guard) = aaudio_guard.as_ref() {
                         resampler.set_output_sample_rate(guard.sample_rate());
+                        // A route with a larger HAL burst can drain the
+                        // decoupler below one burst on its first callback.
+                        // Re-arm prebuffer and PLC pacing so no concealed
+                        // subframe is emitted before real audio is queued.
+                        let reopened_hal_burst_samples = (guard.frames_per_burst() as usize) * 2;
+                        if reopened_hal_burst_samples > burst_fifo.available_samples() {
+                            prebuffer_ready = false;
+                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            last_plc_emit = None;
+                            sequencer.arm_fade_in();
+                        }
                     }
                     // The previous route's measurement is no longer valid.
                     telemetry.downstream_hw_delay_ms.store(0, Ordering::Relaxed);
@@ -1763,13 +1810,17 @@ impl ClientEngine {
             // refill loop uses to decide whether it can make progress. If the
             // loop will immediately `break` (slot genuinely in flight with
             // real audio still queued), blocking is correct and spinning is not.
+            let slot_missing_now = sequencer.is_slot_missing(next_play_seq) && !opus_ready_now;
+            let plc_pace_ok = last_plc_emit
+                .map(|t| t.elapsed() >= Duration::from_micros(2_500))
+                .unwrap_or(true);
             let can_refill_now = !should_hold_missing_slot(
-                sequencer.is_slot_missing(next_play_seq) && !opus_ready_now,
+                slot_missing_now,
                 fifo_avail_now,
                 last_plc_watermark,
                 latest_rx_seq.wrapping_sub(next_play_seq) as i16,
                 in_flight_wait_subframes(last_pkt_subframe_count),
-            );
+            ) && (!slot_missing_now || plc_pace_ok);
             let refill_poll = stream_initialized
                 && prebuffer_ready
                 && fifo_avail_now < last_fifo_watermark
@@ -1798,6 +1849,19 @@ impl ClientEngine {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
+
+            // 2.4 GHz cushion ceiling. A Bluetooth route or the 10 ms / 4-subframe
+            // framing needs a deeper burst cushion than the old 14-subframe
+            // (35 ms) cap allowed; the extra headroom is what keeps a large
+            // A-MPDU burst from turning into PLC. Recomputed once per pass so
+            // every use below shares the same branch (no hot-path allocation).
+            let adaptive_ceiling = if telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0
+                || last_pkt_subframe_count >= 4
+            {
+                28.0
+            } else {
+                24.0
+            };
 
             let mut packets_drained = 0u8;
             // Only the first audio packet of a drain pass feeds the RFC 3550
@@ -1870,6 +1934,7 @@ impl ClientEngine {
                             // replay stale payloads.
                             sequencer.reset();
                             opus_decoder = None;
+                            last_plc_emit = None;
                             for slot in &mut opus_ring {
                                 slot.seq = None;
                             }
@@ -1938,8 +2003,8 @@ impl ClientEngine {
                         initial_wifi_floor =
                             wifi_floor_for_packet(bt_coex_floor, last_pkt_subframe_count);
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
-                        let proactive_floor =
-                            ((jitter_estimate_us / 2500.0) * 2.2).clamp(initial_wifi_floor, 14.0);
+                        let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.2)
+                            .clamp(initial_wifi_floor, adaptive_ceiling);
                         adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
 
                         if !stream_initialized {
@@ -1983,6 +2048,7 @@ impl ClientEngine {
                             latest_rx_seq = base_seq;
                             prebuffer_ready = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            last_plc_emit = None;
                             prev_rx_us = None;
                             opus_decoder = None;
                             for slot in &mut opus_ring {
@@ -2150,17 +2216,44 @@ impl ClientEngine {
                     }
                     Err(_) => {}
                 }
-                if packets_drained >= 16 {
+                if packets_drained >= 64 {
                     break;
                 }
             }
+            // The HAL burst must be known before the base target and the
+            // prebuffer gate are decided: a Dolby/BT burst is many subframes
+            // long, so draining it drops the decoupler far below the normal
+            // watermark. Pre-buffer that much extra depth and raise the target
+            // by the burst's excess over the two-subframe baseline instead of
+            // letting emergency PLC fill the gap at CPU speed.
+            #[cfg(target_os = "android")]
+            let hal_burst_samples = aaudio_guard
+                .as_ref()
+                .map(|g| (g.frames_per_burst() as usize) * 2)
+                .filter(|&s| s > 0)
+                .unwrap_or(480);
+            #[cfg(not(target_os = "android"))]
+            let hal_burst_samples = desktop_stream
+                .as_ref()
+                .and_then(|(_, _, _, observed)| {
+                    let frames = observed.load(Ordering::Relaxed);
+                    if frames > 0 {
+                        Some(frames * 2)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(480usize);
+            let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
+            let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
+
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
-            let base_target = if gaming_lock {
+            let base_target = (if gaming_lock {
                 gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
             } else {
                 adaptive_wifi_subframes
-            };
+            }) + large_burst_extra_sf;
             let base_fifo_subframes = fifo_target_subframes(base_target);
             let my_downstream_delay_ms = telemetry
                 .downstream_bt_delay_ms
@@ -2193,7 +2286,7 @@ impl ClientEngine {
                 last_aligned_target_subframes = target_fifo_subframes;
 
                 // Sequencer only prebuffers the base floor (4..=11 subframes = 10..=27.5 ms)
-                // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (48 subframes).
+                // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (88 subframes).
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
@@ -2255,32 +2348,17 @@ impl ClientEngine {
                 Ordering::Relaxed,
             );
             let fifo_capacity = burst_fifo.capacity_samples().saturating_sub(2);
-            #[cfg(target_os = "android")]
-            let hal_burst_samples = aaudio_guard
-                .as_ref()
-                .map(|g| (g.frames_per_burst() as usize) * 2)
-                .filter(|&s| s > 0)
-                .unwrap_or(480);
-            #[cfg(not(target_os = "android"))]
-            let hal_burst_samples = desktop_stream
-                .as_ref()
-                .and_then(|(_, _, _, observed)| {
-                    let frames = observed.load(Ordering::Relaxed);
-                    if frames > 0 {
-                        Some(frames * 2)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(480usize);
             let one_subframe_samples = resampler.subframes_to_samples(1);
             let fifo_watermark = resampler
                 .subframes_to_samples(target_fifo_subframes)
                 .max(hal_burst_samples + one_subframe_samples * 2)
                 .min(fifo_capacity);
+            // Deliberately NOT scaled by `hal_burst_samples`: tying the
+            // emergency watermark to a whole HAL burst made every callback
+            // drain dip below it, so unpaced WSOLA ran at CPU speed and the
+            // playhead raced tens of subframes ahead of the network.
             let plc_emergency_watermark = resampler
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
-                .max(hal_burst_samples)
                 .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
             last_fifo_watermark = fifo_watermark;
             last_plc_watermark = plc_emergency_watermark;
@@ -2302,8 +2380,19 @@ impl ClientEngine {
                 let missing_delta = latest_rx_seq.wrapping_sub(next_play_seq) as i16;
                 let opus_slot_idx = (next_play_seq as usize) & (RING_SLOTS - 1);
                 let has_opus_slot = opus_ring[opus_slot_idx].seq == Some(next_play_seq);
+                let slot_missing = sequencer.is_slot_missing(next_play_seq) && !has_opus_slot;
+                // A concealed subframe buys exactly one 2.5 ms DAC slot. Never
+                // conceal twice inside the same slot: the refill loop would
+                // otherwise walk `next_play_seq` forward at CPU speed (the
+                // runaway that produced tens of thousands of PLC frames).
+                let plc_pace_ok = last_plc_emit
+                    .map(|t| t.elapsed() >= Duration::from_micros(2_500))
+                    .unwrap_or(true);
+                if !plc_pace_ok && slot_missing {
+                    break;
+                }
                 if should_hold_missing_slot(
-                    sequencer.is_slot_missing(next_play_seq) && !has_opus_slot,
+                    slot_missing,
                     burst_fifo.available_samples(),
                     plc_emergency_watermark,
                     missing_delta,
@@ -2367,6 +2456,7 @@ impl ClientEngine {
                     STATUS_PRIMARY_LOSSLESS => {
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = 0;
+                        last_plc_emit = None;
                         window.record_primary();
                         telemetry
                             .primary_frames_played
@@ -2375,9 +2465,12 @@ impl ClientEngine {
                     STATUS_HEALED_BY_FEC => {
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = 0;
+                        last_plc_emit = None;
                         window.record_fec();
-                        // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by +0.35 subframes (max 14.0 = 35.0ms)
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.35).min(14.0);
+                        // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by
+                        // +0.35 subframes, clamped to the route-aware ceiling.
+                        adaptive_wifi_subframes =
+                            (adaptive_wifi_subframes + 0.35).min(adaptive_ceiling);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
@@ -2391,6 +2484,8 @@ impl ClientEngine {
                         // right tradeoff once its slot has been concealed.
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
+                        // Start the real-time pacing window for the next slot.
+                        last_plc_emit = Some(Instant::now());
                         // Session high-water mark of the PLC burst length;
                         // fetch_max is a single lock-free op, safe on the RT
                         // refill path.
@@ -2398,8 +2493,10 @@ impl ClientEngine {
                             .max_consecutive_plc
                             .fetch_max(consecutive_empty_ticks, Ordering::Relaxed);
                         window.record_fec();
-                        // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(14.0);
+                        // 2.4GHz burst delay exceeded cushion: expand cushion by
+                        // +0.75 subframes, clamped to the route-aware ceiling.
+                        adaptive_wifi_subframes =
+                            (adaptive_wifi_subframes + 0.75).min(adaptive_ceiling);
                         telemetry
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
@@ -2421,6 +2518,7 @@ impl ClientEngine {
                             prebuffer_ready = false;
                             stream_initialized = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            last_plc_emit = None;
                             sequencer.reset();
                             // A restarted host re-anchors at a low base_seq, so
                             // needs_stream_resync never runs and a stale Opus
@@ -2508,7 +2606,12 @@ impl ClientEngine {
                     &mut next_play_seq,
                     &mut net_subframes,
                     fifo_subframes,
-                    target_buf,
+                    // A large HAL burst legitimately keeps the decoupler deep
+                    // between callbacks. Fast-forwarding that depth would
+                    // replay real audio and re-trigger PLC, so measure the cap
+                    // against the actual filled watermark instead of the bare
+                    // network target.
+                    target_buf.max(resampler.samples_to_subframes(fifo_watermark)),
                     last_pkt_subframe_count,
                 ) {
                     // Fast-forward skipped real audio; splice the next frame
@@ -3530,6 +3633,35 @@ mod tests {
     }
 
     #[test]
+    fn test_aaudio_normal_mixer_double_buffers_dolby_and_bt() {
+        // On PERFORMANCE_MODE_NONE (Dolby Atmos / system EQ) the normal mixer
+        // needs two bursts of DMA headroom; one burst underruns. The granted
+        // capacity still caps the result.
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(1280, 3840, true),
+            Some(2560)
+        );
+        // A 20 ms A2DP burst of 882 frames fits exactly twice in its 1764-frame
+        // granted capacity; the old `burst * 3` policy would have asked for
+        // 2646 frames and been clamped away.
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(882, 1764, true),
+            Some(1764)
+        );
+        // The raw low-latency path is unchanged: large bursts use one burst.
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(1280, 3840, false),
+            Some(1280)
+        );
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(882, 1764, false),
+            Some(882)
+        );
+        // The legacy wrapper must delegate with `normal_mixer = false`.
+        assert_eq!(aaudio_buffer_frames_for_burst(1280, 3840), Some(1280));
+    }
+
+    #[test]
     fn test_aaudio_capacity_covers_normal_mixer_burst() {
         // The Dolby path opens PERFORMANCE_MODE_NONE, where the normal mixer
         // can use a 1920-frame (40 ms) burst. The old 960-frame ring was
@@ -3703,8 +3835,8 @@ mod tests {
     #[test]
     fn test_stream_resync_thresholds_detect_host_restart() {
         assert!(!needs_stream_resync(0));
-        assert!(!needs_stream_resync(48));
-        assert!(needs_stream_resync(49));
+        assert!(!needs_stream_resync(88));
+        assert!(needs_stream_resync(89));
         assert!(!needs_stream_resync(-32));
         assert!(needs_stream_resync(-33));
 
@@ -3774,7 +3906,7 @@ mod tests {
         let hard_cap = (RING_SLOTS as i16) - 4;
         assert_eq!(resync_ahead_subframes(0), STREAM_RESYNC_AHEAD_SUBFRAMES);
         assert_eq!(resync_ahead_subframes(16), STREAM_RESYNC_AHEAD_SUBFRAMES);
-        assert_eq!(resync_ahead_subframes(40), 56);
+        assert_eq!(resync_ahead_subframes(80), 96); // fifo + 16 still wins once fifo > 72
         assert_eq!(resync_ahead_subframes(200), hard_cap);
         assert_eq!(resync_ahead_subframes(i16::MAX), hard_cap);
         for fifo in 0i16..=i16::MAX {
@@ -4197,7 +4329,8 @@ mod tests {
         assert!(remaining_subframes >= 6.0);
 
         // 3. Bluetooth Group Sync targets > 48 subframes (e.g. 58 subframes = 145 ms):
-        // Base floor (e.g. 6) triggers prebuffer_ready so sequencer never reaches 48 subframes.
+        // Base floor (e.g. 6) triggers prebuffer_ready so sequencer never reaches
+        // STREAM_RESYNC_AHEAD_SUBFRAMES (now 88 subframes).
         let base_subframes = 6usize;
         let mut prebuf = false;
         let total_now = 6.0f32;
@@ -4220,6 +4353,84 @@ mod tests {
             -1,
             in_flight_wait_subframes(2),
         ));
+    }
+
+    #[test]
+    fn test_large_burst_fifo_stays_above_plc_watermark_after_drain() {
+        // Regression: tying `plc_emergency_watermark` to a whole HAL burst made
+        // every AAudio drain dip below it, so WSOLA PLC ran unpaced at CPU
+        // speed on Dolby (1280-frame) and A2DP (882-frame) routes. The FIFO is
+        // preloaded with one burst plus two subframes, so a full drain must
+        // still leave real audio above the (one-subframe) emergency watermark.
+        let resampler = ClockDriftResampler::new();
+        let one_subframe_samples = resampler.subframes_to_samples(1);
+        let fifo_capacity = BurstDecouplerRing::new()
+            .capacity_samples()
+            .saturating_sub(2);
+
+        for hal_frames in [1280usize, 882] {
+            let hal_burst_samples = hal_frames * 2;
+            let fifo_watermark = resampler
+                .subframes_to_samples(fifo_target_subframes(6.0))
+                .max(hal_burst_samples + one_subframe_samples * 2)
+                .min(fifo_capacity);
+            let after_drain = fifo_watermark.saturating_sub(hal_burst_samples);
+
+            let plc_watermark = resampler
+                .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
+            assert!(
+                plc_watermark <= one_subframe_samples,
+                "hal={hal_frames}: PLC watermark {plc_watermark} must not scale with the HAL burst"
+            );
+            assert!(
+                after_drain >= plc_watermark,
+                "hal={hal_frames}: drain left {after_drain} samples below PLC watermark {plc_watermark}"
+            );
+            // The old formula would have tripped PLC on every single drain.
+            let old_watermark = resampler
+                .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                .max(hal_burst_samples)
+                .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
+            assert!(
+                after_drain < old_watermark,
+                "hal={hal_frames}: test must exercise the old failure mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plc_pacing_caps_concealment_to_realtime() {
+        // One concealed subframe buys exactly one 2.5 ms DAC slot. Even if the
+        // refill loop runs thousands of times per second, `last_plc_emit`
+        // gates concealment to real-time so the playhead cannot race ahead.
+        let pace_ok = |last: Option<Instant>| -> bool {
+            last.map(|t| t.elapsed() >= Duration::from_micros(2_500))
+                .unwrap_or(true)
+        };
+        let mut last_plc_emit: Option<Instant> = None;
+        assert!(
+            pace_ok(last_plc_emit),
+            "first PLC must be allowed immediately"
+        );
+
+        last_plc_emit = Some(Instant::now());
+        assert!(!pace_ok(last_plc_emit), "back-to-back PLC must be paced");
+        assert!(
+            !pace_ok(last_plc_emit),
+            "repeated checks stay blocked inside one slot"
+        );
+
+        std::thread::sleep(Duration::from_micros(3_000));
+        assert!(
+            pace_ok(last_plc_emit),
+            "PLC resumes after one real-time slot"
+        );
+
+        // A real/FEC frame or resync clears the gate so the next genuine gap
+        // can be concealed without waiting for the pacing window.
+        last_plc_emit = None;
+        assert!(pace_ok(last_plc_emit));
     }
 
     #[test]
@@ -4659,10 +4870,15 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setSampleRate(builder, AAUDIO_UNSPECIFIED);
                 AAudioStreamBuilder_setChannelCount(builder, 2);
                 AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
-                let capacity_frames = aaudio_capacity_frames(
-                    profile.performance_mode == AAUDIO_PERFORMANCE_MODE_NONE,
-                );
-                AAudioStreamBuilder_setBufferCapacityInFrames(builder, capacity_frames);
+                let normal_mixer_request = profile.performance_mode == AAUDIO_PERFORMANCE_MODE_NONE;
+                let capacity_frames = aaudio_capacity_frames(normal_mixer_request);
+                // On the normal-mixer/Dolby route AudioFlinger owns the ring;
+                // forcing a capacity there is ignored at best and makes the
+                // HAL reject the stream at worst. Let AAudio choose it and use
+                // the granted capacity for the buffer-size decision instead.
+                if !normal_mixer_request {
+                    AAudioStreamBuilder_setBufferCapacityInFrames(builder, capacity_frames);
+                }
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_output_callback,
@@ -4720,8 +4936,14 @@ pub mod android_aaudio {
                 } else {
                     capacity_frames
                 };
+                // Trust the mode the HAL actually granted, not the one we
+                // requested: a shared stream can be downgraded/upgraded by the
+                // platform, and the normal-mixer double-buffer is only correct
+                // when AAudio really put us on PERFORMANCE_MODE_NONE.
+                let granted_normal_mixer =
+                    AAudioStream_getPerformanceMode(stream) == AAUDIO_PERFORMANCE_MODE_NONE;
                 if let Some(target_frames) =
-                    aaudio_buffer_frames_for_burst(raw_burst, cap_for_burst)
+                    aaudio_buffer_frames_for_profile(raw_burst, cap_for_burst, granted_normal_mixer)
                 {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
