@@ -625,6 +625,16 @@ impl PhoneMicReceiver {
                         local_delay_ms,
                     );
                     let target_depth = target_subframes.ceil() as i16;
+                    // In pull-sink mode the FIFO oscillates by one callback
+                    // burst below `target_subframes`; center the clock-loop
+                    // setpoint at the sawtooth midpoint so both +ppm and -ppm
+                    // drift track without bias.
+                    let cb_subframes = cb_frames as f32 / SUBFRAME_FRAMES as f32;
+                    let clock_setpoint = if pull_sink_active {
+                        (target_subframes - 0.5 * cb_subframes).max(1.0)
+                    } else {
+                        target_subframes
+                    };
                     let fifo_watermark = resampler
                         .subframes_to_samples(target_subframes.ceil() as usize)
                         .min(mic_fifo_thread.capacity_samples());
@@ -829,9 +839,10 @@ impl PhoneMicReceiver {
                             } else {
                                 fb_recovered_or_lost += 1;
                             }
-                            let planned_cushion =
-                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes;
-                            resampler.update_clock_loop(planned_cushion, target_subframes);
+                            let observed = buffered_subframes(latest_seq, next_seq) as f32
+                                + resampler
+                                    .samples_to_subframes(mic_fifo_thread.available_samples());
+                            resampler.update_clock_loop(observed, clock_setpoint);
                             next_tick = now + Duration::from_micros(2500);
                         }
                     }
@@ -872,15 +883,10 @@ impl PhoneMicReceiver {
                             } else {
                                 fb_recovered_or_lost += 1;
                             }
-                            let planned_cushion = if pull_sink_active {
-                                buffered_subframes(latest_seq, next_seq) as f32 + target_subframes
-                            } else {
-                                buffered_subframes(latest_seq, next_seq) as f32
-                                    + resampler.samples_to_subframes(
-                                        mic_fifo_thread.available_samples(),
-                                    )
-                            };
-                            resampler.update_clock_loop(planned_cushion, target_subframes);
+                            let observed = buffered_subframes(latest_seq, next_seq) as f32
+                                + resampler
+                                    .samples_to_subframes(mic_fifo_thread.available_samples());
+                            resampler.update_clock_loop(observed, clock_setpoint);
                         }
                     }
 
