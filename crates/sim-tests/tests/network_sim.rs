@@ -24,6 +24,7 @@ struct SimConfig {
     jitter_ms: f64,
     reorder_pct: u32,
     hal_frames: usize,
+    output_rate_hz: u32,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,10 @@ fn run_sim(cfg: SimConfig) -> SimReport {
     let key = SessionKey::from_pin("4829");
     let mut sequencer = ZeroJitterSequencer::new();
     let mut resampler = ClockDriftResampler::new();
+    // 48 kHz network stream rendered by a possibly different-rate DAC (A2DP
+    // commonly reports 44.1 kHz). This sets the resampler base ratio that all
+    // watermark and clock-setpoint conversions below use.
+    resampler.set_sample_rates(audioshare_protocol::SAMPLE_RATE, cfg.output_rate_hz);
     let ring = BurstDecouplerRing::new();
     let mut limiter = TruePeakLimiter::new(0.0);
 
@@ -58,7 +63,8 @@ fn run_sim(cfg: SimConfig) -> SimReport {
         - 0.5 * resampler.samples_to_subframes(hal_burst_samples))
     .max(1.0);
 
-    let hal_period_ms = cfg.hal_frames as f64 / 48.0; // 48 kHz -> ms
+    let hal_period_ms =
+        cfg.hal_frames as f64 * 1000.0 / cfg.output_rate_hz as f64; // frames -> ms
     let mut t = 0.0f64;
     let mut next_tx = 5.0f64;
     let mut next_hal = hal_period_ms;
@@ -340,6 +346,7 @@ fn base(drift: i32) -> SimConfig {
         jitter_ms: 0.0,
         reorder_pct: 0,
         hal_frames: 192,
+        output_rate_hz: 48_000,
     }
 }
 
@@ -392,6 +399,23 @@ fn hal_burst_sizes_keep_the_decoupler_stable() {
             cfg.hal_frames = frames;
             let r = run_sim(cfg);
             assert_sla(&r, drift, &format!("HAL {frames} frames, drift {drift}"));
+        }
+    }
+}
+
+/// A 48 kHz network stream played by a 44.1 kHz A2DP DAC (or a 96 kHz hi-res
+/// output) must still converge and keep the decoupler fed. The resampler base
+/// ratio changes the meaning of "one subframe" in samples, so the watermark
+/// and clock setpoint conversions must scale with it.
+#[test]
+fn sample_rate_mismatch_sla_holds() {
+    for &rate in &[44_100u32, 48_000, 96_000] {
+        for &drift in &[-200, 200] {
+            let mut cfg = base(drift);
+            cfg.duration_secs = 180;
+            cfg.output_rate_hz = rate;
+            let r = run_sim(cfg);
+            assert_sla(&r, drift, &format!("output {rate} Hz, drift {drift}"));
         }
     }
 }
