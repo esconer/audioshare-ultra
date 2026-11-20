@@ -426,11 +426,11 @@ impl BurstDecouplerRing {
                 .store(r.wrapping_add(req_even), Ordering::Release);
             true
         } else if req_even > 0 && (avail & !1) > 0 {
-            // Partial underrun: copy what is left, but cross-fade the final
-            // frames to zero before the exponential tail. A callback that is
-            // only one frame short would otherwise leave the output at ~98.5%
-            // amplitude, and the next (empty) callback starts at -90 dBFS
-            // comfort dither: a full-scale step into the DAC.
+            // Partial underrun: copy what is left, cross-fading the final
+            // frames to zero and zero-filling the remainder. Without the fade,
+            // a callback only one frame short would leave the output near
+            // full-scale, and the next (empty) callback starts at -90 dBFS
+            // comfort dither: an audible step into the DAC.
             let safe_avail = (avail & !1).min(req_even); // Keep stereo L/R alignment
             let fade_frames = (safe_avail / 2).min(16);
             let fade_samples = fade_frames * 2;
