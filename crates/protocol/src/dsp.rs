@@ -538,15 +538,24 @@ impl TruePeakLimiter {
             // re-compress material that already fits; applying it at 0 dB
             // audibly squashes peaks between -1.4 dBFS and -0.1 dBFS. Keep
             // the envelope updated above so later gain changes start from the
-            // real signal level, and still engage the knee for any sample
-            // that would actually exceed the ceiling.
+            // real signal level.
+            //
+            // p4-C1: the old condition bypassed the knee for peak <= CEILING
+            // (0.955) then jumped abruptly into the THRESHOLD (0.85) formula
+            // the instant a sample exceeded 0.955 -- a ~10% downward step on
+            // every kick/snare (audible crackle). Use a C1-continuous unity
+            // knee starting at UNITY_THRESHOLD = 0.92: <= 0.92 stays bit-exact,
+            // 0.92 -> 0.955 is monotonic with slope 1.0 at the knee start
+            // (zero step), and the ceiling is still honoured.
             let unity_gain = (self.current_gain_linear - 1.0).abs() <= 1e-4
                 && (self.target_gain_linear - 1.0).abs() <= 1e-4;
+            const UNITY_THRESHOLD: f32 = 0.92;
+            let knee_start = if unity_gain { UNITY_THRESHOLD } else { THRESHOLD };
             let det = self.envelope.max(peak);
-            if (!unity_gain || peak > CEILING) && det > THRESHOLD {
-                let over = det - THRESHOLD;
-                let compressed =
-                    THRESHOLD + (CEILING - THRESHOLD) * (over / (over + (CEILING - THRESHOLD)));
+            if det > knee_start {
+                let over = det - knee_start;
+                let headroom = CEILING - knee_start;
+                let compressed = knee_start + headroom * (over / (over + headroom));
                 let scale = compressed / det;
                 l *= scale;
                 r *= scale;

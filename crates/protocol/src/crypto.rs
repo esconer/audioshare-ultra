@@ -3,13 +3,15 @@
 //! The session key is PBKDF2-HMAC-SHA256(65,536 rounds) over the pairing PIN
 //! with a fixed domain salt. Each `SessionKey::from_pin` also draws a random
 //! 4-byte per-session nonce salt, so restarting a host with the same PIN never
-//! reuses a keystream (no two-time pad). Audio and feedback use disjoint 12-byte
-//! nonces derived from that salt / strictly monotonic feedback sequence.
+//! reuses a keystream (no two-time pad). Audio uses a 12-byte nonce derived from
+//! that salt; feedback uses a truncated HMAC-SHA256 (nonce-misuse resistant).
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce, Tag};
+use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2_hmac_array;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::wire::WireHeader;
 
@@ -18,7 +20,8 @@ const PIN_KDF_ROUNDS: u32 = 65_536;
 
 /// Per-session nonce salt length (also transmitted in the AEAD trailer).
 pub const NONCE_SALT_LEN: usize = 4;
-/// Poly1305 tag length. The full wire trailer is salt + tag = 20 bytes.
+/// Tag length: Poly1305 for audio, truncated HMAC-SHA256 for feedback.
+/// The full wire trailer is salt + tag = 20 bytes.
 pub const AEAD_TAG_LEN: usize = 16;
 
 /// 256-bit symmetric session key derived from a pairing PIN or QR token.
@@ -85,15 +88,6 @@ impl SessionKey {
         ]
     }
 
-    /// Feedback uses a separate domain and the strictly monotonic sequence.
-    #[inline]
-    fn feedback_nonce(feedback_seq: u32) -> [u8; 12] {
-        let seq = feedback_seq.to_be_bytes();
-        [
-            b'A', b'S', b'U', b'L', b'C', b'T', b'R', b'L', seq[0], seq[1], seq[2], seq[3],
-        ]
-    }
-
     /// Encrypt `payload` in place, authenticating the 14-byte wire header and
     /// the 4-byte session salt as AAD. Returns the salt and detached Poly1305 tag.
     #[inline]
@@ -141,22 +135,23 @@ impl SessionKey {
             .is_ok()
     }
 
-    /// Compute a 128-bit Poly1305 AEAD tag over the 20-byte feedback body,
-    /// domain-separated by the monotonic `feedback_seq` nonce.
+    /// Compute a 128-bit truncated HMAC-SHA256 tag over the 20-byte feedback
+    /// body + sequence. Unlike Poly1305, HMAC-SHA256 is nonce-misuse resistant
+    /// when multiple clients or reconnects share the same PIN and start at seq=1.
     #[inline]
     pub fn sign_feedback(&self, body_20: &[u8; 20], feedback_seq: u32) -> [u8; AEAD_TAG_LEN] {
-        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
-        let nonce_bytes = Self::feedback_nonce(feedback_seq);
-        let mut empty = [];
-        let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), body_20, &mut empty)
-            .expect("feedback tag");
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("32-byte key");
+        mac.update(b"ASULCTR2-MAC");
+        mac.update(&feedback_seq.to_be_bytes());
+        mac.update(body_20);
+        let digest = mac.finalize().into_bytes();
         let mut out = [0u8; AEAD_TAG_LEN];
-        out.copy_from_slice(tag.as_slice());
+        out.copy_from_slice(&digest[..AEAD_TAG_LEN]);
         out
     }
 
-    /// Constant-time feedback tag verification.
+    /// Constant-time 128-bit HMAC-SHA256 feedback tag verification.
     #[inline]
     pub fn verify_feedback(
         &self,
@@ -164,17 +159,8 @@ impl SessionKey {
         feedback_seq: u32,
         tag: &[u8; AEAD_TAG_LEN],
     ) -> bool {
-        let cipher = ChaCha20Poly1305::new_from_slice(&self.key).expect("32-byte key");
-        let nonce_bytes = Self::feedback_nonce(feedback_seq);
-        let mut empty = [];
-        cipher
-            .decrypt_in_place_detached(
-                Nonce::from_slice(&nonce_bytes),
-                body_20,
-                &mut empty,
-                Tag::from_slice(tag),
-            )
-            .is_ok()
+        let expected = self.sign_feedback(body_20, feedback_seq);
+        bool::from(expected.ct_eq(tag))
     }
 }
 
