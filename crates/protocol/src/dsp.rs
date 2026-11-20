@@ -425,7 +425,7 @@ impl BurstDecouplerRing {
             .into_boxed_slice();
         Self {
             write_idx: CachePadded(AtomicUsize::new(0)),
-            read_idx: CachePadded<AtomicUsize::new(0)),
+            read_idx: CachePadded(AtomicUsize::new(0)),
             buf,
         }
     }
