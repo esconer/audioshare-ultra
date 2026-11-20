@@ -597,7 +597,18 @@ impl PhoneMicReceiver {
                 let mut last_sender_addr: Option<SocketAddr> = None;
                 let mut max_group_delay_ms: u16 = 0;
                 let mut last_feedback_sent = Instant::now();
-                let mut feedback_seq: u32 = 0;
+                // Seed the feedback sequence from wall-clock 250 ms epoch ticks
+                // so restarting the PC PhoneMicReceiver on static port 65532
+                // never replays a Party Host's old-session sequence: ticks are
+                // >2x the 500 ms feedback send rate, so every restart starts
+                // strictly ahead of the host's replay high-water mark (wraps
+                // every ~34 years).
+                let wall_clock_ticks = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    / 250) as u32;
+                let mut feedback_seq: u32 = wall_clock_ticks.max(1);
                 let mut fb_primary_frames: u32 = 0;
                 let mut fb_recovered_or_lost: u32 = 0;
 
