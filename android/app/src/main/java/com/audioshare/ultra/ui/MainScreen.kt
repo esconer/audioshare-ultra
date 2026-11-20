@@ -283,43 +283,6 @@ fun MainScreen() {
         }
     }
 
-    // The foreground service must hold the MICROPHONE type before a hardware
-    // mic capture starts, especially with targetSdk 34 and the screen off.
-    // Plain playback and playback capture never call this.
-    fun enterCaptureForeground(label: String) {
-        if (isConnected) {
-            val intent = Intent(context, AudioEngineService::class.java).apply {
-                action = "ACTION_SET_MIC_CAPTURE"
-                putExtra("MIC_ACTIVE", true)
-            }
-            context.startService(intent)
-        } else {
-            val guardIntent = Intent(context, AudioEngineService::class.java).apply {
-                action = "ACTION_START_CAST_GUARD"
-                putExtra("CAST_LABEL", label)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(guardIntent)
-            } else {
-                context.startService(guardIntent)
-            }
-        }
-    }
-
-    fun exitCaptureForeground(remainingCapture: Boolean) {
-        if (isConnected) {
-            val intent = Intent(context, AudioEngineService::class.java).apply {
-                action = "ACTION_SET_MIC_CAPTURE"
-                putExtra("MIC_ACTIVE", remainingCapture)
-            }
-            context.startService(intent)
-        } else if (!remainingCapture) {
-            val stopIntent = Intent(context, AudioEngineService::class.java).apply {
-                action = "ACTION_STOP"
-            }
-            context.startService(stopIntent)
-        }
-    }
 
     fun startPhoneMicInService() {
         val intent = Intent(context, AudioEngineService::class.java).apply {
