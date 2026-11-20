@@ -3,9 +3,9 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 #[cfg(not(target_os = "android"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
@@ -638,6 +638,43 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     let _ = sock_ref.set_send_buffer_size(65_536);
     let _ = sock_ref.set_recv_buffer_size(131_072);
 
+    // Disable Winsock's legacy SIO_UDP_CONNRESET behavior: without this, one
+    // ICMP Port Unreachable from a restarting/disconnected phone makes
+    // recv_from() fail with WSAECONNRESET (10054) and aborts the control drain
+    // (the host then goes deaf to all subsequent HELLO/feedback packets).
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn WSAIoctl(
+                s: usize,
+                dw_io_control_code: u32,
+                lpv_in_buffer: *const core::ffi::c_void,
+                cb_in_buffer: u32,
+                lpv_out_buffer: *mut core::ffi::c_void,
+                cb_out_buffer: u32,
+                lpcb_bytes_returned: *mut u32,
+                lp_overlapped: *mut core::ffi::c_void,
+                lp_completion_routine: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+        let disable: u32 = 0;
+        let mut bytes_returned: u32 = 0;
+        WSAIoctl(
+            socket.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            &disable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            core::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         use std::os::fd::AsRawFd;
@@ -997,6 +1034,10 @@ pub struct ConnectedClient {
     /// True when this client has engaged 5 ms Gaming Hard-Lock. At least one
     /// such client makes the host tighten packetization for the session.
     pub gaming_lock: bool,
+    /// Highest authenticated feedback sequence seen from this peer (AEAD v2).
+    /// Kept on the client entry so kicking/expiring a peer clears the replay
+    /// high-water mark and a fresh session may start at sequence 1.
+    pub last_feedback_seq: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1055,6 +1096,12 @@ pub struct HostTelemetry {
     pub tx_packet_interval_us: AtomicU32,
     /// Captured audio waiting in the host ring at send time, in microseconds.
     pub capture_buffer_us: AtomicU32,
+    /// Count of rejected client handshakes (bad PIN/tag or legacy 0.2.x magic).
+    pub rejected_handshakes: AtomicU64,
+    /// Test-only instrumentation: Opus encoders created by this host's TX loop.
+    /// Used by the zero-client idle-allocation regression test.
+    #[cfg(test)]
+    pub opus_encoder_allocs: AtomicU64,
 }
 
 impl Default for HostTelemetry {
@@ -1084,6 +1131,9 @@ impl Default for HostTelemetry {
             tx_subframes_per_packet: AtomicU8::new(1),
             tx_packet_interval_us: AtomicU32::new(2500),
             capture_buffer_us: AtomicU32::new(0),
+            rejected_handshakes: AtomicU64::new(0),
+            #[cfg(test)]
+            opus_encoder_allocs: AtomicU64::new(0),
         }
     }
 }
@@ -1108,9 +1158,7 @@ impl HostTelemetry {
         let packet_ms = (self.tx_packet_interval_us.load(Ordering::Relaxed) / 1000) as u16;
         // `downstream` already includes BT delay + excess FIFO above the 10 ms
         // base floor. Add the base floor and this packet's framing interval.
-        downstream
-            .saturating_add(10)
-            .saturating_add(packet_ms)
+        downstream.saturating_add(10).saturating_add(packet_ms)
     }
 }
 
@@ -1307,6 +1355,9 @@ impl HostEngine {
                 (config.subframes_per_packet.clamp(1, 4) as u32) * 2500,
             ),
             capture_buffer_us: AtomicU32::new(0),
+            rejected_handshakes: AtomicU64::new(0),
+            #[cfg(test)]
+            opus_encoder_allocs: AtomicU64::new(0),
         });
 
         let mut client_map = HashMap::new();
@@ -1324,6 +1375,7 @@ impl HostEngine {
                     hardware_delay_ms: 0,
                     client_volume: 100,
                     gaming_lock: false,
+                    last_feedback_seq: 0,
                 },
             );
         }
@@ -2121,8 +2173,6 @@ impl HostEngine {
         }
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
-        // Per-peer highest authenticated feedback sequence (anti-replay).
-        let mut last_feedback_seq: HashMap<SocketAddr, u32> = HashMap::new();
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
@@ -2149,8 +2199,7 @@ impl HostEngine {
 
             // 1. Hot-Plug Audio Device Watchdog (Solves Issues #173, #122, #103)
             #[cfg(target_os = "windows")]
-            if !use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500)
-            {
+            if !use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500) {
                 last_watchdog_check = Instant::now();
                 let now_ms = start_instant.elapsed().as_millis() as u64;
                 let latest_name = current_default_output_name();
@@ -2219,6 +2268,11 @@ impl HostEngine {
                     // client; otherwise any LAN host could add itself to the
                     // stream target list without knowing the PIN.
                     if session_key.lock().unwrap().is_some() {
+                        // A bare HELLO is unauthenticated: when a PIN is set it
+                        // can only be a duplicate/late join or a LAN probe.
+                        telemetry
+                            .rejected_handshakes
+                            .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     let mut map = clients.lock().unwrap();
@@ -2234,6 +2288,7 @@ impl HostEngine {
                             hardware_delay_ms: 0,
                             client_volume: 100,
                             gaming_lock: false,
+                            last_feedback_seq: 0,
                         })
                         .last_seen = Instant::now();
                     telemetry
@@ -2254,13 +2309,25 @@ impl HostEngine {
                     // complete body before acting on any of it. Unencrypted LAN
                     // and party mode have no key and stay backward compatible.
                     let active_key = *session_key.lock().unwrap();
-                    if let Some(fb) =
-                        ClientFeedbackPacket::decode_verified(&ctrl_buf[..len], active_key.as_ref())
+                    let Some(fb) = ClientFeedbackPacket::decode_verified(
+                        &ctrl_buf[..len],
+                        active_key.as_ref(),
+                    ) else {
+                        // A wrong PIN / forged AEAD tag must not register a
+                        // client or issue any remote-control command.
+                        telemetry
+                            .rejected_handshakes
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    // Reject replayed authenticated feedback BEFORE any command
+                    // side effect. The sequence is nonce-bound, so an attacker
+                    // cannot simply bump it on a captured packet. The high-water
+                    // mark lives on the ConnectedClient: kicking/expiring a peer
+                    // removes it, so a reconnect may legitimately restart at 1.
                     {
-                        // Reject replayed authenticated feedback BEFORE any
-                        // command side effect. The sequence is nonce-bound, so
-                        // an attacker cannot simply bump it on a captured packet.
-                        let last = last_feedback_seq.get(&src_addr).copied().unwrap_or(0);
+                        let map = clients.lock().unwrap();
+                        let last = map.get(&src_addr).map(|c| c.last_feedback_seq).unwrap_or(0);
                         if audioshare_protocol::wire::feedback_is_replay(
                             active_key.is_some(),
                             fb.feedback_seq,
@@ -2268,106 +2335,113 @@ impl HostEngine {
                         ) {
                             continue;
                         }
-                        last_feedback_seq.insert(src_addr, fb.feedback_seq);
-                        let mut gaming_lock_update: Option<bool> = None;
+                    }
+                    let mut gaming_lock_update: Option<bool> = None;
 
-                        // Compressed-codec backend selection from the phone UI:
-                        // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
-                        // This is separate from the quality profile and only
-                        // affects compressed modes.
-                        // 40/41 carry the client's 5 ms hard-lock state so the
-                        // host can tighten packetization for the session.
-                        match fb.requested_mode {
-                            20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
-                            21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
-                            40 => gaming_lock_update = Some(false),
-                            41 => gaming_lock_update = Some(true),
-                            _ => {}
-                        }
+                    // Compressed-codec backend selection from the phone UI:
+                    // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
+                    // This is separate from the quality profile and only
+                    // affects compressed modes.
+                    // 40/41 carry the client's 5 ms hard-lock state so the
+                    // host can tighten packetization for the session.
+                    match fb.requested_mode {
+                        20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
+                        21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
+                        40 => gaming_lock_update = Some(false),
+                        41 => gaming_lock_update = Some(true),
+                        _ => {}
+                    }
 
-                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
-                        // Keep this range below 20 so codec-backend commands are
-                        // not mistaken for transport commands.
-                        if (10..20).contains(&fb.requested_mode) {
-                            let cmd = match fb.requested_mode {
-                                10 => bt_optimization::RemoteMediaCommand::PlayPause,
-                                11 => bt_optimization::RemoteMediaCommand::NextTrack,
-                                12 => bt_optimization::RemoteMediaCommand::PrevTrack,
-                                _ => bt_optimization::RemoteMediaCommand::None,
-                            };
-                            bt_optimization::execute_remote_media_command(cmd);
-                        }
+                    // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
+                    // Keep this range below 20 so codec-backend commands are
+                    // not mistaken for transport commands.
+                    if (10..20).contains(&fb.requested_mode) {
+                        let cmd = match fb.requested_mode {
+                            10 => bt_optimization::RemoteMediaCommand::PlayPause,
+                            11 => bt_optimization::RemoteMediaCommand::NextTrack,
+                            12 => bt_optimization::RemoteMediaCommand::PrevTrack,
+                            _ => bt_optimization::RemoteMediaCommand::None,
+                        };
+                        bt_optimization::execute_remote_media_command(cmd);
+                    }
 
-                        // Remote quality-mode selection from the phone UI:
-                        // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
-                        // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                        // Bitrate selections are 30=96, 31=160, 32=256, 33=320 kbps.
-                        // Other values are media transport or codec-backend
-                        // commands handled above.
-                        if (1..=5).contains(&fb.requested_mode) {
-                            telemetry
-                                .quality_profile
-                                .store(fb.requested_mode - 1, Ordering::Relaxed);
-                        } else {
-                            let kbps = match fb.requested_mode {
-                                30 => Some(96u16),
-                                31 => Some(160),
-                                32 => Some(256),
-                                33 => Some(320),
-                                _ => None,
-                            };
-                            if let Some(kbps) = kbps {
-                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
-                            }
-                        }
-
-                        let mut map = clients.lock().unwrap();
-                        Self::evict_same_ip_stale_ports(&mut map, src_addr);
-                        let entry = map.entry(src_addr).or_insert(ConnectedClient {
-                            addr: src_addr,
-                            last_seen: Instant::now(),
-                            is_usb,
-                            muted: false,
-                            fec_rate_permille: fb.fec_rate_permille,
-                            bluetooth_delay_ms: fb.bluetooth_delay_ms,
-                            hardware_delay_ms: fb.hardware_delay_ms,
-                            client_volume: fb.client_volume,
-                            gaming_lock: false,
-                        });
-                        entry.last_seen = Instant::now();
-                        entry.fec_rate_permille = fb.fec_rate_permille;
-                        entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
-                        entry.hardware_delay_ms = fb.hardware_delay_ms;
-                        entry.client_volume = fb.client_volume;
-                        if let Some(gaming_lock) = gaming_lock_update {
-                            entry.gaming_lock = gaming_lock;
-                        }
+                    // Remote quality-mode selection from the phone UI:
+                    // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
+                    // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
+                    // Bitrate selections are 30=96, 31=160, 32=256, 33=320 kbps.
+                    // Other values are media transport or codec-backend
+                    // commands handled above.
+                    if (1..=5).contains(&fb.requested_mode) {
                         telemetry
-                            .active_clients_count
-                            .store(map.len() as u8, Ordering::Relaxed);
-
-                        // Fast attack / paced release. A borderline link
-                        // that alternates between 5% and 0% loss must not
-                        // recreate the Opus encoder every 500 ms. Muted
-                        // clients do not receive audio, so they cannot drive
-                        // the governor.
-                        let raw_worst = map
-                            .values()
-                            .filter(|c| !c.muted)
-                            .map(|c| c.fec_rate_permille)
-                            .max()
-                            .unwrap_or(0);
-                        loss_governor.update(raw_worst, Instant::now());
-                        Self::refresh_client_delay_telemetry(&map, &telemetry);
-                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
-
-                        cached_targets.clear();
-                        for c in map.values() {
-                            if !c.muted {
-                                cached_targets.push(c.addr);
-                            }
+                            .quality_profile
+                            .store(fb.requested_mode - 1, Ordering::Relaxed);
+                    } else {
+                        let kbps = match fb.requested_mode {
+                            30 => Some(96u16),
+                            31 => Some(160),
+                            32 => Some(256),
+                            33 => Some(320),
+                            _ => None,
+                        };
+                        if let Some(kbps) = kbps {
+                            telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
                         }
                     }
+
+                    let mut map = clients.lock().unwrap();
+                    Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                    let entry = map.entry(src_addr).or_insert(ConnectedClient {
+                        addr: src_addr,
+                        last_seen: Instant::now(),
+                        is_usb,
+                        muted: false,
+                        fec_rate_permille: fb.fec_rate_permille,
+                        bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                        hardware_delay_ms: fb.hardware_delay_ms,
+                        client_volume: fb.client_volume,
+                        gaming_lock: false,
+                        last_feedback_seq: 0,
+                    });
+                    entry.last_seen = Instant::now();
+                    entry.fec_rate_permille = fb.fec_rate_permille;
+                    entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                    entry.hardware_delay_ms = fb.hardware_delay_ms;
+                    entry.client_volume = fb.client_volume;
+                    entry.last_feedback_seq = fb.feedback_seq;
+                    if let Some(gaming_lock) = gaming_lock_update {
+                        entry.gaming_lock = gaming_lock;
+                    }
+                    telemetry
+                        .active_clients_count
+                        .store(map.len() as u8, Ordering::Relaxed);
+
+                    // Fast attack / paced release. A borderline link
+                    // that alternates between 5% and 0% loss must not
+                    // recreate the Opus encoder every 500 ms. Muted
+                    // clients do not receive audio, so they cannot drive
+                    // the governor.
+                    let raw_worst = map
+                        .values()
+                        .filter(|c| !c.muted)
+                        .map(|c| c.fec_rate_permille)
+                        .max()
+                        .unwrap_or(0);
+                    loss_governor.update(raw_worst, Instant::now());
+                    Self::refresh_client_delay_telemetry(&map, &telemetry);
+                    Self::refresh_gaming_lock_telemetry(&map, &telemetry);
+
+                    cached_targets.clear();
+                    for c in map.values() {
+                        if !c.muted {
+                            cached_targets.push(c.addr);
+                        }
+                    }
+                } else if len >= 8 && &ctrl_buf[..8] == b"ASULCTRL" {
+                    // Legacy v1 (0.2.x) client tried to join a v2 host. Count
+                    // the rejection so operators can spot version mismatches.
+                    telemetry
+                        .rejected_handshakes
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
 
@@ -2398,14 +2472,6 @@ impl HostEngine {
                         }
                     }
                 }
-            }
-
-            // With no connected receivers the encoded bytes are discarded.
-            // Clear codec/FEC history so the next client never receives stale
-            // Opus lookahead or ADPCM backups from a previous session.
-            if cached_targets.is_empty() {
-                fec_hist_len = 0;
-                opus_encoder = None;
             }
 
             // 2c. Evaluate the user-selected quality profile (re-evaluated every
@@ -2490,13 +2556,31 @@ impl HostEngine {
             // compressed packet contains live lookahead audio rather than a
             // silent pre-roll; other lossless profiles still drop it.
             let prefer_opus = telemetry.prefer_opus.load(Ordering::Relaxed);
+            let has_targets = !cached_targets.is_empty();
             if !prefer_opus {
                 opus_encoder = None;
                 opus_encoder_failed = false;
+                if !has_targets {
+                    fec_hist_len = 0;
+                }
+            } else if !has_targets {
+                // Standby with zero receivers: no encoded byte can be consumed.
+                // Clearing history here (after profile selection) avoids the
+                // old 200x/s OpusStreamEncoder allocation storm while still
+                // publishing the codec mode the next client will actually get.
+                fec_hist_len = 0;
+                opus_encoder = None;
+                if dynamic_codec_mode == CodecMode::CompressedLowDelay && !opus_encoder_failed {
+                    dynamic_codec_mode = CodecMode::OpusRld;
+                }
             } else if dynamic_codec_mode == CodecMode::CompressedLowDelay
                 || profile == QualityProfile::SmartAuto
             {
                 if opus_encoder.is_none() && !opus_encoder_failed {
+                    #[cfg(test)]
+                    telemetry
+                        .opus_encoder_allocs
+                        .fetch_add(1, Ordering::Relaxed);
                     opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                     if opus_encoder.is_none() {
                         opus_encoder_failed = true;
@@ -2568,7 +2652,7 @@ impl HostEngine {
                 Ordering::Relaxed,
             );
 
-            // 3. Encode Subframes
+            // 3. Collect Subframes
             let mut primary_bundle = [0u8; MAX_LOSSLESS_PCM24_BYTES * 4 + 12];
             let mut primary_cursor = 0usize;
             // Byte range of each length-prefixed subframe inside
@@ -2577,6 +2661,12 @@ impl HostEngine {
             // FEC ADPCM copy of each subframe encoded in this packet. The
             // per-subframe split path uses [i-1] and [i-2] as its N-1/N-2.
             let mut packet_fec = [[0u8; ADPCM_FEC_BYTES]; 4];
+            // Both f32 capture and i16 noise-shaped forms are collected for the
+            // whole packet BEFORE the codec is chosen. A mid-packet Opus failure
+            // can then rebuild every subframe as VBR instead of emitting a
+            // mixed [Opus, VBR] datagram.
+            let mut f32_subframes = [[0.0f32; SUBFRAME_STEREO_SAMPLES]; 4];
+            let mut i16_subframes = [[0i16; SUBFRAME_STEREO_SAMPLES]; 4];
             let base_seq = seq;
             // Clients unconditionally ignore ADPCM FEC on Opus packets (the
             // 0 ms ADPCM backup jumps phase against the 2.5 ms Opus lookahead;
@@ -2594,7 +2684,7 @@ impl HostEngine {
             let mut packet_max_vu_pct: u8 = 0;
 
             for sub_idx in 0..subframes_per_pkt {
-                let mut f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                let f32_subframe = &mut f32_subframes[sub_idx];
                 let mut dummy_rng = 1u32;
 
                 if use_test_tone {
@@ -2608,13 +2698,13 @@ impl HostEngine {
                             tone_phase -= 1.0;
                         }
                     }
-                } else if !ring.pop_exact_or_dither(&mut f32_subframe, &mut dummy_rng) {
+                } else if !ring.pop_exact_or_dither(f32_subframe, &mut dummy_rng) {
                     f32_subframe.fill(0.0);
                 }
 
                 // Inject 2.5ms Acoustic Latency Sonar Chirp if requested by user
                 if telemetry.trigger_sonar_ping.swap(false, Ordering::Relaxed) {
-                    audioshare_protocol::sync_and_eq::LatencySonar::inject_chirp(&mut f32_subframe);
+                    audioshare_protocol::sync_and_eq::LatencySonar::inject_chirp(f32_subframe);
                     let now_us = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -2624,9 +2714,8 @@ impl HostEngine {
                         .store(now_us, Ordering::Relaxed);
                 }
 
-                let mut i16_subframe = [0i16; SUBFRAME_STEREO_SAMPLES];
-                let max_abs =
-                    noise_shaper.quantize_stereo_subframe(&f32_subframe, &mut i16_subframe);
+                let i16_subframe = &mut i16_subframes[sub_idx];
+                let max_abs = noise_shaper.quantize_stereo_subframe(f32_subframe, i16_subframe);
                 let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
                 packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
@@ -2644,95 +2733,127 @@ impl HostEngine {
                     silent_subframes = silent_subframes.saturating_add(1);
                 }
 
-                if !suppress_adpcm_fec {
-                    fec_hist.copy_within(0..3, 1);
-                    encode_fec_subframe(&i16_subframe, &mut fec_hist[0]);
-                    fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
-                    packet_fec[sub_idx] = fec_hist[0];
-                }
-
-                let entry_start = primary_cursor;
-                if matches!(
-                    dynamic_codec_mode,
-                    CodecMode::CompressedLowDelay | CodecMode::OpusRld
-                ) {
-                    // Compressed primary payload targeted by the selected
-                    // quality mode. The tag inside the payload tells the
-                    // receiver whether this is pure-Rust VBR or Opus, so a
-                    // live backend switch never requires a client restart.
-                    let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                    let enc_len = if dynamic_codec_mode == CodecMode::OpusRld {
-                        let opus_len = opus_encoder.as_mut().and_then(|encoder| {
-                            encoder.encode_subframe(
-                                &i16_subframe,
-                                tx_bitrate_kbps,
-                                &mut enc_primary,
-                            )
-                        });
-                        match opus_len {
-                            Some(len) => len,
-                            None => {
-                                // Never drop audio on a codec failure. Fall
-                                // back to VBR for this packet, mark the Opus
-                                // backend unavailable, and let the next
-                                // toggle retry it.
-                                opus_encoder = None;
-                                opus_encoder_failed = true;
-                                dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                                encode_vbr_subframe(
-                                    &i16_subframe,
-                                    tx_bitrate_kbps,
-                                    &mut enc_primary,
-                                )
-                            }
-                        }
-                    } else {
-                        encode_vbr_subframe(&i16_subframe, tx_bitrate_kbps, &mut enc_primary)
-                    };
-                    let len_be = (enc_len as u16).to_be_bytes();
-                    primary_bundle[primary_cursor] = len_be[0];
-                    primary_bundle[primary_cursor + 1] = len_be[1];
-                    primary_cursor += 2;
-                    primary_bundle[primary_cursor..primary_cursor + enc_len]
-                        .copy_from_slice(&enc_primary[..enc_len]);
-                    primary_cursor += enc_len;
-                } else if profile == QualityProfile::StudioLossless24Bit {
-                    // Encode from the original f32 samples (not the i16
-                    // noise-shaper output) so the lower 8 bits carry genuine
-                    // 24-bit resolution when the transport provides it.
-                    let mut enc_24 = [0u8; MAX_LOSSLESS_PCM24_BYTES];
-                    let enc_len = encode_lossless_pcm24_subframe(&f32_subframe, &mut enc_24);
-                    let len_be = (enc_len as u16).to_be_bytes();
-                    primary_bundle[primary_cursor] = len_be[0];
-                    primary_bundle[primary_cursor + 1] = len_be[1];
-                    primary_cursor += 2;
-                    primary_bundle[primary_cursor..primary_cursor + enc_len]
-                        .copy_from_slice(&enc_24[..enc_len]);
-                    primary_cursor += enc_len;
-                } else {
-                    // Tier 0 of Smart Auto is lossless, but the Opus encoder
-                    // is kept primed so a sudden loss spike does not start
-                    // with 2.5 ms of codec warm-up silence.
-                    if profile == QualityProfile::SmartAuto && prefer_opus {
-                        warm_opus_lookahead(&mut opus_encoder, &i16_subframe, tx_bitrate_kbps);
-                    }
-                    let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                    let enc_len = encode_lossless_subframe(&i16_subframe, &mut enc_sub);
-                    let len_be = (enc_len as u16).to_be_bytes();
-                    primary_bundle[primary_cursor] = len_be[0];
-                    primary_bundle[primary_cursor + 1] = len_be[1];
-                    primary_cursor += 2;
-                    primary_bundle[primary_cursor..primary_cursor + enc_len]
-                        .copy_from_slice(&enc_sub[..enc_len]);
-                    primary_cursor += enc_len;
-                }
-                subframe_ranges[sub_idx] = (entry_start, primary_cursor);
-
                 seq = seq.wrapping_add(1);
             }
             telemetry
                 .host_vu_peak_pct
                 .store(packet_max_vu_pct, Ordering::Relaxed);
+
+            // Encode only when at least one receiver is connected. With zero
+            // targets the collected samples still drive VU/DTX telemetry and
+            // the capture pacer still runs, but no codec state or datagram is
+            // produced (the old code allocated a fresh OpusStreamEncoder on
+            // every 2.5 ms idle tick).
+            if has_targets {
+                if dynamic_codec_mode == CodecMode::OpusRld {
+                    let mut opus_ok = true;
+                    for sub_idx in 0..subframes_per_pkt {
+                        let entry_start = primary_cursor;
+                        let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                        let opus_len = opus_encoder.as_mut().and_then(|encoder| {
+                            encoder.encode_subframe_f32(
+                                &f32_subframes[sub_idx],
+                                tx_bitrate_kbps,
+                                &mut enc_primary,
+                            )
+                        });
+                        match opus_len {
+                            Some(len) => {
+                                let len_be = (len as u16).to_be_bytes();
+                                primary_bundle[primary_cursor] = len_be[0];
+                                primary_bundle[primary_cursor + 1] = len_be[1];
+                                primary_cursor += 2;
+                                primary_bundle[primary_cursor..primary_cursor + len]
+                                    .copy_from_slice(&enc_primary[..len]);
+                                primary_cursor += len;
+                                subframe_ranges[sub_idx] = (entry_start, primary_cursor);
+                            }
+                            None => {
+                                // One failed subframe invalidates the whole
+                                // packet: earlier subframes are Opus-tagged.
+                                // Drop the encoder, rewind the cursor and let
+                                // the loop below rebuild EVERY subframe as VBR.
+                                opus_encoder = None;
+                                opus_encoder_failed = true;
+                                dynamic_codec_mode = CodecMode::CompressedLowDelay;
+                                primary_cursor = 0;
+                                opus_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if opus_ok {
+                        fec_hist_len = 0;
+                    }
+                }
+
+                if dynamic_codec_mode != CodecMode::OpusRld {
+                    // VBR / 24-bit / lossless, or a full VBR rebuild after an
+                    // Opus failure. `primary_cursor` is 0 on the rebuild path,
+                    // so no stale Opus bytes can survive in the datagram.
+                    for sub_idx in 0..subframes_per_pkt {
+                        fec_hist.copy_within(0..3, 1);
+                        encode_fec_subframe(&i16_subframes[sub_idx], &mut fec_hist[0]);
+                        fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
+                        packet_fec[sub_idx] = fec_hist[0];
+
+                        let entry_start = primary_cursor;
+                        if dynamic_codec_mode == CodecMode::CompressedLowDelay {
+                            let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                            let enc_len = encode_vbr_subframe(
+                                &i16_subframes[sub_idx],
+                                tx_bitrate_kbps,
+                                &mut enc_primary,
+                            );
+                            let len_be = (enc_len as u16).to_be_bytes();
+                            primary_bundle[primary_cursor] = len_be[0];
+                            primary_bundle[primary_cursor + 1] = len_be[1];
+                            primary_cursor += 2;
+                            primary_bundle[primary_cursor..primary_cursor + enc_len]
+                                .copy_from_slice(&enc_primary[..enc_len]);
+                            primary_cursor += enc_len;
+                        } else if profile == QualityProfile::StudioLossless24Bit {
+                            // Encode from the original f32 samples (not the i16
+                            // noise-shaper output) so the lower 8 bits carry
+                            // genuine 24-bit resolution when available.
+                            let mut enc_24 = [0u8; MAX_LOSSLESS_PCM24_BYTES];
+                            let enc_len = encode_lossless_pcm24_subframe(
+                                &f32_subframes[sub_idx],
+                                &mut enc_24,
+                            );
+                            let len_be = (enc_len as u16).to_be_bytes();
+                            primary_bundle[primary_cursor] = len_be[0];
+                            primary_bundle[primary_cursor + 1] = len_be[1];
+                            primary_cursor += 2;
+                            primary_bundle[primary_cursor..primary_cursor + enc_len]
+                                .copy_from_slice(&enc_24[..enc_len]);
+                            primary_cursor += enc_len;
+                        } else {
+                            // Tier 0 of Smart Auto is lossless, but the Opus
+                            // encoder is kept primed so a sudden loss spike
+                            // does not start with codec warm-up silence.
+                            if profile == QualityProfile::SmartAuto && prefer_opus {
+                                warm_opus_lookahead(
+                                    &mut opus_encoder,
+                                    &i16_subframes[sub_idx],
+                                    tx_bitrate_kbps,
+                                );
+                            }
+                            let mut enc_sub = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                            let enc_len =
+                                encode_lossless_subframe(&i16_subframes[sub_idx], &mut enc_sub);
+                            let len_be = (enc_len as u16).to_be_bytes();
+                            primary_bundle[primary_cursor] = len_be[0];
+                            primary_bundle[primary_cursor + 1] = len_be[1];
+                            primary_cursor += 2;
+                            primary_bundle[primary_cursor..primary_cursor + enc_len]
+                                .copy_from_slice(&enc_sub[..enc_len]);
+                            primary_cursor += enc_len;
+                        }
+                        subframe_ranges[sub_idx] = (entry_start, primary_cursor);
+                    }
+                }
+            }
 
             // If an Opus encode failed mid-packet we fell back to VBR above;
             // publish the mode that matches the payload actually built.
@@ -3003,7 +3124,8 @@ mod tests {
         // P1-1: clients unconditionally ignore ADPCM FEC on Opus packets.
         // HostEngine must not encode/transmit it (248 B/packet = ~397 kbps at 200 pps).
         let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         let target = rx.local_addr().unwrap();
         let mut engine = HostEngine::start(
             HostConfig {
@@ -3030,15 +3152,21 @@ mod tests {
                 if let Ok(hdr) = WireHeader::decode(&buf[..len]) {
                     if hdr.mode == CodecMode::OpusRld {
                         opus_packets += 1;
-                        max_fec_bytes = max_fec_bytes
-                            .max(hdr.fec_n1_len as usize + hdr.fec_n2_len as usize);
+                        max_fec_bytes =
+                            max_fec_bytes.max(hdr.fec_n1_len as usize + hdr.fec_n2_len as usize);
                     }
                 }
             }
         }
         engine.stop();
-        assert!(opus_packets >= 4, "only {opus_packets} Opus packets received");
-        assert_eq!(max_fec_bytes, 0, "Opus packets carried up to {max_fec_bytes} bytes of unused ADPCM FEC");
+        assert!(
+            opus_packets >= 4,
+            "only {opus_packets} Opus packets received"
+        );
+        assert_eq!(
+            max_fec_bytes, 0,
+            "Opus packets carried up to {max_fec_bytes} bytes of unused ADPCM FEC"
+        );
     }
 
     #[test]
@@ -3046,7 +3174,8 @@ mod tests {
         let t = HostTelemetry::new();
         assert_eq!(t.video_lipsync_offset_ms(), 0, "no BT client => no offset");
         t.max_client_bt_delay_ms.store(185, Ordering::Relaxed);
-        t.max_client_downstream_delay_ms.store(185, Ordering::Relaxed);
+        t.max_client_downstream_delay_ms
+            .store(185, Ordering::Relaxed);
         t.tx_packet_interval_us.store(5_000, Ordering::Relaxed);
         // 185 downstream + 10 ms base floor + 5 ms packetization.
         assert_eq!(t.video_lipsync_offset_ms(), 200);
@@ -3097,6 +3226,7 @@ mod tests {
                 hardware_delay_ms: 17,
                 client_volume: 100,
                 gaming_lock: false,
+                last_feedback_seq: 0,
             },
         );
         map.insert(
@@ -3111,6 +3241,7 @@ mod tests {
                 hardware_delay_ms: 30,
                 client_volume: 100,
                 gaming_lock: false,
+                last_feedback_seq: 0,
             },
         );
         map.insert(
@@ -3125,6 +3256,7 @@ mod tests {
                 hardware_delay_ms: 200,
                 client_volume: 100,
                 gaming_lock: false,
+                last_feedback_seq: 0,
             },
         );
 
@@ -3159,6 +3291,176 @@ mod tests {
                 .active_clients_count
                 .load(Ordering::Relaxed),
             1
+        );
+        engine.stop();
+    }
+
+    /// P1 regression: a host with zero receivers must keep publishing VU and
+    /// codec telemetry, but must not allocate an Opus encoder or send datagrams
+    /// on every 2.5 ms tick. The control phase proves the counter is live by
+    /// registering one client through a bare HELLO.
+    #[test]
+    fn test_zero_client_idle_does_not_allocate_opus_encoder() {
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut engine = HostEngine::start(
+            HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            },
+            vec![],
+        )
+        .expect("start host engine");
+        engine.telemetry.quality_profile.store(
+            QualityProfile::LowLatencyCompressed as u8,
+            Ordering::Relaxed,
+        );
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        let idle_deadline = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < idle_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.telemetry.host_vu_peak_pct.load(Ordering::Relaxed) > 0,
+            "idle TX loop stopped updating VU telemetry"
+        );
+        assert_eq!(
+            engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed),
+            0,
+            "zero-client idle standby allocated an OpusStreamEncoder"
+        );
+        assert_eq!(
+            engine.telemetry.packets_sent.load(Ordering::Relaxed),
+            0,
+            "zero-client idle standby sent datagrams"
+        );
+        assert_eq!(
+            engine.telemetry.active_codec_mode.load(Ordering::Relaxed),
+            CodecMode::OpusRld as u8,
+            "idle standby must still publish the intended codec mode"
+        );
+
+        // Control: one receiver makes the very same profile allocate an encoder.
+        let hello_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        hello_sock.send_to(CONTROL_MAGIC_HELLO, dest).unwrap();
+        let control_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < control_deadline {
+            if engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed) > 0,
+            "control: registering a client did not allocate an encoder (counter is not live)"
+        );
+        engine.stop();
+    }
+
+    /// P1 regression: the replay high-water mark lives on the client entry.
+    /// Kicking a peer must let its next session restart at feedback_seq = 1.
+    #[test]
+    fn test_kicked_client_reconnects_with_fresh_feedback_seq() {
+        use audioshare_protocol::crypto::AEAD_TAG_LEN;
+        use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
+
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut engine = HostEngine::start(
+            HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            },
+            vec![],
+        )
+        .expect("start host engine");
+        let pin = "1234";
+        engine.set_encryption_pin(Some(pin));
+        let key = SessionKey::from_pin(pin);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let addr = client.local_addr().unwrap();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+
+        fn send_feedback(sock: &UdpSocket, dest: SocketAddr, key: &SessionKey, seq: u32, mode: u8) {
+            let mut buf = [0u8; CONTROL_FEEDBACK_LEN];
+            ClientFeedbackPacket {
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                client_volume: 100,
+                requested_mode: mode,
+                hardware_delay_ms: 0,
+                feedback_seq: seq,
+                auth_tag: [0u8; AEAD_TAG_LEN],
+            }
+            .encode_signed(Some(key), &mut buf);
+            sock.send_to(&buf, dest).expect("send feedback");
+        }
+
+        // First authenticated session: seq 5 selects Max Stability (mode 4).
+        send_feedback(&client, dest, &key, 5, 4);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if engine.connected_clients().iter().any(|c| c.addr == addr)
+                && engine.telemetry.quality_profile.load(Ordering::Relaxed)
+                    == QualityProfile::MaxStability24Ghz as u8
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.connected_clients().iter().any(|c| c.addr == addr),
+            "first authenticated feedback did not register the client"
+        );
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::MaxStability24Ghz as u8,
+            "first feedback command was not applied"
+        );
+
+        engine.kick_client(addr);
+        assert!(
+            engine.connected_clients().is_empty(),
+            "kick did not remove client"
+        );
+
+        // New session restarts at seq 1: the old high-water mark was stored on
+        // the removed client entry, so this must be accepted, not replayed.
+        send_feedback(&client, dest, &key, 1, 3);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if engine.connected_clients().iter().any(|c| c.addr == addr) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.connected_clients().iter().any(|c| c.addr == addr),
+            "reconnect with feedback_seq=1 was wrongly rejected as a replay"
+        );
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::LowLatencyCompressed as u8,
+            "second feedback command was not applied"
+        );
+        assert_eq!(
+            engine.connected_clients()[0].last_feedback_seq,
+            1,
+            "per-client replay high-water mark was not updated"
         );
         engine.stop();
     }
@@ -3484,7 +3786,10 @@ mod tests {
             seq = seq.wrapping_add(2);
         }
         // The wall-clock gate still fires after 200 ms.
-        assert!(!dtx_heartbeat_due(start, start + Duration::from_millis(199)));
+        assert!(!dtx_heartbeat_due(
+            start,
+            start + Duration::from_millis(199)
+        ));
         assert!(dtx_heartbeat_due(start, start + Duration::from_millis(200)));
     }
 
@@ -3549,6 +3854,7 @@ mod tests {
                 hardware_delay_ms: 0,
                 client_volume: 100,
                 gaming_lock,
+                last_feedback_seq: 0,
             }
         }
 
@@ -3585,6 +3891,7 @@ mod tests {
                 hardware_delay_ms: 0,
                 client_volume: 100,
                 gaming_lock: false,
+                last_feedback_seq: 0,
             }
         }
 
@@ -3947,18 +4254,24 @@ mod tests {
         assert!(!telemetry.enable_smart_dtx.load(Ordering::Relaxed));
         assert!(!telemetry.use_test_tone.load(Ordering::Relaxed));
         assert_eq!(
-            telemetry.configured_subframes_per_packet.load(Ordering::Relaxed),
+            telemetry
+                .configured_subframes_per_packet
+                .load(Ordering::Relaxed),
             1
         );
 
         telemetry.enable_smart_dtx.store(true, Ordering::Relaxed);
         telemetry.use_test_tone.store(true, Ordering::Relaxed);
-        telemetry.configured_subframes_per_packet.store(2, Ordering::Relaxed);
+        telemetry
+            .configured_subframes_per_packet
+            .store(2, Ordering::Relaxed);
 
         assert!(telemetry.enable_smart_dtx.load(Ordering::Relaxed));
         assert!(telemetry.use_test_tone.load(Ordering::Relaxed));
         assert_eq!(
-            telemetry.configured_subframes_per_packet.load(Ordering::Relaxed),
+            telemetry
+                .configured_subframes_per_packet
+                .load(Ordering::Relaxed),
             2
         );
     }
