@@ -27,49 +27,83 @@ impl RemoteMediaCommand {
     }
 }
 
-/// Extract the controlling card and active port of `default_sink` from
-/// `pactl list sinks` output.
-///
-/// BlueZ sinks expose `Card: N` but no `alsa.card` property, so accepting only
-/// the latter silently disabled the lip-sync offset for BT headphones.
 #[cfg(target_os = "linux")]
-fn parse_default_sink_card_and_port(text: &str, default_sink: &str) -> Option<(String, String)> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LinuxSinkInfo {
+    /// Numeric PipeWire node ID (`object.id`), required by `pw-cli s <id> Props`.
+    node_id: Option<String>,
+    /// PulseAudio/PipeWire card index (`Card: N`), required by `pactl set-port-latency-offset`.
+    card_idx: Option<String>,
+    active_port: Option<String>,
+}
+
+/// Parse `object.id`, `Card:`, and `Active Port:` for `target_sink` from
+/// `pactl list sinks`. Never overwrite `Card:` with kernel `alsa.card = "..."`
+/// because `pactl set-port-latency-offset` expects the Pulse/PipeWire card ID.
+#[cfg(target_os = "linux")]
+fn parse_sink_info(text: &str, target_sink: &str) -> Option<LinuxSinkInfo> {
     let mut in_target = false;
-    let mut card_idx: Option<String> = None;
-    let mut active_port: Option<String> = None;
+    let mut info = LinuxSinkInfo::default();
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("Sink #") {
             if in_target {
                 break;
             }
-            card_idx = None;
-            active_port = None;
+            info = LinuxSinkInfo::default();
         } else if let Some(name) = trimmed.strip_prefix("Name: ") {
-            in_target = name.trim() == default_sink;
+            in_target = name.trim() == target_sink;
         } else if in_target {
-            if let Some(card) = trimmed.strip_prefix("Card: ") {
-                card_idx = Some(card.trim().to_string());
-            } else if let Some(card) = trimmed.strip_prefix("alsa.card = \"") {
-                card_idx = Some(card.trim_end_matches('"').to_string());
+            if let Some(id) = trimmed.strip_prefix("object.id = \"") {
+                let id = id.trim_end_matches('"').trim();
+                if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+                    info.node_id = Some(id.to_string());
+                }
+            } else if let Some(card) = trimmed.strip_prefix("Card: ") {
+                info.card_idx = Some(card.trim().to_string());
             } else if let Some(port) = trimmed.strip_prefix("Active Port: ") {
-                active_port = Some(port.trim().to_string());
+                info.active_port = Some(port.trim().to_string());
+            } else if info.card_idx.is_none() {
+                if let Some(card) = trimmed.strip_prefix("alsa.card = \"") {
+                    info.card_idx = Some(card.trim_end_matches('"').to_string());
+                }
             }
         }
     }
-    Some((card_idx?, active_port?))
+    if in_target
+        && (info.node_id.is_some() || (info.card_idx.is_some() && info.active_port.is_some()))
+    {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_default_sink_card_and_port() -> Option<(String, String)> {
-    let def = Command::new("pactl").arg("get-default-sink").output().ok()?;
-    let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
-    if default_sink.is_empty() {
-        return None;
+fn parse_default_sink_card_and_port(text: &str, default_sink: &str) -> Option<(String, String)> {
+    let info = parse_sink_info(text, default_sink)?;
+    Some((info.card_idx?, info.active_port?))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_lipsync_targets() -> Vec<LinuxSinkInfo> {
+    let Ok(sinks_out) = Command::new("pactl").args(["list", "sinks"]).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&sinks_out.stdout);
+    let mut targets = Vec::new();
+    if let Some(virt) = parse_sink_info(&text, "AudioShare_Ultra") {
+        targets.push(virt);
     }
-    let sinks = Command::new("pactl").args(["list", "sinks"]).output().ok()?;
-    let text = String::from_utf8_lossy(&sinks.stdout);
-    parse_default_sink_card_and_port(&text, &default_sink)
+    if let Ok(def) = Command::new("pactl").arg("get-default-sink").output() {
+        let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
+        if !default_sink.is_empty() && default_sink != "AudioShare_Ultra" {
+            if let Some(info) = parse_sink_info(&text, &default_sink) {
+                targets.push(info);
+            }
+        }
+    }
+    targets
 }
 
 #[cfg(target_os = "linux")]
@@ -77,7 +111,8 @@ static LAST_LIPSYNC_REQUESTED: AtomicU16 = AtomicU16::new(u16::MAX);
 #[cfg(target_os = "linux")]
 static LIPSYNC_APPLY_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(target_os = "linux")]
-static LIPSYNC_APPLIED_TARGETS: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+static LIPSYNC_APPLIED_TARGETS: std::sync::OnceLock<Mutex<Vec<LinuxSinkInfo>>> =
+    std::sync::OnceLock::new();
 
 /// Apply the offset synchronously. Used by both the async normal path and the
 /// exit-time synchronous reset (which must finish before the process dies).
@@ -89,21 +124,7 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
     }
     let offset_us = (bt_delay_ms as u64) * 1_000;
     let offset_ns = offset_us * 1_000;
-    let mut targets: Vec<String> = Vec::new();
-    if let Ok(def) = Command::new("pactl").arg("get-default-sink").output() {
-        let sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
-        if !sink.is_empty() {
-            targets.push(sink);
-        }
-    }
-    let sinks = Command::new("pactl")
-        .args(["list", "sinks"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    if sinks.contains("Name: AudioShare_Ultra") {
-        targets.push("AudioShare_Ultra".to_string());
-    }
+    let mut targets = resolve_linux_lipsync_targets();
     let history = LIPSYNC_APPLIED_TARGETS.get_or_init(|| Mutex::new(Vec::new()));
     if bt_delay_ms == 0 {
         // Reset any sink we previously offset even if the default sink changed.
@@ -118,12 +139,14 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
     let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
     let us_str = offset_us.to_string();
     for sink in &targets {
-        let _ = Command::new("pw-cli")
-            .args(["s", sink, "Props", &prop])
-            .output();
-        if let Some((card, port)) = resolve_default_sink_card_and_port() {
+        if let Some(ref node_id) = sink.node_id {
+            let _ = Command::new("pw-cli")
+                .args(["s", node_id, "Props", &prop])
+                .output();
+        }
+        if let (Some(ref card), Some(ref port)) = (&sink.card_idx, &sink.active_port) {
             let _ = Command::new("pactl")
-                .args(["set-port-latency-offset", &card, &port, &us_str])
+                .args(["set-port-latency-offset", card, port, &us_str])
                 .output();
         }
     }
@@ -248,17 +271,20 @@ Sink #1
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_sink_card_parser_prefers_alsa_card_property() {
+    fn test_sink_card_parser_prefers_pulse_card_index_and_reads_node_id() {
         let listing = "\
 Sink #2
 \tName: alsa_output.usb-Corsair
 \tCard: 4
+\tobject.id = \"56\"
 \talsa.card = \"7\"
 \tActive Port: analog-output
 ";
+        let info = parse_sink_info(listing, "alsa_output.usb-Corsair").unwrap();
+        assert_eq!(info.node_id.as_deref(), Some("56"));
         assert_eq!(
             parse_default_sink_card_and_port(listing, "alsa_output.usb-Corsair"),
-            Some(("7".to_string(), "analog-output".to_string()))
+            Some(("4".to_string(), "analog-output".to_string()))
         );
     }
 

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
+use audioshare_host_engine::bt_optimization::apply_automatic_video_lipsync_offset_ms;
 use audioshare_host_engine::discovery_and_os::{
     AdbUsbWatcher, DiscoveryBeacon, VirtualSpeakerAndRadioGuard,
 };
@@ -181,6 +182,7 @@ fn run_host(args: &[String]) {
         "[+] Waiting for clients (or run `as-ultra client 127.0.0.1` in another terminal)...\n"
     );
 
+    let mut last_applied_lipsync: u16 = 0;
     loop {
         std::thread::sleep(Duration::from_secs(1));
         let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
@@ -190,6 +192,15 @@ fn run_host(args: &[String]) {
             os_guard.activate();
         } else {
             os_guard.deactivate();
+        }
+        let lipsync_ms = host.telemetry.video_lipsync_offset_ms();
+        if lipsync_ms != last_applied_lipsync
+            && (lipsync_ms == 0
+                || last_applied_lipsync == 0
+                || lipsync_ms.abs_diff(last_applied_lipsync) >= 10)
+        {
+            apply_automatic_video_lipsync_offset_ms(lipsync_ms);
+            last_applied_lipsync = lipsync_ms;
         }
         let dtx = host.telemetry.dtx_silent_mode.load(Ordering::Relaxed);
         let codec = codec_mode_name(host.telemetry.active_codec_mode.load(Ordering::Relaxed));
