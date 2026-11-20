@@ -1,6 +1,12 @@
 #[cfg(target_os = "linux")]
 use std::process::Command;
 
+/// Sink-input IDs this host moved into `AudioShare_Ultra`. Only these are
+/// restored on `restore_all_apps_to_default_sink`; unrelated applications must
+/// keep whatever output the user chose.
+#[cfg(target_os = "linux")]
+static ROUTED_SINK_INPUTS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
 #[cfg(target_os = "windows")]
 use crate::discovery_and_os::silent_command;
 
@@ -544,6 +550,29 @@ pub fn list_active_audio_apps() -> Vec<AudioAppEntry> {
     }
 }
 
+/// Live sink-input IDs currently routed to `sink_name` (PipeWire/Pulse).
+#[cfg(target_os = "linux")]
+fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
+    let Ok(output) = Command::new("pactl")
+        .args(["list", "short", "sink-inputs"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(id) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if fields.next() == Some(sink_name) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 #[cfg(target_os = "linux")]
 fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
     let mut apps = Vec::new();
@@ -587,6 +616,110 @@ fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
 
 #[cfg(target_os = "windows")]
 fn list_windows_audio_processes() -> Vec<AudioAppEntry> {
+    // Authoritative source: CoreAudio's own session enumerator. An app only
+    // qualifies for WASAPI process loopback while it actually holds a render
+    // session, which avoids the stale/guessed entries of a plain tasklist scan.
+    let mut apps = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for pid in windows_audio_session_pids() {
+        if pid == 0 || !seen.insert(pid) {
+            continue; // dedup by PID: one process can own several sessions
+        }
+        let name = windows_process_image_name(pid).unwrap_or_else(|| format!("PID {pid}"));
+        apps.push(AudioAppEntry {
+            id: pid,
+            pid,
+            name,
+        });
+    }
+    if !apps.is_empty() {
+        return apps;
+    }
+    // Fallback for systems where COM enumeration is unavailable/empty.
+    list_windows_audio_processes_tasklist()
+}
+
+/// Enumerate the PIDs behind every active CoreAudio render session via
+/// `IAudioSessionManager2::GetSessionEnumerator` ->
+/// `IAudioSessionControl2::GetProcessId`.
+#[cfg(target_os = "windows")]
+fn windows_audio_session_pids() -> Vec<u32> {
+    use windows::core::Interface;
+    use windows::Win32::Media::Audio::{
+        IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
+        MMDeviceEnumerator,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    let mut pids = Vec::new();
+    unsafe {
+        let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let enumerated = (|| -> windows::core::Result<()> {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let endpoint = enumerator.GetDefaultAudioEndpoint(
+                windows::Win32::Media::Audio::eRender,
+                windows::Win32::Media::Audio::eMultimedia,
+            )?;
+            let manager: IAudioSessionManager2 = endpoint.Activate(CLSCTX_ALL, None)?;
+            let sessions: IAudioSessionEnumerator = manager.GetSessionEnumerator()?;
+            for index in 0..sessions.GetCount()? {
+                if let Ok(control) = sessions.GetSession(index) {
+                    if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                        if let Ok(pid) = control2.GetProcessId() {
+                            pids.push(pid);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        let _ = enumerated;
+        if com_ok {
+            CoUninitialize();
+        }
+    }
+    pids
+}
+
+/// Resolve a PID to its executable image name (file name only).
+#[cfg(target_os = "windows")]
+fn windows_process_image_name(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = [0u16; 260];
+        let mut len = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if !ok || len == 0 || len as usize > buffer.len() {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        let name = path.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(&path);
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn list_windows_audio_processes_tasklist() -> Vec<AudioAppEntry> {
     let mut apps = Vec::new();
     // Query active desktop apps with window titles (candidates for WASAPI Process Loopback)
     let Ok(output) = silent_command("tasklist")
@@ -659,6 +792,11 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             .map_err(|e| format!("Failed to move sink-input: {}", e))?;
 
         if status.success() {
+            if let Ok(mut routed) = ROUTED_SINK_INPUTS.lock() {
+                if !routed.contains(&app.id) {
+                    routed.push(app.id);
+                }
+            }
             Ok(format!(
                 "Routed '{}' (PID {}) -> AudioShare_Ultra",
                 app.name, app.pid
@@ -691,17 +829,34 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
 pub fn restore_all_apps_to_default_sink() -> String {
     #[cfg(target_os = "linux")]
     {
-        for app in list_active_audio_apps() {
+        // Restore only what this host moved, plus any live input still parked
+        // on AudioShare_Ultra (e.g. after a host restart lost the in-memory
+        // record). Applications on their own output are left untouched.
+        let recorded: Vec<u32> = {
+            let mut routed = ROUTED_SINK_INPUTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *routed)
+        };
+        let mut to_restore = recorded;
+        for id in sink_inputs_on_sink("AudioShare_Ultra") {
+            if !to_restore.contains(&id) {
+                to_restore.push(id);
+            }
+        }
+        for id in &to_restore {
             let _ = Command::new("pactl")
-                .args(["move-sink-input", &app.id.to_string(), "@DEFAULT_SINK@"])
+                .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
                 .output();
         }
-        if let Ok(out) = Command::new("pactl").arg("get-default-sink").output() {
-            let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !sink.is_empty() && sink != "AudioShare_Ultra" {
-                let _ = Command::new("pactl")
-                    .args(["set-default-source", &format!("{}.monitor", sink)])
-                    .output();
+        if !to_restore.is_empty() {
+            if let Ok(out) = Command::new("pactl").arg("get-default-sink").output() {
+                let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !sink.is_empty() && sink != "AudioShare_Ultra" {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", &format!("{}.monitor", sink)])
+                        .output();
+                }
             }
         }
         "Restored: Capturing Full System Audio (All Applications)".into()

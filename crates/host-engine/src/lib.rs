@@ -21,8 +21,8 @@ use audioshare_protocol::lpc_lossless::{
 };
 use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
 use audioshare_protocol::wire::{
-    pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader, CONTROL_FEEDBACK_MAGIC,
-    HEADER_LEN, MAC_TAG_LEN,
+    pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
+    CONTROL_FEEDBACK_MAGIC, HEADER_LEN, MAC_TAG_LEN,
 };
 use audioshare_protocol::{
     MAX_SAFE_UDP_PAYLOAD, SAMPLE_RATE, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES,
@@ -197,6 +197,10 @@ impl PreviewPull {
         let out_channels = out_channels.max(1);
         let mut resampler = ClockDriftResampler::new();
         resampler.set_output_sample_rate(out_rate);
+        // The 48 kHz stereo fast path pops straight into the caller's buffer
+        // and never touches the remap/resampler scratch. Skip those ~64 KB of
+        // per-stream allocations entirely.
+        let needs_remap_scratch = !(out_channels == 2 && out_rate == SAMPLE_RATE);
         Self {
             fifo,
             resampler,
@@ -204,8 +208,16 @@ impl PreviewPull {
             out_rate,
             dither_rng: 12345,
             observed_cb_frames,
-            stereo_in: vec![0.0; PREVIEW_CHUNK_FRAMES * 2],
-            stereo_out: vec![0.0; PREVIEW_CHUNK_FRAMES * 2 + 32],
+            stereo_in: if needs_remap_scratch {
+                vec![0.0; PREVIEW_CHUNK_FRAMES * 2]
+            } else {
+                Vec::new()
+            },
+            stereo_out: if needs_remap_scratch {
+                vec![0.0; PREVIEW_CHUNK_FRAMES * 2 + 32]
+            } else {
+                Vec::new()
+            },
             f32_scratch: vec![0.0; PREVIEW_CONVERT_CHUNK_FRAMES * out_channels],
         }
     }
@@ -341,7 +353,12 @@ impl PreviewPull {
     fn fill_i16(&mut self, out: &mut [i16]) {
         if self.out_channels == 2 && self.out_rate == SAMPLE_RATE {
             self.note_cb_frames(out.len());
-            ClientPreviewSink::fill_i16_output(&self.fifo, out, &mut self.dither_rng);
+            ClientPreviewSink::fill_i16_output(
+                &self.fifo,
+                out,
+                &mut self.dither_rng,
+                &mut self.f32_scratch,
+            );
             return;
         }
         self.fill_converted(out, |sample| {
@@ -373,16 +390,25 @@ impl ClientPreviewSink {
         Self::spawn_preferred_with_cb_frames(fifo, None, None)
     }
 
-    fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
-        // CPAL callbacks can be larger than 4096 samples on PulseAudio/ALSA.
-        let mut tmp = [0.0f32; 4096];
+    fn fill_i16_output(
+        fifo: &BurstDecouplerRing,
+        out: &mut [i16],
+        dither_rng: &mut u32,
+        scratch: &mut [f32],
+    ) {
+        // Reuse the caller's heap scratch instead of a 16 KB stack array.
+        // CPAL callbacks can span several chunks on PulseAudio/ALSA.
+        debug_assert!(
+            !scratch.is_empty(),
+            "fill_i16_output needs a non-empty scratch buffer"
+        );
         let mut offset = 0usize;
         while offset < out.len() {
-            let chunk = (out.len() - offset).min(tmp.len());
-            fifo.pop_exact_or_dither(&mut tmp[..chunk], dither_rng);
+            let chunk = (out.len() - offset).min(scratch.len());
+            fifo.pop_exact_or_dither(&mut scratch[..chunk], dither_rng);
             for (dst, &s) in out[offset..offset + chunk]
                 .iter_mut()
-                .zip(tmp[..chunk].iter())
+                .zip(scratch[..chunk].iter())
             {
                 *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             }
@@ -1039,10 +1065,10 @@ pub struct ConnectedClient {
     /// True when this client has engaged 5 ms Gaming Hard-Lock. At least one
     /// such client makes the host tighten packetization for the session.
     pub gaming_lock: bool,
-    /// Highest authenticated feedback sequence seen from this peer (AEAD v2).
-    /// Kept on the client entry so kicking/expiring a peer clears the replay
-    /// high-water mark and a fresh session may start at sequence 1.
-    pub last_feedback_seq: u32,
+    /// Sliding replay window for authenticated feedback (AEAD v2). Kept on the
+    /// client entry so kicking/expiring a peer clears the replay state and a
+    /// fresh session may legitimately restart at sequence 1.
+    pub feedback_window: FeedbackReplayWindow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1269,6 +1295,27 @@ fn pump_pcm_fd_nonblocking(
     }
 }
 
+/// Heap-owned per-stream scratch for the CPAL capture callbacks. The old code
+/// allocated `stereo_buf` + `f32_tmp` + `resampled` (~32 KB) on every callback
+/// stack; one set is allocated up front and moved into the closure instead.
+#[cfg(not(target_os = "android"))]
+struct LoopbackCaptureScratch {
+    stereo_buf: Box<[f32; 2048]>,
+    f32_tmp: Box<[f32; 2048]>,
+    resampled: Box<[f32; 4096]>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl LoopbackCaptureScratch {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            stereo_buf: Box::new([0.0; 2048]),
+            f32_tmp: Box::new([0.0; 2048]),
+            resampled: Box::new([0.0; 4096]),
+        })
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub enum HostCaptureStream {
     #[cfg(target_os = "linux")]
@@ -1326,6 +1373,9 @@ pub struct HostEngine {
     pub telemetry: Arc<HostTelemetry>,
     clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
     session_key: Arc<Mutex<Option<SessionKey>>>,
+    /// Bumped whenever `session_key` is swapped (or its nonce salt rotated).
+    /// The real-time TX loop only re-locks the key mutex when this changes.
+    key_version: Arc<AtomicU64>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
     volume_monitor: Option<HostVolumeMonitor>,
 }
@@ -1383,7 +1433,7 @@ impl HostEngine {
                     hardware_delay_ms: 0,
                     client_volume: 100,
                     gaming_lock: false,
-                    last_feedback_seq: 0,
+                    feedback_window: FeedbackReplayWindow::default(),
                 },
             );
         }
@@ -1395,6 +1445,7 @@ impl HostEngine {
         );
         let clients = Arc::new(Mutex::new(client_map));
         let session_key = Arc::new(Mutex::new(None));
+        let key_version = Arc::new(AtomicU64::new(0));
 
         // Poll the OS master sink volume/mute state on a dedicated, non-RT
         // thread so physical PC keyboard Vol+/Vol-/Mute keys propagate to the
@@ -1415,6 +1466,7 @@ impl HostEngine {
         let telemetry_clone = Arc::clone(&telemetry);
         let clients_clone = Arc::clone(&clients);
         let key_clone = Arc::clone(&session_key);
+        let key_version_clone = Arc::clone(&key_version);
 
         let worker_handle = std::thread::Builder::new()
             .name("as-ultra-host-tx".into())
@@ -1430,6 +1482,7 @@ impl HostEngine {
                     telemetry_clone,
                     clients_clone,
                     key_clone,
+                    key_version_clone,
                 );
             })
             .map_err(|e| format!("Failed to spawn real-time TX thread: {}", e))?;
@@ -1439,14 +1492,28 @@ impl HostEngine {
             telemetry,
             clients,
             session_key,
+            key_version,
             worker_handle: Some(worker_handle),
             volume_monitor,
         })
     }
 
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
-        let mut guard = self.session_key.lock().unwrap();
+        let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
         *guard = pin.map(SessionKey::from_pin);
+        drop(guard);
+        self.key_version.fetch_add(1, Ordering::AcqRel);
+        self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
+    }
+
+    /// Replace the session key directly (e.g. one derived from a QR token)
+    /// and publish a new version so the real-time TX loop refreshes its local
+    /// cache instead of locking the key mutex on every packet.
+    pub fn set_session_key(&self, key: Option<SessionKey>) {
+        let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = key;
+        drop(guard);
+        self.key_version.fetch_add(1, Ordering::AcqRel);
         self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
     }
 
@@ -1514,6 +1581,23 @@ impl HostEngine {
     /// Muted clients receive no audio, so they cannot request framing.
     fn any_client_gaming_lock(map: &HashMap<SocketAddr, ConnectedClient>) -> bool {
         map.values().any(|c| !c.muted && c.gaming_lock)
+    }
+
+    /// True when every unmuted client is on a USB-tethered subnet. Wired USB
+    /// links have ample headroom, so Smart Auto Tier 0 does not need to keep an
+    /// Opus encoder warm for a possible loss spike on those sessions.
+    fn all_active_targets_are_usb(map: &HashMap<SocketAddr, ConnectedClient>) -> bool {
+        let mut any = false;
+        for client in map.values() {
+            if client.muted {
+                continue;
+            }
+            any = true;
+            if !client.is_usb {
+                return false;
+            }
+        }
+        any
     }
 
     /// Pure computation behind [`Self::refresh_client_delay_telemetry`].
@@ -1908,6 +1992,18 @@ impl HostEngine {
         let channels = supported_cfg.channels() as usize;
         let src_rate = supported_cfg.sample_rate().0;
         let sample_format = supported_cfg.sample_format();
+        if !matches!(
+            sample_format,
+            cpal::SampleFormat::I16
+                | cpal::SampleFormat::U16
+                | cpal::SampleFormat::I32
+                | cpal::SampleFormat::F32
+                | cpal::SampleFormat::F64
+        ) {
+            return Err(format!(
+                "Unsupported loopback capture sample format {sample_format:?}"
+            ));
+        }
 
         let stream_cfg = cpal::StreamConfig {
             channels: channels as u16,
@@ -1925,11 +2021,14 @@ impl HostEngine {
         let ratio_cap = ((2000.0 * host_resampler.ratio).floor() as usize).max(1);
         stream_error.store(false, Ordering::Relaxed);
 
+        // One heap allocation per stream, moved into the callback closure: no
+        // 32 KB of stack scratch is laid down on every audio callback.
         let stream = match sample_format {
             cpal::SampleFormat::I16 => {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
@@ -1937,29 +2036,31 @@ impl HostEngine {
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         let ch = channels.max(1);
                         let in_frames = data.len() / ch;
-                        let mut stereo_buf = [0.0f32; 2048];
-                        let mut f32_tmp = [0.0f32; 2048];
                         let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
                             let src_slice =
                                 &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
-                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                            for (dst, &s) in scratch.f32_tmp[..src_slice.len()]
+                                .iter_mut()
+                                .zip(src_slice)
+                            {
                                 *dst = (s as f32) * (1.0 / 32768.0);
                             }
                             downmix_to_stereo(
-                                &f32_tmp[..chunk_frames * ch],
+                                &scratch.f32_tmp[..chunk_frames * ch],
                                 ch,
-                                &mut stereo_buf[..chunk_frames * 2],
+                                &mut scratch.stereo_buf[..chunk_frames * 2],
                             );
                             if src_rate == SAMPLE_RATE {
-                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                                ring_buf.push_samples(&scratch.stereo_buf[..chunk_frames * 2]);
                             } else {
-                                let mut resampled = [0.0f32; 4096];
-                                let out_frames = host_resampler
-                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
-                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                                let out_frames = host_resampler.process(
+                                    &scratch.stereo_buf[..chunk_frames * 2],
+                                    &mut scratch.resampled[..],
+                                );
+                                ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
                             frame_offset += chunk_frames;
                         }
@@ -1974,6 +2075,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -1981,29 +2083,31 @@ impl HostEngine {
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         let ch = channels.max(1);
                         let in_frames = data.len() / ch;
-                        let mut stereo_buf = [0.0f32; 2048];
-                        let mut f32_tmp = [0.0f32; 2048];
                         let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
                             let src_slice =
                                 &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
-                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                            for (dst, &s) in scratch.f32_tmp[..src_slice.len()]
+                                .iter_mut()
+                                .zip(src_slice)
+                            {
                                 *dst = ((s as f32) - 32768.0) * (1.0 / 32768.0);
                             }
                             downmix_to_stereo(
-                                &f32_tmp[..chunk_frames * ch],
+                                &scratch.f32_tmp[..chunk_frames * ch],
                                 ch,
-                                &mut stereo_buf[..chunk_frames * 2],
+                                &mut scratch.stereo_buf[..chunk_frames * 2],
                             );
                             if src_rate == SAMPLE_RATE {
-                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                                ring_buf.push_samples(&scratch.stereo_buf[..chunk_frames * 2]);
                             } else {
-                                let mut resampled = [0.0f32; 4096];
-                                let out_frames = host_resampler
-                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
-                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                                let out_frames = host_resampler.process(
+                                    &scratch.stereo_buf[..chunk_frames * 2],
+                                    &mut scratch.resampled[..],
+                                );
+                                ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
                             frame_offset += chunk_frames;
                         }
@@ -2018,6 +2122,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
                     move |data: &[i32], _: &cpal::InputCallbackInfo| {
@@ -2025,29 +2130,119 @@ impl HostEngine {
                             .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                         let ch = channels.max(1);
                         let in_frames = data.len() / ch;
-                        let mut stereo_buf = [0.0f32; 2048];
-                        let mut f32_tmp = [0.0f32; 2048];
                         let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
                         let mut frame_offset = 0usize;
                         while frame_offset < in_frames {
                             let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
                             let src_slice =
                                 &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
-                            for (dst, &s) in f32_tmp[..src_slice.len()].iter_mut().zip(src_slice) {
+                            for (dst, &s) in scratch.f32_tmp[..src_slice.len()]
+                                .iter_mut()
+                                .zip(src_slice)
+                            {
                                 *dst = i32_capture_to_f32(s);
                             }
                             downmix_to_stereo(
-                                &f32_tmp[..chunk_frames * ch],
+                                &scratch.f32_tmp[..chunk_frames * ch],
                                 ch,
-                                &mut stereo_buf[..chunk_frames * 2],
+                                &mut scratch.stereo_buf[..chunk_frames * 2],
                             );
                             if src_rate == SAMPLE_RATE {
-                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
+                                ring_buf.push_samples(&scratch.stereo_buf[..chunk_frames * 2]);
                             } else {
-                                let mut resampled = [0.0f32; 4096];
-                                let out_frames = host_resampler
-                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
-                                ring_buf.push_samples(&resampled[..out_frames * 2]);
+                                let out_frames = host_resampler.process(
+                                    &scratch.stereo_buf[..chunk_frames * 2],
+                                    &mut scratch.resampled[..],
+                                );
+                                ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
+                        }
+                    },
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::F64 => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
+                let mut scratch = LoopbackCaptureScratch::new();
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[f64], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            for (dst, &s) in scratch.f32_tmp[..src_slice.len()]
+                                .iter_mut()
+                                .zip(src_slice)
+                            {
+                                *dst = s as f32;
+                            }
+                            downmix_to_stereo(
+                                &scratch.f32_tmp[..chunk_frames * ch],
+                                ch,
+                                &mut scratch.stereo_buf[..chunk_frames * 2],
+                            );
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&scratch.stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let out_frames = host_resampler.process(
+                                    &scratch.stereo_buf[..chunk_frames * 2],
+                                    &mut scratch.resampled[..],
+                                );
+                                ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
+                            }
+                            frame_offset += chunk_frames;
+                        }
+                    },
+                    move |_| {
+                        err_flag.store(true, Ordering::Release);
+                    },
+                    None,
+                )
+            }
+            cpal::SampleFormat::F32 => {
+                let heartbeat = Arc::clone(&heartbeat_ms);
+                let ring_buf = Arc::clone(&ring);
+                let err_flag = Arc::clone(&stream_error);
+                let mut scratch = LoopbackCaptureScratch::new();
+                device.build_input_stream(
+                    &stream_cfg,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        heartbeat
+                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        let ch = channels.max(1);
+                        let in_frames = data.len() / ch;
+                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
+                        let mut frame_offset = 0usize;
+                        while frame_offset < in_frames {
+                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
+                            let src_slice =
+                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
+                            downmix_to_stereo(
+                                src_slice,
+                                ch,
+                                &mut scratch.stereo_buf[..chunk_frames * 2],
+                            );
+                            if src_rate == SAMPLE_RATE {
+                                ring_buf.push_samples(&scratch.stereo_buf[..chunk_frames * 2]);
+                            } else {
+                                let out_frames = host_resampler.process(
+                                    &scratch.stereo_buf[..chunk_frames * 2],
+                                    &mut scratch.resampled[..],
+                                );
+                                ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
                             frame_offset += chunk_frames;
                         }
@@ -2059,40 +2254,8 @@ impl HostEngine {
                 )
             }
             _ => {
-                let heartbeat = Arc::clone(&heartbeat_ms);
-                let ring_buf = Arc::clone(&ring);
-                let err_flag = Arc::clone(&stream_error);
-                device.build_input_stream(
-                    &stream_cfg,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        heartbeat
-                            .store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-                        let ch = channels.max(1);
-                        let in_frames = data.len() / ch;
-                        let mut stereo_buf = [0.0f32; 2048];
-                        let max_chunk_frames = (2048 / ch).min(1024).min(ratio_cap).max(1);
-                        let mut frame_offset = 0usize;
-                        while frame_offset < in_frames {
-                            let chunk_frames = (in_frames - frame_offset).min(max_chunk_frames);
-                            let src_slice =
-                                &data[frame_offset * ch..(frame_offset + chunk_frames) * ch];
-                            downmix_to_stereo(src_slice, ch, &mut stereo_buf[..chunk_frames * 2]);
-                            if src_rate == SAMPLE_RATE {
-                                ring_buf.push_samples(&stereo_buf[..chunk_frames * 2]);
-                            } else {
-                                let mut resampled = [0.0f32; 4096];
-                                let out_frames = host_resampler
-                                    .process(&stereo_buf[..chunk_frames * 2], &mut resampled);
-                                ring_buf.push_samples(&resampled[..out_frames * 2]);
-                            }
-                            frame_offset += chunk_frames;
-                        }
-                    },
-                    move |_| {
-                        err_flag.store(true, Ordering::Release);
-                    },
-                    None,
-                )
+                // Validated above; cpal's enum is non-exhaustive.
+                unreachable!("unsupported loopback capture sample format");
             }
         }
         .map_err(|e| format!("Failed to build loopback stream: {}", e))?;
@@ -2113,6 +2276,7 @@ impl HostEngine {
         telemetry: Arc<HostTelemetry>,
         clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
+        key_version: Arc<AtomicU64>,
     ) {
         #[cfg(target_os = "android")]
         let _ = &capture_heartbeat_ms;
@@ -2120,13 +2284,51 @@ impl HostEngine {
         #[cfg(not(target_os = "android"))]
         let capture_stream_error = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
-        let current_default_output_name = || -> Option<String> {
+        let latest_output_name = Arc::new(Mutex::new(
             cpal::default_host()
                 .default_output_device()
-                .and_then(|d| d.name().ok())
-        };
+                .and_then(|d| d.name().ok()),
+        ));
         #[cfg(target_os = "windows")]
-        let mut bound_output_name = current_default_output_name();
+        let output_generation = Arc::new(AtomicU64::new(0));
+        #[cfg(target_os = "windows")]
+        {
+            // Polling `default_output_device().name()` can stall for tens of
+            // milliseconds. Do it on a non-RT watcher (mirror Linux's
+            // `as-ultra-sink-watch`) and let the TX loop read only a generation.
+            let watcher_running = Arc::clone(&running);
+            let watcher_latest = Arc::clone(&latest_output_name);
+            let watcher_generation = Arc::clone(&output_generation);
+            let _ = std::thread::Builder::new()
+                .name("as-ultra-output-watch".into())
+                .spawn(move || {
+                    let mut last = watcher_latest
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    while watcher_running.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(500));
+                        if let Some(current) = cpal::default_host()
+                            .default_output_device()
+                            .and_then(|d| d.name().ok())
+                        {
+                            if current != last {
+                                last = current.clone();
+                                *watcher_latest.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(current);
+                                watcher_generation.fetch_add(1, Ordering::Release);
+                            }
+                        }
+                    }
+                });
+        }
+        #[cfg(target_os = "windows")]
+        let mut bound_output_generation = output_generation.load(Ordering::Acquire);
+        #[cfg(target_os = "windows")]
+        let mut bound_output_name = latest_output_name
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         #[cfg(target_os = "windows")]
         let mut bound_target_pid: u32 = app_routing::windows_target_capture_pid();
         #[cfg(target_os = "windows")]
@@ -2186,18 +2388,51 @@ impl HostEngine {
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
         let mut opus_encoder_failed = false;
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
+        let mut cached_all_usb = false;
         if let Ok(map) = clients.lock() {
             for c in map.values() {
                 if !c.muted {
                     cached_targets.push(c.addr);
                 }
             }
+            cached_all_usb = Self::all_active_targets_are_usb(&map);
         }
+        // Cache the session key locally. The UI swaps it through
+        // `set_session_key`/`set_encryption_pin`, which bump `key_version`; the
+        // loop only re-locks the key mutex when the version actually changes.
+        let mut key_version_seen = key_version.load(Ordering::Acquire);
+        let mut active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
+        let mut last_salt_rotation = Instant::now();
+        const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
+
+            let current_key_version = key_version.load(Ordering::Acquire);
+            if current_key_version != key_version_seen {
+                active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
+                key_version_seen = current_key_version;
+            }
+            // Long-lived encrypted sessions rotate the 4-byte nonce salt so a
+            // 32-bit salt cannot be reused into a two-time-pad. The salt travels
+            // in each packet's AAD, so clients follow the rotation seamlessly.
+            if active_key_cache.is_some()
+                && last_salt_rotation.elapsed() >= SALT_ROTATION_INTERVAL
+            {
+                last_salt_rotation = Instant::now();
+                let mut guard = session_key.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(key) = guard.as_mut() {
+                    key.rotate_session_salt();
+                    active_key_cache = Some(*key);
+                }
+                drop(guard);
+                // Leave `key_version_seen` at the pre-bump value so the next
+                // tick re-reads the mutex (a concurrent UI key swap wins). The
+                // redundant reload is harmless and keeps the cache coherent.
+                key_version_seen = key_version.fetch_add(1, Ordering::AcqRel);
+            }
 
             #[cfg(target_os = "linux")]
             if !use_test_tone && active_stream.is_none() {
@@ -2224,8 +2459,18 @@ impl HostEngine {
             if !use_test_tone && last_watchdog_check.elapsed() >= Duration::from_millis(500) {
                 last_watchdog_check = Instant::now();
                 let now_ms = start_instant.elapsed().as_millis() as u64;
-                let latest_name = current_default_output_name();
-                let device_changed = latest_name.is_some() && latest_name != bound_output_name;
+                // Cheap generation read only: the actual cpal device query runs
+                // on the non-RT `as-ultra-output-watch` thread.
+                let generation = output_generation.load(Ordering::Acquire);
+                let device_changed = generation != bound_output_generation;
+                let latest_name = if device_changed {
+                    latest_output_name
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                } else {
+                    bound_output_name.clone()
+                };
                 let target_pid = app_routing::windows_target_capture_pid();
                 let pid_changed = target_pid != bound_target_pid;
                 // Only rebind when the stream is missing, reported a device error,
@@ -2271,6 +2516,7 @@ impl HostEngine {
                     };
                     if active_stream.is_some() {
                         bound_output_name = latest_name;
+                        bound_output_generation = generation;
                         bound_target_pid = target_pid;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
@@ -2289,7 +2535,7 @@ impl HostEngine {
                     // session key, only authenticated feedback may register a
                     // client; otherwise any LAN host could add itself to the
                     // stream target list without knowing the PIN.
-                    if session_key.lock().unwrap().is_some() {
+                    if active_key_cache.is_some() {
                         // A bare HELLO is unauthenticated: when a PIN is set it
                         // can only be a duplicate/late join or a LAN probe.
                         telemetry
@@ -2315,7 +2561,7 @@ impl HostEngine {
                             hardware_delay_ms: 0,
                             client_volume: 100,
                             gaming_lock: false,
-                            last_feedback_seq: 0,
+                            feedback_window: FeedbackReplayWindow::default(),
                         })
                         .last_seen = Instant::now();
                     telemetry
@@ -2329,13 +2575,14 @@ impl HostEngine {
                             cached_targets.push(c.addr);
                         }
                     }
+                    cached_all_usb = Self::all_active_targets_are_usb(&map);
                 } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
                     // Feedback carries remote-control commands (quality profile,
                     // codec backend, media transport) and group-sync delays.
                     // When a PIN is configured, require the keyed MAC over the
                     // complete body before acting on any of it. Unencrypted LAN
                     // and party mode have no key and stay backward compatible.
-                    let active_key = *session_key.lock().unwrap();
+                    let active_key = active_key_cache;
                     let Some(fb) = ClientFeedbackPacket::decode_verified(
                         &ctrl_buf[..len],
                         active_key.as_ref(),
@@ -2349,19 +2596,27 @@ impl HostEngine {
                     };
                     // Reject replayed authenticated feedback BEFORE any command
                     // side effect. The sequence is nonce-bound, so an attacker
-                    // cannot simply bump it on a captured packet. The high-water
-                    // mark lives on the ConnectedClient: kicking/expiring a peer
-                    // removes it, so a reconnect may legitimately restart at 1.
-                    {
-                        let map = clients.lock().unwrap();
-                        let last = map.get(&src_addr).map(|c| c.last_feedback_seq).unwrap_or(0);
-                        if audioshare_protocol::wire::feedback_is_replay(
-                            active_key.is_some(),
-                            fb.feedback_seq,
-                            last,
-                        ) {
-                            continue;
+                    // cannot simply bump it on a captured packet. `check_and_accept`
+                    // both filters the replay and records the newly accepted seq;
+                    // for a not-yet-registered peer we seed a temporary window and
+                    // carry it into the entry created below. Kicking a peer drops
+                    // its window, so a reconnect may legitimately restart at 1.
+                    let mut accepted_window = FeedbackReplayWindow::default();
+                    let replay = {
+                        let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+                        match map.get_mut(&src_addr) {
+                            Some(entry) => !entry.feedback_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ),
+                            None => !accepted_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ),
                         }
+                    };
+                    if replay {
+                        continue;
                     }
                     let mut gaming_lock_update: Option<bool> = None;
 
@@ -2432,14 +2687,13 @@ impl HostEngine {
                         hardware_delay_ms: fb.hardware_delay_ms,
                         client_volume: fb.client_volume,
                         gaming_lock: false,
-                        last_feedback_seq: 0,
+                        feedback_window: accepted_window,
                     });
                     entry.last_seen = Instant::now();
                     entry.fec_rate_permille = fb.fec_rate_permille;
                     entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
                     entry.hardware_delay_ms = fb.hardware_delay_ms;
                     entry.client_volume = fb.client_volume;
-                    entry.last_feedback_seq = fb.feedback_seq;
                     if let Some(gaming_lock) = gaming_lock_update {
                         entry.gaming_lock = gaming_lock;
                     }
@@ -2468,6 +2722,7 @@ impl HostEngine {
                             cached_targets.push(c.addr);
                         }
                     }
+                    cached_all_usb = Self::all_active_targets_are_usb(&map);
                 } else if len >= 8 && &ctrl_buf[..8] == b"ASULCTRL" {
                     // Legacy v1 (0.2.x) client tried to join a v2 host. Count
                     // the rejection so operators can spot version mismatches.
@@ -2503,6 +2758,7 @@ impl HostEngine {
                             cached_targets.push(c.addr);
                         }
                     }
+                    cached_all_usb = Self::all_active_targets_are_usb(&map);
                 }
             }
 
@@ -2897,8 +3153,13 @@ impl HostEngine {
                         } else {
                             // Tier 0 of Smart Auto is lossless, but the Opus
                             // encoder is kept primed so a sudden loss spike
-                            // does not start with codec warm-up silence.
-                            if profile == QualityProfile::SmartAuto && prefer_opus {
+                            // does not start with codec warm-up silence. USB
+                            // tethered links have ample headroom, so an all-USB
+                            // session skips that work entirely.
+                            if profile == QualityProfile::SmartAuto
+                                && prefer_opus
+                                && !cached_all_usb
+                            {
                                 warm_opus_lookahead(
                                     &mut opus_encoder,
                                     &i16_subframes[sub_idx],
@@ -2935,7 +3196,7 @@ impl HostEngine {
 
             let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
             let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
-            let active_key = *session_key.lock().unwrap();
+            let active_key = active_key_cache;
 
             // `is_dtx_active` was evaluated right after subframe collection,
             // before any encoder allocation or encoding work.
@@ -3314,7 +3575,7 @@ mod tests {
                 hardware_delay_ms: 17,
                 client_volume: 100,
                 gaming_lock: false,
-                last_feedback_seq: 0,
+                feedback_window: FeedbackReplayWindow::default(),
             },
         );
         map.insert(
@@ -3329,7 +3590,7 @@ mod tests {
                 hardware_delay_ms: 30,
                 client_volume: 100,
                 gaming_lock: false,
-                last_feedback_seq: 0,
+                feedback_window: FeedbackReplayWindow::default(),
             },
         );
         map.insert(
@@ -3344,7 +3605,7 @@ mod tests {
                 hardware_delay_ms: 200,
                 client_volume: 100,
                 gaming_lock: false,
-                last_feedback_seq: 0,
+                feedback_window: FeedbackReplayWindow::default(),
             },
         );
 
@@ -3608,10 +3869,10 @@ mod tests {
             QualityProfile::LowLatencyCompressed as u8,
             "second feedback command was not applied"
         );
-        assert_eq!(
-            engine.connected_clients()[0].last_feedback_seq,
-            1,
-            "per-client replay high-water mark was not updated"
+        let mut window = engine.connected_clients()[0].feedback_window;
+        assert!(
+            !window.check_and_accept(true, 1),
+            "per-client replay window did not record the accepted seq 1"
         );
         engine.stop();
     }
@@ -4005,7 +4266,7 @@ mod tests {
                 hardware_delay_ms: 0,
                 client_volume: 100,
                 gaming_lock,
-                last_feedback_seq: 0,
+                feedback_window: FeedbackReplayWindow::default(),
             }
         }
 
@@ -4042,7 +4303,7 @@ mod tests {
                 hardware_delay_ms: 0,
                 client_volume: 100,
                 gaming_lock: false,
-                last_feedback_seq: 0,
+                feedback_window: FeedbackReplayWindow::default(),
             }
         }
 
@@ -4636,5 +4897,107 @@ mod tests {
         );
         assert_eq!(ring.available_samples(), 0);
         close_fd(read_fd);
+    }
+
+    /// Lane E regression: a later-but-unseen feedback sequence arriving out of
+    /// order must be accepted, while a duplicate and a sequence older than the
+    /// replay window must not trigger any command side effect.
+    #[test]
+    fn test_host_engine_accepts_out_of_order_feedback_and_rejects_replays() {
+        use audioshare_protocol::crypto::AEAD_TAG_LEN;
+        use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
+
+        let (mut engine, port) = start_test_host();
+        let pin = "4321";
+        engine.set_encryption_pin(Some(pin));
+        let key = SessionKey::from_pin(pin);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+
+        fn send_feedback(sock: &UdpSocket, dest: SocketAddr, key: &SessionKey, seq: u32, mode: u8) {
+            let mut buf = [0u8; CONTROL_FEEDBACK_LEN];
+            ClientFeedbackPacket {
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                client_volume: 100,
+                requested_mode: mode,
+                hardware_delay_ms: 0,
+                feedback_seq: seq,
+                auth_tag: [0u8; AEAD_TAG_LEN],
+            }
+            .encode_signed(Some(key), &mut buf);
+            sock.send_to(&buf, dest).expect("send feedback");
+        }
+
+        fn wait_for_profile(engine: &HostEngine, profile: QualityProfile, timeout_ms: u64) -> bool {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            while Instant::now() < deadline {
+                if engine.telemetry.quality_profile.load(Ordering::Relaxed) == profile as u8 {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            engine.telemetry.quality_profile.load(Ordering::Relaxed) == profile as u8
+        }
+
+        // Highest seq first: mode 4 selects Max Stability (profile 3).
+        send_feedback(&client, dest, &key, 5, 4);
+        assert!(
+            wait_for_profile(&engine, QualityProfile::MaxStability24Ghz, 2_000),
+            "initial authenticated feedback was not applied"
+        );
+
+        // Out-of-order seq 3 is within the 64-slot bitmap and unseen: accept.
+        send_feedback(&client, dest, &key, 3, 3);
+        assert!(
+            wait_for_profile(&engine, QualityProfile::LowLatencyCompressed, 2_000),
+            "out-of-order feedback seq 3 was wrongly rejected as a replay"
+        );
+
+        // Duplicate seq 3: its bit is already set, so the command must not run.
+        send_feedback(&client, dest, &key, 3, 2);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::LowLatencyCompressed as u8,
+            "duplicate feedback seq 3 was applied (replay was not rejected)"
+        );
+
+        // Jump past the window, then send a seq too old for the 64-bit bitmap.
+        send_feedback(&client, dest, &key, 100, 5);
+        assert!(
+            wait_for_profile(&engine, QualityProfile::StudioLossless24Bit, 2_000),
+            "forward feedback seq 100 was not applied"
+        );
+        send_feedback(&client, dest, &key, 1, 3);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::StudioLossless24Bit as u8,
+            "feedback seq 1 older than the replay window was applied"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn test_preview_pull_48k_stereo_skips_remap_scratch() {
+        let fifo = Arc::new(BurstDecouplerRing::new());
+        let pull = PreviewPull::new(Arc::clone(&fifo), 2, SAMPLE_RATE, None);
+        assert!(
+            pull.stereo_in.is_empty() && pull.stereo_out.is_empty(),
+            "48 kHz stereo fast path must not allocate remap scratch"
+        );
+        assert!(!pull.f32_scratch.is_empty());
+
+        // Both non-fast paths still need the buffers.
+        let mono = PreviewPull::new(Arc::clone(&fifo), 1, SAMPLE_RATE, None);
+        assert!(!mono.stereo_in.is_empty(), "mono remap needs scratch");
+        let resampled = PreviewPull::new(Arc::clone(&fifo), 2, 44_100, None);
+        assert!(
+            !resampled.stereo_out.is_empty(),
+            "resampling needs scratch"
+        );
     }
 }
