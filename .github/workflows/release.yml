@@ -11,6 +11,11 @@ on:
         required: false
         type: string
         default: ''
+      skip_publish:
+        description: 'CI verification only - skip creating a GitHub release'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -199,7 +204,7 @@ jobs:
   # 4. Publish GitHub Release (Runs on tags, pushes to main, and manual workflow dispatch)
   publish-release:
     needs: [build-linux, build-windows, build-android]
-    if: always() && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' && needs.build-android.result == 'success'
+    if: always() && needs.build-linux.result == 'success' && needs.build-windows.result == 'success' && needs.build-android.result == 'success' && inputs.skip_publish != true
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
