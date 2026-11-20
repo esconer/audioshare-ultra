@@ -1829,7 +1829,7 @@ mod tests {
         // live socket and audio sink, so only the decisive clamp/prebuffer
         // behaviour is unit-tested here.
         let ring_cap = audioshare_protocol::sequencer::RING_SLOTS as i16;
-        assert_eq!(ring_cap, 128);
+        assert_eq!(ring_cap, 256);
 
         let base_target = mic_fifo_target_subframes(240); // 6.0 (5 ms callback floor)
         let base_depth = base_target.ceil() as i16;
@@ -1884,7 +1884,7 @@ mod tests {
             resync_ahead(60) >= target_depth,
             "a deep BT cushion must not be resynced mid-prebuffer"
         );
-        assert_eq!(resync_ahead(500), 124); // capped to ring capacity - 4
+        assert_eq!(resync_ahead(500), ring_cap - 4); // capped to ring capacity - 4
 
         // At the base cushion the guard stays at the 48 floor, far above the
         // 6-packet prebuffer, so the fill phase never trips a reset.
