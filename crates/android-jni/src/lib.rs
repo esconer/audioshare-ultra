@@ -14,7 +14,9 @@ use audioshare_host_engine::{
     DEFAULT_PORT,
 };
 use audioshare_protocol::crypto::SessionKey;
+use audioshare_protocol::diagnostics;
 use audioshare_protocol::dsp::BurstDecouplerRing;
+use audioshare_protocol::latency::codec_mode_name;
 use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
@@ -1051,7 +1053,10 @@ pub fn android_start_stream(
                 .parse::<IpAddr>()
                 .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
         })
-        .map_err(|e| format!("Invalid SocketAddr {}: {}", host_ip_port, e))?;
+        .map_err(|e| {
+            diagnostics::warn("session-start", format!("invalid host address: {e}"));
+            format!("Invalid SocketAddr {}: {}", host_ip_port, e)
+        })?;
 
     let existing = GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut existing) = existing {
@@ -1069,7 +1074,25 @@ pub fn android_start_stream(
         dolby_effects,
     };
 
-    let client = ClientEngine::connect_with_pin(cfg, pin)?;
+    let client = ClientEngine::connect_with_pin(cfg, pin).map_err(|e| {
+        diagnostics::error(
+            "session-start",
+            format!("connect failed to {}:{} ({})", addr.ip(), addr.port(), e),
+        );
+        e
+    })?;
+    // Log the parsed host/port, never the raw input or PIN: the PIN is a
+    // separate argument and must not end up in a pasteable diagnostics bundle.
+    diagnostics::info(
+        "session-start",
+        format!(
+            "host={} port={} codec={} usb={}",
+            addr.ip(),
+            addr.port(),
+            codec_mode_name(client.telemetry.codec_mode.load(Ordering::Relaxed)),
+            detected_usb,
+        ),
+    );
     *GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()) = Some(client);
     Ok(())
 }
@@ -1078,6 +1101,16 @@ pub fn android_stop_client_only() {
     let client = GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut client) = client {
         client.stop();
+        // `stop()` consumes the running session but leaves `telemetry` intact.
+        // Flatten the multi-line summary so the final counters survive in a
+        // single event-log entry after the client has disconnected.
+        diagnostics::info(
+            "session-end",
+            client
+                .telemetry
+                .diagnostics_summary(0.0)
+                .replace('\n', " | "),
+        );
     }
 }
 
@@ -1524,16 +1557,69 @@ pub mod android_native {
         }
     }
 
-    /// Return a pasteable diagnostics bundle (platform info + event log).
+    /// Return a pasteable diagnostics bundle (platform info + live telemetry +
+    /// event log) from the Rust side.
     #[no_mangle]
     pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetDiagnostics(
         env: JNIEnv,
         _class: JClass,
     ) -> jstring {
-        let report = audioshare_protocol::diagnostics::export_report("Platform: Android JNI");
+        let mut summary = String::from("Platform: Android JNI");
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
+            summary.push('\n');
+            summary.push_str(&client.telemetry.diagnostics_summary(0.0));
+        }
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
+            let party = &tx.party_telemetry;
+            summary.push('\n');
+            summary.push_str(&format!(
+                "Party Host: peers={} codec={} port={} sync={}ms muted={}",
+                party.listener_count.load(Ordering::Relaxed),
+                codec_mode_name(party.active_codec_mode.load(Ordering::Relaxed)),
+                party.bound_port,
+                party.max_group_delay_ms.load(Ordering::Relaxed),
+                party.cast_muted.load(Ordering::Relaxed),
+            ));
+        }
+        let report = diagnostics::export_report(&summary);
         match env.new_string(report) {
             Ok(value) => value.into_raw(),
             Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Bridge Kotlin-side state transitions into the shared ring-buffered
+    /// diagnostics log. Mirrors
+    /// `AudioEngineService.nativeLogEvent(level, component, message)`:
+    /// level 0 = info, 1 = warn, anything else = error.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeLogEvent(
+        mut env: JNIEnv,
+        _class: JClass,
+        level: jint,
+        component: JString,
+        message: JString,
+    ) {
+        let component = env
+            .get_string(&component)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                // A failed GetStringUTFChars leaves a pending Java exception;
+                // clear it before returning or the next JNI call inherits it.
+                let _ = env.exception_clear();
+                "kotlin".to_string()
+            });
+        let message = env
+            .get_string(&message)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                let _ = env.exception_clear();
+                String::new()
+            });
+        match level {
+            0 => diagnostics::info(&component, &message),
+            1 => diagnostics::warn(&component, &message),
+            _ => diagnostics::error(&component, &message),
         }
     }
 }
