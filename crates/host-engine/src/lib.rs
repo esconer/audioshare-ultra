@@ -2312,8 +2312,8 @@ impl HostEngine {
                             .default_output_device()
                             .and_then(|d| d.name().ok())
                         {
-                            if current != last {
-                                last = current.clone();
+                            if Some(&current) != last.as_ref() {
+                                last = Some(current.clone());
                                 *watcher_latest.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(current);
                                 watcher_generation.fetch_add(1, Ordering::Release);

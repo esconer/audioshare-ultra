@@ -65,6 +65,7 @@ fn is_virtual_interface_name(name: &str) -> bool {
     lower.contains("docker")
         || lower.contains("wsl")
         || lower.contains("vethernet")
+        || lower.starts_with("veth")
         || lower.contains("vmware")
         || lower.contains("vmnet")
         || lower.contains("vbox")
