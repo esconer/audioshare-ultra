@@ -983,7 +983,14 @@ impl ClientEngine {
             effective_config.server_addr = bridge.local_udp_addr;
         }
 
-        let _ = socket.send_to(CONTROL_MAGIC_HELLO, effective_config.server_addr);
+        // Only send the bare unauthenticated HELLO when no PIN is active. With
+        // a PIN, the RX loop immediately sends a signed ASULCTR2 feedback
+        // packet on its first pass (last_gaming_lock_state = None), so a bare
+        // HELLO would be rejected by the host and bump `rejected_handshakes`
+        // on every legitimate encrypted connection.
+        if session_key.lock().unwrap().is_none() {
+            let _ = socket.send_to(CONTROL_MAGIC_HELLO, effective_config.server_addr);
+        }
 
         let burst_fifo = Arc::new(BurstDecouplerRing::new());
         let running_clone = Arc::clone(&running);
@@ -2258,6 +2265,53 @@ mod tests {
         client.stop();
         host.stop();
         assert!(received > 0, "no packets crossed the ADB TCP<->UDP bridge");
+    }
+
+    /// A valid PIN connect must not emit a bare HELLO. The host would reject
+    /// it and bump `rejected_handshakes` on every legitimate encrypted client,
+    /// permanently showing the "check matching PIN & app version" warning.
+    #[test]
+    fn test_valid_pin_connect_does_not_bump_rejected_handshakes() {
+        use audioshare_host_engine::{HostConfig, HostEngine};
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut host = HostEngine::start(
+            HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            },
+            vec![],
+        )
+        .expect("start host");
+        host.set_encryption_pin(Some("4829"));
+
+        let mut client = ClientEngine::connect_with_pin(
+            ClientConfig {
+                server_addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                target_buffer_subframes: 4.0,
+                preamp_gain_db: 0.0,
+                dolby_effects: false,
+            },
+            Some("4829"),
+        )
+        .expect("connect client");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && client.telemetry.packets_received.load(Ordering::Relaxed) < 4
+        {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let rx = client.telemetry.packets_received.load(Ordering::Relaxed);
+        let rej = host.telemetry.rejected_handshakes.load(Ordering::Relaxed);
+        client.stop();
+        host.stop();
+        assert!(rx >= 4, "valid PIN client did not receive audio ({rx} pkts)");
+        assert_eq!(rej, 0, "valid PIN connect triggered false rejected_handshakes={rej}");
     }
 
     /// Accept a connection from a non-blocking listener within `timeout`.
