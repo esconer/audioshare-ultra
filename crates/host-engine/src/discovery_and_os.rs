@@ -209,6 +209,16 @@ impl DiscoveryScanner {
                 let mut last_mcast_refresh = Instant::now();
 
                 while run_clone.load(Ordering::Relaxed) {
+                    // While paused (e.g. the app is in the background or a
+                    // network switch is in progress) check FIRST and skip all
+                    // work — including the 2 s multicast refresh — sleeping
+                    // 250 ms instead of waking every 50 ms. The socket stays
+                    // bound; datagrams queue in the kernel and are processed
+                    // as soon as scanning resumes.
+                    if paused_clone.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
                     if last_mcast_refresh.elapsed() >= Duration::from_secs(2) {
                         last_mcast_refresh = Instant::now();
                         for iface in crate::list_valid_host_interfaces() {
@@ -217,14 +227,7 @@ impl DiscoveryScanner {
                             }
                         }
                     }
-                    // While paused (e.g. the app is in the background or a
-                    // network switch is in progress) skip the receive entirely
-                    // so no stale or in-flight beacon can add a host. The
-                    // socket stays bound; datagrams queue in the kernel and are
-                    // processed as soon as scanning resumes.
-                    if paused_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(50));
-                    } else if let Ok((len, src)) = sock.recv_from(&mut buf) {
+                    if let Ok((len, src)) = sock.recv_from(&mut buf) {
                         // The thread may have been blocked inside recv_from when
                         // a pause was requested, so re-check before processing.
                         if paused_clone.load(Ordering::Relaxed) {
@@ -560,6 +563,26 @@ impl DirectHotspotController {
     }
 }
 
+/// Pure-Rust RFC 4648 Base64 encoder for PowerShell `-EncodedCommand` (UTF-16LE),
+/// avoiding nested-quote escaping failures on paths containing spaces.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn encode_powershell_utf16le_base64(script: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// Returns `true` if Windows Defender Firewall already has the inbound
 /// `AudioShare_Ultra_UDP` allow rule (does not require Administrator rights).
 /// Always returns `true` on non-Windows platforms.
@@ -591,27 +614,32 @@ pub fn open_os_firewall_ports() -> String {
     #[cfg(target_os = "windows")]
     {
         let exe_path = std::env::current_exe()
-            .map(|p| p.to_string_lossy().replace('\'', "''"))
+            .map(|p| p.to_string_lossy().replace('"', ""))
             .unwrap_or_default();
         // Add BOTH a port rule AND a program allow rule across `profile=any`
         // (Public/Hotspot + Private + Domain), deleting any duplicate rules
         // first. Uses `Start-Process -Verb RunAs` to trigger a standard Windows
-        // UAC prompt instead of failing silently as a standard user.
-        let ps_inner = format!(
-            "netsh advfirewall firewall delete rule name='AudioShare_Ultra_UDP' | Out-Null; \
-             netsh advfirewall firewall delete rule name='AudioShare_Ultra_App' | Out-Null; \
-             netsh advfirewall firewall add rule name='AudioShare_Ultra_UDP' dir=in action=allow protocol=UDP localport=65530-65532 profile=any | Out-Null; \
-             if ('{exe}' -ne '') {{ netsh advfirewall firewall add rule name='AudioShare_Ultra_App' dir=in action=allow program='{exe}' profile=any | Out-Null }}",
-            exe = exe_path
+        // UAC prompt instead of failing silently as a standard user. The inner
+        // script is passed as UTF-16LE Base64 via `-EncodedCommand`, so paths
+        // with spaces or Unicode need no nested-quote escaping.
+        let mut script = String::from(
+            "netsh advfirewall firewall delete rule name=\"AudioShare_Ultra_UDP\" | Out-Null\n\
+             netsh advfirewall firewall delete rule name=\"AudioShare_Ultra_App\" | Out-Null\n\
+             netsh advfirewall firewall add rule name=\"AudioShare_Ultra_UDP\" dir=in action=allow protocol=UDP localport=65530-65532 profile=any | Out-Null\n",
         );
+        if !exe_path.is_empty() {
+            script.push_str(&format!(
+                "netsh advfirewall firewall add rule name=\"AudioShare_Ultra_App\" dir=in action=allow program=\"{exe_path}\" profile=any | Out-Null\n"
+            ));
+        }
+        let encoded = encode_powershell_utf16le_base64(&script);
         let elevated = silent_command("powershell")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
                 &format!(
-                    "Start-Process -FilePath 'powershell' -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-Command',\"{}\"",
-                    ps_inner.replace('"', "`\"")
+                    "Start-Process -FilePath 'powershell' -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'"
                 ),
             ])
             .status();
@@ -642,7 +670,7 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
         if enable {
             let _ = std::fs::create_dir_all(&autostart_dir);
             let content = format!(
-                "[Desktop Entry]\nType=Application\nName=AudioShare Ultra\nExec={} --autostart\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+                "[Desktop Entry]\nType=Application\nName=AudioShare Ultra\nExec=\"{}\" --autostart\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
                 exe_str
             );
             match std::fs::write(&desktop_file, content) {
