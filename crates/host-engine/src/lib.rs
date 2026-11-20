@@ -1040,11 +1040,19 @@ fn pack_and_send(
         return false;
     };
     for &target_addr in targets {
-        if socket.send_to(&datagram[..pkt_len], target_addr).is_ok() {
-            telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
-            telemetry
-                .bytes_sent
-                .fetch_add(pkt_len as u64, Ordering::Relaxed);
+        match socket.send_to(&datagram[..pkt_len], target_addr) {
+            Ok(_) => {
+                telemetry.packets_sent.fetch_add(1, Ordering::Relaxed);
+                telemetry
+                    .bytes_sent
+                    .fetch_add(pkt_len as u64, Ordering::Relaxed);
+            }
+            Err(_) => {
+                // Non-blocking UDP send failures are otherwise silent (the
+                // socket cannot report an ICMP error from `recv_from`). Count
+                // them so a saturating link is visible in diagnostics.
+                telemetry.tx_send_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     true
@@ -1129,6 +1137,13 @@ pub struct HostTelemetry {
     pub capture_buffer_us: AtomicU32,
     /// Count of rejected client handshakes (bad PIN/tag or legacy 0.2.x magic).
     pub rejected_handshakes: AtomicU64,
+    /// Max observed gap (ms) between consecutive capture callback heartbeats.
+    /// A large value points at an OS audio-stack stall (BT route change, device
+    /// sleep, a wedged loopback capture) rather than a network problem.
+    pub capture_cb_max_gap_ms: AtomicU16,
+    /// Failed `send_to` calls on the real-time TX socket. The socket is
+    /// non-blocking, so without this counter a saturated link drops silently.
+    pub tx_send_errors: AtomicU64,
     /// Test-only instrumentation: Opus encoders created by this host's TX loop.
     /// Used by the zero-client idle-allocation regression test.
     #[cfg(test)]
@@ -1163,6 +1178,8 @@ impl Default for HostTelemetry {
             tx_packet_interval_us: AtomicU32::new(2500),
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
+            capture_cb_max_gap_ms: AtomicU16::new(0),
+            tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
         }
@@ -1172,6 +1189,39 @@ impl Default for HostTelemetry {
 impl HostTelemetry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pasteable one-line snapshot of the sender side for diagnostics reports.
+    /// All loads are relaxed: this is an observational read, never a control
+    /// input, and the counters are monotonic or sampled gauges.
+    pub fn diagnostics_summary(&self) -> String {
+        let profile = QualityProfile::from_u8(self.quality_profile.load(Ordering::Relaxed));
+        let codec = audioshare_protocol::latency::codec_mode_name(
+            self.active_codec_mode.load(Ordering::Relaxed),
+        );
+        let packets = self.packets_sent.load(Ordering::Relaxed);
+        let bytes = self.bytes_sent.load(Ordering::Relaxed);
+        format!(
+            "Host: profile={:?} codec={} opus={} bitrate={}kbps \
+             pkt_interval={:.2}ms subframes={} dtx={} smart_dtx={} \
+             packets_sent={} bytes_sent={} send_err={} \
+             cap_buf={:.2}ms cap_max_gap={}ms rebinds={} rej_hs={}",
+            profile,
+            codec,
+            self.prefer_opus.load(Ordering::Relaxed),
+            self.target_bitrate_kbps.load(Ordering::Relaxed),
+            self.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            self.tx_subframes_per_packet.load(Ordering::Relaxed),
+            self.dtx_silent_mode.load(Ordering::Relaxed),
+            self.enable_smart_dtx.load(Ordering::Relaxed),
+            packets,
+            bytes,
+            self.tx_send_errors.load(Ordering::Relaxed),
+            self.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            self.capture_cb_max_gap_ms.load(Ordering::Relaxed),
+            self.hotplug_rebinds.load(Ordering::Relaxed),
+            self.rejected_handshakes.load(Ordering::Relaxed),
+        )
     }
 
     /// Total estimated one-way audio delay (ms) reported to Linux
@@ -1411,6 +1461,8 @@ impl HostEngine {
             ),
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
+            capture_cb_max_gap_ms: AtomicU16::new(0),
+            tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
         });
@@ -1487,6 +1539,18 @@ impl HostEngine {
             })
             .map_err(|e| format!("Failed to spawn real-time TX thread: {}", e))?;
 
+        audioshare_protocol::diagnostics::info(
+            "host",
+            format!(
+                "start: port={} subframes={} test_tone={} smart_dtx={} clients={}",
+                config.bind_port,
+                config.subframes_per_packet,
+                config.use_test_tone,
+                config.enable_smart_dtx,
+                telemetry.active_clients_count.load(Ordering::Relaxed),
+            ),
+        );
+
         Ok(Self {
             running,
             telemetry,
@@ -1519,6 +1583,19 @@ impl HostEngine {
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {
         self.clients.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Count a rejected handshake and log only the first one and every 50th
+    /// after that. A bad-PIN flood or a legacy-client scan must not evict the
+    /// useful entries from the 128-line diagnostics ring.
+    fn note_rejected_handshake(telemetry: &HostTelemetry, reason: &str) {
+        let count = telemetry.rejected_handshakes.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count % 50 == 0 {
+            audioshare_protocol::diagnostics::warn(
+                "host-handshake",
+                format!("rejected handshake #{count}: {reason}"),
+            );
+        }
     }
 
     /// A socket address already in the map is an existing client whose
@@ -1631,12 +1708,23 @@ impl HostEngine {
 
     pub fn kick_client(&self, addr: SocketAddr) {
         let mut map = self.clients.lock().unwrap();
-        map.remove(&addr);
+        let removed = map.remove(&addr).is_some();
         self.telemetry
             .active_clients_count
             .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
+        drop(map);
+        if removed {
+            audioshare_protocol::diagnostics::info(
+                "host-clients",
+                format!(
+                    "kick {} (remaining {})",
+                    addr,
+                    self.telemetry.active_clients_count.load(Ordering::Relaxed)
+                ),
+            );
+        }
     }
 
     pub fn stop(&mut self) {
@@ -1646,6 +1734,12 @@ impl HostEngine {
         }
         // Dropping the monitor stops and joins its polling thread.
         self.volume_monitor = None;
+        // Final snapshot after the TX thread has stopped: useful when a
+        // session ends unexpectedly and the report is pulled offline.
+        audioshare_protocol::diagnostics::info(
+            "host",
+            format!("stop: {}", self.telemetry.diagnostics_summary().replace('\n', " | ")),
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2406,6 +2500,14 @@ impl HostEngine {
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
+        // Capture-callback gap instrumentation. Anchors are reset when the
+        // capture source changes, so a rebind's fresh heartbeat is never
+        // compared against the old stream's epoch.
+        let mut last_observed_cb_ms: u64 = 0;
+        let mut last_observed_rebinds: u16 = 0;
+        // Edge-triggered TX logs: only write when the framing actually moves.
+        let mut last_logged_codec_mode = telemetry.active_codec_mode.load(Ordering::Relaxed);
+        let mut last_logged_subframes = telemetry.tx_subframes_per_packet.load(Ordering::Relaxed);
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
@@ -2519,11 +2621,42 @@ impl HostEngine {
                         bound_output_generation = generation;
                         bound_target_pid = target_pid;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
-                        telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed);
+                        let rebinds =
+                            telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed) + 1;
+                        audioshare_protocol::diagnostics::info(
+                            "host-capture",
+                            format!(
+                                "hotplug rebind #{}: endpoint={:?} generation={} pid={}",
+                                rebinds, bound_output_name, generation, target_pid
+                            ),
+                        );
                     }
                 }
             } else if use_test_tone && active_stream.is_some() {
                 active_stream = None;
+            }
+
+            // Capture-callback gap tracking. The heartbeat advances on every
+            // delivered subframe; a long gap means the OS audio stack stalled.
+            // Test tone has no capture callbacks, and a rebind starts a fresh
+            // producer, so both reset the anchor rather than reporting a
+            // meaningless spike.
+            let observed_rebinds = telemetry.hotplug_rebinds.load(Ordering::Relaxed);
+            if use_test_tone || observed_rebinds != last_observed_rebinds {
+                last_observed_cb_ms = 0;
+                last_observed_rebinds = observed_rebinds;
+            } else {
+                let cb_ms = capture_heartbeat_ms.load(Ordering::Relaxed);
+                if cb_ms > last_observed_cb_ms {
+                    if last_observed_cb_ms > 0 {
+                        let gap = cb_ms - last_observed_cb_ms;
+                        telemetry.capture_cb_max_gap_ms.fetch_max(
+                            gap.min(u16::MAX as u64) as u16,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    last_observed_cb_ms = cb_ms;
+                }
             }
 
             // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
@@ -2538,9 +2671,10 @@ impl HostEngine {
                     if active_key_cache.is_some() {
                         // A bare HELLO is unauthenticated: when a PIN is set it
                         // can only be a duplicate/late join or a LAN probe.
-                        telemetry
-                            .rejected_handshakes
-                            .fetch_add(1, Ordering::Relaxed);
+                        Self::note_rejected_handshake(
+                            &telemetry,
+                            "bare HELLO while a PIN is set",
+                        );
                         continue;
                     }
                     let mut map = clients.lock().unwrap();
@@ -2550,6 +2684,7 @@ impl HostEngine {
                         // an existing client mid-stream.
                         continue;
                     }
+                    let newly_joined = !map.contains_key(&src_addr);
                     map.entry(src_addr)
                         .or_insert(ConnectedClient {
                             addr: src_addr,
@@ -2576,6 +2711,18 @@ impl HostEngine {
                         }
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    drop(map);
+                    if newly_joined {
+                        audioshare_protocol::diagnostics::info(
+                            "host-clients",
+                            format!(
+                                "join {} usb={} (total {})",
+                                src_addr,
+                                is_usb,
+                                telemetry.active_clients_count.load(Ordering::Relaxed)
+                            ),
+                        );
+                    }
                 } else if len >= 8 && &ctrl_buf[..8] == CONTROL_FEEDBACK_MAGIC {
                     // Feedback carries remote-control commands (quality profile,
                     // codec backend, media transport) and group-sync delays.
@@ -2589,9 +2736,7 @@ impl HostEngine {
                     ) else {
                         // A wrong PIN / forged AEAD tag must not register a
                         // client or issue any remote-control command.
-                        telemetry
-                            .rejected_handshakes
-                            .fetch_add(1, Ordering::Relaxed);
+                        Self::note_rejected_handshake(&telemetry, "invalid feedback MAC");
                         continue;
                     };
                     // Reject replayed authenticated feedback BEFORE any command
@@ -2677,6 +2822,7 @@ impl HostEngine {
                         // grow the map beyond the u8-safe cap.
                         continue;
                     }
+                    let newly_joined = !map.contains_key(&src_addr);
                     let entry = map.entry(src_addr).or_insert(ConnectedClient {
                         addr: src_addr,
                         last_seen: Instant::now(),
@@ -2723,12 +2869,22 @@ impl HostEngine {
                         }
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    drop(map);
+                    if newly_joined {
+                        audioshare_protocol::diagnostics::info(
+                            "host-clients",
+                            format!(
+                                "join {} usb={} (total {})",
+                                src_addr,
+                                is_usb,
+                                telemetry.active_clients_count.load(Ordering::Relaxed)
+                            ),
+                        );
+                    }
                 } else if len >= 8 && &ctrl_buf[..8] == b"ASULCTRL" {
                     // Legacy v1 (0.2.x) client tried to join a v2 host. Count
                     // the rejection so operators can spot version mismatches.
-                    telemetry
-                        .rejected_handshakes
-                        .fetch_add(1, Ordering::Relaxed);
+                    Self::note_rejected_handshake(&telemetry, "legacy v1 handshake");
                 }
             }
 
@@ -2739,9 +2895,18 @@ impl HostEngine {
                     let before = map.len();
                     map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(10));
                     if map.len() != before {
+                        let expired = before - map.len();
+                        let remaining = map.len();
                         telemetry
                             .active_clients_count
-                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
+                            .store(remaining.min(u8::MAX as usize) as u8, Ordering::Relaxed);
+                        audioshare_protocol::diagnostics::info(
+                            "host-clients",
+                            format!(
+                                "expired {} idle client(s) (remaining {})",
+                                expired, remaining
+                            ),
+                        );
                     }
                     let raw_worst = map
                         .values()
@@ -2873,6 +3038,25 @@ impl HostEngine {
             telemetry
                 .tx_packet_interval_us
                 .store((2500 * subframes_per_pkt) as u32, Ordering::Relaxed);
+            // Codec/framing changes are rare and interesting; the 200 Hz
+            // steady state must never touch the diagnostics ring.
+            let codec_mode_byte = dynamic_codec_mode as u8;
+            let subframes_byte = subframes_per_pkt as u8;
+            if codec_mode_byte != last_logged_codec_mode || subframes_byte != last_logged_subframes {
+                audioshare_protocol::diagnostics::info(
+                    "host-tx",
+                    format!(
+                        "codec={} subframes={} interval_us={} bitrate={}kbps profile={:?}",
+                        audioshare_protocol::latency::codec_mode_name(codec_mode_byte),
+                        subframes_per_pkt,
+                        2500 * subframes_per_pkt,
+                        tx_bitrate_kbps,
+                        profile,
+                    ),
+                );
+                last_logged_codec_mode = codec_mode_byte;
+                last_logged_subframes = subframes_byte;
+            }
 
             // Wait until soundcard pushes a full packet of samples into `ring`,
             // or fall back to silence synthesis only if capture endpoint is truly idle >80ms.
@@ -3528,6 +3712,26 @@ mod tests {
         t.tx_packet_interval_us.store(5_000, Ordering::Relaxed);
         // 185 downstream + 10 ms base floor + 5 ms packetization.
         assert_eq!(t.video_lipsync_offset_ms(), 200);
+    }
+
+    #[test]
+    fn test_host_diagnostics_summary_includes_capture_gap_and_send_errors() {
+        let t = HostTelemetry::new();
+        let baseline = t.diagnostics_summary();
+        assert!(baseline.contains("cap_max_gap=0ms"), "{baseline}");
+        assert!(baseline.contains("send_err=0 "), "{baseline}");
+        assert!(baseline.contains("profile=SmartAuto"), "{baseline}");
+        assert!(baseline.contains("codec=Lossless LPC"), "{baseline}");
+
+        t.capture_cb_max_gap_ms.store(37, Ordering::Relaxed);
+        t.tx_send_errors.store(9, Ordering::Relaxed);
+        t.hotplug_rebinds.store(2, Ordering::Relaxed);
+        t.rejected_handshakes.store(4, Ordering::Relaxed);
+        let summary = t.diagnostics_summary();
+        assert!(summary.contains("cap_max_gap=37ms"), "{summary}");
+        assert!(summary.contains("send_err=9 "), "{summary}");
+        assert!(summary.contains("rebinds=2"), "{summary}");
+        assert!(summary.contains("rej_hs=4"), "{summary}");
     }
 
     #[test]
