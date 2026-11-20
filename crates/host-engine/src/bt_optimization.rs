@@ -81,7 +81,7 @@ fn parse_sink_info(text: &str, target_sink: &str) -> Option<LinuxSinkInfo> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn parse_default_sink_card_and_port(text: &str, default_sink: &str) -> Option<(String, String)> {
     let info = parse_sink_info(text, default_sink)?;
     Some((info.card_idx?, info.active_port?))

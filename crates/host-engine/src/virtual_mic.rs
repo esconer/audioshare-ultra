@@ -895,7 +895,6 @@ impl PhoneMicReceiver {
                                 for slot in &mut opus_ring {
                                     slot.seq = None;
                                 }
-                                opus_stream_active = false;
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
