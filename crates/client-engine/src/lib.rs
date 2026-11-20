@@ -1998,7 +1998,13 @@ impl ClientEngine {
                         sequencer.pop_next(next_play_seq, &mut raw_subframe)
                     }
                 } else {
-                    sequencer.pop_next(next_play_seq, &mut raw_subframe)
+                    let st = sequencer.pop_next(next_play_seq, &mut raw_subframe);
+                    if st != STATUS_EMPTY {
+                        // Leaving Opus for Lossless/VBR: drop stale Opus state so a
+                        // later switch back after >82s cannot hit 16-bit wrap lockout.
+                        opus_decoder = None;
+                    }
+                    st
                 };
 
                 match status {
