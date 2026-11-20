@@ -129,6 +129,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativeSetPartyCastMuted(muted: Boolean)
 
         @JvmStatic
+        external fun nativeTakePartyMediaCommand(): Int
+
+        @JvmStatic
         external fun nativeGetDiscoveredHosts(): String
 
         @JvmStatic
@@ -176,8 +179,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private val partyMediaPollRunnable = object : Runnable {
         override fun run() {
             if (!isPartyCasting) return
-            val telem = runCatching { nativeGetTelemetry() }.getOrNull()
-            val cmd = ((telem?.getOrElse(22) { 0L } ?: 0L) ushr 32 and 0xFFL).toInt()
+            val cmd = runCatching { nativeTakePartyMediaCommand() }.getOrDefault(0)
             if (cmd in 10..12) {
                 val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 val keyCode = when (cmd) {
@@ -228,6 +230,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         if (intent?.action == ACTION_STOP_CLIENT_ONLY) {
             nativeStopClient()
             isStreaming = false
+            sleepHandler.removeCallbacks(sleepTickRunnable)
+            broadcastSleepTimer(0)
+            broadcastStreamState(false, null)
             if (!isPartyCasting && !micCaptureActive) {
                 stopStreamAndService()
                 return START_NOT_STICKY

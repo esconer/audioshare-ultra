@@ -1315,10 +1315,14 @@ pub mod android_native {
             let listeners = tx.party_telemetry.listener_count.load(Ordering::Relaxed) as i64;
             let mode = tx.party_telemetry.active_codec_mode.load(Ordering::Relaxed) as i64;
             let port = tx.party_telemetry.bound_port as i64;
+            // Telemetry polling must be read-only: the UI calls this every
+            // 60-250 ms for the VU meter, so consuming the pending command here
+            // would steal peer media keys from partyMediaPollRunnable. The
+            // dedicated nativeTakePartyMediaCommand() owns consumption.
             let remote_cmd = tx
                 .party_telemetry
                 .pending_remote_media_cmd
-                .swap(0, Ordering::Relaxed) as i64;
+                .load(Ordering::Relaxed) as i64;
             let party_vu = tx
                 .party_telemetry
                 .capture_vu_peak_pct
@@ -1335,6 +1339,22 @@ pub mod android_native {
         };
         let _ = env.set_long_array_region(&arr, 0, &stats);
         arr.into_raw()
+    }
+
+    /// Atomically consume the next pending remote media command (10..=12) for
+    /// `AudioEngineService.partyMediaPollRunnable` without racing UI polling.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeTakePartyMediaCommand(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jint {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
+            tx.party_telemetry
+                .pending_remote_media_cmd
+                .swap(0, Ordering::Relaxed) as jint
+        } else {
+            0
+        }
     }
 
     /// Return a pasteable diagnostics bundle (platform info + event log).
