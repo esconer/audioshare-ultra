@@ -20,6 +20,9 @@ use audioshare_host_engine::discovery_and_os::{
     open_os_firewall_ports, set_os_boot_autostart, AdbUsbWatcher, DirectHotspotController,
     DiscoveryBeacon, DiscoveryScanner, VirtualSpeakerAndRadioGuard,
 };
+// Added by the Windows firewall lane (L4); gated so Linux check stays valid here.
+#[cfg(target_os = "windows")]
+use audioshare_host_engine::discovery_and_os::is_windows_firewall_configured;
 use audioshare_host_engine::virtual_mic::{PhoneMicReceiver, PhoneRxRoutingMode, PHONE_MIC_PORT};
 use audioshare_host_engine::{
     is_usb_subnet_ip, list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo,
@@ -232,6 +235,8 @@ struct AudioShareApp {
     vu_peak_hold: f32,
     /// Transient banner text plus the instant it was raised. Cleared after 2.5 s.
     toast: Option<(String, Instant)>,
+    #[cfg(target_os = "windows")]
+    windows_firewall_ok: bool,
     dark_mode: bool,
     minimize_on_close: bool,
     autostart_stream_on_launch: bool,
@@ -371,6 +376,8 @@ impl AudioShareApp {
             pin_dirty: false,
             vu_peak_hold: 0.0,
             toast: None,
+            #[cfg(target_os = "windows")]
+            windows_firewall_ok: is_windows_firewall_configured(),
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
@@ -1352,7 +1359,7 @@ impl AudioShareApp {
 
                         ui.separator();
                         ui.label(
-                            egui::RichText::new("Stream Security (ChaCha20 + MAC32)")
+                            egui::RichText::new("Stream Security (ChaCha20-Poly1305 AEAD)")
                                 .size(13.5)
                                 .strong(),
                         );
@@ -1360,7 +1367,7 @@ impl AudioShareApp {
                             ui,
                             dark,
                             "Require Pairing PIN Encryption",
-                            "Encrypts all audio and control packets with RFC 8439 ChaCha20",
+                            "Encrypts all audio and control packets with RFC 8439 ChaCha20-Poly1305 + anti-replay",
                             &mut self.enable_pin_encryption,
                         ) {
                             self.apply_pin_now();
@@ -1572,6 +1579,47 @@ impl AudioShareApp {
                     egui::Color32::from_rgb(66, 32, 6),
                     egui::Color32::from_rgb(253, 224, 71),
                 );
+            }
+
+            // DEFERRED_CI: gated on Windows because is_windows_firewall_configured()
+            // (L4) and telemetry.rejected_handshakes (L1) arrive in later merges.
+            #[cfg(target_os = "windows")]
+            {
+                if !self.windows_firewall_ok {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        uw::status_pill(
+                            ui,
+                            "Windows Firewall may block phone connections (especially on Public/Hotspot)",
+                            egui::Color32::from_rgb(66, 32, 6),
+                            egui::Color32::from_rgb(253, 224, 71),
+                        );
+                        if ui.button("Allow Through Firewall (UAC)").clicked() {
+                            let msg = open_os_firewall_ports();
+                            self.windows_firewall_ok = is_windows_firewall_configured();
+                            self.hotspot_status = msg.clone();
+                            self.show_toast(msg);
+                        }
+                    });
+                }
+
+                let rejected = self
+                    .host_engine
+                    .as_ref()
+                    .map(|h| h.telemetry.rejected_handshakes.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if rejected > 0 {
+                    ui.add_space(2.0);
+                    uw::status_pill(
+                        ui,
+                        &format!(
+                            "Rejected {} client handshake(s) — check matching PIN & app version (v2)",
+                            rejected
+                        ),
+                        egui::Color32::from_rgb(66, 32, 6),
+                        egui::Color32::from_rgb(253, 224, 71),
+                    );
+                }
             }
         });
 

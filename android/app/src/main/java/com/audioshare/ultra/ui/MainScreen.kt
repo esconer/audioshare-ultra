@@ -7,17 +7,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
-import android.media.AudioDeviceInfo
-import android.media.AudioManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
-import android.provider.MediaStore
 import android.provider.Settings
-import android.view.KeyEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -159,7 +154,7 @@ fun MainScreen() {
     var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
     // 0..10 legacy counters, 11..21 live latency breakdown.
-    var telemetry by remember { mutableStateOf(LongArray(24)) }
+    var telemetry by remember { mutableStateOf(LongArray(25)) }
     var btEarbudsDetected by remember { mutableStateOf(false) }
 
     // Progressive Disclosure Drawer States ("Simple First, Complex When Needed")
@@ -424,24 +419,14 @@ fun MainScreen() {
         }
     }
 
-    // Poll 4Hz native telemetry & check if Bluetooth A2DP headphones are connected
+    // Poll 4Hz native telemetry. Remote Party media keys are dispatched by
+    // AudioEngineService, which owns the single media-button receiver.
     LaunchedEffect(isConnected, castPhoneInternalAudio, sharePhoneMic, dolbyEffects) {
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         while (isConnected || castPhoneInternalAudio || sharePhoneMic) {
             if (isConnected && !AudioEngineService.isStreaming) {
                 isConnected = false
             }
             telemetry = AudioEngineService.nativeGetTelemetry()
-            val remoteMediaCmd = ((telemetry.getOrElse(22) { 0L } ushr 32) and 0xFFL).toInt()
-            if (remoteMediaCmd in 10..12) {
-                val keyCode = when (remoteMediaCmd) {
-                    10 -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
-                    11 -> KeyEvent.KEYCODE_MEDIA_NEXT
-                    else -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
-                }
-                audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
-                audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
-            }
 
             // Auto-disconnect if PC host has been silent/unreachable for 5 minutes (300 seconds)
             val silenceSec = telemetry.getOrElse(6) { 0L }
@@ -619,7 +604,6 @@ fun MainScreen() {
                 }
                 if (isConnected) {
                     val vuNow = telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
-                    StudioLedVuMeter(vuPct = vuNow, peakHoldPct = vuPeakHold)
                     FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
                 }
                 if (isConnected) {
@@ -814,7 +798,13 @@ fun MainScreen() {
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         FilledTonalButton(
-                            onClick = { hostAddress = "127.0.0.1:65530" },
+                            onClick = {
+                                if (!isConnected) {
+                                    connectToHost("127.0.0.1:65530", true, pinCode)
+                                } else {
+                                    hostAddress = "127.0.0.1:65530"
+                                }
+                            },
                             shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
                         ) {
@@ -843,12 +833,10 @@ fun MainScreen() {
                     }
 
                     // Progressive Disclosure: Manual Host IP & PIN fields.
-                    // Keep the PIN editor visible while no PIN is saved, even
-                    // when a discovered host is available, so a first-time
-                    // encrypted connection cannot fail on a hidden credential.
-                    AnimatedVisibility(
-                        visible = showManualConnect || discoveredHosts.isEmpty() || pinCode.isBlank()
-                    ) {
+                    // Keep open only when manually expanded or no LAN host is
+                    // discovered; encrypted discovered hosts trigger the 1-tap
+                    // PIN dialog automatically on tap.
+                    AnimatedVisibility(visible = showManualConnect || discoveredHosts.isEmpty()) {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             HorizontalDivider(color = Color(0xFF243047))
                             if (showManualConnect || discoveredHosts.isEmpty()) {
@@ -867,88 +855,11 @@ fun MainScreen() {
                                     showManualConnect = true
                                     prefs.edit().putString("pin_code", it).apply()
                                 },
-                                label = { Text("PIN (Optional, ChaCha20 + MAC32)") },
+                                label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
-                    }
-                }
-
-                // =====================================================================
-                // 2. QUICK PC MEDIA TRANSPORT & SLEEP TIMER CARD
-                // =====================================================================
-                StudioCard {
-                    Text(
-                        "Remote PC Media & Sleep Timer",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OutlinedButton(
-                            onClick = { AudioEngineService.nativeSendMediaCommand(12) },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
-                        }
-                        FilledTonalButton(
-                            onClick = { AudioEngineService.nativeSendMediaCommand(10) },
-                            modifier = Modifier.weight(1.4f)
-                        ) {
-                            Icon(Icons.Rounded.PlayArrow, contentDescription = "Play / Pause")
-                            Spacer(Modifier.width(4.dp))
-                            Text("Play / Pause")
-                        }
-                        OutlinedButton(
-                            onClick = { AudioEngineService.nativeSendMediaCommand(11) },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Icon(Icons.Rounded.SkipNext, contentDescription = "Next")
-                        }
-                    }
-
-                    Text("Sleep Timer:", style = MaterialTheme.typography.labelMedium)
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
-                            FilterChip(
-                                selected = (mins == 0 && sleepTimerMinutes == 0) ||
-                                    (mins > 0 && sleepTimerMinutes > 0 && sleepTimerMinutes <= mins),
-                                onClick = {
-                                    runCatching {
-                                        context.startService(
-                                            Intent(context, AudioEngineService::class.java).apply {
-                                                action = AudioEngineService.ACTION_SET_SLEEP_TIMER
-                                                putExtra("MINUTES", mins)
-                                            }
-                                        )
-                                    }
-                                },
-                                label = { Text(lbl) }
-                            )
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                                .getOrDefault("Diagnostics unavailable")
-                            clipboard.setText(AnnotatedString(diag))
-                            scope.launch {
-                                snackbarHostState.showSnackbar("Diagnostics copied to clipboard")
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(
-                            Icons.Rounded.ContentCopy,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text("Copy Diagnostics Report")
                     }
                 }
 
@@ -1710,10 +1621,29 @@ fun MainScreen() {
                 OutlinedTextField(
                     value = pinCode,
                     onValueChange = { pinCode = it },
-                    label = { Text("PIN (Optional)") },
+                    label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                OutlinedButton(
+                    onClick = {
+                        val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                            .getOrDefault("Diagnostics unavailable")
+                        clipboard.setText(AnnotatedString(diag))
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Diagnostics copied to clipboard")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        Icons.Rounded.ContentCopy,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Copy Diagnostics Report")
+                }
                 Spacer(Modifier.height(12.dp))
             }
         }

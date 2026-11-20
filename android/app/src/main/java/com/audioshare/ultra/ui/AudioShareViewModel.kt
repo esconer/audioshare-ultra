@@ -39,7 +39,7 @@ data class AudioShareUiState(
     val useOpus: Boolean = true,
     val btDelayOverrideMs: Int = 0,
     val forwardPartyToPc: Boolean = false,
-    val muteHostSpeakerInParty: Boolean = false,
+    val muteHostSpeakerInParty: Boolean = true,
     val showManualConnect: Boolean = false,
     val showTelemetryDrawer: Boolean = false,
     val showEqDrawer: Boolean = false,
@@ -85,7 +85,7 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
             useOpus = prefs.getBoolean("use_opus", true),
             btDelayOverrideMs = prefs.getInt("bt_delay_override_ms", 0),
             forwardPartyToPc = prefs.getBoolean("party_forward_pc", false),
-            muteHostSpeakerInParty = prefs.getBoolean("party_mute_local", false)
+            muteHostSpeakerInParty = prefs.getBoolean("party_mute_local", true)
         )
     }
 

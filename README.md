@@ -21,11 +21,13 @@ Rust core across desktop and Android.
   decouple the network quantum from the audio device burst size.
 - **Smart DTX** — silence is not transmitted; a −90 dBFS keep-alive keeps
   Bluetooth earbuds awake without draining the battery.
-- **Optional Opus backend** — live-switchable pure-Rust Opus for compressed
+- **Pure-Rust Opus RLD default** — live-switchable pure-Rust Opus for compressed
   profiles, with automatic per-packet detection and VBR fallback.
-- **Hitless USB/Wi-Fi failover** — active-active feedback and deduplication.
-- **Encrypted streaming** — optional 1-tap PIN pairing with ChaCha20 and MAC32
-  authentication.
+- **Dual Wired USB Paths** — zero-touch USB ADB (`TCP_NODELAY` loopback tunnel
+  with auto-reconnect) and zero-ADB USB Tethering (RNDIS/NCM) alongside Wi-Fi.
+- **Authenticated Encryption** — optional PIN/QR pairing using RFC 8439
+  ChaCha20-Poly1305 (128-bit Poly1305 tag, 65,536-round PBKDF2-SHA256,
+  per-session random nonce salt, and monotonic anti-replay feedback).
 - **Bluetooth Video Lip-Sync (Linux)** — automatic PipeWire/PulseAudio latency
   compensation (`pw-cli` + `pactl`) paired with a live Android BT calibration slider.
 - **Cross-platform** — native Rust desktop GUI (egui), CLI, Windows/Linux host
