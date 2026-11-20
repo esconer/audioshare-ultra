@@ -1,0 +1,13 @@
+[package]
+name = "audioshare-sim-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+audioshare-protocol = { path = "../protocol" }
+audioshare-host-engine = { path = "../host-engine" }

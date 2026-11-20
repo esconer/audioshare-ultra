@@ -518,6 +518,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "audioshare-sim-tests"
+version = "1.0.0-beta.2"
+dependencies = [
+ "audioshare-host-engine",
+ "audioshare-protocol",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
