@@ -62,6 +62,21 @@ impl SessionKey {
         Self { key, session_salt }
     }
 
+    /// Rotate the 4-byte session nonce salt to a fresh value while leaving the
+    /// derived key untouched. Draws from the OS CSPRNG; if that fails or the
+    /// RNG happens to return the current salt, advance the previous salt by
+    /// one instead so the salt is always different (no nonce reuse).
+    pub fn rotate_session_salt(&mut self) {
+        let prev = self.session_salt;
+        let mut fresh = [0u8; NONCE_SALT_LEN];
+        let changed = getrandom::getrandom(&mut fresh).is_ok() && fresh != prev;
+        self.session_salt = if changed {
+            fresh
+        } else {
+            u32::from_be_bytes(prev).wrapping_add(1).to_be_bytes()
+        };
+    }
+
     /// 12-byte nonce for an audio packet: salt(4) | timestamp(4) | seq(2) |
     /// stream_id(1) | domain(1). Nonce uniqueness is per-session.
     #[inline]
@@ -218,5 +233,28 @@ mod tests {
         assert!(key.verify_feedback(&body, 1, &tag));
         assert!(!key.verify_feedback(&body, 2, &tag), "feedback seq is bound to tag");
         assert!(!wrong.verify_feedback(&body, 1, &tag));
+    }
+
+    #[test]
+    fn test_rotate_session_salt_changes_salt_but_preserves_key_identity() {
+        let mut key = SessionKey::from_pin("4829");
+        let before = key; // SessionKey is Copy
+        let original_salt = key.session_salt;
+
+        key.rotate_session_salt();
+
+        assert_ne!(
+            key.session_salt, original_salt,
+            "rotation must always change the session salt"
+        );
+        assert_eq!(key, before, "rotation must not change the derived key identity");
+
+        // Repeated rotations keep changing the salt while equality still holds.
+        for _ in 0..8 {
+            let prev = key.session_salt;
+            key.rotate_session_salt();
+            assert_ne!(key.session_salt, prev);
+            assert_eq!(key, before);
+        }
     }
 }

@@ -455,9 +455,10 @@ fn encode_vbr_subframe_layout(
             out[hdr_off + 1] = seed[1];
             let lead_in_is_silent = first_active_k.is_some_and(|onset_k| {
                 let block_start = block * spec.block_len;
+                // Judge the lead-in per channel: a loud pre-roll in the other
+                // ear must not stop this channel from seeding its transient.
                 (block_start..block_start + onset_k).all(|i| {
-                    pcm_stereo[i * 2].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
-                        && pcm_stereo[i * 2 + 1].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
+                    pcm_stereo[i * 2 + ch].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
                 })
             });
             // Slot 0 is the legacy layout and also means "no late onset".
@@ -843,8 +844,10 @@ pub fn decode_lossless_subframe(
     }
 
     if encoded[0] == TAG_RAW_PCM16 {
-        if encoded.len() < 481 {
-            return Err("Truncated raw PCM16 subframe");
+        // A raw fallback is always exactly one tag plus 480 PCM bytes.
+        // Anything else is corrupt or carries unexpected trailing data.
+        if encoded.len() != 481 {
+            return Err("Invalid raw PCM16 subframe length");
         }
         for i in 0..SUBFRAME_STEREO_SAMPLES {
             out_pcm[i] = i16::from_le_bytes([encoded[1 + i * 2], encoded[2 + i * 2]]);
@@ -886,6 +889,12 @@ pub fn decode_lossless_subframe(
                 }
             }
         }
+    }
+
+    // A packed subframe must end exactly where the block parser stopped;
+    // trailing bytes would otherwise be silently ignored.
+    if cursor != encoded.len() {
+        return Err("Trailing bytes after LPC subframe");
     }
 
     // Reconstruct 2nd-Order LPC and inverse Mid-Side transform

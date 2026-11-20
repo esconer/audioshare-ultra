@@ -423,7 +423,11 @@ impl LatencySonar {
             let t = (i as f32) / 120.0;
             // Hann window envelope so the chirp has zero click artifacts
             let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * t).cos());
-            let freq = 3500.0 + 3500.0 * t;
+            // The phase below is `i * 2pi * freq / 48000`, so the true
+            // instantaneous frequency is d(phase)/d(time) = f0 + 2*delta*t.
+            // Use delta = 1750 Hz to get the intended 3.5 -> 7.0 kHz sweep;
+            // a delta of 3500 actually swept up to 10.5 kHz.
+            let freq = 3500.0 + 1750.0 * t;
             let sample =
                 ((i as f32) * 2.0 * std::f32::consts::PI * freq / 48_000.0).sin() * window * 0.80;
             stereo_subframe[i * 2] = sample;

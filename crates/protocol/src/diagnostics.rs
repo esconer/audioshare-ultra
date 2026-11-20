@@ -2,7 +2,7 @@
 //! and crash reports. Never call from the 2.5 ms real-time packet hot path.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::Instant;
 
 const MAX_LOG_ENTRIES: usize = 128;
@@ -73,9 +73,59 @@ pub fn export_report(live_summary: &str) -> String {
 pub fn install_crash_hook(crash_log_path: std::path::PathBuf) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        error("panic", format!("{panic_info}"));
-        let report = export_report("Status  : FATAL PANIC");
-        let _ = std::fs::write(&crash_log_path, report);
+        // Never block on the log mutex here. The panic may have fired while
+        // this thread already held it (e.g. inside a formatting call), and a
+        // second blocking lock() would deadlock before the crash log is
+        // written. `try_lock` keeps the hook bounded; a poisoned lock is still
+        // recovered so the buffered events survive.
+        let s = store();
+        let secs = s.epoch.elapsed().as_secs_f64();
+        let line = format!("[+{secs:8.3}s] [ERR ] [panic] {panic_info}");
+        match s.entries.try_lock() {
+            Ok(mut guard) => {
+                if guard.len() >= MAX_LOG_ENTRIES {
+                    guard.pop_front();
+                }
+                guard.push_back(line);
+            }
+            Err(TryLockError::Poisoned(e)) => {
+                let mut guard = e.into_inner();
+                if guard.len() >= MAX_LOG_ENTRIES {
+                    guard.pop_front();
+                }
+                guard.push_back(line);
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+
+        let mut out = format!(
+            "=== AudioShare Ultra Diagnostics ===\n\
+             OS/Arch : {}/{}\n\
+             Version : {}\n\
+             {}\n\
+             --- Event Log (newest last) ---\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+            "Status  : FATAL PANIC".trim()
+        );
+        match s.entries.try_lock() {
+            Ok(guard) => {
+                for entry in guard.iter() {
+                    out.push_str(entry);
+                    out.push('\n');
+                }
+            }
+            Err(TryLockError::Poisoned(e)) => {
+                let guard = e.into_inner();
+                for entry in guard.iter() {
+                    out.push_str(entry);
+                    out.push('\n');
+                }
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let _ = std::fs::write(&crash_log_path, out);
         prev(panic_info);
     }));
 }
