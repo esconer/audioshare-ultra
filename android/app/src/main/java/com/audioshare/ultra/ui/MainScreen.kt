@@ -33,14 +33,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.audioshare.ultra.service.AudioEngineService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlin.properties.ReadWriteProperty
+import kotlin.reflect.KProperty
 import kotlin.math.abs
 
 private fun usToMs(us: Long): String = "%.1f".format(us / 1000.0)
@@ -54,17 +62,375 @@ private fun codecModeName(mode: Long): String = when (mode.toInt()) {
     else -> "Unknown"
 }
 
+/**
+ * Telemetry-heavy hero. All 16 Hz snapshot reads are confined to this leaf
+ * (and the two other telemetry leaves), keeping them out of the Connect/EQ/
+ * Party card bodies. The snapshot is read via a lambda passed from the parent.
+ */
+@Composable
+private fun HeroStageSection(
+    telemetry: () -> TelemetrySnapshot,
+    isConnected: Boolean,
+    isPartyCasting: Boolean,
+    sharePhoneMic: Boolean,
+    hostAddress: String,
+    sleepRemainingMins: Int,
+    latencyDebug: Boolean
+) {
+    val t = telemetry()
+    val heroGlow = when {
+        isPartyCasting && !isConnected -> Color(0xFFA855F7)
+        sharePhoneMic && !isConnected -> StudioColors.Accent
+        !isConnected -> StudioColors.Muted
+        else -> StudioColors.LiveGlow
+    }
+    HeroAudioStage(
+        glowColor = heroGlow,
+        energyFraction = if (isConnected) {
+            t.getOrElse(24) { 0L }.toInt().coerceIn(0, 100) / 100f
+        } else 0f
+    ) {
+        val authErr = t.getOrElse(5) { 0L }
+        val idleSecs = t.getOrElse(6) { 0L }
+        val dtxSilent = t.getOrElse(7) { 0L } == 1L
+        val hostVol = t.getOrElse(8) { 100L }
+        val groupDelay = t.getOrElse(9) { 0L }
+        val codecMode = t.getOrElse(19) { 0L }
+        val partyPacked = t.getOrElse(22) { 0L }
+        val partyListeners = (partyPacked and 0xFFL).toInt()
+        val partyCodec = (partyPacked shr 8) and 0xFFL
+        val partySyncMs = t.getOrElse(23) { 0L }
+
+        val (statusTitle, dotColor) = when {
+            isPartyCasting && !isConnected ->
+                "Party Broadcast • $partyListeners Peer(s) • ${codecModeName(partyCodec)} • Sync +${partySyncMs}ms" to Color(0xFFA855F7)
+            sharePhoneMic && !isConnected ->
+                "Wireless Mic Active -> $hostAddress" to StudioColors.Accent
+            !isConnected ->
+                "Ready to Connect" to StudioColors.Muted
+            authErr > 5 ->
+                "Wrong Encryption PIN ($authErr rejected)" to StudioColors.DangerSoft
+            idleSecs >= 3 ->
+                "Host Signal Lost (${idleSecs}s) — Waiting..." to StudioColors.WarnFg
+            dtxSilent ->
+                "Smart DTX Standby (-90 dBFS BT Keep-Alive)" to StudioColors.AccentSoft
+            else ->
+                "Streaming 48 kHz • ${codecModeName(codecMode)}" to StudioColors.OkFg
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            PulsingStatusDot(
+                active = isConnected || isPartyCasting || sharePhoneMic,
+                color = dotColor
+            )
+            Text(
+                text = statusTitle,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (isConnected) {
+                StatusBadge(
+                    text = "Vol ${hostVol}%",
+                    containerColor = Color(0xFF1E3A5F),
+                    contentColor = Color(0xFF93C5FD)
+                )
+            }
+            if (sleepRemainingMins > 0) {
+                StatusBadge(
+                    text = "${sleepRemainingMins}m",
+                    containerColor = StudioColors.AccentDeep,
+                    contentColor = StudioColors.AccentSoft
+                )
+            }
+        }
+        if (isConnected) {
+            val vuNow = t.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
+            FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
+        }
+        if (isConnected) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                StatusBadge("Pkts: ${t[0]}")
+                StatusBadge("FEC: ${t[2]}")
+                StatusBadge("Drift: ${t[4]} ppm")
+                if (groupDelay > 0) {
+                    StatusBadge("Sync: +${groupDelay}ms")
+                }
+                if (latencyDebug) {
+                    val estMs = t.getOrElse(20) { 0L } / 10.0
+                    val targetMs = t.getOrElse(14) { 0L } / 1000.0
+                    val bufferedMs = t.getOrElse(15) { 0L } / 1000.0
+                    StatusBadge(
+                        text = "Est ${"%.1f".format(estMs)}ms • FIFO ${"%.1f".format(bufferedMs)}/${"%.1f".format(targetMs)}ms",
+                        containerColor = Color(0xFF14532D),
+                        contentColor = Color(0xFF86EFAC)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Telemetry drawer: all 16 Hz counter/latency reads live here, not in MainScreen. */
+@Composable
+private fun TelemetryDrawerSection(
+    telemetry: () -> TelemetrySnapshot,
+    expanded: Boolean,
+    latencyDebug: Boolean,
+    btDelayOverrideMs: Int,
+    btEarbudsDetected: Boolean,
+    onToggleExpanded: () -> Unit,
+    onToggleLatencyDebug: () -> Unit,
+    onBtOverrideChanged: (Int) -> Unit,
+    onBtOverrideFinished: () -> Unit,
+    onBtAuto: () -> Unit
+) {
+    val t = telemetry()
+    ProDrawerHeader(
+        title = "Real-Time Telemetry & Latency Breakdown",
+        badge = "Drift ${t[4]} ppm • FEC ${t[2]}",
+        expanded = expanded,
+        onToggle = onToggleExpanded
+    )
+
+    AnimatedVisibility(visible = expanded) {
+        StudioCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "Hardware Sequencer Counters",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                FilterChip(
+                    selected = latencyDebug,
+                    onClick = onToggleLatencyDebug,
+                    label = { Text("Stage Breakdown") }
+                )
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetricTile("RX Packets", "${t[0]}", Modifier.weight(1f))
+                MetricTile("Lossless Frames", "${t[1]}", Modifier.weight(1f))
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetricTile("FEC Healed", "${t[2]}", Modifier.weight(1f))
+                MetricTile("WSOLA PLC", "${t[3]}", Modifier.weight(1f))
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetricTile("Clock Drift", "${t[4]} ppm", Modifier.weight(1f))
+                MetricTile("AAudio DAC", "${t.getOrElse(10) { 0L }} ms", Modifier.weight(1f))
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                MetricTile("Host Silence", "${t.getOrElse(6) { 0L }} s", Modifier.weight(1f))
+                MetricTile("Auth Errors", "${t.getOrElse(5) { 0L }}", Modifier.weight(1f))
+            }
+
+            if (btEarbudsDetected) {
+                val activeBtMs = t.getOrElse(17) { 185L }
+                    .toInt().coerceIn(40, 350)
+                StatusBadge(
+                    text = "Bluetooth Audio Active: Reporting +${activeBtMs}ms A/V Sync Offset to PC",
+                    containerColor = Color(0xFF14532D),
+                    contentColor = Color(0xFF86EFAC)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "BT Lip-Sync Calibration: ${if (btDelayOverrideMs == 0) "Auto (${activeBtMs}ms)" else "${btDelayOverrideMs}ms"}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    TextButton(onClick = onBtAuto) { Text("Auto") }
+                }
+                Slider(
+                    value = (if (btDelayOverrideMs == 0) activeBtMs else btDelayOverrideMs).toFloat(),
+                    onValueChange = { onBtOverrideChanged(it.toInt().coerceIn(40, 350)) },
+                    onValueChangeFinished = onBtOverrideFinished,
+                    valueRange = 40f..350f
+                )
+            }
+
+            if (latencyDebug) {
+                val packetUs = t.getOrElse(11) { 0L }
+                val jitterUs = t.getOrElse(12) { 0L }
+                val adaptiveUs = t.getOrElse(13) { 0L }
+                val targetUs = t.getOrElse(14) { 0L }
+                val bufferedUs = t.getOrElse(15) { 0L }
+                val groupUs = t.getOrElse(16) { 0L }
+                val btMs = t.getOrElse(17) { 0L }
+                val prebufferReady = t.getOrElse(18) { 0L } == 1L
+                val codecMode = t.getOrElse(19) { 0L }
+                val estMs = t.getOrElse(20) { 0L } / 10.0
+                val codecLookaheadMs = t.getOrElse(21) { 0L } / 10.0
+                val fillPct = if (targetUs > 0) {
+                    ((bufferedUs.toDouble() / targetUs) * 100.0).coerceIn(0.0, 100.0)
+                } else {
+                    0.0
+                }
+                val btLabel = if (btMs > 0) "$btMs ms (fixed A2DP)" else "not routed"
+                val prebufferLabel = if (prebufferReady) "READY" else "FILLING"
+
+                HorizontalDivider(color = Color(0xFF243047))
+                Text(
+                    "Live Latency Breakdown",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Estimated one-way  : ${"%.1f".format(estMs)} ms",
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.tertiary
+                )
+                Text("Sender packetization: ${usToMs(packetUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Network jitter     : ${usToMs(jitterUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Adaptive cushion   : ${usToMs(adaptiveUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Target FIFO        : ${usToMs(targetUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Buffered right now : ${usToMs(bufferedUs)} ms (${"%.0f".format(fillPct)}%)",
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Text("Group sync addition: +${usToMs(groupUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("DAC queue          : ${t.getOrElse(10) { 0L }} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Codec lookahead    : ${"%.1f".format(codecLookaheadMs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Bluetooth estimate : $btLabel", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text("Prebuffer / Codec  : $prebufferLabel • ${codecModeName(codecMode)}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Estimate = packetization + target FIFO + max(DAC, BT, output) + codec lookahead.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/** Live party-host telemetry (only composed while a party cast is active). */
+@Composable
+private fun PartyTelemetrySection(
+    telemetry: () -> TelemetrySnapshot,
+    partySilenceWarning: Boolean,
+    showPartyQrDialog: Boolean,
+    pinCode: String,
+    onSilenceWarning: (Boolean) -> Unit,
+    onShowQr: () -> Unit,
+    onDismissQr: () -> Unit,
+    onCopied: () -> Unit
+) {
+    val t = telemetry()
+    val partyPacked = t.getOrElse(22) { 0L }
+    val partyListeners = (partyPacked and 0xFFL).toInt()
+    val partyCodec = (partyPacked shr 8) and 0xFFL
+    val partyPort = ((partyPacked shr 16) and 0xFFFFL).let { if (it > 0) it else 65530L }
+    val partySyncMs = t.getOrElse(23) { 0L }
+    // stats[22] bits 40..47 carry the live capture VU peak. Zero for ~12 polls
+    // (~3 s) means DRM/OEM mute is feeding silence to peers.
+    val partyVu = ((partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
+
+    LaunchedEffect(partyVu == 0) {
+        if (partyVu == 0) {
+            delay(3000)
+            onSilenceWarning(true)
+        } else {
+            onSilenceWarning(false)
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        HorizontalDivider(color = Color(0xFF243047))
+        Text(
+            "Live Party Host Telemetry (Port $partyPort)",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.secondary
+        )
+        Text(
+            "Captured Audio Level",
+            style = MaterialTheme.typography.labelSmall,
+            color = StudioColors.Muted
+        )
+        FluidAudioVisualizer(vuPct = partyVu, isLive = partyVu > 0)
+        if (partySilenceWarning) {
+            StatusBadge(
+                text = "No app audio detected — start music or check DRM/mute",
+                containerColor = StudioColors.WarnBg,
+                contentColor = StudioColors.WarnFg
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            MetricTile("Connected Peers", "$partyListeners", Modifier.weight(1f))
+            MetricTile("Party Codec", codecModeName(partyCodec), Modifier.weight(1f))
+            MetricTile("Group Sync", "+${partySyncMs} ms", Modifier.weight(1f))
+        }
+        FilledTonalButton(
+            onClick = onShowQr,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Rounded.QrCode, null, Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Show Party QR Code (Port $partyPort)")
+        }
+        Text(
+            "Tip: For 3+ peers or outdoors, enable this phone's Mobile Hotspot for a 1-hop direct link with half the Wi-Fi lag.",
+            style = MaterialTheme.typography.bodySmall,
+            color = StudioColors.Muted
+        )
+    }
+    if (showPartyQrDialog) {
+        PartyQrDialog(
+            partyPort = partyPort.toInt(),
+            pinCode = pinCode,
+            onDismiss = onDismissQr,
+            onCopied = onCopied
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun MainScreen() {
+fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val state by vm.uiState.collectAsState()
+
+    /**
+     * Reads are served from the collected [state] so Compose observes every
+     * change; writes go through [AudioShareViewModel.update] so they survive
+     * rotation. Purely local UI state (dialogs, launchers) stays as `remember`.
+     */
+    fun <T> vmField(
+        read: (AudioShareUiState) -> T,
+        write: (AudioShareUiState, T) -> AudioShareUiState
+    ): ReadWriteProperty<Any?, T> = object : ReadWriteProperty<Any?, T> {
+        override fun getValue(thisRef: Any?, property: KProperty<*>): T = read(state)
+        override fun setValue(thisRef: Any?, property: KProperty<*>, value: T) {
+            vm.update { write(it, value) }
+        }
+    }
+
     val clipboard = LocalClipboardManager.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var showQrScanner by remember { mutableStateOf(false) }
     var showToolsSheet by remember { mutableStateOf(false) }
     var showPartyQrDialog by remember { mutableStateOf(false) }
-    var partySilenceWarning by remember { mutableStateOf(false) }
+    // partySilenceWarning is now owned by the ViewModel (survives rotation).
     var pendingEncryptedHost by remember { mutableStateOf<String?>(null) }
     var promptPinInput by remember { mutableStateOf("") }
 
@@ -111,67 +477,94 @@ fun MainScreen() {
         }
     }
 
-    var hostAddress by remember {
-        mutableStateOf(prefs.getString("last_host_addr", "192.168.42.129:65530") ?: "192.168.42.129:65530")
-    }
-    var pinCode by remember {
-        mutableStateOf(prefs.getString("pin_code", "") ?: "")
-    }
-    var selectedTab by remember { mutableIntStateOf(0) } // 0=Connect, 1=Audio & Tune, 2=Mic & Party
-    var isConnected by remember { mutableStateOf(AudioEngineService.isStreaming) }
-    var preampGainDb by remember { mutableFloatStateOf(prefs.getFloat("gain_db", 0.0f)) }
-    var bassDb by remember { mutableFloatStateOf(prefs.getFloat("bass_db", 0.0f)) }
-    var vocalDb by remember { mutableFloatStateOf(prefs.getFloat("vocal_db", 0.0f)) }
-    var trebleDb by remember { mutableFloatStateOf(prefs.getFloat("treble_db", 0.0f)) }
-    var nightMode by remember { mutableStateOf(prefs.getBoolean("night_mode", false)) }
-    var crossfeed by remember { mutableStateOf(prefs.getBoolean("crossfeed", false)) }
-    var gamingLock by remember { mutableStateOf(prefs.getBoolean("gaming_lock", false)) }
+    // Every field below is backed by AudioShareUiState via vmField. Initial
+    // values (prefs / service state) are loaded once in the ViewModel.
+    var hostAddress by vmField({ it.hostAddress }, { s, v -> s.copy(hostAddress = v) })
+    var pinCode by vmField({ it.pinCode }, { s, v -> s.copy(pinCode = v) })
+    var selectedTab by vmField({ it.selectedTab }, { s, v -> s.copy(selectedTab = v) }) // 0=Connect, 1=Audio & Tune, 2=Mic & Party
+    var isConnected by vmField({ it.isConnected }, { s, v -> s.copy(isConnected = v) })
+    var preampGainDb by vmField({ it.preampGainDb }, { s, v -> s.copy(preampGainDb = v) })
+    var bassDb by vmField({ it.bassDb }, { s, v -> s.copy(bassDb = v) })
+    var vocalDb by vmField({ it.vocalDb }, { s, v -> s.copy(vocalDb = v) })
+    var trebleDb by vmField({ it.trebleDb }, { s, v -> s.copy(trebleDb = v) })
+    var nightMode by vmField({ it.nightMode }, { s, v -> s.copy(nightMode = v) })
+    var crossfeed by vmField({ it.crossfeed }, { s, v -> s.copy(crossfeed = v) })
+    var gamingLock by vmField({ it.gamingLock }, { s, v -> s.copy(gamingLock = v) })
     // OFF (default) keeps the raw low-latency AAudio path. ON switches to the
     // shared mixer so OEM Dolby Atmos / Dirac / system EQ can post-process.
-    var dolbyEffects by remember { mutableStateOf(prefs.getBoolean("dolby_fx", false)) }
-    var pendingInternalAudioCast by remember { mutableStateOf(false) }
-    var latencyDebug by remember { mutableStateOf(prefs.getBoolean("latency_debug", false)) }
-    var channelRole by remember { mutableIntStateOf(prefs.getInt("channel_role", 0)) }
+    var dolbyEffects by vmField({ it.dolbyEffects }, { s, v -> s.copy(dolbyEffects = v) })
+    var pendingInternalAudioCast by vmField(
+        { it.pendingInternalAudioCast },
+        { s, v -> s.copy(pendingInternalAudioCast = v) }
+    )
+    var partySilenceWarning by vmField(
+        { it.partySilenceWarning },
+        { s, v -> s.copy(partySilenceWarning = v) }
+    )
+    var latencyDebug by vmField({ it.latencyDebug }, { s, v -> s.copy(latencyDebug = v) })
+    var channelRole by vmField({ it.channelRole }, { s, v -> s.copy(channelRole = v) })
     // 0=Smart Auto, 1=Studio Lossless 16-bit, 2=Low-Latency VBR,
     // 3=Max Stability (10ms 2.4GHz), 4=Studio Master 24-bit
-    var qualityMode by remember { mutableIntStateOf(prefs.getInt("quality_mode", 0)) }
-    // Target for the compressed profiles. Persisted and restored on the next
-    // stream start; command codes 30..33 are 96/160/256/320 kbps.
-    var compressedBitrateKbps by remember {
-        mutableIntStateOf(
-            prefs.getInt("target_bitrate_kbps", 256).let {
-                if (it == 96 || it == 160 || it == 256 || it == 320) it else 256
-            }
-        )
-    }
+    var qualityMode by vmField({ it.qualityMode }, { s, v -> s.copy(qualityMode = v) })
+    // Target for the compressed profiles; command codes 30..33 = 96/160/256/320 kbps.
+    var compressedBitrateKbps by vmField(
+        { it.compressedBitrateKbps },
+        { s, v -> s.copy(compressedBitrateKbps = v) }
+    )
     // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
-    // Sent to the host as feedback code 20/21; only affects compressed modes.
-    var useOpus by remember { mutableStateOf(prefs.getBoolean("use_opus", true)) }
-    var btDelayOverrideMs by remember {
-        mutableIntStateOf(prefs.getInt("bt_delay_override_ms", 0))
-    }
-    // The service owns the phone-mic lifecycle (ACTION_START/STOP_PHONE_MIC).
-    // Mirror its broadcast-backed state so the switch survives UI recreation.
-    var sharePhoneMic by remember { mutableStateOf(AudioEngineService.isPhoneMicActive) }
-    // The service owns the MediaProjection token and the caster. The UI only
-    // mirrors the service's broadcast so a system-revoked projection turns
-    // the switch off even if the app was backgrounded.
-    var castPhoneInternalAudio by remember { mutableStateOf(AudioEngineService.isPartyCasting) }
-    var forwardPartyToPc by remember { mutableStateOf(prefs.getBoolean("party_forward_pc", false)) }
+    var useOpus by vmField({ it.useOpus }, { s, v -> s.copy(useOpus = v) })
+    var btDelayOverrideMs by vmField(
+        { it.btDelayOverrideMs },
+        { s, v -> s.copy(btDelayOverrideMs = v) }
+    )
+    // The service owns mic / party-cast lifecycles; these mirror its broadcasts.
+    var sharePhoneMic by vmField({ it.sharePhoneMic }, { s, v -> s.copy(sharePhoneMic = v) })
+    var castPhoneInternalAudio by vmField(
+        { it.castPhoneInternalAudio },
+        { s, v -> s.copy(castPhoneInternalAudio = v) }
+    )
+    var forwardPartyToPc by vmField(
+        { it.forwardPartyToPc },
+        { s, v -> s.copy(forwardPartyToPc = v) }
+    )
     // Default ON to eliminate the ~60 ms same-room speaker slapback echo.
-    var muteHostSpeakerInParty by remember { mutableStateOf(prefs.getBoolean("party_mute_local", true)) }
-    var sleepTimerMinutes by remember { mutableIntStateOf(AudioEngineService.sleepRemainingMinutes) } // 0=Off, 15, 30, 60m
-    // Index contract matches crates/android-jni/src/lib.rs:
-    // 0..10 legacy counters, 11..21 live latency breakdown.
-    var telemetry by remember { mutableStateOf(LongArray(25)) }
-    var btEarbudsDetected by remember { mutableStateOf(false) }
+    var muteHostSpeakerInParty by vmField(
+        { it.muteHostSpeakerInParty },
+        { s, v -> s.copy(muteHostSpeakerInParty = v) }
+    )
+    var sleepTimerMinutes by vmField(
+        { it.sleepRemainingMins },
+        { s, v -> s.copy(sleepRemainingMins = v) }
+    ) // 0=Off, 15, 30, 60m
+    // 25 immutable telemetry slots (see TelemetrySnapshot in AudioShareViewModel).
+    var telemetry by vmField({ it.telemetry }, { s, v -> s.copy(telemetry = v) })
+    var btEarbudsDetected by vmField(
+        { it.btEarbudsDetected },
+        { s, v -> s.copy(btEarbudsDetected = v) }
+    )
 
     // Progressive Disclosure Drawer States ("Simple First, Complex When Needed")
-    var showManualConnect by remember { mutableStateOf(false) }
-    var showTelemetryDrawer by remember { mutableStateOf(latencyDebug) }
-    var showEqDrawer by remember { mutableStateOf(false) }
-    var showCodecDrawer by remember { mutableStateOf(false) }
+    var showManualConnect by vmField(
+        { it.showManualConnect },
+        { s, v -> s.copy(showManualConnect = v) }
+    )
+    var showTelemetryDrawer by vmField(
+        { it.showTelemetryDrawer },
+        { s, v -> s.copy(showTelemetryDrawer = v) }
+    )
+    var showEqDrawer by vmField({ it.showEqDrawer }, { s, v -> s.copy(showEqDrawer = v) })
+    var showCodecDrawer by vmField({ it.showCodecDrawer }, { s, v -> s.copy(showCodecDrawer = v) })
 
+    /** Zero-allocation live DSP update: JNI only, no SharedPreferences or intents. */
+    fun applyDspLive() {
+        AudioEngineService.nativeSetGainDb(preampGainDb)
+        AudioEngineService.nativeConfigureDsp(
+            bassDb, vocalDb, trebleDb, channelRole,
+            crossfeed, nightMode, gamingLock, dolbyEffects
+        )
+    }
+
+    /** Flush the final DSP values to prefs and the service after a gesture ends. */
     fun syncAndSaveDsp() {
         prefs.edit()
             .putFloat("gain_db", preampGainDb)
@@ -184,7 +577,7 @@ fun MainScreen() {
             .putBoolean("dolby_fx", dolbyEffects)
             .putInt("channel_role", channelRole)
             .apply()
-        AudioEngineService.nativeSetGainDb(preampGainDb)
+        applyDspLive()
         // Changing the preamp unmutes audio via nativeSetGainDb above. Clear
         // the service's notification mute flag in the same gesture so the
         // notification cannot stay stuck on "MUTED".
@@ -195,10 +588,6 @@ fun MainScreen() {
                 }
             )
         }
-        AudioEngineService.nativeConfigureDsp(
-            bassDb, vocalDb, trebleDb, channelRole,
-            crossfeed, nightMode, gamingLock, dolbyEffects
-        )
     }
 
     fun setDolbyEffects(enabled: Boolean) {
@@ -273,7 +662,7 @@ fun MainScreen() {
 
     // Route every "connect" gesture through one place. True connection state
     // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
-    fun connectToHost(addr: String, isUsb: Boolean, pin: String) {
+    fun connectToHost(addr: String, isUsb: Boolean? = null, pin: String) {
         hostAddress = addr
         pinCode = pin
         prefs.edit()
@@ -282,7 +671,9 @@ fun MainScreen() {
             .apply()
         val intent = Intent(context, AudioEngineService::class.java).apply {
             putExtra("HOST_ADDR", addr)
-            putExtra("IS_USB", isUsb)
+            // A null value omits IS_USB so the service falls back to
+            // auto-detecting RNDIS/USB hosts from the address.
+            if (isUsb != null) putExtra("IS_USB", isUsb)
             putExtra("GAIN_DB", preampGainDb)
             putExtra("PIN", pin)
         }
@@ -383,43 +774,40 @@ fun MainScreen() {
     // 1-Tap auto-discovery: the native UDP beacon scanner runs in the Rust JNI layer
     var discoveredHosts by remember { mutableStateOf<List<String>>(emptyList()) }
     LaunchedEffect(Unit) {
-        while (true) {
-            isConnected = AudioEngineService.isStreaming
-            discoveredHosts = runCatching {
-                AudioEngineService.nativeGetDiscoveredHosts()
-            }.getOrDefault("").lines().filter { it.isNotBlank() }
-            delay(2000)
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                isConnected = AudioEngineService.isStreaming
+                discoveredHosts = withContext(Dispatchers.IO) {
+                    runCatching { AudioEngineService.nativeGetDiscoveredHosts() }
+                        .getOrDefault("").lines().filter { it.isNotBlank() }
+                }
+                delay(2000)
+            }
         }
     }
 
-    // Poll 4Hz native telemetry. Remote Party media keys are dispatched by
-    // AudioEngineService, which owns the single media-button receiver.
+    // Poll native telemetry (4 Hz idle / ~16 Hz live). Remote Party media keys
+    // are dispatched by AudioEngineService, which owns the single media receiver.
+    // The 300 s silence auto-disconnect now lives in the service watchdog so it
+    // also fires while the screen is off.
     LaunchedEffect(isConnected, castPhoneInternalAudio, sharePhoneMic, dolbyEffects) {
-        while (isConnected || castPhoneInternalAudio || sharePhoneMic) {
-            if (isConnected && !AudioEngineService.isStreaming) {
-                isConnected = false
-            }
-            telemetry = AudioEngineService.nativeGetTelemetry()
-
-            // Auto-disconnect if PC host has been silent/unreachable for 5 minutes (300 seconds)
-            val silenceSec = telemetry.getOrElse(6) { 0L }
-            if (isConnected && silenceSec >= 300L && !sharePhoneMic && !castPhoneInternalAudio) {
-                val stopIntent = Intent(context, AudioEngineService::class.java).apply {
-                    action = "ACTION_STOP"
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (isConnected || castPhoneInternalAudio || sharePhoneMic) {
+                if (isConnected && !AudioEngineService.isStreaming) {
+                    isConnected = false
                 }
-                context.startService(stopIntent)
-                isConnected = false
-                break
-            }
+                val raw = withContext(Dispatchers.IO) {
+                    AudioEngineService.nativeGetTelemetry()
+                }
+                vm.updateTelemetry(raw)
 
-            if (!isConnected) {
-                delay(250)
-                continue
+                if (!isConnected) {
+                    delay(250)
+                    continue
+                }
+                // ~16Hz refresh while connected keeps the hero visualizer fluid.
+                delay(60)
             }
-
-            btEarbudsDetected = telemetry.getOrElse(17) { 0L } > 0L
-            // ~16Hz refresh while connected keeps the hero visualizer fluid.
-            delay(if (isConnected) 60 else 250)
         }
     }
 
@@ -499,105 +887,15 @@ fun MainScreen() {
             // =====================================================================
             // ATMOSPHERIC HERO AUDIO STAGE (single calm focal point)
             // =====================================================================
-            val heroGlow = when {
-                castPhoneInternalAudio && !isConnected -> Color(0xFFA855F7)
-                sharePhoneMic && !isConnected -> StudioColors.Accent
-                !isConnected -> StudioColors.Muted
-                else -> StudioColors.LiveGlow
-            }
-            HeroAudioStage(
-                glowColor = heroGlow,
-                energyFraction = if (isConnected) {
-                    telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100) / 100f
-                } else 0f
-            ) {
-                val authErr = telemetry.getOrElse(5) { 0L }
-                val idleSecs = telemetry.getOrElse(6) { 0L }
-                val dtxSilent = telemetry.getOrElse(7) { 0L } == 1L
-                val hostVol = telemetry.getOrElse(8) { 100L }
-                val groupDelay = telemetry.getOrElse(9) { 0L }
-                val codecMode = telemetry.getOrElse(19) { 0L }
-                val partyPacked = telemetry.getOrElse(22) { 0L }
-                val partyListeners = (partyPacked and 0xFFL).toInt()
-                val partyCodec = (partyPacked shr 8) and 0xFFL
-                val partySyncMs = telemetry.getOrElse(23) { 0L }
-
-                val (statusTitle, dotColor) = when {
-                    castPhoneInternalAudio && !isConnected ->
-                        "Party Broadcast • $partyListeners Peer(s) • ${codecModeName(partyCodec)} • Sync +${partySyncMs}ms" to Color(0xFFA855F7)
-                    sharePhoneMic && !isConnected ->
-                        "Wireless Mic Active -> $hostAddress" to StudioColors.Accent
-                    !isConnected ->
-                        "Ready to Connect" to StudioColors.Muted
-                    authErr > 5 ->
-                        "Wrong Encryption PIN ($authErr rejected)" to StudioColors.DangerSoft
-                    idleSecs >= 3 ->
-                        "Host Signal Lost (${idleSecs}s) — Waiting..." to StudioColors.WarnFg
-                    dtxSilent ->
-                        "Smart DTX Standby (-90 dBFS BT Keep-Alive)" to StudioColors.AccentSoft
-                    else ->
-                        "Streaming 48 kHz • ${codecModeName(codecMode)}" to StudioColors.OkFg
-                }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    PulsingStatusDot(
-                        active = isConnected || castPhoneInternalAudio || sharePhoneMic,
-                        color = dotColor
-                    )
-                    Text(
-                        text = statusTitle,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f)
-                    )
-                    if (isConnected) {
-                        StatusBadge(
-                            text = "Vol ${hostVol}%",
-                            containerColor = Color(0xFF1E3A5F),
-                            contentColor = Color(0xFF93C5FD)
-                        )
-                    }
-                    if (sleepTimerMinutes > 0) {
-                        StatusBadge(
-                            text = "${sleepTimerMinutes}m",
-                            containerColor = StudioColors.AccentDeep,
-                            contentColor = StudioColors.AccentSoft
-                        )
-                    }
-                }
-                if (isConnected) {
-                    val vuNow = telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
-                    FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
-                }
-                if (isConnected) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        StatusBadge("Pkts: ${telemetry[0]}")
-                        StatusBadge("FEC: ${telemetry[2]}")
-                        StatusBadge("Drift: ${telemetry[4]} ppm")
-                        if (groupDelay > 0) {
-                            StatusBadge("Sync: +${groupDelay}ms")
-                        }
-                        if (latencyDebug) {
-                            val estMs = telemetry.getOrElse(20) { 0L } / 10.0
-                            val targetMs = telemetry.getOrElse(14) { 0L } / 1000.0
-                            val bufferedMs = telemetry.getOrElse(15) { 0L } / 1000.0
-                            StatusBadge(
-                                text = "Est ${"%.1f".format(estMs)}ms • FIFO ${"%.1f".format(bufferedMs)}/${"%.1f".format(targetMs)}ms",
-                                containerColor = Color(0xFF14532D),
-                                contentColor = Color(0xFF86EFAC)
-                            )
-                        }
-                    }
-                }
-            }
+            HeroStageSection(
+                telemetry = { telemetry },
+                isConnected = isConnected,
+                isPartyCasting = castPhoneInternalAudio,
+                sharePhoneMic = sharePhoneMic,
+                hostAddress = hostAddress,
+                sleepRemainingMins = sleepTimerMinutes,
+                latencyDebug = latencyDebug
+            )
 
             // Tab navigation moved to the ergonomic bottom NavigationBar above.
 
@@ -724,24 +1022,16 @@ fun MainScreen() {
 
                     Button(
                         onClick = {
-                            prefs.edit()
-                                .putString("last_host_addr", hostAddress)
-                                .putString("pin_code", pinCode)
-                                .apply()
-                            val intent = Intent(context, AudioEngineService::class.java)
                             if (isConnected) {
-                                intent.action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
+                                val intent = Intent(context, AudioEngineService::class.java).apply {
+                                    action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
+                                }
                                 context.startService(intent)
                                 isConnected = false
                             } else {
-                                intent.putExtra("HOST_ADDR", hostAddress)
-                                intent.putExtra("GAIN_DB", preampGainDb)
-                                intent.putExtra("PIN", pinCode)
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                    context.startForegroundService(intent)
-                                } else {
-                                    context.startService(intent)
-                                }
+                                // Primary connect: omit IS_USB so the service
+                                // auto-detects USB RNDIS vs Wi-Fi hosts.
+                                connectToHost(addr = hostAddress, isUsb = null, pin = pinCode)
                                 // Real result arrives via ACTION_STREAM_STATE.
                             }
                         },
@@ -843,149 +1133,41 @@ fun MainScreen() {
                 // =====================================================================
                 // 3. PRO TELEMETRY & STAGE-BY-STAGE LATENCY DRAWER (On-Demand)
                 // =====================================================================
-                ProDrawerHeader(
-                    title = "Real-Time Telemetry & Latency Breakdown",
-                    badge = "Drift ${telemetry[4]} ppm • FEC ${telemetry[2]}",
+                TelemetryDrawerSection(
+                    telemetry = { telemetry },
                     expanded = showTelemetryDrawer,
-                    onToggle = { showTelemetryDrawer = !showTelemetryDrawer }
-                )
-
-                AnimatedVisibility(visible = showTelemetryDrawer) {
-                    StudioCard {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                "Hardware Sequencer Counters",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            FilterChip(
-                                selected = latencyDebug,
-                                onClick = {
-                                    val next = !latencyDebug
-                                    latencyDebug = next
-                                    prefs.edit().putBoolean("latency_debug", next).apply()
-                                },
-                                label = { Text("Stage Breakdown") }
-                            )
-                        }
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            MetricTile("RX Packets", "${telemetry[0]}", Modifier.weight(1f))
-                            MetricTile("Lossless Frames", "${telemetry[1]}", Modifier.weight(1f))
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            MetricTile("FEC Healed", "${telemetry[2]}", Modifier.weight(1f))
-                            MetricTile("WSOLA PLC", "${telemetry[3]}", Modifier.weight(1f))
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            MetricTile("Clock Drift", "${telemetry[4]} ppm", Modifier.weight(1f))
-                            MetricTile("AAudio DAC", "${telemetry.getOrElse(10) { 0L }} ms", Modifier.weight(1f))
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            MetricTile("Host Silence", "${telemetry.getOrElse(6) { 0L }} s", Modifier.weight(1f))
-                            MetricTile("Auth Errors", "${telemetry.getOrElse(5) { 0L }}", Modifier.weight(1f))
-                        }
-
-                        if (btEarbudsDetected) {
-                            val activeBtMs = telemetry.getOrElse(17) { 185L }
-                                .toInt().coerceIn(40, 350)
-                            StatusBadge(
-                                text = "Bluetooth Audio Active: Reporting +${activeBtMs}ms A/V Sync Offset to PC",
-                                containerColor = Color(0xFF14532D),
-                                contentColor = Color(0xFF86EFAC)
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    "BT Lip-Sync Calibration: ${if (btDelayOverrideMs == 0) "Auto (${activeBtMs}ms)" else "${btDelayOverrideMs}ms"}",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                TextButton(onClick = {
-                                    btDelayOverrideMs = 0
-                                    prefs.edit().putInt("bt_delay_override_ms", 0).apply()
-                                    context.startService(
-                                        Intent(context, AudioEngineService::class.java).apply {
-                                            action = AudioEngineService.ACTION_SET_BT_OFFSET
-                                        }
-                                    )
-                                }) { Text("Auto") }
+                    latencyDebug = latencyDebug,
+                    btDelayOverrideMs = btDelayOverrideMs,
+                    btEarbudsDetected = btEarbudsDetected,
+                    onToggleExpanded = { showTelemetryDrawer = !showTelemetryDrawer },
+                    onToggleLatencyDebug = {
+                        val next = !latencyDebug
+                        latencyDebug = next
+                        prefs.edit().putBoolean("latency_debug", next).apply()
+                    },
+                    onBtOverrideChanged = { v ->
+                        btDelayOverrideMs = v
+                        // Zero-allocation live JNI update while dragging.
+                        AudioEngineService.nativeReportBluetoothDelayMs(v)
+                    },
+                    onBtOverrideFinished = {
+                        prefs.edit().putInt("bt_delay_override_ms", btDelayOverrideMs).apply()
+                        context.startService(
+                            Intent(context, AudioEngineService::class.java).apply {
+                                action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
-                            Slider(
-                                value = (if (btDelayOverrideMs == 0) activeBtMs else btDelayOverrideMs).toFloat(),
-                                onValueChange = {
-                                    val v = it.toInt().coerceIn(40, 350)
-                                    btDelayOverrideMs = v
-                                    prefs.edit().putInt("bt_delay_override_ms", v).apply()
-                                    context.startService(
-                                        Intent(context, AudioEngineService::class.java).apply {
-                                            action = AudioEngineService.ACTION_SET_BT_OFFSET
-                                        }
-                                    )
-                                },
-                                valueRange = 40f..350f
-                            )
-                        }
-
-                        if (latencyDebug) {
-                            val packetUs = telemetry.getOrElse(11) { 0L }
-                            val jitterUs = telemetry.getOrElse(12) { 0L }
-                            val adaptiveUs = telemetry.getOrElse(13) { 0L }
-                            val targetUs = telemetry.getOrElse(14) { 0L }
-                            val bufferedUs = telemetry.getOrElse(15) { 0L }
-                            val groupUs = telemetry.getOrElse(16) { 0L }
-                            val btMs = telemetry.getOrElse(17) { 0L }
-                            val prebufferReady = telemetry.getOrElse(18) { 0L } == 1L
-                            val codecMode = telemetry.getOrElse(19) { 0L }
-                            val estMs = telemetry.getOrElse(20) { 0L } / 10.0
-                            val codecLookaheadMs = telemetry.getOrElse(21) { 0L } / 10.0
-                            val fillPct = if (targetUs > 0) {
-                                ((bufferedUs.toDouble() / targetUs) * 100.0).coerceIn(0.0, 100.0)
-                            } else {
-                                0.0
+                        )
+                    },
+                    onBtAuto = {
+                        btDelayOverrideMs = 0
+                        prefs.edit().putInt("bt_delay_override_ms", 0).apply()
+                        context.startService(
+                            Intent(context, AudioEngineService::class.java).apply {
+                                action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
-                            val btLabel = if (btMs > 0) "$btMs ms (fixed A2DP)" else "not routed"
-                            val prebufferLabel = if (prebufferReady) "READY" else "FILLING"
-
-                            HorizontalDivider(color = Color(0xFF243047))
-                            Text(
-                                "Live Latency Breakdown",
-                                style = MaterialTheme.typography.titleSmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                "Estimated one-way  : ${"%.1f".format(estMs)} ms",
-                                fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.tertiary
-                            )
-                            Text("Sender packetization: ${usToMs(packetUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Network jitter     : ${usToMs(jitterUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Adaptive cushion   : ${usToMs(adaptiveUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Target FIFO        : ${usToMs(targetUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text(
-                                "Buffered right now : ${usToMs(bufferedUs)} ms (${"%.0f".format(fillPct)}%)",
-                                fontFamily = FontFamily.Monospace,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            Text("Group sync addition: +${usToMs(groupUs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("DAC queue          : ${telemetry.getOrElse(10) { 0L }} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Codec lookahead    : ${"%.1f".format(codecLookaheadMs)} ms", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Bluetooth estimate : $btLabel", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text("Prebuffer / Codec  : $prebufferLabel • ${codecModeName(codecMode)}", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
-                            Text(
-                                "Estimate = packetization + target FIFO + max(DAC, BT, output) + codec lookahead.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
+                        )
                     }
-                }
+                )
             } // End Tab 0
 
             if (selectedTab == 1) {
@@ -1111,8 +1293,9 @@ fun MainScreen() {
                         valueRange = -12.0f..24.0f,
                         onValueChange = {
                             preampGainDb = it
-                            syncAndSaveDsp()
-                        }
+                            applyDspLive()
+                        },
+                        onValueChangeFinished = { syncAndSaveDsp() }
                     )
                 }
 
@@ -1182,8 +1365,9 @@ fun MainScreen() {
                             valueRange = -12.0f..12.0f,
                             onValueChange = {
                                 bassDb = it
-                                syncAndSaveDsp()
-                            }
+                                applyDspLive()
+                            },
+                            onValueChangeFinished = { syncAndSaveDsp() }
                         )
                         StudioFaderRow(
                             title = "Vocal Presence",
@@ -1192,8 +1376,9 @@ fun MainScreen() {
                             valueRange = -12.0f..12.0f,
                             onValueChange = {
                                 vocalDb = it
-                                syncAndSaveDsp()
-                            }
+                                applyDspLive()
+                            },
+                            onValueChangeFinished = { syncAndSaveDsp() }
                         )
                         StudioFaderRow(
                             title = "Treble Air",
@@ -1202,8 +1387,9 @@ fun MainScreen() {
                             valueRange = -12.0f..12.0f,
                             onValueChange = {
                                 trebleDb = it
-                                syncAndSaveDsp()
-                            }
+                                applyDspLive()
+                            },
+                            onValueChangeFinished = { syncAndSaveDsp() }
                         )
 
                         HorizontalDivider(color = Color(0xFF243047))
@@ -1429,81 +1615,20 @@ fun MainScreen() {
                         )
 
                         AnimatedVisibility(visible = castPhoneInternalAudio) {
-                            val partyPacked = telemetry.getOrElse(22) { 0L }
-                            val partyListeners = (partyPacked and 0xFFL).toInt()
-                            val partyCodec = (partyPacked shr 8) and 0xFFL
-                            val partyPort = ((partyPacked shr 16) and 0xFFFFL).let { if (it > 0) it else 65530L }
-                            val partySyncMs = telemetry.getOrElse(23) { 0L }
-                            // stats[22] bits 40..47 carry the live capture VU peak
-                            // from PhoneMicTransmitter. Zero for ~12 polls (~3 s)
-                            // means DRM/OEM mute is feeding silence to peers.
-                            val partyVu = ((partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
-
-                            LaunchedEffect(castPhoneInternalAudio, partyVu == 0) {
-                                if (!castPhoneInternalAudio) {
-                                    partySilenceWarning = false
-                                } else if (partyVu == 0) {
-                                    delay(3000)
-                                    partySilenceWarning = true
-                                } else {
-                                    partySilenceWarning = false
-                                }
-                            }
-
-                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                HorizontalDivider(color = Color(0xFF243047))
-                                Text(
-                                    "Live Party Host Telemetry (Port $partyPort)",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.secondary
-                                )
-                                Text(
-                                    "Captured Audio Level",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = StudioColors.Muted
-                                )
-                                FluidAudioVisualizer(vuPct = partyVu, isLive = partyVu > 0)
-                                if (partySilenceWarning) {
-                                    StatusBadge(
-                                        text = "No app audio detected — start music or check DRM/mute",
-                                        containerColor = StudioColors.WarnBg,
-                                        contentColor = StudioColors.WarnFg
-                                    )
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    MetricTile("Connected Peers", "$partyListeners", Modifier.weight(1f))
-                                    MetricTile("Party Codec", codecModeName(partyCodec), Modifier.weight(1f))
-                                    MetricTile("Group Sync", "+${partySyncMs} ms", Modifier.weight(1f))
-                                }
-                                FilledTonalButton(
-                                    onClick = { showPartyQrDialog = true },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(Icons.Rounded.QrCode, null, Modifier.size(18.dp))
-                                    Spacer(Modifier.width(8.dp))
-                                    Text("Show Party QR Code (Port $partyPort)")
-                                }
-                                Text(
-                                    "Tip: For 3+ peers or outdoors, enable this phone's Mobile Hotspot for a 1-hop direct link with half the Wi-Fi lag.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = StudioColors.Muted
-                                )
-                            }
-                            if (showPartyQrDialog) {
-                                PartyQrDialog(
-                                    partyPort = partyPort.toInt(),
-                                    pinCode = pinCode,
-                                    onDismiss = { showPartyQrDialog = false },
-                                    onCopied = {
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Party link copied")
-                                        }
+                            PartyTelemetrySection(
+                                telemetry = { telemetry },
+                                partySilenceWarning = partySilenceWarning,
+                                showPartyQrDialog = showPartyQrDialog,
+                                pinCode = pinCode,
+                                onSilenceWarning = { partySilenceWarning = it },
+                                onShowQr = { showPartyQrDialog = true },
+                                onDismissQr = { showPartyQrDialog = false },
+                                onCopied = {
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("Party link copied")
                                     }
-                                )
-                            }
+                                }
+                            )
                         }
                     }
 

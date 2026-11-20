@@ -24,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -35,7 +36,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
-import kotlin.math.ceil
 import kotlin.math.sin
 
 /** Studio palette: calm tonal layering instead of heavy 1dp blue-gray outlines. */
@@ -113,15 +113,17 @@ fun HeroAudioStage(
             .fillMaxWidth()
             .clip(shape)
             .background(StudioColors.CardBg)
-            .background(
-                Brush.radialGradient(
-                    colors = listOf(
-                        glowColor.copy(alpha = 0.14f + 0.14f * smoothEnergy),
-                        Color.Transparent
-                    ),
-                    radius = 520f
+            .drawBehind {
+                drawRect(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            glowColor.copy(alpha = 0.14f + 0.14f * smoothEnergy),
+                            Color.Transparent
+                        ),
+                        radius = 520f
+                    )
                 )
-            )
+            }
             .border(1.dp, glowColor.copy(alpha = 0.24f), shape)
     ) {
         Column(
@@ -215,47 +217,6 @@ fun StatusBadge(
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.SemiBold
-            )
-        }
-    }
-}
-
-/** 24-segment studio LED peak-hold VU meter (matches the desktop console). */
-@Composable
-fun StudioLedVuMeter(vuPct: Int, peakHoldPct: Float, modifier: Modifier = Modifier) {
-    Canvas(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(14.dp)
-    ) {
-        val segments = 24
-        val gap = 3.dp.toPx()
-        val segW = (size.width - gap * (segments + 1)) / segments
-        val segH = size.height - 4.dp.toPx()
-        val active = ceil((vuPct.coerceIn(0, 100) * segments) / 100.0).toInt()
-        val holdIdx = if (peakHoldPct > 2f) {
-            (ceil((peakHoldPct.coerceIn(0f, 100f) * segments) / 100.0).toInt() - 1)
-                .coerceIn(0, segments - 1)
-        } else -1
-
-        drawRoundRect(
-            color = StudioColors.TileBg,
-            cornerRadius = CornerRadius(5.dp.toPx())
-        )
-        for (i in 0 until segments) {
-            val x = gap + i * (segW + gap)
-            val color = when {
-                i == holdIdx && i >= active -> Color(0xFFF1F5F9)
-                i < active && i >= 21 -> Color(0xFFEF4444)
-                i < active && i >= 16 -> Color(0xFFF59E0B)
-                i < active -> Color(0xFF10B981)
-                else -> Color(0xFF1E2638)
-            }
-            drawRoundRect(
-                color = color,
-                topLeft = Offset(x, 2.dp.toPx()),
-                size = Size(segW, segH),
-                cornerRadius = CornerRadius(2.dp.toPx())
             )
         }
     }
@@ -419,7 +380,8 @@ fun StudioFaderRow(
     freqLabel: String,
     value: Float,
     valueRange: ClosedFloatingPointRange<Float>,
-    onValueChange: (Float) -> Unit
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: (() -> Unit)? = null
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(
@@ -436,9 +398,17 @@ fun StudioFaderRow(
                 text = "%+.1f dB".format(value),
                 containerColor = if (boosted) StudioColors.AccentDeep else Color(0xFF1A2436),
                 contentColor = if (boosted) StudioColors.AccentSoft else StudioColors.Muted,
-                onClick = { onValueChange(0f) }
+                onClick = {
+                    onValueChange(0f)
+                    onValueChangeFinished?.invoke()
+                }
             )
         }
-        Slider(value = value, onValueChange = onValueChange, valueRange = valueRange)
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            onValueChangeFinished = onValueChangeFinished,
+            valueRange = valueRange
+        )
     }
 }

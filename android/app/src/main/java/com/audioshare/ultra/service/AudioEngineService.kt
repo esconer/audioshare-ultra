@@ -220,6 +220,38 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
+    // Host-silence watchdog. The old 300 s auto-disconnect lived in the Compose
+    // UI, which cannot poll once the screen is off. Keep it here so it survives
+    // rotation and backgrounding: tick every 15 s and stop cleanly once the host
+    // telemetry reports >= 300 s of silence, but only for a plain listening
+    // session (no party cast, no phone mic). Native telemetry index 6 is the
+    // existing host-silence seconds counter.
+    private val silenceHandler = Handler(Looper.getMainLooper())
+    private val silenceWatchdogRunnable = object : Runnable {
+        override fun run() {
+            if (!isStreaming && !isPartyCasting && !isPhoneMicActive) return
+            if (isStreaming && !isPartyCasting && !isPhoneMicActive) {
+                val silenceSec = runCatching { nativeGetTelemetry().getOrElse(6) { 0L } }
+                    .getOrDefault(0L)
+                if (silenceSec >= 300L) {
+                    ensureForegroundBeforeStop()
+                    stopStreamAndService()
+                    return
+                }
+            }
+            silenceHandler.postDelayed(this, 15_000L)
+        }
+    }
+
+    private fun scheduleSilenceWatchdog() {
+        silenceHandler.removeCallbacks(silenceWatchdogRunnable)
+        silenceHandler.postDelayed(silenceWatchdogRunnable, 15_000L)
+    }
+
+    private fun stopSilenceWatchdog() {
+        silenceHandler.removeCallbacks(silenceWatchdogRunnable)
+    }
+
     // Auto-mute if wired headphones are unplugged or Bluetooth earbuds disconnect unexpectedly
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -255,6 +287,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     if (engineExecutor.isShutdown) return@post
                     isStreaming = false
                     sleepHandler.removeCallbacks(sleepTickRunnable)
+                    stopSilenceWatchdog()
                     broadcastSleepTimer(0)
                     broadcastStreamState(false, null)
                     if (!isPartyCasting && !micCaptureActive) {
@@ -484,6 +517,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             return
         }
         broadcastStreamState(true, null)
+        scheduleSilenceWatchdog()
         // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
         // Lock and the Dolby/system-effects preference automatically!
         applyDspFromPrefs()
@@ -1288,6 +1322,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         isStreaming = false
         sleepHandler.removeCallbacks(sleepTickRunnable)
+        stopSilenceWatchdog()
         broadcastSleepTimer(0)
         broadcastStreamState(false, null)
         micCaptureActive = false

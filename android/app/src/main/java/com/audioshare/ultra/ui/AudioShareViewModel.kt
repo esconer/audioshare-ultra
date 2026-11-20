@@ -2,6 +2,7 @@ package com.audioshare.ultra.ui
 
 import android.app.Application
 import android.content.Context
+import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import com.audioshare.ultra.service.AudioEngineService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,12 +10,114 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
+@Immutable
 data class DiscoveredHostItem(
     val name: String,
     val addr: String,
     val isUsb: Boolean,
     val encrypted: Boolean
 )
+
+/**
+ * Immutable, Compose-friendly view of the 25-slot JNI telemetry array.
+ *
+ * Every slot is a primitive `Long`, so [TelemetrySnapshot] is safe to pass into
+ * leaf composables: a 16 Hz telemetry tick only re-executes the leaves that
+ * actually read the snapshot, not the whole screen. The index-based accessors
+ * mirror the native `stats[]` contract used by the JNI layer and keep the
+ * existing UI formulas readable.
+ */
+@Immutable
+data class TelemetrySnapshot(
+    val rxPackets: Long = 0L,
+    val losslessFrames: Long = 0L,
+    val fecHealed: Long = 0L,
+    val wsolaPlc: Long = 0L,
+    val clockDriftPpm: Long = 0L,
+    val authErrors: Long = 0L,
+    val hostSilenceSec: Long = 0L,
+    val dtxSilent: Long = 0L,
+    val hostVolumePct: Long = 0L,
+    val groupDelayMs: Long = 0L,
+    val dacMs: Long = 0L,
+    val packetizationUs: Long = 0L,
+    val jitterUs: Long = 0L,
+    val adaptiveUs: Long = 0L,
+    val targetFifoUs: Long = 0L,
+    val bufferedUs: Long = 0L,
+    val groupSyncUs: Long = 0L,
+    val btMs: Long = 0L,
+    val prebufferReady: Long = 0L,
+    val codecMode: Long = 0L,
+    val estimatedLatencyTenthsMs: Long = 0L,
+    val codecLookaheadTenthsMs: Long = 0L,
+    val partyPacked: Long = 0L,
+    val partySyncMs: Long = 0L,
+    val vuPeak: Long = 0L
+) {
+    operator fun get(index: Int): Long = when (index) {
+        0 -> rxPackets
+        1 -> losslessFrames
+        2 -> fecHealed
+        3 -> wsolaPlc
+        4 -> clockDriftPpm
+        5 -> authErrors
+        6 -> hostSilenceSec
+        7 -> dtxSilent
+        8 -> hostVolumePct
+        9 -> groupDelayMs
+        10 -> dacMs
+        11 -> packetizationUs
+        12 -> jitterUs
+        13 -> adaptiveUs
+        14 -> targetFifoUs
+        15 -> bufferedUs
+        16 -> groupSyncUs
+        17 -> btMs
+        18 -> prebufferReady
+        19 -> codecMode
+        20 -> estimatedLatencyTenthsMs
+        21 -> codecLookaheadTenthsMs
+        22 -> partyPacked
+        23 -> partySyncMs
+        24 -> vuPeak
+        else -> 0L
+    }
+
+    /** Drop-in replacement for the old `LongArray.getOrElse(i) { default }` reads. */
+    fun getOrElse(index: Int, defaultValue: () -> Long): Long =
+        if (index in 0..24) get(index) else defaultValue()
+
+    companion object {
+        fun fromRaw(raw: LongArray): TelemetrySnapshot = TelemetrySnapshot(
+            rxPackets = raw.getOrElse(0) { 0L },
+            losslessFrames = raw.getOrElse(1) { 0L },
+            fecHealed = raw.getOrElse(2) { 0L },
+            wsolaPlc = raw.getOrElse(3) { 0L },
+            clockDriftPpm = raw.getOrElse(4) { 0L },
+            authErrors = raw.getOrElse(5) { 0L },
+            hostSilenceSec = raw.getOrElse(6) { 0L },
+            dtxSilent = raw.getOrElse(7) { 0L },
+            hostVolumePct = raw.getOrElse(8) { 0L },
+            groupDelayMs = raw.getOrElse(9) { 0L },
+            dacMs = raw.getOrElse(10) { 0L },
+            packetizationUs = raw.getOrElse(11) { 0L },
+            jitterUs = raw.getOrElse(12) { 0L },
+            adaptiveUs = raw.getOrElse(13) { 0L },
+            targetFifoUs = raw.getOrElse(14) { 0L },
+            bufferedUs = raw.getOrElse(15) { 0L },
+            groupSyncUs = raw.getOrElse(16) { 0L },
+            btMs = raw.getOrElse(17) { 0L },
+            prebufferReady = raw.getOrElse(18) { 0L },
+            codecMode = raw.getOrElse(19) { 0L },
+            estimatedLatencyTenthsMs = raw.getOrElse(20) { 0L },
+            codecLookaheadTenthsMs = raw.getOrElse(21) { 0L },
+            partyPacked = raw.getOrElse(22) { 0L },
+            partySyncMs = raw.getOrElse(23) { 0L },
+            vuPeak = raw.getOrElse(24) { 0L }
+        )
+    }
+}
 
 data class AudioShareUiState(
     val selectedTab: Int = 0,
@@ -45,9 +148,14 @@ data class AudioShareUiState(
     val showEqDrawer: Boolean = false,
     val showCodecDrawer: Boolean = false,
     val discoveredHosts: List<DiscoveredHostItem> = emptyList(),
-    val telemetry: LongArray = LongArray(25),
+    val telemetry: TelemetrySnapshot = TelemetrySnapshot(),
     val vuPeakHold: Float = 0f,
-    val btEarbudsDetected: Boolean = false
+    val btEarbudsDetected: Boolean = false,
+    // One-shot gesture guards that used to be Compose-local; keeping them in
+    // the ViewModel means a permission dialog surviving rotation no longer
+    // silently drops the pending action.
+    val pendingInternalAudioCast: Boolean = false,
+    val partySilenceWarning: Boolean = false
 )
 
 /** Rotation-safe state holder for the Compose UI. */
@@ -117,7 +225,7 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
                 (st.vuPeakHold - 3.0f).coerceAtLeast(0f)
             }
             st.copy(
-                telemetry = raw,
+                telemetry = TelemetrySnapshot.fromRaw(raw),
                 vuPeakHold = nextHold,
                 btEarbudsDetected = raw.getOrElse(17) { 0L } > 0L
             )

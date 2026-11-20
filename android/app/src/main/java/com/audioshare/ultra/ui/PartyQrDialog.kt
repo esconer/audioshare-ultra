@@ -25,6 +25,8 @@ import androidx.compose.ui.window.Dialog
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.QRCodeWriter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -93,7 +95,11 @@ fun PartyQrDialog(
     onCopied: () -> Unit
 ) {
     val clipboard = LocalClipboardManager.current
-    val endpoints = remember { listReachablePartyEndpoints() }
+    // Network-interface enumeration and ZXing encoding are both blocking;
+    // keep them off the Main thread so the dialog never janks the audio UI.
+    val endpoints by produceState<List<PhoneNetEndpoint>>(emptyList()) {
+        value = withContext(Dispatchers.Default) { listReachablePartyEndpoints() }
+    }
     var selectedIdx by remember { mutableIntStateOf(0) }
     val activeEndpoint = endpoints.getOrNull(selectedIdx)
     val ip = activeEndpoint?.ip
@@ -108,7 +114,9 @@ fun PartyQrDialog(
             .build()
             .toString()
     }
-    val qrBitmap = remember(uri) { uri?.let { renderQrBitmap(it) } }
+    val qrBitmap by produceState<Bitmap?>(null, uri) {
+        value = withContext(Dispatchers.Default) { uri?.let { renderQrBitmap(it) } }
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         StudioCard {
