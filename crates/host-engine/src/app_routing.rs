@@ -307,11 +307,11 @@ pub fn spawn_windows_process_loopback(
         AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
     };
-    use windows::Win32::System::Com::StructuredStorage::InitPropVariantFromBuffer;
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, IAgileObject, COINIT_MULTITHREADED};
     use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-    #[implement(IActivateAudioInterfaceCompletionHandler)]
+    #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
     struct CompletionHandler {
         event: HANDLE,
         result: std::sync::Mutex<Option<Result<IAudioClient, String>>>,
@@ -358,7 +358,7 @@ pub fn spawn_windows_process_loopback(
                     };
                     let handler: IActivateAudioInterfaceCompletionHandler = handler_impl.into();
 
-                    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+                    let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
                         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
                         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -367,20 +367,34 @@ pub fn spawn_windows_process_loopback(
                             },
                         },
                     };
-                    let param_bytes = core::slice::from_raw_parts(
-                        &params as *const AUDIOCLIENT_ACTIVATION_PARAMS as *const u8,
-                        core::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>(),
+                    // ActivateAudioInterfaceAsync requires VT_BLOB (0x0041);
+                    // InitPropVariantFromBuffer produces VT_VECTOR|VT_UI1 -> E_INVALIDARG.
+                    #[repr(C)]
+                    struct RawBlobPropVariant {
+                        vt: u16,
+                        r1: u16,
+                        r2: u16,
+                        r3: u16,
+                        cb_size: u32,
+                        p_blob_data: *mut u8,
+                    }
+                    const _: () = assert!(
+                        core::mem::size_of::<RawBlobPropVariant>()
+                            == core::mem::size_of::<PROPVARIANT>()
                     );
-                    let prop = InitPropVariantFromBuffer(
-                        param_bytes.as_ptr() as *const core::ffi::c_void,
-                        param_bytes.len() as u32,
-                    )
-                    .map_err(|e| format!("InitPropVariantFromBuffer failed: {e}"))?;
+                    let raw_prop = RawBlobPropVariant {
+                        vt: 0x0041, // VT_BLOB
+                        r1: 0,
+                        r2: 0,
+                        r3: 0,
+                        cb_size: core::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                        p_blob_data: &mut params as *mut _ as *mut u8,
+                    };
 
                     let _op = ActivateAudioInterfaceAsync(
                         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
                         &IAudioClient::IID,
-                        Some(&prop),
+                        Some(&raw_prop as *const RawBlobPropVariant as *const PROPVARIANT),
                         &handler,
                     )
                     .map_err(|e| format!("ActivateAudioInterfaceAsync failed: {e}"))?;
