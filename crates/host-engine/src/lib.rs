@@ -1387,6 +1387,12 @@ impl HostEngine {
                 },
             );
         }
+        // Seed the count from the admitted map, not the raw request list:
+        // initial_targets may exceed MAX_CONNECTED_CLIENTS and the map dedups.
+        telemetry.active_clients_count.store(
+            client_map.len().min(u8::MAX as usize) as u8,
+            Ordering::Relaxed,
+        );
         let clients = Arc::new(Mutex::new(client_map));
         let session_key = Arc::new(Mutex::new(None));
 
