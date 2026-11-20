@@ -74,6 +74,7 @@ private fun HeroStageSection(
     sharePhoneMic: Boolean,
     hostAddress: String,
     sleepRemainingMins: Int,
+    gamingLock: Boolean,
     latencyDebug: Boolean
 ) {
     val t = telemetry()
@@ -136,6 +137,13 @@ private fun HeroStageSection(
                     text = "Vol ${hostVol}%",
                     containerColor = Color(0xFF1E3A5F),
                     contentColor = Color(0xFF93C5FD)
+                )
+            }
+            if (gamingLock) {
+                StatusBadge(
+                    text = "GAMING",
+                    containerColor = StudioColors.WarnBg,
+                    contentColor = StudioColors.WarnFg
                 )
             }
             if (sleepRemainingMins > 0) {
@@ -978,6 +986,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 sharePhoneMic = sharePhoneMic,
                 hostAddress = hostAddress,
                 sleepRemainingMins = sleepTimerMinutes,
+                gamingLock = gamingLock,
                 latencyDebug = latencyDebug
             )
 
