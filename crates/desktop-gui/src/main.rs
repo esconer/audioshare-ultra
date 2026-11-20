@@ -1696,14 +1696,34 @@ impl AudioShareApp {
                             egui::RichText::new("Diagnostics").size(13.5).strong(),
                         );
                         if ui.button("Copy Diagnostics Report").clicked() {
-                            let summary = format!(
-                                "Host    : {}\nClient  : {}\nProfile : {:?} | Opus={} | Bitrate={}k",
-                                self.host_status_msg,
-                                self.client_status_msg,
-                                self.quality_profile,
-                                self.prefer_opus,
-                                self.target_bitrate_kbps
+                            let mut summary = format!(
+                                "HostMsg : {}\nClientMg: {}",
+                                self.host_status_msg, self.client_status_msg
                             );
+                            if let Some(ref host) = self.host_engine {
+                                summary.push('\n');
+                                summary.push_str(&host.telemetry.diagnostics_summary());
+                                for c in host.connected_clients() {
+                                    summary.push_str(&format!(
+                                        "\nPeer    : {} usb={} loss={:.1}% bt={}ms hw={}ms gaming={} muted={}",
+                                        c.addr,
+                                        c.is_usb,
+                                        c.fec_rate_permille as f32 / 10.0,
+                                        c.bluetooth_delay_ms,
+                                        c.hardware_delay_ms,
+                                        c.gaming_lock,
+                                        c.muted,
+                                    ));
+                                }
+                            }
+                            if let Some(ref client) = self.client_engine {
+                                summary.push('\n');
+                                summary.push_str(
+                                    &client
+                                        .telemetry
+                                        .diagnostics_summary(DESKTOP_OUTPUT_BUFFER_MS),
+                                );
+                            }
                             ui.ctx().copy_text(
                                 audioshare_protocol::diagnostics::export_report(&summary),
                             );
