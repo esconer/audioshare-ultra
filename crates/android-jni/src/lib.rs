@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "android")]
@@ -21,13 +21,13 @@ use audioshare_protocol::lpc_lossless::{
 };
 use audioshare_protocol::opus_codec::OpusStreamEncoder;
 use audioshare_protocol::wire::{
-    feedback_is_replay, pack_datagram_with_key, ClientFeedbackPacket, CodecMode, WireHeader,
+    pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
     CONTROL_FEEDBACK_MAGIC,
 };
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 
-static GLOBAL_ANDROID_CLIENT: Mutex<Option<ClientEngine>> = Mutex::new(None);
-static GLOBAL_PHONE_MIC_TX: Mutex<Option<PhoneMicTransmitter>> = Mutex::new(None);
+static GLOBAL_ANDROID_CLIENT: RwLock<Option<ClientEngine>> = RwLock::new(None);
+static GLOBAL_PHONE_MIC_TX: RwLock<Option<PhoneMicTransmitter>> = RwLock::new(None);
 static GLOBAL_SCANNER: OnceLock<DiscoveryScanner> = OnceLock::new();
 
 pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
@@ -110,6 +110,9 @@ const PARTY_LOSS_HOLD: Duration = Duration::from_secs(3);
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
 const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
 const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
+/// Hard cap on distinct Party listener IPs. An unbounded unicast fan-out from a
+/// phone host saturates its 2.4 GHz TX queue; 16 is the tested ceiling.
+const MAX_PARTY_PEERS: usize = 16;
 
 /// Select Party compressed bitrate based on peer fan-out and worst link loss.
 /// Phone-to-phone traffic traverses the AP twice (uplink + downlink), so 3+
@@ -137,26 +140,81 @@ fn party_subframes_per_packet(listener_ips: usize, worst_loss_permille: u16) -> 
     }
 }
 
+/// Build the two FEC fields for one outgoing packet from the sliding history.
+///
+/// `hist[0]` is N-1 (newest). Normal framing carries one frame per field.
+/// Four-subframe 10 ms framing interleaves two frames per field:
+/// `fec_n1 = [N-1, N-3]`, `fec_n2 = [N-2, N-4]`. Keeping N-1/N-2 as the first
+/// frame of each field is the compatibility contract with
+/// `client-engine::heal_packet_fec`: older clients decode only those 124 bytes,
+/// while newer clients read the second frame as the older half. A contiguous
+/// `[N-1,N-2] + [N-3,N-4]` layout would heal the wrong slot on old clients.
+///
+/// `audioshare_protocol` does not export a history packer (host-engine keeps
+/// its copy private), so mirror it here instead of adding a cross-crate API.
+fn pack_fec_history(
+    pair_fec: bool,
+    hist: &[[u8; ADPCM_FEC_BYTES]; 4],
+    hist_len: usize,
+    pair_1: &mut [u8; ADPCM_FEC_BYTES * 2],
+    pair_2: &mut [u8; ADPCM_FEC_BYTES * 2],
+) -> (usize, usize) {
+    if pair_fec && hist_len >= 3 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        pair_1[ADPCM_FEC_BYTES..].copy_from_slice(&hist[2]);
+        pair_2[..ADPCM_FEC_BYTES].copy_from_slice(&hist[1]);
+        if hist_len >= 4 {
+            pair_2[ADPCM_FEC_BYTES..].copy_from_slice(&hist[3]);
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES * 2)
+        } else {
+            // Ramp-up: N-2 alone stays the legacy field for one packet.
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES)
+        }
+    } else if hist_len >= 2 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        pair_2[..ADPCM_FEC_BYTES].copy_from_slice(&hist[1]);
+        (ADPCM_FEC_BYTES, ADPCM_FEC_BYTES)
+    } else if hist_len == 1 {
+        pair_1[..ADPCM_FEC_BYTES].copy_from_slice(&hist[0]);
+        (ADPCM_FEC_BYTES, 0)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Shift the newest-first FEC history right and prepend `frame` as the new N-1.
+#[inline]
+fn push_fec_history(
+    hist: &mut [[u8; ADPCM_FEC_BYTES]; 4],
+    hist_len: &mut usize,
+    frame: &[i16; SUBFRAME_STEREO_SAMPLES],
+) {
+    hist.copy_within(0..3, 1);
+    encode_fec_subframe(frame, &mut hist[0]);
+    *hist_len = (*hist_len + 1).min(hist.len());
+}
+
+/// Convert a dB value to the integer tenths stored in telemetry atomics.
+/// A non-finite value from Java must never poison DSP state, and `.round()`
+/// avoids the downward bias of a plain float-to-int cast.
+#[inline]
+fn db_to_tenths(db: f32, min: f32, max: f32) -> i32 {
+    if !db.is_finite() {
+        return 0;
+    }
+    (db.clamp(min, max) * 10.0).round() as i32
+}
+
 #[derive(Clone, Copy)]
 struct PartyPeerState {
     last_seen: Instant,
     delay_ms: u16,
     fec_permille: u16,
-    /// Highest authenticated feedback sequence seen from this peer (AEAD v2).
-    last_feedback_seq: u32,
-}
-
-/// Replay gate for authenticated Party feedback. Unencrypted LAN feedback has
-/// no sequence guarantee, so the check only applies with a session key.
-#[inline]
-fn party_feedback_is_replay(
-    peers: &HashMap<SocketAddr, PartyPeerState>,
-    src: SocketAddr,
-    seq: u32,
-    authenticated: bool,
-) -> bool {
-    let last = peers.get(&src).map(|p| p.last_feedback_seq).unwrap_or(0);
-    feedback_is_replay(authenticated, seq, last)
+    /// Anti-replay sliding window for authenticated Party feedback (AEAD v2).
+    /// Unencrypted LAN feedback has no sequence guarantee, so the gate is a
+    /// no-op there; with a session key, out-of-order packets inside the window
+    /// are accepted exactly once.
+    feedback_replay: FeedbackReplayWindow,
 }
 
 fn parse_target_endpoints_with_locals(
@@ -227,7 +285,7 @@ fn initial_party_peers(
         last_seen: now,
         delay_ms: 0,
         fec_permille: 0,
-        last_feedback_seq: 0,
+        feedback_replay: FeedbackReplayWindow::default(),
     };
     let mut peers = HashMap::new();
     for &addr in static_targets {
@@ -255,6 +313,13 @@ fn unique_peer_ip_count(peers: &HashMap<SocketAddr, PartyPeerState>) -> usize {
     ips.len()
 }
 
+/// True when this IP is already registered on any port. At the peer cap an
+/// existing IP may still reconnect on a new port or receive an update.
+#[inline]
+fn peer_ip_known(peers: &HashMap<SocketAddr, PartyPeerState>, ip: IpAddr) -> bool {
+    peers.keys().any(|addr| addr.ip() == ip)
+}
+
 /// Replace any old dynamic port for this IP, but keep the configured PC
 /// receiver endpoints. A peer that reconnects on a new ephemeral port must not
 /// leave the old port receiving packets forever.
@@ -272,6 +337,19 @@ fn register_party_peer(
     static_targets: &[SocketAddr],
     now: Instant,
 ) {
+    // A HELLO from a new IP at the cap is dropped. An existing IP (including
+    // this exact socket reconnecting on a new port) is always allowed through,
+    // and a same-socket re-registration keeps its anti-replay watermark.
+    if !peers.contains_key(&src)
+        && !peer_ip_known(peers, src.ip())
+        && unique_peer_ip_count(peers) >= MAX_PARTY_PEERS
+    {
+        return;
+    }
+    let replay = peers
+        .get(&src)
+        .map(|p| p.feedback_replay)
+        .unwrap_or_default();
     retain_static_and_current(peers, src, static_targets);
     peers.insert(
         src,
@@ -279,20 +357,38 @@ fn register_party_peer(
             last_seen: now,
             delay_ms: 0,
             fec_permille: 0,
-            last_feedback_seq: 0,
+            feedback_replay: replay,
         },
     );
 }
 
+/// Apply one authenticated feedback update. Returns `false` when the packet is
+/// a replay (or a new IP arrives at the peer cap), leaving state unchanged.
+/// The replay window is checked and advanced in place here because a plain
+/// `insert` would otherwise reset the watermark on every 500 ms feedback.
 fn update_party_peer_feedback(
     peers: &mut HashMap<SocketAddr, PartyPeerState>,
     src: SocketAddr,
     delay_ms: u16,
     fec_permille: u16,
     feedback_seq: u32,
+    authenticated: bool,
     static_targets: &[SocketAddr],
     now: Instant,
-) {
+) -> bool {
+    let mut replay = peers
+        .get(&src)
+        .map(|p| p.feedback_replay)
+        .unwrap_or_default();
+    if !replay.check_and_accept(authenticated, feedback_seq) {
+        return false;
+    }
+    if !peers.contains_key(&src)
+        && !peer_ip_known(peers, src.ip())
+        && unique_peer_ip_count(peers) >= MAX_PARTY_PEERS
+    {
+        return false;
+    }
     retain_static_and_current(peers, src, static_targets);
     peers.insert(
         src,
@@ -300,9 +396,10 @@ fn update_party_peer_feedback(
             last_seen: now,
             delay_ms,
             fec_permille,
-            last_feedback_seq: feedback_seq,
+            feedback_replay: replay,
         },
     );
+    true
 }
 
 fn expire_party_peers(
@@ -444,10 +541,9 @@ impl PhoneMicTransmitter {
                 let mut last_mic_open_attempt = Instant::now();
                 let start = Instant::now();
                 let mut seq: u16 = 0;
-                let mut fec_n1 = [0u8; ADPCM_FEC_BYTES];
-                let mut fec_n2 = [0u8; ADPCM_FEC_BYTES];
-                let mut has_fec_n1 = false;
-                let mut has_fec_n2 = false;
+                // Newest-first ADPCM FEC history: hist[0] = N-1 ... hist[3] = N-4.
+                let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
+                let mut fec_hist_len = 0usize;
                 let mut dither_rng = 1u32;
                 let mut noise_shaper =
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
@@ -465,10 +561,11 @@ impl PhoneMicTransmitter {
                 };
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
-                // Per-peer highest authenticated feedback sequence lives in
-                // `PartyPeerState::last_feedback_seq` so a feedback update
+                // Per-peer authenticated feedback history lives in
+                // `PartyPeerState::feedback_replay` so a feedback update
                 // cannot reset the anti-replay watermark.
                 let mut last_sweep = Instant::now();
+                let mut last_iface_refresh = Instant::now();
                 let mut governed_loss_permille: u16 = 0;
                 let mut loss_hold_until = Instant::now();
                 let mut silent_subframes: u32 = 0;
@@ -539,31 +636,26 @@ impl PhoneMicTransmitter {
                                     &ctrl_buf[..len],
                                     session_key.as_ref(),
                                 ) {
-                                    if party_feedback_is_replay(
-                                        &peers,
-                                        src_addr,
-                                        fb.feedback_seq,
-                                        session_key.is_some(),
-                                    ) {
-                                        continue;
-                                    }
-                                    if (10..=12).contains(&fb.requested_mode) {
-                                        party_telem_clone
-                                            .pending_remote_media_cmd
-                                            .store(fb.requested_mode, Ordering::Relaxed);
-                                    }
                                     // Align the fixed downstream delay (A2DP or
                                     // measured DAC), never the adaptive network
-                                    // jitter buffer.
-                                    update_party_peer_feedback(
+                                    // jitter buffer. `update_party_peer_feedback`
+                                    // runs the replay gate and advances the
+                                    // per-peer window in one atomic step.
+                                    let accepted = update_party_peer_feedback(
                                         &mut peers,
                                         src_addr,
                                         fb.bluetooth_delay_ms.max(fb.hardware_delay_ms),
                                         fb.fec_rate_permille,
                                         fb.feedback_seq,
+                                        session_key.is_some(),
                                         &static_targets,
                                         Instant::now(),
                                     );
+                                    if accepted && (10..=12).contains(&fb.requested_mode) {
+                                        party_telem_clone
+                                            .pending_remote_media_cmd
+                                            .store(fb.requested_mode, Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }
@@ -574,6 +666,12 @@ impl PhoneMicTransmitter {
                         if last_sweep.elapsed() >= Duration::from_secs(1) {
                             last_sweep = Instant::now();
                             expire_party_peers(&mut peers, &static_targets, last_sweep);
+                        }
+                        // Enumerating host interfaces walks the OS network
+                        // stack. Keep the 1 s peer-expiry sweep but refresh the
+                        // local-IP allowlist only every 10 s.
+                        if last_iface_refresh.elapsed() >= Duration::from_secs(10) {
+                            last_iface_refresh = Instant::now();
                             local_ips = list_valid_host_interfaces()
                                 .into_iter()
                                 .map(|iface| iface.ip)
@@ -631,8 +729,7 @@ impl PhoneMicTransmitter {
                                 Ordering::Relaxed,
                             );
                             opus_encoder = None;
-                            has_fec_n1 = false;
-                            has_fec_n2 = false;
+                            fec_hist_len = 0;
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -652,10 +749,8 @@ impl PhoneMicTransmitter {
                         }
 
                         let base_seq = seq;
-                        let prev_n1 = fec_n1;
-                        let prev_n2 = fec_n2;
-                        let send_n1 = has_fec_n1;
-                        let send_n2 = has_fec_n2;
+                        let prev_hist = fec_hist;
+                        let prev_hist_len = fec_hist_len;
                         let mut primary_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 4 + 8];
                         let mut cursor = 0usize;
                         let mut packet_is_silent = true;
@@ -711,8 +806,7 @@ impl PhoneMicTransmitter {
                             && party_dtx_active(packet_is_silent, silent_subframes);
                         if dtx {
                             opus_encoder = None;
-                            has_fec_n1 = false;
-                            has_fec_n2 = false;
+                            fec_hist_len = 0;
                             let now = Instant::now();
                             if !party_dtx_heartbeat_due(last_party_dtx_heartbeat, now) {
                                 // Nothing goes out: leave last_tx at the last
@@ -813,14 +907,10 @@ impl PhoneMicTransmitter {
                                 // phase-aligned CELT PLC. A zero-lookahead ADPCM
                                 // backup would jump the waveform by one subframe,
                                 // so suppress it and save 248 bytes per packet.
-                                has_fec_n1 = false;
-                                has_fec_n2 = false;
+                                fec_hist_len = 0;
                             } else {
                                 for frame in pcm_frames.iter().take(subframes_per_pkt) {
-                                    fec_n2 = fec_n1;
-                                    has_fec_n2 = has_fec_n1;
-                                    encode_fec_subframe(frame, &mut fec_n1);
-                                    has_fec_n1 = true;
+                                    push_fec_history(&mut fec_hist, &mut fec_hist_len, frame);
                                 }
                             }
                         }
@@ -867,8 +957,27 @@ impl PhoneMicTransmitter {
                         } else {
                             &primary_bundle[..cursor]
                         };
-                        let f1 = if !dtx && send_n1 { &prev_n1[..] } else { &[] };
-                        let f2 = if !dtx && send_n2 { &prev_n2[..] } else { &[] };
+                        // 10 ms / 4-subframe VBR framing carries the previous
+                        // four subframes interleaved across the two fields:
+                        // [N-1,N-3] / [N-2,N-4]. The first frame of each field
+                        // keeps its legacy meaning for old clients.
+                        let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
+                        let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
+                        let (n1_len, n2_len) = if dtx {
+                            (0, 0)
+                        } else {
+                            let pair_fec =
+                                subframes_per_pkt == 4 && codec_mode != CodecMode::OpusRld;
+                            pack_fec_history(
+                                pair_fec,
+                                &prev_hist,
+                                prev_hist_len,
+                                &mut fec_pair_1,
+                                &mut fec_pair_2,
+                            )
+                        };
+                        let f1 = &fec_pair_1[..n1_len];
+                        let f2 = &fec_pair_2[..n2_len];
                         let packed = pack_datagram_with_key(
                             hdr,
                             primary,
@@ -944,7 +1053,7 @@ pub fn android_start_stream(
         })
         .map_err(|e| format!("Invalid SocketAddr {}: {}", host_ip_port, e))?;
 
-    let existing = GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let existing = GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut existing) = existing {
         existing.stop();
     }
@@ -961,12 +1070,12 @@ pub fn android_start_stream(
     };
 
     let client = ClientEngine::connect_with_pin(cfg, pin)?;
-    *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(client);
+    *GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()) = Some(client);
     Ok(())
 }
 
 pub fn android_stop_client_only() {
-    let client = GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let client = GLOBAL_ANDROID_CLIENT.write().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut client) = client {
         client.stop();
     }
@@ -978,7 +1087,7 @@ pub fn android_stop_stream() {
 }
 
 pub fn android_stop_phone_mic() {
-    let mic = GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mic = GLOBAL_PHONE_MIC_TX.write().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut mic) = mic {
         mic.stop();
     }
@@ -987,22 +1096,22 @@ pub fn android_stop_phone_mic() {
 /// Mute/unmute the Party cast at the capture source. The service owns this so
 /// a notification toggle keeps working after the app goes to the background.
 pub fn android_set_party_cast_muted(muted: bool) {
-    if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
         tx.party_telemetry.cast_muted.store(muted, Ordering::Relaxed);
     }
 }
 
 pub fn android_set_gain_db(gain_db: f32) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .preamp_gain_db_tenths
-            .store((gain_db * 10.0) as i32, Ordering::Relaxed);
+            .store(db_to_tenths(gain_db, -12.0, 24.0), Ordering::Relaxed);
     }
 }
 
 pub fn android_report_bt_delay_ms(delay_ms: u16) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .downstream_bt_delay_ms
@@ -1011,7 +1120,7 @@ pub fn android_report_bt_delay_ms(delay_ms: u16) {
 }
 
 pub fn android_send_media_command(cmd_code: u8) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         // Quality/media, compressed bitrate and codec-backend commands each
         // have their own slot so a startup restore cannot overwrite a command
         // that has not reached the host yet.
@@ -1044,19 +1153,19 @@ pub fn android_configure_dsp(
     gaming_lock: bool,
     dolby_effects: bool,
 ) {
-    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+    if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
             .eq_bass_db_tenths
-            .store((bass_db * 10.0) as i32, Ordering::Relaxed);
+            .store(db_to_tenths(bass_db, -12.0, 12.0), Ordering::Relaxed);
         client
             .telemetry
             .eq_presence_db_tenths
-            .store((pres_db * 10.0) as i32, Ordering::Relaxed);
+            .store(db_to_tenths(pres_db, -12.0, 12.0), Ordering::Relaxed);
         client
             .telemetry
             .eq_treble_db_tenths
-            .store((treb_db * 10.0) as i32, Ordering::Relaxed);
+            .store(db_to_tenths(treb_db, -12.0, 12.0), Ordering::Relaxed);
         client.telemetry.channel_role.store(role, Ordering::Relaxed);
         client
             .telemetry
@@ -1241,11 +1350,19 @@ pub mod android_native {
         _class: JClass,
         pcm_float: jni::objects::JFloatArray,
     ) {
+        // A null Java array makes get_float_array_region fail and leaves a
+        // pending exception. Bail out before the copy and clear it so the next
+        // JNI call on this thread starts with a clean exception state.
+        if pcm_float.is_null() {
+            return;
+        }
         let mut buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-        if env.get_float_array_region(&pcm_float, 0, &mut buf).is_ok() {
-            if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
-                tx.mic_input_ring.push_samples(&buf);
-            }
+        if env.get_float_array_region(&pcm_float, 0, &mut buf).is_err() {
+            let _ = env.exception_clear();
+            return;
+        }
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
+            tx.mic_input_ring.push_samples(&buf);
         }
     }
 
@@ -1273,7 +1390,7 @@ pub mod android_native {
         };
         android_stop_phone_mic();
         if let Ok(tx) = PhoneMicTransmitter::start_with_pin(&ip_rust, use_hardware_mic != 0, pin_opt) {
-            *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+            *GLOBAL_PHONE_MIC_TX.write().unwrap_or_else(|e| e.into_inner()) = Some(tx);
             1
         } else {
             0
@@ -1298,13 +1415,13 @@ pub mod android_native {
         _class: JClass,
     ) -> jintArray {
         let mut tids: Vec<jint> = Vec::with_capacity(2);
-        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
             let tid = client.telemetry.rt_thread_tid.load(Ordering::Relaxed);
             if tid > 0 && !tids.contains(&tid) {
                 tids.push(tid);
             }
         }
-        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
             let tid = tx.party_telemetry.rt_thread_tid.load(Ordering::Relaxed);
             if tid > 0 && !tids.contains(&tid) {
                 tids.push(tid);
@@ -1328,7 +1445,7 @@ pub mod android_native {
         // `LongArray(25)` telemetry buffer: 0..10 legacy counters, 11..21 live
         // latency breakdown, 22..23 party host, 24 client output VU peak.
         let mut stats = [0i64; 25];
-        if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref c) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
             let latency = c.telemetry.latency_snapshot(0.0);
             stats[0] = c.telemetry.packets_received.load(Ordering::Relaxed) as i64;
             stats[1] = c.telemetry.primary_frames_played.load(Ordering::Relaxed) as i64;
@@ -1357,7 +1474,7 @@ pub mod android_native {
             stats[21] = (latency.codec_lookahead_ms * 10.0).round() as i64;
             stats[24] = c.telemetry.client_vu_peak_pct.load(Ordering::Relaxed) as i64;
         }
-        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
             // Pack Party Host telemetry into slots 22 and 23:
             // stats[22]: (capture_vu << 40) | (remote_cmd << 32) | (bound_port << 16)
             //            | (active_codec_mode << 8) | listener_count
@@ -1398,7 +1515,7 @@ pub mod android_native {
         _env: JNIEnv,
         _class: JClass,
     ) -> jint {
-        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.lock().unwrap_or_else(|e| e.into_inner()) {
+        if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
             tx.party_telemetry
                 .pending_remote_media_cmd
                 .swap(0, Ordering::Relaxed) as jint
@@ -1549,10 +1666,17 @@ mod tests {
         );
         assert!(peers.contains_key(&phone_new));
 
-        update_party_peer_feedback(&mut peers, phone_new, 120, 80, 7, &static_targets, now);
+        assert!(update_party_peer_feedback(
+            &mut peers, phone_new, 120, 80, 7, true, &static_targets, now
+        ));
         assert_eq!(peers[&phone_new].delay_ms, 120);
         assert_eq!(peers[&phone_new].fec_permille, 80);
-        assert_eq!(peers[&phone_new].last_feedback_seq, 7);
+        assert!(
+            !update_party_peer_feedback(
+                &mut peers, phone_new, 120, 80, 7, true, &static_targets, now
+            ),
+            "a duplicate authenticated sequence is a replay"
+        );
 
         expire_party_peers(&mut peers, &static_targets, now + Duration::from_secs(11));
         assert!(
@@ -1985,28 +2109,31 @@ mod tests {
     }
 
     #[test]
-    fn test_party_last_feedback_seq_replay_rejection() {
+    fn test_party_feedback_replay_window_accepts_once() {
         let now = Instant::now();
         let peer: SocketAddr = "192.168.1.70:40000".parse().unwrap();
         let static_targets: [SocketAddr; 0] = [];
         let mut peers = initial_party_peers(&static_targets, now);
+        let fb = |seq, auth| {
+            update_party_peer_feedback(&mut peers, peer, 120, 80, seq, auth, &static_targets, now)
+        };
 
         // The first authenticated feedback from a peer is never a replay.
-        assert!(!party_feedback_is_replay(&peers, peer, 1, true));
-        update_party_peer_feedback(&mut peers, peer, 120, 80, 1, &static_targets, now);
-        assert_eq!(peers[&peer].last_feedback_seq, 1);
-
-        // Authenticated stale/duplicate sequences are rejected; newer accepted.
-        assert!(party_feedback_is_replay(&peers, peer, 1, true));
-        assert!(party_feedback_is_replay(&peers, peer, 0, true));
-        assert!(!party_feedback_is_replay(&peers, peer, 2, true));
-        update_party_peer_feedback(&mut peers, peer, 130, 90, 2, &static_targets, now);
-        assert!(party_feedback_is_replay(&peers, peer, 2, true));
-        assert!(!party_feedback_is_replay(&peers, peer, 3, true));
+        assert!(fb(1, true));
+        // A duplicate and sequence 0 are always rejected when authenticated.
+        assert!(!fb(1, true));
+        assert!(!fb(0, true));
+        // Newer sequences advance the window.
+        assert!(fb(2, true));
+        assert!(!fb(2, true));
+        // Out-of-order sequences inside the 64-bit window are accepted once.
+        assert!(fb(4, true));
+        assert!(fb(3, true));
+        assert!(!fb(3, true));
 
         // Unencrypted feedback has no sequence guarantee: never rejected.
-        assert!(!party_feedback_is_replay(&peers, peer, 2, false));
-        assert!(!party_feedback_is_replay(&peers, peer, 0, false));
+        assert!(fb(2, false));
+        assert!(fb(0, false));
     }
 
     #[test]
@@ -2085,5 +2212,100 @@ mod tests {
             "unmuting must restore the live capture VU"
         );
         tx.stop();
+    }
+
+    #[test]
+    fn test_interleaved_fec_history_pairs() {
+        let mut hist = [[0u8; ADPCM_FEC_BYTES]; 4];
+        for i in 0..4 {
+            hist[i].fill(i as u8 + 1);
+        }
+        let mut p1 = [0u8; ADPCM_FEC_BYTES * 2];
+        let mut p2 = [0u8; ADPCM_FEC_BYTES * 2];
+
+        // Four-subframe VBR: [N-1,N-3] / [N-2,N-4], newest first in each field.
+        assert_eq!(
+            pack_fec_history(true, &hist, 4, &mut p1, &mut p2),
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES * 2)
+        );
+        assert_eq!(&p1[..ADPCM_FEC_BYTES], &hist[0][..]);
+        assert_eq!(&p1[ADPCM_FEC_BYTES..], &hist[2][..]);
+        assert_eq!(&p2[..ADPCM_FEC_BYTES], &hist[1][..]);
+        assert_eq!(&p2[ADPCM_FEC_BYTES..], &hist[3][..]);
+
+        // Ramp-up with three subframes: N-4 is not available yet.
+        assert_eq!(
+            pack_fec_history(true, &hist, 3, &mut p1, &mut p2),
+            (ADPCM_FEC_BYTES * 2, ADPCM_FEC_BYTES)
+        );
+
+        // Two-subframe framing keeps the legacy one-frame-per-field layout
+        // even when a full history happens to be present.
+        assert_eq!(
+            pack_fec_history(false, &hist, 4, &mut p1, &mut p2),
+            (ADPCM_FEC_BYTES, ADPCM_FEC_BYTES)
+        );
+        assert_eq!(&p1[..ADPCM_FEC_BYTES], &hist[0][..]);
+        assert_eq!(&p2[..ADPCM_FEC_BYTES], &hist[1][..]);
+
+        // Pushing shifts the previous newest frame to the N-2 slot.
+        let frame_a = [100i16; SUBFRAME_STEREO_SAMPLES];
+        let frame_b = [200i16; SUBFRAME_STEREO_SAMPLES];
+        let mut push_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
+        let mut len = 0;
+        push_fec_history(&mut push_hist, &mut len, &frame_a);
+        let after_a = push_hist[0];
+        push_fec_history(&mut push_hist, &mut len, &frame_b);
+        assert_eq!(push_hist[1], after_a, "previous newest must shift to N-2");
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn test_max_party_peers_cap_allows_existing_ip_updates() {
+        let now = Instant::now();
+        let static_targets: [SocketAddr; 0] = [];
+        let mut peers = initial_party_peers(&static_targets, now);
+        for i in 0..MAX_PARTY_PEERS {
+            let addr: SocketAddr = format!("192.168.2.{}:40000", i + 1).parse().unwrap();
+            register_party_peer(&mut peers, addr, &static_targets, now);
+            assert!(peers.contains_key(&addr), "peer {i} should register");
+        }
+        assert_eq!(unique_peer_ip_count(&peers), MAX_PARTY_PEERS);
+
+        // A 17th distinct IP is rejected from either registration path.
+        let extra: SocketAddr = "192.168.2.200:40000".parse().unwrap();
+        register_party_peer(&mut peers, extra, &static_targets, now);
+        assert!(!peers.contains_key(&extra));
+        let extra_fb: SocketAddr = "192.168.2.201:40000".parse().unwrap();
+        assert!(!update_party_peer_feedback(
+            &mut peers, extra_fb, 10, 20, 5, true, &static_targets, now
+        ));
+        assert!(!peers.contains_key(&extra_fb));
+        assert_eq!(unique_peer_ip_count(&peers), MAX_PARTY_PEERS);
+
+        // An existing IP may still reconnect on a new port and receive updates
+        // while the map is at the cap.
+        let reconnect: SocketAddr = "192.168.2.1:41000".parse().unwrap();
+        register_party_peer(&mut peers, reconnect, &static_targets, now);
+        assert!(peers.contains_key(&reconnect));
+        assert!(!peers.contains_key(&"192.168.2.1:40000".parse().unwrap()));
+        assert_eq!(unique_peer_ip_count(&peers), MAX_PARTY_PEERS);
+        assert!(update_party_peer_feedback(
+            &mut peers, reconnect, 30, 40, 1, true, &static_targets, now
+        ));
+    }
+
+    #[test]
+    fn test_db_to_tenths_rejects_nonfinite_and_rounds() {
+        assert_eq!(db_to_tenths(f32::NAN, -24.0, 24.0), 0);
+        assert_eq!(db_to_tenths(f32::INFINITY, -24.0, 24.0), 0);
+        assert_eq!(db_to_tenths(f32::NEG_INFINITY, -24.0, 24.0), 0);
+        // Half-way values round away from zero, not truncate.
+        assert_eq!(db_to_tenths(1.25, -12.0, 24.0), 13);
+        assert_eq!(db_to_tenths(1.24, -12.0, 24.0), 12);
+        assert_eq!(db_to_tenths(-1.25, -12.0, 24.0), -13);
+        // Out-of-range values clamp before scaling.
+        assert_eq!(db_to_tenths(100.0, -12.0, 24.0), 240);
+        assert_eq!(db_to_tenths(-100.0, -12.0, 24.0), -120);
     }
 }
