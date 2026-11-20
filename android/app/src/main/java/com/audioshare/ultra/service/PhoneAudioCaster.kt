@@ -189,11 +189,13 @@ class PhoneAudioCaster(
                     val wasStopRequested = stopRequested
                     running = false
                     audioRecord = null
-                    readerThread = null
                     runCatching { activeRecord.stop() }
                     runCatching { activeRecord.release() }
                     runCatching { mediaProjection.unregisterCallback(projectionCallback) }
                     runCatching { mediaProjection.stop() }
+                    // Clear the thread ref only after full teardown so a
+                    // concurrent stopCasting() still sees it and joins.
+                    readerThread = null
                     if (!wasStopRequested) {
                         // The reader died on its own (device busy, route
                         // change, revoked consent). The service must drop the
