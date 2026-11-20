@@ -67,7 +67,6 @@ fun MainScreen() {
     var partySilenceWarning by remember { mutableStateOf(false) }
     var pendingEncryptedHost by remember { mutableStateOf<String?>(null) }
     var promptPinInput by remember { mutableStateOf("") }
-    var vuPeakHold by remember { mutableFloatStateOf(0f) }
 
     val cameraPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -100,6 +99,16 @@ fun MainScreen() {
                 true
             }
         )
+    }
+    val batteryOptLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { _ ->
+        // Re-check only after the OS dialog closes; never grant optimistically.
+        isBatteryUnrestricted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            powerManager.isIgnoringBatteryOptimizations(context.packageName)
+        } else {
+            true
+        }
     }
 
     var hostAddress by remember {
@@ -266,6 +275,7 @@ fun MainScreen() {
     // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
     fun connectToHost(addr: String, isUsb: Boolean, pin: String) {
         hostAddress = addr
+        pinCode = pin
         prefs.edit()
             .putString("last_host_addr", addr)
             .putString("pin_code", pin)
@@ -408,13 +418,6 @@ fun MainScreen() {
             }
 
             btEarbudsDetected = telemetry.getOrElse(17) { 0L } > 0L
-            // Telemetry index 24 is the client's post-volume VU peak (0..100).
-            val vuNow = telemetry.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
-            vuPeakHold = if (vuNow >= vuPeakHold) {
-                vuNow.toFloat()
-            } else {
-                (vuPeakHold - 3.0f).coerceAtLeast(0f)
-            }
             // ~16Hz refresh while connected keeps the hero visualizer fluid.
             delay(if (isConnected) 60 else 250)
         }
@@ -624,13 +627,24 @@ fun MainScreen() {
                                 )
                             }
                             OutlinedButton(onClick = {
+                                val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                }
                                 try {
-                                    val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                                        data = Uri.parse("package:${context.packageName}")
+                                    batteryOptLauncher.launch(i)
+                                } catch (_: Exception) {
+                                    // Some OEMs omit the Doze-exemption screen; fall back to
+                                    // app settings and still re-check the real OS state on return.
+                                    try {
+                                        batteryOptLauncher.launch(
+                                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                                data = Uri.parse("package:${context.packageName}")
+                                            }
+                                        )
+                                    } catch (_: Exception) {
+                                        // Leave the banner visible; no optimistic grant.
                                     }
-                                    context.startActivity(i)
-                                    isBatteryUnrestricted = true
-                                } catch (_: Exception) {}
+                                }
                             }) { Text("Allow") }
                         }
                     }
@@ -998,9 +1012,11 @@ fun MainScreen() {
                         badge = if (qualityMode == 4) "24-Bit" else "16-Bit",
                         selected = qualityMode == 1 || qualityMode == 4,
                         onClick = {
-                            qualityMode = 1
-                            prefs.edit().putInt("quality_mode", 1).apply()
-                            AudioEngineService.nativeSendMediaCommand(2)
+                            if (qualityMode != 1 && qualityMode != 4) {
+                                qualityMode = 1
+                                prefs.edit().putInt("quality_mode", 1).apply()
+                                AudioEngineService.nativeSendMediaCommand(2)
+                            }
                         },
                         modifier = Modifier.weight(1f)
                     )
@@ -1012,7 +1028,7 @@ fun MainScreen() {
                     ModePresetCard(
                         title = "Smooth Wi-Fi",
                         subtitle = "Best for 2.4G / BT",
-                        badge = "Opus ${compressedBitrateKbps}k",
+                        badge = "${if (useOpus) "Opus" else "VBR"} ${compressedBitrateKbps}k",
                         selected = qualityMode == 2,
                         onClick = {
                             qualityMode = 2
@@ -1423,8 +1439,10 @@ fun MainScreen() {
                             // means DRM/OEM mute is feeding silence to peers.
                             val partyVu = ((partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
 
-                            LaunchedEffect(partyVu == 0) {
-                                if (partyVu == 0) {
+                            LaunchedEffect(castPhoneInternalAudio, partyVu == 0) {
+                                if (!castPhoneInternalAudio) {
+                                    partySilenceWarning = false
+                                } else if (partyVu == 0) {
                                     delay(3000)
                                     partySilenceWarning = true
                                 } else {
@@ -1592,7 +1610,10 @@ fun MainScreen() {
                 )
                 OutlinedTextField(
                     value = pinCode,
-                    onValueChange = { pinCode = it },
+                    onValueChange = {
+                        pinCode = it
+                        prefs.edit().putString("pin_code", it).apply()
+                    },
                     label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
