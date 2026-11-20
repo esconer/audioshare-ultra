@@ -6,7 +6,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 use std::process::{Child, Stdio};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -307,6 +307,9 @@ impl AdbUsbWatcher {
         let run_clone = Arc::clone(&running);
         let usb_clone = Arc::clone(&usb_device_connected);
         let bridge_run = Arc::clone(&running);
+        // Shared across every accepted ADB reverse session so a flood of
+        // connects cannot spawn unbounded reader/writer thread pairs.
+        let active_sessions = Arc::new(AtomicUsize::new(0));
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-adb-watcher".into())
@@ -361,7 +364,12 @@ impl AdbUsbWatcher {
                 let _ = listener.set_nonblocking(true);
                 while bridge_run.load(Ordering::Relaxed) {
                     match listener.accept() {
-                        Ok((stream, _)) => spawn_host_adb_tcp_session(stream, port, Arc::clone(&bridge_run)),
+                        Ok((stream, _)) => spawn_host_adb_tcp_session(
+                            stream,
+                            port,
+                            Arc::clone(&bridge_run),
+                            Arc::clone(&active_sessions),
+                        ),
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(50));
                         }
@@ -381,13 +389,98 @@ impl AdbUsbWatcher {
     }
 }
 
+/// Maximum number of simultaneous `adb reverse` TCP sessions bridged by one
+/// `AdbUsbWatcher`. Each session owns two detached worker threads, so capping
+/// sessions also bounds the thread/channel fan-out from a buggy or hostile peer.
+const MAX_ADB_TCP_SESSIONS: usize = 8;
+
+/// Overall deadline for a single framed read (length prefix or packet body).
+/// The socket's 200 ms read timeout still unblocks the worker sooner on
+/// shutdown; this is only a safety net against a stalled peer.
+const ADB_TCP_READ_DEADLINE: Duration = Duration::from_secs(2);
+
+/// One reserved slot in the shared session counter. Cloned into both worker
+/// threads so the slot is released only when the last clone drops — i.e. after
+/// *both* threads have exited. RAII also covers every early-return / spawn-
+/// failure path, so the counter can never leak a slot.
+struct AdbSessionSlot(Arc<AtomicUsize>);
+
+impl Drop for AdbSessionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Read exactly `buf.len()` bytes, preserving partial progress across
+/// `WouldBlock` / `TimedOut` (e.g. a socket read timeout) instead of restarting
+/// at offset 0 and corrupting the wire framing. The deadline is rechecked on
+/// every retry so a peer that trickles bytes cannot pin a worker forever.
+fn read_exact_interruptible<T: Read>(
+    reader: &mut T,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ADB TCP framing read deadline exceeded",
+            ));
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB TCP peer closed mid-frame",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Bridge one `adb reverse` TCP connection to the local UDP `HostEngine`
 /// using `[u16_be len][datagram]` framing.
-fn spawn_host_adb_tcp_session(stream: TcpStream, host_udp_port: u16, host_running: Arc<AtomicBool>) {
+fn spawn_host_adb_tcp_session(
+    stream: TcpStream,
+    host_udp_port: u16,
+    host_running: Arc<AtomicBool>,
+    active_sessions: Arc<AtomicUsize>,
+) {
+    // Reserve a session slot with a CAS loop. At the cap, drop the accepted
+    // stream and return without spawning anything.
+    let mut observed = active_sessions.load(Ordering::Relaxed);
+    loop {
+        if observed >= MAX_ADB_TCP_SESSIONS {
+            return;
+        }
+        match active_sessions.compare_exchange_weak(
+            observed,
+            observed + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
+    let slot = Arc::new(AdbSessionSlot(Arc::clone(&active_sessions)));
+
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
     let Ok(mut tcp_writer) = stream.try_clone() else {
+        return;
+    };
+    // Dedicated clone for the reader thread: whichever thread exits first
+    // shuts the socket down and unblocks the other immediately.
+    let Ok(tcp_writer_for_reader) = tcp_writer.try_clone() else {
         return;
     };
     let Ok(udp_rx) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
@@ -404,6 +497,7 @@ fn spawn_host_adb_tcp_session(stream: TcpStream, host_udp_port: u16, host_runnin
 
     let alive_in = Arc::clone(&alive);
     let run_in = Arc::clone(&host_running);
+    let slot_in = Arc::clone(&slot);
     let mut tcp_reader = stream;
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-in".into())
@@ -411,28 +505,38 @@ fn spawn_host_adb_tcp_session(stream: TcpStream, host_udp_port: u16, host_runnin
             let mut len_buf = [0u8; 2];
             let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
-                match tcp_reader.read_exact(&mut len_buf) {
-                    Ok(()) => {
-                        let len = u16::from_be_bytes(len_buf) as usize;
-                        if len == 0 || len > pkt.len() {
-                            break;
-                        }
-                        if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
-                            break;
-                        }
-                        let _ = udp_tx.send(&pkt[..len]);
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(_) => break,
+                if read_exact_interruptible(
+                    &mut tcp_reader,
+                    &mut len_buf,
+                    Instant::now() + ADB_TCP_READ_DEADLINE,
+                )
+                .is_err()
+                {
+                    break;
                 }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                if len == 0 || len > pkt.len() {
+                    break;
+                }
+                if read_exact_interruptible(
+                    &mut tcp_reader,
+                    &mut pkt[..len],
+                    Instant::now() + ADB_TCP_READ_DEADLINE,
+                )
+                .is_err()
+                {
+                    break;
+                }
+                let _ = udp_tx.send(&pkt[..len]);
             }
             alive_in.store(false, Ordering::Release);
+            let _ = tcp_writer_for_reader.shutdown(std::net::Shutdown::Both);
+            drop(slot_in);
         });
 
     let alive_out = Arc::clone(&alive);
     let run_out = Arc::clone(&host_running);
+    let slot_out = Arc::clone(&slot);
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-out".into())
         .spawn(move || {
@@ -453,6 +557,8 @@ fn spawn_host_adb_tcp_session(stream: TcpStream, host_udp_port: u16, host_runnin
                 }
             }
             alive_out.store(false, Ordering::Release);
+            let _ = tcp_writer.shutdown(std::net::Shutdown::Both);
+            drop(slot_out);
         });
 }
 
