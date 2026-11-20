@@ -27,7 +27,54 @@ use audioshare_protocol::sequencer::{
 use audioshare_protocol::wire::{pack_datagram_with_key, CodecMode, ParsedPacket, WireHeader};
 use audioshare_protocol::{SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
+/// Set by the SIGINT/SIGTERM handler so the host/client HUD loops can unwind
+/// cleanly and run all `Drop` guards (and reset the PipeWire lip-sync offset).
+static CLI_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Install an async-signal-safe flag setter for Ctrl+C / `kill -TERM`.
+///
+/// `libc` is intentionally *not* a direct dependency of `audioshare-cli`, so on
+/// Unix we declare `signal(2)` locally against `libc` (already linked by std)
+/// instead of adding a crate. On Windows we use `kernel32`'s
+/// `SetConsoleCtrlHandler`, which is also already linked by std.
+fn install_shutdown_handler() {
+    #[cfg(unix)]
+    unsafe {
+        #[link(name = "c")]
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+
+        extern "C" fn on_signal(_: i32) {
+            // Atomic store is async-signal-safe; Release pairs with the
+            // Acquire loads in the host/client loops.
+            CLI_STOP.store(true, Ordering::Release);
+        }
+
+        signal(SIGINT, on_signal as usize);
+        signal(SIGTERM, on_signal as usize);
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleCtrlHandler(
+                handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                add: i32,
+            ) -> i32;
+        }
+        unsafe extern "system" fn on_ctrl(_: u32) -> i32 {
+            CLI_STOP.store(true, Ordering::Release);
+            1
+        }
+        SetConsoleCtrlHandler(Some(on_ctrl), 1);
+    }
+}
+
 fn main() {
+    install_shutdown_handler();
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
@@ -186,8 +233,11 @@ fn run_host(args: &[String]) {
     );
 
     let mut last_applied_lipsync: u16 = 0;
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
+    while !CLI_STOP.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(250));
+        if CLI_STOP.load(Ordering::Acquire) {
+            break;
+        }
         let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
         let bytes = host.telemetry.bytes_sent.load(Ordering::Relaxed);
         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
@@ -254,6 +304,13 @@ fn run_host(args: &[String]) {
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
+    println!("\n[*] Shutting down host cleanly...");
+    if last_applied_lipsync != 0 {
+        audioshare_host_engine::bt_optimization::reset_video_lipsync_offset_blocking();
+    }
+    // Run the guard deterministically before returning (restores the default
+    // speaker and clears the WlanSetInterface media-streaming override).
+    drop(os_guard);
 }
 
 fn run_client(args: &[String]) {
@@ -279,8 +336,11 @@ fn run_client(args: &[String]) {
 
     let client = ClientEngine::connect_with_pin(cfg, pin).expect("Failed to start ClientEngine");
 
-    loop {
-        std::thread::sleep(Duration::from_millis(500));
+    while !CLI_STOP.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(250));
+        if CLI_STOP.load(Ordering::Acquire) {
+            break;
+        }
         let pkts = client.telemetry.packets_received.load(Ordering::Relaxed);
         let prim = client
             .telemetry
