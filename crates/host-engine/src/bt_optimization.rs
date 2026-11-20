@@ -6,6 +6,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +116,20 @@ static LIPSYNC_APPLY_LOCK: Mutex<()> = Mutex::new(());
 static LIPSYNC_APPLIED_TARGETS: std::sync::OnceLock<Mutex<Vec<LinuxSinkInfo>>> =
     std::sync::OnceLock::new();
 
+/// Minimum spacing between remote media subprocess launches. This is called
+/// from the host's hard real-time TX loop; an unauthenticated LAN peer sending
+/// hundreds of feedback packets per second must not be able to fork that many
+/// `playerctl`/`xdotool` processes.
+#[cfg(target_os = "linux")]
+const MEDIA_CMD_MIN_INTERVAL: Duration = Duration::from_millis(150);
+#[cfg(target_os = "linux")]
+static LAST_MEDIA_CMD: Mutex<Option<Instant>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+fn media_command_due(last: Option<Instant>, now: Instant) -> bool {
+    last.map_or(true, |prev| now.saturating_duration_since(prev) >= MEDIA_CMD_MIN_INTERVAL)
+}
+
 /// Apply the offset synchronously. Used by both the async normal path and the
 /// exit-time synchronous reset (which must finish before the process dies).
 #[cfg(target_os = "linux")]
@@ -195,6 +211,17 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
             RemoteMediaCommand::PrevTrack => "previous",
             RemoteMediaCommand::None => return,
         };
+        // Rate-limit BEFORE spawning a thread: the feedback packet carrying a
+        // media command can be replayed hundreds of times per second by a
+        // misbehaving LAN peer.
+        {
+            let mut last = LAST_MEDIA_CMD.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if !media_command_due(*last, now) {
+                return;
+            }
+            *last = Some(now);
+        }
         // This function is called from the host's hard real-time TX loop.
         // `playerctl` talks to D-Bus/MPRIS and can block for tens of
         // milliseconds, which would starve every connected client. Run the
@@ -202,8 +229,15 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
         let _ = std::thread::Builder::new()
             .name("as-ultra-media-key".into())
             .spawn(move || {
-                // Try playerctl (MPRIS standard used by Chrome, Firefox, Spotify, VLC)
-                if Command::new("playerctl").arg(action).output().is_err() {
+                // Try playerctl (MPRIS standard used by Chrome, Firefox, Spotify, VLC).
+                // Fall back to X11 keys whenever it is unavailable OR the
+                // command fails (no active MPRIS player, D-Bus error, etc.).
+                let mpris_ok = Command::new("playerctl")
+                    .arg(action)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if !mpris_ok {
                     let key = match cmd {
                         RemoteMediaCommand::PlayPause => "XF86AudioPlay",
                         RemoteMediaCommand::NextTrack => "XF86AudioNext",
@@ -304,6 +338,19 @@ Sink #2
         );
         assert_eq!(RemoteMediaCommand::from_u8(0), RemoteMediaCommand::None);
         execute_remote_media_command(RemoteMediaCommand::None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_remote_media_command_throttle_window() {
+        let t = Instant::now();
+        assert!(media_command_due(None, t));
+        assert!(!media_command_due(Some(t), t + Duration::from_millis(149)));
+        assert!(media_command_due(Some(t), t + Duration::from_millis(150)));
+        assert!(media_command_due(
+            Some(t),
+            t + Duration::from_millis(1_000)
+        ));
     }
 
     #[test]

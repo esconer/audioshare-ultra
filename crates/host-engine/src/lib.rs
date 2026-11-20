@@ -39,6 +39,11 @@ use discovery_and_os::HostVolumeMonitor;
 
 pub const DEFAULT_PORT: u16 = 65530;
 const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
+/// Hard cap on tracked clients. `active_clients_count` is a `u8`, so an
+/// unbounded map would silently wrap to 0 at 256 clients and disable the
+/// virtual-speaker guard in the middle of a live stream. New peers are
+/// rejected at capacity; existing clients are never evicted to make room.
+const MAX_CONNECTED_CLIENTS: usize = 32;
 
 /// Smart Auto selects compressed audio above this reported loss.
 const SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE: u16 = 45;
@@ -1344,7 +1349,7 @@ impl HostEngine {
             target_bitrate_kbps: AtomicU16::new(256),
             host_volume: AtomicU8::new(100),
             host_vu_peak_pct: AtomicU8::new(0),
-            active_clients_count: AtomicU8::new(initial_targets.len() as u8),
+            active_clients_count: AtomicU8::new(initial_targets.len().min(u8::MAX as usize) as u8),
             max_client_bt_delay_ms: AtomicU16::new(0),
             max_client_downstream_delay_ms: AtomicU16::new(0),
             hotplug_rebinds: AtomicU16::new(0),
@@ -1362,6 +1367,9 @@ impl HostEngine {
 
         let mut client_map = HashMap::new();
         for addr in initial_targets {
+            if !Self::can_admit_client(&client_map, addr) {
+                continue;
+            }
             let is_usb = is_usb_subnet_ip(addr.ip());
             client_map.insert(
                 addr,
@@ -1438,6 +1446,13 @@ impl HostEngine {
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {
         self.clients.lock().unwrap().values().cloned().collect()
+    }
+
+    /// A socket address already in the map is an existing client whose
+    /// telemetry may be updated; a genuinely new address is only admitted
+    /// while the hard cap has room. Never evict an active peer for a newcomer.
+    fn can_admit_client(map: &HashMap<SocketAddr, ConnectedClient>, addr: SocketAddr) -> bool {
+        map.contains_key(&addr) || map.len() < MAX_CONNECTED_CLIENTS
     }
 
     /// Recompute both delay maxima from the live client map.
@@ -1529,7 +1544,7 @@ impl HostEngine {
         map.remove(&addr);
         self.telemetry
             .active_clients_count
-            .store(map.len() as u8, Ordering::Relaxed);
+            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
     }
@@ -2278,6 +2293,11 @@ impl HostEngine {
                     }
                     let mut map = clients.lock().unwrap();
                     Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                    if !Self::can_admit_client(&map, src_addr) {
+                        // At capacity: drop the new join rather than evicting
+                        // an existing client mid-stream.
+                        continue;
+                    }
                     map.entry(src_addr)
                         .or_insert(ConnectedClient {
                             addr: src_addr,
@@ -2294,7 +2314,7 @@ impl HostEngine {
                         .last_seen = Instant::now();
                     telemetry
                         .active_clients_count
-                        .store(map.len() as u8, Ordering::Relaxed);
+                        .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
@@ -2391,6 +2411,11 @@ impl HostEngine {
 
                     let mut map = clients.lock().unwrap();
                     Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                    if !Self::can_admit_client(&map, src_addr) {
+                        // At capacity: feedback from an unknown peer must not
+                        // grow the map beyond the u8-safe cap.
+                        continue;
+                    }
                     let entry = map.entry(src_addr).or_insert(ConnectedClient {
                         addr: src_addr,
                         last_seen: Instant::now(),
@@ -2414,7 +2439,7 @@ impl HostEngine {
                     }
                     telemetry
                         .active_clients_count
-                        .store(map.len() as u8, Ordering::Relaxed);
+                        .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
 
                     // Fast attack / paced release. A borderline link
                     // that alternates between 5% and 0% loss must not
@@ -2455,7 +2480,7 @@ impl HostEngine {
                     if map.len() != before {
                         telemetry
                             .active_clients_count
-                            .store(map.len() as u8, Ordering::Relaxed);
+                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
                     }
                     let raw_worst = map
                         .values()
@@ -2559,41 +2584,21 @@ impl HostEngine {
             let prefer_opus = telemetry.prefer_opus.load(Ordering::Relaxed);
             let has_targets = !cached_targets.is_empty();
             if !prefer_opus {
-                opus_encoder = None;
+                // A disabled backend must not pin a stale creation failure:
+                // re-enabling Opus has to be allowed to try again.
                 opus_encoder_failed = false;
-                if !has_targets {
-                    fec_hist_len = 0;
-                }
-            } else if !has_targets {
-                // Standby with zero receivers: no encoded byte can be consumed.
-                // Clearing history here (after profile selection) avoids the
-                // old 200x/s OpusStreamEncoder allocation storm while still
-                // publishing the codec mode the next client will actually get.
-                fec_hist_len = 0;
-                opus_encoder = None;
-                if dynamic_codec_mode == CodecMode::CompressedLowDelay && !opus_encoder_failed {
-                    dynamic_codec_mode = CodecMode::OpusRld;
-                }
-            } else if dynamic_codec_mode == CodecMode::CompressedLowDelay
-                || profile == QualityProfile::SmartAuto
+            }
+            // Publish the *intended* codec mode here so the UI and the next
+            // client see the right mode even during silence. The actual
+            // OpusStreamEncoder allocation and all primary/FEC encoding are
+            // deferred until after DTX silence is evaluated below; otherwise
+            // Smart DTX allocated and discarded an encoder at 200 Hz for the
+            // whole duration of PC silence.
+            if prefer_opus
+                && dynamic_codec_mode == CodecMode::CompressedLowDelay
+                && !opus_encoder_failed
             {
-                if opus_encoder.is_none() && !opus_encoder_failed {
-                    #[cfg(test)]
-                    telemetry
-                        .opus_encoder_allocs
-                        .fetch_add(1, Ordering::Relaxed);
-                    opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
-                    if opus_encoder.is_none() {
-                        opus_encoder_failed = true;
-                    }
-                }
-                if dynamic_codec_mode == CodecMode::CompressedLowDelay && opus_encoder.is_some() {
-                    dynamic_codec_mode = CodecMode::OpusRld;
-                }
-            } else {
-                // Leaving compressed mode: drop the codec state so a later
-                // compressed period starts clean.
-                opus_encoder = None;
+                dynamic_codec_mode = CodecMode::OpusRld;
             }
 
             packet_interval = Duration::from_micros((2500 * subframes_per_pkt) as u64);
@@ -2669,18 +2674,9 @@ impl HostEngine {
             let mut f32_subframes = [[0.0f32; SUBFRAME_STEREO_SAMPLES]; 4];
             let mut i16_subframes = [[0i16; SUBFRAME_STEREO_SAMPLES]; 4];
             let base_seq = seq;
-            // Clients unconditionally ignore ADPCM FEC on Opus packets (the
-            // 0 ms ADPCM backup jumps phase against the 2.5 ms Opus lookahead;
-            // Opus heals gaps with phase-aligned CELT PLC). Encoding and
-            // sending it wasted 248 B/packet ~= 397 kbps at 200 pps.
-            let suppress_adpcm_fec = dynamic_codec_mode == CodecMode::OpusRld;
-            if suppress_adpcm_fec {
-                fec_hist_len = 0;
-            }
-            let prev_hist = fec_hist;
-            let prev_hist_len = if suppress_adpcm_fec { 0 } else { fec_hist_len };
-            let send_n1 = prev_hist_len >= 1;
-            let send_n2 = prev_hist_len >= 2;
+            // The FEC snapshot and the Opus encoder allocation are taken after
+            // DTX silence is evaluated (below), so a silent packet never builds
+            // codec state nor discards FEC history.
             let mut packet_is_silent = true;
             let mut packet_max_vu_pct: u8 = 0;
 
@@ -2740,12 +2736,75 @@ impl HostEngine {
                 .host_vu_peak_pct
                 .store(packet_max_vu_pct, Ordering::Relaxed);
 
-            // Encode only when at least one receiver is connected. With zero
-            // targets the collected samples still drive VU/DTX telemetry and
-            // the capture pacer still runs, but no codec state or datagram is
+            // Evaluate DTX immediately after the collection loop finalized
+            // `packet_is_silent` / `silent_subframes`. This MUST precede any
+            // codec allocation or encoding: the old order allocated a fresh
+            // OpusStreamEncoder, encoded the silent packet, then discarded the
+            // encoder in the DTX branch below -- 200 allocations/sec of silence.
+            let is_dtx_active = telemetry.enable_smart_dtx.load(Ordering::Relaxed)
+                && packet_is_silent
+                && silent_subframes > 200;
+            telemetry
+                .dtx_silent_mode
+                .store(is_dtx_active, Ordering::Relaxed);
+
+            // No receivers or Smart DTX silence: no codec state is needed.
+            // VU/codec telemetry was published above and the DTX heartbeat and
+            // packet pacer below keep running, but nothing is allocated here.
+            if !has_targets || is_dtx_active {
+                opus_encoder = None;
+                fec_hist_len = 0;
+            }
+            if !prefer_opus {
+                opus_encoder = None;
+            }
+
+            // Lazily allocate the Opus encoder only for a real, audible packet
+            // with at least one receiver. Both zero-client standby and DTX
+            // silence leave it None, so neither can trigger the old 200 Hz
+            // alloc/drop cycle.
+            if has_targets
+                && !is_dtx_active
+                && dynamic_codec_mode == CodecMode::OpusRld
+                && opus_encoder.is_none()
+                && !opus_encoder_failed
+            {
+                #[cfg(test)]
+                telemetry
+                    .opus_encoder_allocs
+                    .fetch_add(1, Ordering::Relaxed);
+                opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
+                if opus_encoder.is_none() {
+                    opus_encoder_failed = true;
+                }
+            }
+            if dynamic_codec_mode == CodecMode::OpusRld && opus_encoder_failed {
+                // OpusStreamEncoder::new failed for a real audible packet:
+                // fall back to the pure-Rust VBR path. Standby/silence never
+                // attempts allocation and keeps publishing the intended mode.
+                dynamic_codec_mode = CodecMode::CompressedLowDelay;
+            }
+
+            // Clients unconditionally ignore ADPCM FEC on Opus packets (the
+            // 0 ms ADPCM backup jumps phase against the 2.5 ms Opus lookahead;
+            // Opus heals gaps with phase-aligned CELT PLC). Encoding and
+            // sending it wasted 248 B/packet ~= 397 kbps at 200 pps.
+            let suppress_adpcm_fec = dynamic_codec_mode == CodecMode::OpusRld;
+            if suppress_adpcm_fec {
+                fec_hist_len = 0;
+            }
+            let prev_hist = fec_hist;
+            let prev_hist_len = if suppress_adpcm_fec { 0 } else { fec_hist_len };
+            let send_n1 = prev_hist_len >= 1;
+            let send_n2 = prev_hist_len >= 2;
+
+            // Encode only when at least one receiver is connected and the
+            // packet is not being suppressed by Smart DTX. With zero targets
+            // or during silence the collected samples still drive VU/DTX
+            // telemetry and the pacing loop, but no codec state or datagram is
             // produced (the old code allocated a fresh OpusStreamEncoder on
-            // every 2.5 ms idle tick).
-            if has_targets {
+            // every 2.5 ms idle or silent tick).
+            if has_targets && !is_dtx_active {
                 if dynamic_codec_mode == CodecMode::OpusRld {
                     let mut opus_ok = true;
                     for sub_idx in 0..subframes_per_pkt {
@@ -2854,6 +2913,12 @@ impl HostEngine {
                         subframe_ranges[sub_idx] = (entry_start, primary_cursor);
                     }
                 }
+            } else if profile != QualityProfile::SmartAuto {
+                // Leaving compressed/SmartAuto: drop the codec state so a
+                // later compressed period starts clean. SmartAuto Tier 0
+                // intentionally keeps the encoder warm for the first
+                // compressed packet after a loss spike.
+                opus_encoder = None;
             }
 
             // If an Opus encode failed mid-packet we fell back to VBR above;
@@ -2866,13 +2931,8 @@ impl HostEngine {
             let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
             let active_key = *session_key.lock().unwrap();
 
-            let is_dtx_active = telemetry.enable_smart_dtx.load(Ordering::Relaxed)
-                && packet_is_silent
-                && silent_subframes > 200;
-            telemetry
-                .dtx_silent_mode
-                .store(is_dtx_active, Ordering::Relaxed);
-
+            // `is_dtx_active` was evaluated right after subframe collection,
+            // before any encoder allocation or encoding work.
             let mut sent_any = false;
             if is_dtx_active {
                 // Receivers drop their Opus decoder and sequencer state on
@@ -3369,6 +3429,94 @@ mod tests {
             engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed) > 0,
             "control: registering a client did not allocate an encoder (counter is not live)"
         );
+        engine.stop();
+    }
+
+    /// P1 regression: Smart DTX silence with a connected client must not
+    /// allocate a new OpusStreamEncoder every 2.5 ms. The old TX loop allocated
+    /// the encoder (and encoded the silent packet) before discovering DTX and
+    /// discarding it -- 200 heap allocations/sec for the whole silence.
+    #[test]
+    fn test_dtx_silence_with_connected_client_does_not_reallocate_opus_encoder() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = rx.local_addr().unwrap();
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: false, // empty capture ring => synthesized silence
+            subframes_per_packet: 1,
+            enable_smart_dtx: true,
+        };
+        // The initial target is the connected client; no HELLO needed.
+        let mut engine = HostEngine::start(config, vec![target]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::SmartAuto as u8, Ordering::Relaxed);
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+        engine
+            .telemetry
+            .enable_smart_dtx
+            .store(true, Ordering::Relaxed);
+        assert_eq!(engine.connected_clients().len(), 1);
+
+        // >600 ms of silence: 200+ 2.5 ms subframes are required before DTX
+        // engages. Wait long enough for that plus the 80 ms capture-idle guard.
+        let deadline = Instant::now() + Duration::from_millis(1_200);
+        while Instant::now() < deadline {
+            if engine.telemetry.dtx_silent_mode.load(Ordering::Relaxed)
+                && engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed) > 0
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            engine.telemetry.dtx_silent_mode.load(Ordering::Relaxed),
+            "Smart DTX never engaged on >600 ms of silence"
+        );
+        let allocs = engine.telemetry.opus_encoder_allocs.load(Ordering::Relaxed);
+        assert!(
+            allocs <= 1,
+            "DTX silence allocated {allocs} OpusStreamEncoders (expected <= 1)"
+        );
+        engine.stop();
+    }
+
+    /// P1 regression: the client map is capped so the u8 telemetry count can
+    /// never wrap, and new peers are rejected rather than evicting live ones.
+    #[test]
+    fn test_host_rejects_clients_beyond_max_and_never_wraps_u8() {
+        let targets: Vec<SocketAddr> = (0..40)
+            .map(|i| SocketAddr::from(([127, 0, 0, 1], 50_000 + i)))
+            .collect();
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 1,
+            enable_smart_dtx: false,
+        };
+        let mut engine = HostEngine::start(config, targets.clone()).expect("start host engine");
+        assert_eq!(engine.connected_clients().len(), MAX_CONNECTED_CLIENTS);
+        assert_eq!(
+            engine.telemetry.active_clients_count.load(Ordering::Relaxed) as usize,
+            MAX_CONNECTED_CLIENTS
+        );
+
+        // Existing clients remain admitted and can still be updated.
+        for addr in targets.iter().take(MAX_CONNECTED_CLIENTS) {
+            assert!(HostEngine::can_admit_client(
+                &engine.clients.lock().unwrap(),
+                *addr
+            ));
+        }
+        // A new peer at capacity is rejected, but the original client count
+        // and membership are untouched (no eviction).
+        let extra: SocketAddr = "127.0.0.1:51000".parse().unwrap();
+        assert!(!HostEngine::can_admit_client(
+            &engine.clients.lock().unwrap(),
+            extra
+        ));
+        assert_eq!(engine.connected_clients().len(), MAX_CONNECTED_CLIENTS);
         engine.stop();
     }
 
