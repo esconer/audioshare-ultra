@@ -264,18 +264,19 @@ fn update_pkt_subframe_count(current: &mut u8, smaller_run: &mut u8, incoming: u
     }
 }
 
-/// Output decoupler watermark in 2.5 ms subframes (4..=64, up to 160 ms).
+/// Output decoupler watermark in 2.5 ms subframes (4..=120, up to 300 ms).
 ///
 /// The upper bound used to be 12 (30 ms), which silently capped group-sync
 /// alignment: a wired client could never add enough cushion to match a
-/// Bluetooth peer. 64 subframes (160 ms) is the deliberate maximum that
-/// still fits the 32,768-sample decoupler at the two supported output rates:
-/// at 96 kHz `base_ratio` is 0.5, so one subframe is 480 samples and 64
-/// subframes are 30,720 samples, leaving 2,048 samples (10.7 ms) of
-/// headroom. 69 subframes (33,120 samples) would overflow the ring.
+/// Bluetooth peer. 120 subframes (300 ms) is the deliberate maximum that
+/// still fits the 65,536-sample decoupler at the two supported output rates:
+/// at 96 kHz `base_ratio` is 0.5, so one subframe is 480 samples and 120
+/// subframes are 57,600 samples, leaving 7,936 samples of headroom.
 #[inline]
 fn fifo_target_subframes(target_buf: f32) -> usize {
-    (target_buf.ceil() as usize).clamp(4, 64)
+    // 120 subframes (300 ms) fits the 65,536-sample decoupler even at 96 kHz
+    // (120 * 480 = 57,600 samples, leaving 7,936 samples of headroom).
+    (target_buf.ceil() as usize).clamp(4, 120)
 }
 
 /// Number of subframes of real audio left after the current decoupler
@@ -397,10 +398,58 @@ impl LossWindow {
     }
 }
 
-/// A packet this far ahead of the playhead means the sequence tracker was
-/// lost or the sender restarted. 88 subframes = 220 ms, still inside the
-/// 128-slot sequencer ring (which clamps the actual jump to 124 subframes).
-const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 88;
+/// Allow up to 450 ms (180 subframes, safely inside RING_SLOTS = 256) so
+/// 225-394 ms stock-OS Wi-Fi background scans never trigger hard resync storms.
+const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 180;
+
+/// Radio-freeze threshold (50 ms) that arms the temporary scan-burst shield
+/// on Bluetooth and 10 ms 2.4 GHz streams.
+const SCAN_SHIELD_TRIGGER_EMPTY_TICKS: u16 = 20;
+const SCAN_SHIELD_MAX_SUBFRAMES: f32 = 110.0; // 275 ms
+const SCAN_SHIELD_HOLD: Duration = Duration::from_secs(25);
+
+#[inline]
+fn update_scan_shield(
+    bt_active: bool,
+    pkt_subframes: u8,
+    consecutive_empty_ticks: u16,
+    now: Instant,
+    shield_until: &mut Option<Instant>,
+    shield_subframes: &mut f32,
+) -> bool {
+    if (bt_active || pkt_subframes >= 4)
+        && consecutive_empty_ticks >= SCAN_SHIELD_TRIGGER_EMPTY_TICKS
+    {
+        *shield_until = Some(now + SCAN_SHIELD_HOLD);
+        let needed = (consecutive_empty_ticks as f32 + 12.0).min(SCAN_SHIELD_MAX_SUBFRAMES);
+        *shield_subframes = shield_subframes.max(needed);
+        return true;
+    }
+    false
+}
+
+#[inline]
+fn effective_wifi_ceiling(
+    bt_active: bool,
+    pkt_subframes: u8,
+    now: Instant,
+    shield_until: &mut Option<Instant>,
+    shield_subframes: &mut f32,
+) -> f32 {
+    let base_cap = if bt_active || pkt_subframes >= 4 {
+        28.0
+    } else {
+        24.0
+    };
+    if let Some(until) = *shield_until {
+        if now < until && (bt_active || pkt_subframes >= 4) {
+            return base_cap.max(*shield_subframes);
+        }
+        *shield_until = None;
+        *shield_subframes = 0.0;
+    }
+    base_cap
+}
 
 /// A packet this far behind the playhead is outside the 35 ms maximum jitter
 /// buffer. Treat it as a new stream instead of discarding hundreds of
@@ -1506,6 +1555,10 @@ impl ClientEngine {
         let mut last_plc_watermark =
             resampler.subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES);
         let mut consecutive_empty_ticks: u16 = 0;
+        // Zero-config scan-burst absorption: armed only on Bluetooth or 10 ms
+        // (4-subframe) 2.4 GHz streams, cleared on DTX or after the hold expires.
+        let mut scan_shield_until: Option<Instant> = None;
+        let mut scan_shield_subframes: f32 = 0.0;
         let mut smoothed_host_vol: f32 = 1.0;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
@@ -1923,6 +1976,11 @@ impl ClientEngine {
                         // behind the 16-bit wrap point.
                         if parsed.header.mode == CodecMode::SilenceHeartbeat {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
+                            // DTX means the burst is over: drop any expanded
+                            // scan shield and return the cushion to baseline.
+                            scan_shield_until = None;
+                            scan_shield_subframes = 0.0;
+                            adaptive_wifi_subframes = initial_wifi_floor;
                             prebuffer_ready = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             next_play_seq = base_seq;
@@ -1995,7 +2053,8 @@ impl ClientEngine {
                         // framing. Use the smoothed count so a transient
                         // `SplitPerSubframe` datagram cannot drop the floor
                         // from 15 ms to 10 ms for one packet.
-                        let bt_coex_floor = if telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0 {
+                        let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
+                        let bt_coex_floor = if bt_now {
                             configured_floor.max(8.0)
                         } else {
                             configured_floor
@@ -2003,8 +2062,16 @@ impl ClientEngine {
                         initial_wifi_floor =
                             wifi_floor_for_packet(bt_coex_floor, last_pkt_subframe_count);
                         // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
+                        let wifi_ceiling = effective_wifi_ceiling(
+                            bt_now,
+                            last_pkt_subframe_count,
+                            Instant::now(),
+                            &mut scan_shield_until,
+                            &mut scan_shield_subframes,
+                        )
+                        .max(initial_wifi_floor);
                         let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.2)
-                            .clamp(initial_wifi_floor, adaptive_ceiling);
+                            .clamp(initial_wifi_floor, wifi_ceiling);
                         adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
 
                         if !stream_initialized {
@@ -2216,7 +2283,7 @@ impl ClientEngine {
                     }
                     Err(_) => {}
                 }
-                if packets_drained >= 64 {
+                if packets_drained >= 128 {
                     break;
                 }
             }
@@ -2286,7 +2353,7 @@ impl ClientEngine {
                 last_aligned_target_subframes = target_fifo_subframes;
 
                 // Sequencer only prebuffers the base floor (4..=11 subframes = 10..=27.5 ms)
-                // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (88 subframes).
+                // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (180 subframes).
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
@@ -2495,16 +2562,40 @@ impl ClientEngine {
                         window.record_fec();
                         // 2.4GHz burst delay exceeded cushion: expand cushion by
                         // +0.75 subframes, clamped to the route-aware ceiling.
-                        adaptive_wifi_subframes =
-                            (adaptive_wifi_subframes + 0.75).min(adaptive_ceiling);
+                        let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
+                        let now_empty = Instant::now();
+                        let shield_armed = update_scan_shield(
+                            bt_now,
+                            last_pkt_subframe_count,
+                            consecutive_empty_ticks,
+                            now_empty,
+                            &mut scan_shield_until,
+                            &mut scan_shield_subframes,
+                        );
+                        let wifi_ceiling = effective_wifi_ceiling(
+                            bt_now,
+                            last_pkt_subframe_count,
+                            now_empty,
+                            &mut scan_shield_until,
+                            &mut scan_shield_subframes,
+                        )
+                        .max(initial_wifi_floor);
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(wifi_ceiling);
+                        if shield_armed {
+                            // Grow cushion immediately so Hit #1's arriving packet clump is
+                            // retained in the FIFO and shields Hits #2..#12 of the scan.
+                            adaptive_wifi_subframes =
+                                adaptive_wifi_subframes.max(scan_shield_subframes);
+                        }
                         telemetry
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
 
-                        // If Host disconnected or Wi-Fi dropped for >200ms (80 PLC
-                        // subframes), suspend into clean standby. 60ms was too
-                        // aggressive for 2.4GHz bursts and caused false standby.
-                        if consecutive_empty_ticks >= 80 {
+                        // If Host disconnected or Wi-Fi dropped for >600ms (240 PLC
+                        // subframes), suspend into clean standby. 200ms was too
+                        // aggressive for 225-394 ms stock-OS Wi-Fi scans and
+                        // caused false standby.
+                        if consecutive_empty_ticks >= 240 {
                             telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
                             audioshare_protocol::diagnostics::warn(
                                 "client-rx",
@@ -3050,39 +3141,42 @@ mod tests {
 
     #[test]
     fn test_group_sync_target_is_not_capped_at_30ms() {
-        // Group sync adds up to 64 subframes (160 ms) to match a Bluetooth
+        // Group sync adds up to 120 subframes (300 ms) to match a Bluetooth
         // peer's output delay. The old 12-subframe clamp silently capped it
-        // at 30 ms, and the subsequent 32-subframe clamp capped it at 80 ms.
+        // at 30 ms, and the subsequent 32/64-subframe clamps capped it further.
         assert_eq!(fifo_target_subframes(26.0), 26);
         assert_eq!(fifo_target_subframes(32.0), 32);
         assert_eq!(fifo_target_subframes(40.0), 40);
         assert_eq!(fifo_target_subframes(64.0), 64);
-        assert_eq!(fifo_target_subframes(64.5), 64);
-        assert_eq!(fifo_target_subframes(100.0), 64);
+        assert_eq!(fifo_target_subframes(64.5), 65);
+        assert_eq!(fifo_target_subframes(100.0), 100);
+        assert_eq!(fifo_target_subframes(120.0), 120);
+        assert_eq!(fifo_target_subframes(120.5), 120);
+        assert_eq!(fifo_target_subframes(200.0), 120);
         assert_eq!(fifo_target_subframes(3.0), 4);
         assert!(
-            (64 + 1) * SUBFRAME_STEREO_SAMPLES <= BurstDecouplerRing::new().capacity_samples(),
-            "160 ms target plus one pushed subframe must fit the decoupler"
+            (120 + 1) * SUBFRAME_STEREO_SAMPLES <= BurstDecouplerRing::new().capacity_samples(),
+            "300 ms target plus one pushed subframe must fit the decoupler"
         );
     }
 
     #[test]
     fn test_fifo_target_64_subframes_fits_ring_at_96khz() {
         let ring = BurstDecouplerRing::new();
-        assert_eq!(ring.capacity_samples(), 32_768);
+        assert_eq!(ring.capacity_samples(), 65_536);
 
         let mut resampler = ClockDriftResampler::new();
         resampler.set_output_sample_rate(96_000);
         assert_eq!(resampler.base_ratio, 0.5);
 
-        // A 160 ms group-sync target clamps to 64 subframes, which is
-        // 30,720 output samples at 96 kHz and fits the 32,768-sample ring.
-        let target = fifo_target_subframes(100.0);
-        assert_eq!(target, 64);
+        // A 300 ms group-sync target clamps to 120 subframes, which is
+        // 57,600 output samples at 96 kHz and fits the 65,536-sample ring.
+        let target = fifo_target_subframes(130.0);
+        assert_eq!(target, 120);
         let watermark = resampler
             .subframes_to_samples(target)
             .min(ring.capacity_samples() - 2);
-        assert_eq!(watermark, 30_720);
+        assert_eq!(watermark, 57_600);
         let subframe_samples = resampler.subframes_to_samples(1);
         assert_eq!(subframe_samples, 480);
         assert!(watermark + subframe_samples <= ring.capacity_samples());
@@ -3095,7 +3189,7 @@ mod tests {
             assert_eq!(ring.push_samples(&chunk), subframe_samples);
             pushes += 1;
         }
-        assert_eq!(pushes, 64);
+        assert_eq!(pushes, 120);
         assert_eq!(ring.available_samples(), watermark);
     }
 
@@ -3835,8 +3929,8 @@ mod tests {
     #[test]
     fn test_stream_resync_thresholds_detect_host_restart() {
         assert!(!needs_stream_resync(0));
-        assert!(!needs_stream_resync(88));
-        assert!(needs_stream_resync(89));
+        assert!(!needs_stream_resync(180));
+        assert!(needs_stream_resync(181));
         assert!(!needs_stream_resync(-32));
         assert!(needs_stream_resync(-33));
 
@@ -3852,6 +3946,27 @@ mod tests {
         let late = 140u16;
         let delta = late.wrapping_sub(next_play) as i16;
         assert!(!needs_stream_resync(delta));
+    }
+
+    #[test]
+    fn test_scan_shield_expands_only_for_bt_or_10ms_mode() {
+        let now = Instant::now();
+        let mut until = None;
+        let mut shield = 0.0f32;
+
+        // Low-latency speaker/wired 5 ms stream must stay at 24 sf (60 ms).
+        assert!(!update_scan_shield(false, 2, 40, now, &mut until, &mut shield));
+        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 24.0);
+
+        // Bluetooth stream with a 225 ms (90 sf) scan freeze arms the shield.
+        assert!(update_scan_shield(true, 2, 90, now, &mut until, &mut shield));
+        let cap = effective_wifi_ceiling(true, 2, now, &mut until, &mut shield);
+        assert_eq!(cap, 102.0);
+
+        // Expires cleanly after 25 s back to the 28 sf BT baseline ceiling.
+        let later = now + SCAN_SHIELD_HOLD + Duration::from_secs(1);
+        assert_eq!(effective_wifi_ceiling(true, 2, later, &mut until, &mut shield), 28.0);
+        assert_eq!(shield, 0.0);
     }
 
     /// A length prefix split by a timeout (or EINTR) must resume at the byte
@@ -3904,10 +4019,12 @@ mod tests {
     #[test]
     fn test_resync_ahead_never_exceeds_ring_slots() {
         let hard_cap = (RING_SLOTS as i16) - 4;
-        assert_eq!(resync_ahead_subframes(0), STREAM_RESYNC_AHEAD_SUBFRAMES);
-        assert_eq!(resync_ahead_subframes(16), STREAM_RESYNC_AHEAD_SUBFRAMES);
-        assert_eq!(resync_ahead_subframes(80), 96); // fifo + 16 still wins once fifo > 72
-        assert_eq!(resync_ahead_subframes(200), hard_cap);
+        let base_jump = STREAM_RESYNC_AHEAD_SUBFRAMES.min(hard_cap);
+        assert_eq!(resync_ahead_subframes(0), base_jump);
+        assert_eq!(resync_ahead_subframes(16), base_jump);
+        // The 180-subframe base now dominates until fifo + 16 exceeds it.
+        assert_eq!(resync_ahead_subframes(80), base_jump);
+        assert_eq!(resync_ahead_subframes(200), 216_i16.min(hard_cap));
         assert_eq!(resync_ahead_subframes(i16::MAX), hard_cap);
         for fifo in 0i16..=i16::MAX {
             assert!(
@@ -4177,16 +4294,16 @@ mod tests {
         let mut latest_rx_seq = 100u16;
         let mut consecutive_empty_ticks = 0u16;
 
-        // 80 empty ticks occur (200 ms packet stall)
-        for _ in 0..80 {
+        // 240 empty ticks occur (600 ms packet stall)
+        for _ in 0..240 {
             next_play_seq = next_play_seq.wrapping_add(1);
             consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
         }
-        assert_eq!(next_play_seq, 180);
-        assert_eq!(consecutive_empty_ticks, 80);
+        assert_eq!(next_play_seq, 340);
+        assert_eq!(consecutive_empty_ticks, 240);
 
         // Standby trigger
-        if consecutive_empty_ticks >= 80 {
+        if consecutive_empty_ticks >= 240 {
             prebuffer_ready = false;
             stream_initialized = false; // Fixed: reset stream_initialized
             consecutive_empty_ticks = 0;
@@ -4195,9 +4312,9 @@ mod tests {
         assert!(!stream_initialized);
         assert_eq!(consecutive_empty_ticks, 0);
 
-        // Packets resume at seq 150 (a 125 ms gap)
-        let resuming_packet_base = 150u16;
-        // In the unpatched bug, stream_initialized was left true, so seq_delta = 150 - 180 = -30.
+        // Packets resume at seq 310 (a 525 ms gap from the original seq 100)
+        let resuming_packet_base = 310u16;
+        // In the unpatched bug, stream_initialized was left true, so seq_delta = 310 - 340 = -30.
         // Because -30 is not < -32, needs_stream_resync(-30) was false!
         let buggy_delta = resuming_packet_base.wrapping_sub(next_play_seq) as i16;
         assert_eq!(buggy_delta, -30);
@@ -4210,8 +4327,8 @@ mod tests {
             stream_initialized = true;
         }
         assert!(stream_initialized);
-        assert_eq!(next_play_seq, 150);
-        assert_eq!(latest_rx_seq, 150);
+        assert_eq!(next_play_seq, 310);
+        assert_eq!(latest_rx_seq, 310);
         assert_eq!(resuming_packet_base.wrapping_sub(next_play_seq) as i16, 0);
     }
 
@@ -4330,7 +4447,7 @@ mod tests {
 
         // 3. Bluetooth Group Sync targets > 48 subframes (e.g. 58 subframes = 145 ms):
         // Base floor (e.g. 6) triggers prebuffer_ready so sequencer never reaches
-        // STREAM_RESYNC_AHEAD_SUBFRAMES (now 88 subframes).
+        // STREAM_RESYNC_AHEAD_SUBFRAMES (now 180 subframes).
         let base_subframes = 6usize;
         let mut prebuf = false;
         let total_now = 6.0f32;
