@@ -1909,12 +1909,23 @@ impl ClientEngine {
                 Ordering::Relaxed,
             );
             let fifo_capacity = burst_fifo.capacity_samples().saturating_sub(2);
+            #[cfg(target_os = "android")]
+            let hal_burst_samples = aaudio_guard
+                .as_ref()
+                .map(|g| (g.frames_per_burst() as usize) * 2)
+                .filter(|&s| s > 0)
+                .unwrap_or(480);
+            #[cfg(not(target_os = "android"))]
+            let hal_burst_samples = 480usize;
+            let one_subframe_samples = resampler.subframes_to_samples(1);
             let fifo_watermark = resampler
                 .subframes_to_samples(target_fifo_subframes)
+                .max(hal_burst_samples + one_subframe_samples * 2)
                 .min(fifo_capacity);
             let plc_emergency_watermark = resampler
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
-                .min(fifo_capacity);
+                .max(hal_burst_samples)
+                .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
             last_fifo_watermark = fifo_watermark;
             last_plc_watermark = plc_emergency_watermark;
 
@@ -2149,11 +2160,6 @@ impl ClientEngine {
                 let net_subframes = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
                     as i16)
                     .max(0) as f32;
-                // One hardware callback drain: 240 frames (480 interleaved
-                // samples) on desktop CPAL, and the common 240-frame AAudio
-                // burst on Android. The clock setpoint compensates for the
-                // half-burst structural sawtooth this drain creates.
-                let hal_burst_samples = 480usize;
                 telemetry.buffered_audio_us.store(
                     ((net_subframes + fifo_subframes).max(0.0) * 2500.0) as u32,
                     Ordering::Relaxed,
@@ -3973,6 +3979,7 @@ pub mod android_aaudio {
         stream: *mut AAudioStream,
         ctx_ptr: *mut CallbackContext,
         actual_sample_rate: u32,
+        frames_per_burst: u32,
     }
 
     unsafe impl Send for AAudioOutputGuard {}
@@ -3992,6 +3999,11 @@ pub mod android_aaudio {
         #[inline]
         pub fn sample_rate(&self) -> u32 {
             self.actual_sample_rate
+        }
+
+        #[inline]
+        pub fn frames_per_burst(&self) -> u32 {
+            self.frames_per_burst
         }
 
         /// Measure the downstream hardware/DAC pipeline latency from the
@@ -4120,8 +4132,9 @@ pub mod android_aaudio {
                 // A2DP bursts are already 10-20 ms. Use one burst there and
                 // keep the 3x speaker/USB cushion, otherwise the old code
                 // stacked another 30-60 ms of AAudio buffer on Bluetooth.
+                let raw_burst = AAudioStream_getFramesPerBurst(stream);
                 if let Some(target_frames) = aaudio_buffer_frames_for_burst(
-                    AAudioStream_getFramesPerBurst(stream),
+                    raw_burst,
                     capacity_frames,
                 ) {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
@@ -4136,6 +4149,7 @@ pub mod android_aaudio {
                     stream,
                     ctx_ptr,
                     actual_sample_rate,
+                    frames_per_burst: raw_burst.max(0) as u32,
                 })
             }
         }
