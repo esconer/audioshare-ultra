@@ -474,7 +474,7 @@ pub struct TruePeakLimiter {
 impl TruePeakLimiter {
     #[inline]
     fn gain_db_to_linear(gain_db: f32) -> f32 {
-        if gain_db <= -60.0 {
+        if !gain_db.is_finite() || gain_db <= -60.0 {
             0.0
         } else {
             10.0f32.powf(gain_db.clamp(-60.0, 24.0) / 20.0)
@@ -562,6 +562,10 @@ pub fn soft_limit_post_resample(samples: &mut [f32]) {
     const KNEE: f32 = 0.96;
     const HEADROOM: f32 = 0.039; // asymptotic ceiling = 0.999
     for s in samples.iter_mut() {
+        if !s.is_finite() {
+            *s = 0.0;
+            continue;
+        }
         let a = s.abs();
         if a > KNEE {
             let over = a - KNEE;
@@ -598,7 +602,10 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
     // Equal-power headroom for the stereo bus
     const HEADROOM: f32 = 0.7071;
 
-    let frames = in_interleaved.len() / channels.max(1);
+    if channels == 0 {
+        return;
+    }
+    let frames = (in_interleaved.len() / channels).min(out_stereo.len() / 2);
     for i in 0..frames {
         let src = &in_interleaved[i * channels..(i + 1) * channels];
         let (l, r) = match channels {
@@ -1177,6 +1184,23 @@ mod tests {
     }
 
     #[test]
+    fn test_true_peak_limiter_nan_gain_stays_finite() {
+        // f32::NAN <= -60.0 is false and NAN.clamp(..) returns NAN, so an
+        // unguarded conversion poisons both gain fields and every later sample.
+        let mut limiter = TruePeakLimiter::new(f32::NAN);
+        assert!(limiter.current_gain_linear.is_finite());
+        assert!(limiter.target_gain_linear.is_finite());
+        assert_eq!(limiter.current_gain_linear, 0.0);
+
+        let mut signal = [0.5f32; 240];
+        limiter.process_in_place(&mut signal);
+        assert!(signal.iter().all(|s| s.is_finite()));
+
+        limiter.set_gain_db(f32::INFINITY);
+        assert!(limiter.target_gain_linear.is_finite());
+    }
+
+    #[test]
     fn test_downmix_to_stereo_sanitizes_non_finite_channels() {
         let input = [f32::NAN, 0.5, f32::INFINITY, -0.25, 0.1, f32::NEG_INFINITY];
         let mut out = [0.0f32; 6];
@@ -1188,6 +1212,32 @@ mod tests {
         assert_eq!(out[1], 0.5);
         assert_eq!(out[3], -0.25);
         assert_eq!(out[4], 0.1);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_zero_channels_does_not_panic() {
+        // channels == 0 previously made `frames == in.len()` and produced an
+        // empty `src` slice, panicking on `src[0]` under panic=abort.
+        let mut out = [0.0f32; 4];
+        downmix_to_stereo(&[1.0], 0, &mut out);
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_clamps_to_output_length() {
+        // A short destination must bound the work instead of indexing past it.
+        let input = [0.5f32; 12]; // 6 stereo frames
+        let mut out = [0.0f32; 4]; // room for 2 frames only
+        downmix_to_stereo(&input, 2, &mut out);
+        assert_eq!(out, [0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_soft_limit_post_resample_sanitizes_non_finite() {
+        let mut s = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5];
+        soft_limit_post_resample(&mut s);
+        assert!(s.iter().all(|v| v.is_finite()));
+        assert_eq!(s[3], 0.5);
     }
 
     #[test]

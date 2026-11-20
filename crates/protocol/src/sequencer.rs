@@ -28,7 +28,10 @@ pub struct SequencerSlot {
 unsafe impl Sync for SequencerSlot {}
 
 pub struct ZeroJitterSequencer {
-    slots: [SequencerSlot; RING_SLOTS],
+    // Heap-allocated once: an inline [SequencerSlot; 128] is ~128 KB (each
+    // align(64) slot pads to 1024 bytes) and was returned by value on the
+    // stack, risking overflow on Android worker threads.
+    slots: Box<[SequencerSlot]>,
     /// Rolling 7.5ms stereo history for WSOLA pitch-period autocorrelation PLC
     history: [f32; HISTORY_STEREO_SAMPLES],
     /// Continuation tail for smooth overlap-add when real packets resume after PLC
@@ -48,11 +51,14 @@ pub struct ZeroJitterSequencer {
 
 impl ZeroJitterSequencer {
     pub fn new() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| SequencerSlot {
+        let slots: Vec<SequencerSlot> = (0..RING_SLOTS)
+            .map(|_| SequencerSlot {
                 state: AtomicU32::new(STATUS_EMPTY),
                 samples: UnsafeCell::new([0.0; SUBFRAME_STEREO_SAMPLES]),
-            }),
+            })
+            .collect();
+        Self {
+            slots: slots.into_boxed_slice(),
             history: [0.0; HISTORY_STEREO_SAMPLES],
             plc_recovery_tail: [0.0; CROSSFADE_FRAMES * 2],
             consecutive_plc_count: 0,
@@ -70,7 +76,7 @@ impl ZeroJitterSequencer {
     /// history/tail also prevents PLC from extrapolating audio from the old
     /// stream after a reset.
     pub fn reset(&mut self) {
-        for slot in &self.slots {
+        for slot in self.slots.iter() {
             slot.state.store(STATUS_EMPTY, Ordering::Release);
         }
         self.history.fill(0.0);
@@ -310,6 +316,10 @@ impl ZeroJitterSequencer {
                             out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
                     }
                     self.consecutive_plc_count = 0;
+                    // The PLC recovery crossfade already spliced frame 0.
+                    // Disarm pending_declick so apply_boundary_ramps() below
+                    // does not add the same step a second time.
+                    self.pending_declick = false;
                 } else if self.last_pop_was_fec && cur_status != STATUS_HEALED_BY_FEC {
                     // The previous subframe was an IMA-ADPCM FEC reconstruction.
                     // Its timbre is close, but its accumulated quantization error
@@ -326,6 +336,9 @@ impl ZeroJitterSequencer {
                         out[i * 2] += delta_l * w;
                         out[i * 2 + 1] += delta_r * w;
                     }
+                    // This branch already applied the declick splice; clear
+                    // the arm so apply_boundary_ramps() does not double it.
+                    self.pending_declick = false;
                 }
 
                 self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;

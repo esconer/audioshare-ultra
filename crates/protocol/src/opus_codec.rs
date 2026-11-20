@@ -295,7 +295,14 @@ impl OpusStreamDecoder {
                         .map(|frames| frames == SUBFRAME_FRAMES)
                         .unwrap_or(false);
                     if decoded {
-                        on_plc_frame(start_miss_seq.wrapping_add(i as u16), &concealment);
+                        let missed_seq = start_miss_seq.wrapping_add(i as u16);
+                        // Each concealment frame advances the stateful CELT
+                        // MDCT overlap, so `last_seq` must track the last
+                        // concealed slot even if the real payload that follows
+                        // fails to decode. Otherwise the same gap is concealed
+                        // twice when the next valid packet arrives.
+                        self.last_seq = Some(missed_seq);
+                        on_plc_frame(missed_seq, &concealment);
                     }
                 }
             }
@@ -311,6 +318,14 @@ impl OpusStreamDecoder {
     /// Synthesize one phase-aligned CELT PLC frame for a missing slot right at
     /// playhead pop time, keeping MDCT overlap locked with the next real frame.
     pub fn decode_plc(&mut self, seq: u16, out_f32: &mut [f32; SUBFRAME_STEREO_SAMPLES]) -> bool {
+        // A duplicate or late playhead slot must not be fed through the
+        // stateful CELT decoder, which would corrupt the MDCT overlap tail and
+        // rewind `last_seq`.
+        if let Some(prev) = self.last_seq {
+            if (seq.wrapping_sub(prev) as i16) <= 0 {
+                return false;
+            }
+        }
         let ok = self
             .inner
             .decode(&[], SUBFRAME_FRAMES, out_f32)
@@ -658,6 +673,78 @@ mod tests {
         // A late duplicate of 7 must still be rejected after the PLC advanced
         // the decoder's last_seq.
         assert!(!dec.decode_subframe_at_seq(7, &payload[..len], &mut out));
+    }
+
+    #[test]
+    fn test_decode_plc_rejects_non_advancing_sequence() {
+        let mut enc = OpusStreamEncoder::new(128).unwrap();
+        let mut dec = OpusStreamDecoder::new().unwrap();
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let frame = tone_frame(0);
+        let len = enc.encode_subframe(&frame, 128, &mut payload).unwrap();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(dec.decode_subframe_at_seq(20, &payload[..len], &mut out));
+        assert_eq!(dec.last_seq, Some(20));
+
+        assert!(!dec.decode_plc(20, &mut out), "duplicate seq must be rejected");
+        assert!(!dec.decode_plc(19, &mut out), "late seq must be rejected");
+        assert_eq!(dec.last_seq, Some(20), "rejected PLC must not move last_seq");
+
+        assert!(dec.decode_plc(21, &mut out), "forward seq must be accepted");
+        assert_eq!(dec.last_seq, Some(21));
+    }
+
+    #[test]
+    fn test_corrupt_payload_after_gap_does_not_rewind_plc_sequence() {
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut decoder = OpusStreamDecoder::new().expect("create Opus decoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        let first = tone_frame(0);
+        let len = encoder.encode_subframe(&first, 128, &mut payload).unwrap();
+        assert!(decoder.decode_subframe_at_seq(10, &payload[..len], &mut out));
+        assert_eq!(decoder.last_seq, Some(10));
+
+        // Pick a packet that passes the wire-header check but is rejected by
+        // Opus itself: each TOC below advertises a CELT frame longer than the
+        // 2.5 ms subframe we request. Probing keeps the fixture robust across
+        // opus-rs versions.
+        let corrupt = [0x88u8, 0x80u8, 0x90u8, 0xF8u8, 0xA0u8]
+            .into_iter()
+            .map(|toc| vec![TAG_OPUS_RLD, toc, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
+            .find(|p| {
+                let mut probe = OpusStreamDecoder::new().unwrap();
+                let mut scratch = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                !probe.decode_subframe(p, &mut scratch)
+            })
+            .expect("need one header-valid packet that Opus rejects");
+        assert!(corrupt.len() >= 2 && corrupt[0] == TAG_OPUS_RLD);
+
+        // Gap 10 -> 13 conceals slots 11 and 12, then the corrupt payload
+        // fails. The concealed slots must still advance `last_seq`.
+        let mut gap_plc = Vec::new();
+        assert!(!decoder.decode_subframe_with_plc(13, &corrupt, &mut out, |seq, _| gap_plc
+            .push(seq)));
+        assert_eq!(gap_plc, vec![11, 12]);
+        assert_eq!(
+            decoder.last_seq,
+            Some(12),
+            "concealed slots must advance last_seq even when the final payload fails"
+        );
+
+        // A valid packet at 14 must conceal only the genuinely still-missing
+        // slot 13, not replay 11/12 through the stateful CELT decoder.
+        let second = tone_frame(1);
+        let second_len = encoder.encode_subframe(&second, 128, &mut payload).unwrap();
+        let mut recovered_plc = Vec::new();
+        assert!(decoder.decode_subframe_with_plc(
+            14,
+            &payload[..second_len],
+            &mut out,
+            |seq, _| recovered_plc.push(seq),
+        ));
+        assert_eq!(recovered_plc, vec![13]);
     }
 
     #[test]
