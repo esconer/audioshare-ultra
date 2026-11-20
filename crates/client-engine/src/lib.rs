@@ -700,6 +700,17 @@ pub struct ClientTelemetry {
     pub prebuffer_ready: AtomicBool,
     /// Post-volume output peak level (0..=100%) for the live VU meter.
     pub client_vu_peak_pct: AtomicU8,
+    /// Subframe fragments whose playhead slot had already passed when they
+    /// arrived (negative sequence delta). Counted separately from generic
+    /// out-of-window duplicates so diagnostics can see true late loss.
+    pub late_subframes_dropped: AtomicU64,
+    /// Genuine stream resyncs (host restart / long stall / 80-PLC burst).
+    /// DTX wake-ups re-anchor the playhead but are deliberately excluded.
+    pub stream_resyncs: AtomicU64,
+    /// High-water mark of consecutive STATUS_EMPTY (PLC) refill ticks.
+    pub max_consecutive_plc: AtomicU16,
+    /// AAudio underrun (XRun) count reported by the HAL since stream start.
+    pub aaudio_xrun_count: AtomicU32,
 }
 
 impl ClientTelemetry {
@@ -728,6 +739,51 @@ impl ClientTelemetry {
             prebuffer_ready: self.prebuffer_ready.load(Ordering::Relaxed),
             codec_mode: self.codec_mode.load(Ordering::Relaxed),
         }
+    }
+
+    /// Pasteable, multi-line point-in-time breakdown for diagnostics reports.
+    ///
+    /// Field names mirror [`ClientLatencySnapshot`] and the telemetry atomics
+    /// so a report can be diffed directly against the live debug views.
+    /// `output_buffer_ms` is the same platform output-stage value passed to
+    /// [`Self::latency_snapshot`] (5 ms desktop CPAL, 0 on Android).
+    pub fn diagnostics_summary(&self, output_buffer_ms: f32) -> String {
+        let snap = self.latency_snapshot(output_buffer_ms);
+        let max_plc = self.max_consecutive_plc.load(Ordering::Relaxed);
+        format!(
+            "Client Latency: packet_interval_ms={:.2} network_jitter_ms={:.2} \
+             adaptive_buffer_ms={:.2} target_buffer_ms={:.2} buffered_audio_ms={:.2} \
+             group_sync_extra_ms={:.2} hardware_delay_ms={} bluetooth_delay_ms={} \
+             output_buffer_ms={:.2} codec_lookahead_ms={:.2} prebuffer_ready={} \
+             codec_mode={} ({}) estimated_one_way_ms={:.1}\n\
+             Client Stream: late_subframes_dropped={} stream_resyncs={} \
+             max_consecutive_plc={} subframes ({:.1}ms) aaudio_xrun_count={}\n\
+             Client Recovery: fec_healed_frames={} plc_extrapolated_frames={} \
+             clock_drift_ppm={} auth_failures={}",
+            snap.packet_interval_ms,
+            snap.network_jitter_ms,
+            snap.adaptive_buffer_ms,
+            snap.target_buffer_ms,
+            snap.buffered_audio_ms,
+            snap.group_sync_extra_ms,
+            snap.hardware_delay_ms,
+            snap.bluetooth_delay_ms,
+            snap.output_buffer_ms,
+            snap.codec_lookahead_ms,
+            snap.prebuffer_ready,
+            snap.codec_mode,
+            snap.codec_name(),
+            snap.estimated_one_way_ms(),
+            self.late_subframes_dropped.load(Ordering::Relaxed),
+            self.stream_resyncs.load(Ordering::Relaxed),
+            max_plc,
+            max_plc as f32 * 2.5,
+            self.aaudio_xrun_count.load(Ordering::Relaxed),
+            self.fec_healed_frames.load(Ordering::Relaxed),
+            self.plc_extrapolated_frames.load(Ordering::Relaxed),
+            self.clock_drift_ppm.load(Ordering::Relaxed),
+            self.auth_failures.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1034,6 +1090,10 @@ impl ClientEngine {
             codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
             prebuffer_ready: AtomicBool::new(false),
             client_vu_peak_pct: AtomicU8::new(0),
+            late_subframes_dropped: AtomicU64::new(0),
+            stream_resyncs: AtomicU64::new(0),
+            max_consecutive_plc: AtomicU16::new(0),
+            aaudio_xrun_count: AtomicU32::new(0),
         });
 
         let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
@@ -1116,6 +1176,19 @@ impl ClientEngine {
                 );
             })
             .map_err(|e| format!("Failed to spawn client RX thread: {}", e))?;
+
+        // One-shot connect edge log. Never include the PIN itself; only
+        // whether one was configured, so a shared report cannot leak it.
+        audioshare_protocol::diagnostics::info(
+            "client-connect",
+            format!(
+                "connected to {} (pin={}, target_buffer_subframes={}, dolby={})",
+                effective_config.server_addr,
+                if pin.is_some() { "set" } else { "none" },
+                config.target_buffer_subframes,
+                config.dolby_effects,
+            ),
+        );
 
         Ok(Self {
             running,
@@ -1486,12 +1559,12 @@ impl ClientEngine {
                     && last_aaudio_open_attempt
                         .map(|attempt| attempt.elapsed() >= Duration::from_millis(500))
                         .unwrap_or(true);
-                let hard_reason = aaudio_guard
+                let disconnected = aaudio_guard
                     .as_ref()
                     .map(|g| g.needs_reopen())
-                    .unwrap_or(false)
-                    || want_dolby != last_dolby_state
-                    || retry_due;
+                    .unwrap_or(false);
+                let dolby_changed = want_dolby != last_dolby_state;
+                let hard_reason = disconnected || dolby_changed || retry_due;
                 // A BT route handoff flips `downstream_bt_delay_ms` twice in
                 // quick succession (legacy A2DP estimate arrives, then the
                 // hardware timestamp replaces it). Reopening on both flips
@@ -1505,6 +1578,27 @@ impl ClientEngine {
                             .map(|attempt| attempt.elapsed() >= Duration::from_millis(300))
                             .unwrap_or(true));
                 if reopen {
+                    // Edge-triggered: reopen is rare, so the one formatted log
+                    // line here never touches the 2.5 ms audio hot path.
+                    let reason = if disconnected {
+                        "disconnected"
+                    } else if dolby_changed {
+                        "dolby-toggle"
+                    } else if route_change {
+                        "bt-route"
+                    } else if retry_due {
+                        "no-stream-retry"
+                    } else {
+                        "unknown"
+                    };
+                    audioshare_protocol::diagnostics::info(
+                        "aaudio",
+                        format!(
+                            "reopen output: reason={reason} (disconnected={disconnected}, \
+                             dolby_changed={dolby_changed}, bt_route_changed={route_change}, \
+                             retry_due={retry_due}) dolby={want_dolby} bt_active={bt_active}"
+                        ),
+                    );
                     last_dolby_state = want_dolby;
                     last_bt_active = bt_active;
                     last_aaudio_open_attempt = Some(Instant::now());
@@ -1541,6 +1635,11 @@ impl ClientEngine {
                     telemetry
                         .downstream_hw_delay_ms
                         .store(delay_ms, Ordering::Relaxed);
+                }
+                if let Some(guard) = aaudio_guard.as_ref() {
+                    telemetry
+                        .aaudio_xrun_count
+                        .store(guard.xrun_count(), Ordering::Relaxed);
                 }
             }
 
@@ -1781,6 +1880,16 @@ impl ClientEngine {
                         if let Some(prev_mode) = last_audio_codec_mode {
                             if prev_mode != parsed.header.mode {
                                 sequencer.arm_declick();
+                                // Edge-triggered (SmartAuto backend switches are
+                                // rare); the allocation lives off the steady
+                                // 2.5 ms subframe path.
+                                audioshare_protocol::diagnostics::info(
+                                    "client-rx",
+                                    format!(
+                                        "codec mode changed: {:?} -> {:?} (base_seq={})",
+                                        prev_mode, parsed.header.mode, base_seq
+                                    ),
+                                );
                             }
                         }
                         last_audio_codec_mode = Some(parsed.header.mode);
@@ -1845,10 +1954,24 @@ impl ClientEngine {
                         let fifo_now_subframes =
                             resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
                         let resync_ahead = resync_ahead_subframes(fifo_now_subframes);
-                        if telemetry.server_dtx_silent.swap(false, Ordering::Relaxed)
+                        let was_dtx = telemetry.server_dtx_silent.swap(false, Ordering::Relaxed);
+                        if was_dtx
                             || seq_delta > resync_ahead
                             || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
                         {
+                            if !was_dtx {
+                                // A DTX wake-up legitimately re-anchors the
+                                // playhead; only count/log genuine stream
+                                // restarts and sequence-tracker losses.
+                                telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
+                                audioshare_protocol::diagnostics::warn(
+                                    "client-rx",
+                                    format!(
+                                        "stream resync: seq_delta={} base_seq={} next_play_seq={} fifo_subframes={}",
+                                        seq_delta, base_seq, next_play_seq, fifo_now_subframes
+                                    ),
+                                );
+                            }
                             // The playhead is jumping to a new base sequence.
                             // Clear old slots so a wrapped/reused sequence
                             // number cannot surface a stale payload, and
@@ -1907,15 +2030,23 @@ impl ClientEngine {
 
                             let s = base_seq.wrapping_add(sub_idx);
                             let seq_delta_to_playhead = s.wrapping_sub(next_play_seq) as i16;
+                            // A fragment whose playhead slot has already
+                            // passed is genuinely late loss. Count it before
+                            // skipping so diagnostics can separate true late
+                            // arrivals from generic out-of-window duplicates.
+                            if seq_delta_to_playhead < 0 {
+                                telemetry
+                                    .late_subframes_dropped
+                                    .fetch_add(1, Ordering::Relaxed);
+                                cursor += sub_len;
+                                continue;
+                            }
                             // Skip redundant work before touching any decoder.
                             // Party-mode broadcast and USB+Wi-Fi active-active
-                            // delivery send the same subframe twice, and a
-                            // packet that arrives after its playhead has
-                            // passed cannot be heard at all. Slots at or past
-                            // RING_SLOTS ahead would alias a live slot in the
-                            // sequencer/Opus ring and overwrite its payload.
-                            if seq_delta_to_playhead < 0
-                                || seq_delta_to_playhead >= RING_SLOTS as i16
+                            // delivery send the same subframe twice. Slots at
+                            // or past RING_SLOTS ahead would alias a live slot
+                            // in the sequencer/Opus ring and overwrite it.
+                            if seq_delta_to_playhead >= RING_SLOTS as i16
                                 || sequencer.has_primary(s)
                             {
                                 cursor += sub_len;
@@ -2004,7 +2135,16 @@ impl ClientEngine {
                         }
                     }
                     Err(WireError::AuthenticationFailed) => {
-                        telemetry.auth_failures.fetch_add(1, Ordering::Relaxed);
+                        let count = telemetry.auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        // Throttle: one line for the first failure and every
+                        // 100th after that, so a hostile peer cannot flood the
+                        // 128-entry diagnostics ring from the RX loop.
+                        if count == 1 || count % 100 == 0 {
+                            audioshare_protocol::diagnostics::warn(
+                                "client-auth",
+                                format!("authentication failed (count={count}, peer={src_addr})"),
+                            );
+                        }
                     }
                     Err(_) => {}
                 }
@@ -2249,6 +2389,12 @@ impl ClientEngine {
                         // right tradeoff once its slot has been concealed.
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
+                        // Session high-water mark of the PLC burst length;
+                        // fetch_max is a single lock-free op, safe on the RT
+                        // refill path.
+                        telemetry
+                            .max_consecutive_plc
+                            .fetch_max(consecutive_empty_ticks, Ordering::Relaxed);
                         window.record_fec();
                         // 2.4GHz burst delay exceeded cushion: expand cushion by +0.75 subframes (max 14.0 = 35.0ms)
                         adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(14.0);
@@ -2260,6 +2406,16 @@ impl ClientEngine {
                         // subframes), suspend into clean standby. 60ms was too
                         // aggressive for 2.4GHz bursts and caused false standby.
                         if consecutive_empty_ticks >= 80 {
+                            telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
+                            audioshare_protocol::diagnostics::warn(
+                                "client-rx",
+                                format!(
+                                    "PLC burst resync: {} consecutive empty ticks ({:.1}ms), resetting stream at seq {}",
+                                    consecutive_empty_ticks,
+                                    consecutive_empty_ticks as f32 * 2.5,
+                                    next_play_seq
+                                ),
+                            );
                             prebuffer_ready = false;
                             stream_initialized = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
@@ -4080,6 +4236,60 @@ mod tests {
             "observation {observation} must fall below setpoint {target} when the FIFO drains"
         );
     }
+
+    /// The pasteable diagnostics summary must expose the new observability
+    /// counters (late loss, resyncs, PLC burst high-water mark + ms) alongside
+    /// the recovery counters and the latency snapshot fields.
+    #[test]
+    fn test_client_diagnostics_summary_includes_late_resync_and_plc_burst() {
+        // No host needed: RX loop idles on an unused loopback port.
+        let mut client = ClientEngine::connect_with_pin(
+            ClientConfig {
+                server_addr: SocketAddr::from(([127, 0, 0, 1], 9)),
+                target_buffer_subframes: 4.0,
+                preamp_gain_db: 0.0,
+                dolby_effects: false,
+            },
+            Some("1234"),
+        )
+        .expect("connect client for diagnostics summary test");
+
+        client
+            .telemetry
+            .late_subframes_dropped
+            .store(7, Ordering::Relaxed);
+        client.telemetry.stream_resyncs.store(2, Ordering::Relaxed);
+        client.telemetry.max_consecutive_plc.store(80, Ordering::Relaxed);
+        client
+            .telemetry
+            .aaudio_xrun_count
+            .store(3, Ordering::Relaxed);
+        client
+            .telemetry
+            .fec_healed_frames
+            .store(11, Ordering::Relaxed);
+        client
+            .telemetry
+            .plc_extrapolated_frames
+            .store(13, Ordering::Relaxed);
+        client.telemetry.clock_drift_ppm.store(-42, Ordering::Relaxed);
+        client.telemetry.auth_failures.store(5, Ordering::Relaxed);
+
+        let summary = client.telemetry.diagnostics_summary(5.0);
+        assert!(summary.contains("late_subframes_dropped=7"), "{summary}");
+        assert!(summary.contains("stream_resyncs=2"), "{summary}");
+        assert!(summary.contains("max_consecutive_plc=80"), "{summary}");
+        assert!(summary.contains("200.0ms"), "{summary}"); // 80 * 2.5 ms
+        assert!(summary.contains("aaudio_xrun_count=3"), "{summary}");
+        assert!(summary.contains("fec_healed_frames=11"), "{summary}");
+        assert!(summary.contains("plc_extrapolated_frames=13"), "{summary}");
+        assert!(summary.contains("clock_drift_ppm=-42"), "{summary}");
+        assert!(summary.contains("auth_failures=5"), "{summary}");
+        // Latency snapshot fields (exact names from ClientLatencySnapshot).
+        assert!(summary.contains("output_buffer_ms=5.00"), "{summary}");
+        assert!(summary.contains("estimated_one_way_ms="), "{summary}");
+        client.stop();
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -4253,6 +4463,12 @@ pub mod android_aaudio {
         fn AAudioStream_getFormat(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_getBufferCapacityInFrames(stream: *mut AAudioStream) -> i32;
+        // API 26 base getters used by the diagnostics report. Unlike the API
+        // 36 mmap probe below these are safe to link directly.
+        fn AAudioStream_getSharingMode(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getPerformanceMode(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getBufferSizeInFrames(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getXRunCount(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
         fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
         fn AAudioStream_getTimestamp(
@@ -4338,6 +4554,15 @@ pub mod android_aaudio {
         #[inline]
         pub fn frames_per_burst(&self) -> u32 {
             self.frames_per_burst
+        }
+
+        /// HAL-reported underrun/overrun count since this stream started.
+        #[inline]
+        pub fn xrun_count(&self) -> u32 {
+            if self.stream.is_null() {
+                return 0;
+            }
+            unsafe { AAudioStream_getXRunCount(self.stream).max(0) as u32 }
         }
 
         /// Measure the downstream hardware/DAC pipeline latency from the
@@ -4504,6 +4729,38 @@ pub mod android_aaudio {
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
                 }
+
+                // API 36: AAudioStream_isMMapUsed is not in the API 26 NDK
+                // surface. Resolve it by dlsym ONLY so this library never
+                // carries a direct link dependency on a symbol absent on older
+                // devices. A missing symbol simply reports "unknown".
+                let mmap_used = if let Some(sym) =
+                    aaudio_builder_symbol(b"AAudioStream_isMMapUsed\0")
+                {
+                    let f: unsafe extern "C" fn(*mut AAudioStream) -> bool =
+                        core::mem::transmute(sym);
+                    Some(f(stream))
+                } else {
+                    None
+                };
+                audioshare_protocol::diagnostics::info(
+                    "aaudio",
+                    format!(
+                        "output started: rate={}Hz burst={} buf={}/{} sharing={} perf={} mmap={}",
+                        actual_sample_rate,
+                        raw_burst,
+                        AAudioStream_getBufferSizeInFrames(stream),
+                        cap_for_burst,
+                        AAudioStream_getSharingMode(stream),
+                        AAudioStream_getPerformanceMode(stream),
+                        match mmap_used {
+                            Some(true) => "yes",
+                            Some(false) => "no",
+                            None => "unknown",
+                        }
+                    ),
+                );
+
                 Some(Self {
                     stream,
                     ctx_ptr,
