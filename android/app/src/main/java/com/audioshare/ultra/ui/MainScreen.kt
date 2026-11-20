@@ -190,7 +190,8 @@ private fun TelemetryDrawerSection(
     onToggleLatencyDebug: () -> Unit,
     onBtOverrideChanged: (Int) -> Unit,
     onBtOverrideFinished: () -> Unit,
-    onBtAuto: () -> Unit
+    onBtAuto: () -> Unit,
+    diagnosticsActions: @Composable () -> Unit
 ) {
     val t = telemetry()
     ProDrawerHeader(
@@ -314,6 +315,9 @@ private fun TelemetryDrawerSection(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
+
+            HorizontalDivider(color = Color(0xFF243047))
+            diagnosticsActions()
         }
     }
 }
@@ -398,6 +402,88 @@ private fun PartyTelemetrySection(
             onDismiss = onDismissQr,
             onCopied = onCopied
         )
+    }
+}
+
+/**
+ * Shared Copy/Share diagnostics actions used by both the Tools bottom sheet and
+ * the Connect-tab telemetry drawer. [onDone] runs before any Snackbar is shown
+ * so the Tools sheet can dismiss itself first and keep the message visible.
+ */
+@Composable
+private fun DiagnosticsActionsRow(
+    snackbarHostState: SnackbarHostState,
+    onDone: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        OutlinedButton(
+            onClick = {
+                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                    .getOrNull()?.takeIf { it.isNotBlank() }
+                // Dismiss first so the Snackbar is not hidden behind the sheet.
+                onDone()
+                if (diag == null) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Diagnostics unavailable")
+                    }
+                } else {
+                    val diagChars = diag.length
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                        as? android.content.ClipboardManager
+                    if (cm != null) {
+                        cm.setPrimaryClip(
+                            ClipData.newPlainText("AudioShare Ultra diagnostics", diag)
+                        )
+                    }
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Diagnostics copied ($diagChars chars)")
+                    }
+                }
+            },
+            modifier = Modifier.weight(1f)
+        ) {
+            Icon(
+                Icons.Rounded.ContentCopy,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Copy Diag", maxLines = 1)
+        }
+        OutlinedButton(
+            onClick = {
+                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                    .getOrNull()?.takeIf { it.isNotBlank() }
+                onDone()
+                if (diag != null) {
+                    // Capture the nullable local into a non-null local before use.
+                    val diagText: String = diag
+                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, diagText)
+                    }
+                    runCatching {
+                        context.startActivity(
+                            Intent.createChooser(sendIntent, "Share diagnostics")
+                        )
+                    }
+                }
+            },
+            modifier = Modifier.weight(1f)
+        ) {
+            Icon(
+                Icons.Rounded.Share,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Share Diag", maxLines = 1)
+        }
     }
 }
 
@@ -1164,6 +1250,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
                         )
+                    },
+                    // No sheet to dismiss here; the Scaffold SnackbarHost is shared.
+                    diagnosticsActions = {
+                        DiagnosticsActionsRow(
+                            snackbarHostState = snackbarHostState,
+                            onDone = {}
+                        )
                     }
                 )
             } // End Tab 0
@@ -1664,13 +1757,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     if (showToolsSheet) {
         ModalBottomSheet(
             onDismissRequest = { showToolsSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
             containerColor = StudioColors.CardBg
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 20.dp, vertical = 10.dp)
-                    .navigationBarsPadding(),
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 SectionEyebrow("Remote PC Playback")
@@ -1741,73 +1836,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = {
-                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                                .getOrNull()?.takeIf { it.isNotBlank() }
-                            // Dismiss first so the Snackbar is not hidden behind the sheet.
-                            showToolsSheet = false
-                            if (diag == null) {
-                                scope.launch {
-                                    snackbarHostState.showSnackbar("Diagnostics unavailable")
-                                }
-                            } else {
-                                val diagChars = diag.length
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
-                                    as? android.content.ClipboardManager
-                                if (cm != null) {
-                                    cm.setPrimaryClip(
-                                        ClipData.newPlainText("AudioShare Ultra diagnostics", diag)
-                                    )
-                                }
-                                scope.launch {
-                                    snackbarHostState.showSnackbar("Diagnostics copied ($diagChars chars)")
-                                }
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(
-                            Icons.Rounded.ContentCopy,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text("Copy Diag", maxLines = 1)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                                .getOrNull()?.takeIf { it.isNotBlank() }
-                            showToolsSheet = false
-                            if (diag != null) {
-                                val diagText: String = diag
-                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                                    type = "text/plain"
-                                    putExtra(Intent.EXTRA_TEXT, diagText)
-                                }
-                                runCatching {
-                                    context.startActivity(
-                                        Intent.createChooser(sendIntent, "Share diagnostics")
-                                    )
-                                }
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(
-                            Icons.Rounded.Share,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text("Share Diag", maxLines = 1)
-                    }
-                }
+                DiagnosticsActionsRow(
+                    snackbarHostState = snackbarHostState,
+                    onDone = { showToolsSheet = false }
+                )
                 Spacer(Modifier.height(12.dp))
             }
         }
