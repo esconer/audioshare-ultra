@@ -1349,6 +1349,10 @@ impl AudioShareApp {
                             }
                             if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
                                 self.hotspot_status = open_os_firewall_ports();
+                                #[cfg(target_os = "windows")]
+                                {
+                                    self.windows_firewall_ok = is_windows_firewall_configured();
+                                }
                             }
                         });
                         ui.label(
@@ -1581,8 +1585,6 @@ impl AudioShareApp {
                 );
             }
 
-            // DEFERRED_CI: gated on Windows because is_windows_firewall_configured()
-            // (L4) and telemetry.rejected_handshakes (L1) arrive in later merges.
             #[cfg(target_os = "windows")]
             {
                 if !self.windows_firewall_ok {
@@ -1603,23 +1605,39 @@ impl AudioShareApp {
                     });
                 }
 
-                let rejected = self
-                    .host_engine
-                    .as_ref()
-                    .map(|h| h.telemetry.rejected_handshakes.load(Ordering::Relaxed))
-                    .unwrap_or(0);
-                if rejected > 0 {
+                if self.enable_virtual_speaker
+                    && self
+                        .os_guard
+                        .as_ref()
+                        .map(|g| !g.is_virtual_speaker_available())
+                        .unwrap_or(false)
+                {
                     ui.add_space(2.0);
                     uw::status_pill(
                         ui,
-                        &format!(
-                            "Rejected {} client handshake(s) — check matching PIN & app version (v2)",
-                            rejected
-                        ),
+                        "Virtual Speaker not found — install VB-Cable (CABLE Input) or mute PC speakers",
                         egui::Color32::from_rgb(66, 32, 6),
                         egui::Color32::from_rgb(253, 224, 71),
                     );
                 }
+            }
+
+            let rejected = self
+                .host_engine
+                .as_ref()
+                .map(|h| h.telemetry.rejected_handshakes.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            if rejected > 0 {
+                ui.add_space(2.0);
+                uw::status_pill(
+                    ui,
+                    &format!(
+                        "Rejected {} client handshake(s) — check matching PIN & app version (v2)",
+                        rejected
+                    ),
+                    egui::Color32::from_rgb(66, 32, 6),
+                    egui::Color32::from_rgb(253, 224, 71),
+                );
             }
         });
 
