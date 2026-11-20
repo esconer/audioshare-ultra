@@ -37,6 +37,9 @@ class PhoneAudioCaster(
     @Volatile
     private var audioRecord: AudioRecord? = null
 
+    @Volatile
+    private var readerThread: Thread? = null
+
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
             // The system (or the user via the status bar) revoked projection.
@@ -140,7 +143,7 @@ class PhoneAudioCaster(
             }
             running = true
             val activeRecord = built
-            thread(name = "as-ultra-phone-caster", isDaemon = true) {
+            readerThread = thread(name = "as-ultra-phone-caster", isDaemon = true) {
                 try {
                     android.os.Process.setThreadPriority(
                         android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
@@ -186,6 +189,7 @@ class PhoneAudioCaster(
                     val wasStopRequested = stopRequested
                     running = false
                     audioRecord = null
+                    readerThread = null
                     runCatching { activeRecord.stop() }
                     runCatching { activeRecord.release() }
                     runCatching { mediaProjection.unregisterCallback(projectionCallback) }
@@ -222,12 +226,16 @@ class PhoneAudioCaster(
     }
 
     fun stopCasting() {
-        if (!running && audioRecord == null) return
+        if (!running && audioRecord == null && readerThread == null) return
         stopRequested = true
         running = false
         // `AudioRecord.stop()` is safe from another thread and unblocks a
         // pending READ_BLOCKING call. Do not release here: the reader thread
         // owns the final teardown so native memory is never freed mid-read.
         runCatching { audioRecord?.stop() }
+        val t = readerThread
+        if (t != null && t !== Thread.currentThread()) {
+            runCatching { t.join(500L) }
+        }
     }
 }
