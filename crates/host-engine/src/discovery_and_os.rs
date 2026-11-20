@@ -1152,6 +1152,12 @@ impl VirtualSpeakerAndRadioGuard {
         }
     }
 
+    /// Returns `true` if a virtual playback endpoint was found/created and can
+    /// be switched to while clients are connected.
+    pub fn is_virtual_speaker_available(&self) -> bool {
+        self.enabled
+    }
+
     /// Route the default output into the virtual speaker and capture its
     /// monitor. Idempotent; safe to call from the GUI update loop.
     pub fn activate(&mut self) {
@@ -1344,6 +1350,14 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_powershell_utf16le_base64() {
+        // Acceptance test (n1 item 2): "hi" -> UTF-16LE `68 00 69 00` -> base64.
+        assert_eq!(encode_powershell_utf16le_base64("hi"), "aABpAA==");
+        // Non-ASCII: "é" (U+00E9) -> UTF-16LE `E9 00` -> base64.
+        assert_eq!(encode_powershell_utf16le_base64("é"), "6QA=");
+    }
 
     #[test]
     fn test_discovery_beacon_rejects_port_zero() {
