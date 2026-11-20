@@ -21,7 +21,9 @@ use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::opus_codec::OpusStreamEncoder;
+use audioshare_protocol::opus_codec::{
+    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES,
+};
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
     CONTROL_FEEDBACK_MAGIC,
@@ -546,6 +548,14 @@ impl PhoneMicTransmitter {
                 // Newest-first ADPCM FEC history: hist[0] = N-1 ... hist[3] = N-4.
                 let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
                 let mut fec_hist_len = 0usize;
+                // Exact Opus RED ring ([P-1] / [P-2]) for `OpusRld` packets.
+                // Self-describing blobs from `pack_opus_red_blob` ride in
+                // `WireHeader::fec_n1` / `fec_n2`, so two consecutive dropped
+                // 10 ms Opus packets heal with zero CELT PLC frames.
+                let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
+                let mut opus_red_prev1_len: usize = 0;
+                let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
+                let mut opus_red_prev2_len: usize = 0;
                 let mut dither_rng = 1u32;
                 let mut noise_shaper =
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
@@ -732,6 +742,9 @@ impl PhoneMicTransmitter {
                             );
                             opus_encoder = None;
                             fec_hist_len = 0;
+                            // No listener means no Opus chain to continue.
+                            opus_red_prev1_len = 0;
+                            opus_red_prev2_len = 0;
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -809,6 +822,10 @@ impl PhoneMicTransmitter {
                         if dtx {
                             opus_encoder = None;
                             fec_hist_len = 0;
+                            // Silence breaks the exact-Opus chain: the next
+                            // real Opus packet starts with no prior blobs.
+                            opus_red_prev1_len = 0;
+                            opus_red_prev2_len = 0;
                             let now = Instant::now();
                             if !party_dtx_heartbeat_due(last_party_dtx_heartbeat, now) {
                                 // Nothing goes out: leave last_tx at the last
@@ -845,6 +862,10 @@ impl PhoneMicTransmitter {
                         if !dtx {
                             if !use_compressed {
                                 opus_encoder = None;
+                                // Leaving Opus invalidates the exact-Opus RED
+                                // history; ADPCM FEC takes over again.
+                                opus_red_prev1_len = 0;
+                                opus_red_prev2_len = 0;
                             } else if opus_encoder.is_none() && opus_available {
                                 opus_encoder = OpusStreamEncoder::new(target_kbps);
                                 opus_available = opus_encoder.is_some();
@@ -852,6 +873,10 @@ impl PhoneMicTransmitter {
                         }
 
                         let mut codec_mode = packet_codec;
+                        // Byte ranges of this packet's tagged Opus subframes
+                        // inside `primary_bundle`, captured for the RED ring.
+                        let mut opus_sf_ranges: [(usize, usize); 4] = [(0, 0); 4];
+                        let mut opus_sf_count = 0usize;
                         if !dtx {
                             let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
                             let mut opus_primary = use_compressed && opus_encoder.is_some();
@@ -870,6 +895,9 @@ impl PhoneMicTransmitter {
                                         opus_encoder = None;
                                         opus_available = false;
                                         opus_primary = false;
+                                        opus_sf_count = 0;
+                                        opus_red_prev1_len = 0;
+                                        opus_red_prev2_len = 0;
                                         break;
                                     };
                                     let len_be = (enc_len as u16).to_be_bytes();
@@ -878,6 +906,8 @@ impl PhoneMicTransmitter {
                                     cursor += 2;
                                     primary_bundle[cursor..cursor + enc_len]
                                         .copy_from_slice(&enc[..enc_len]);
+                                    opus_sf_ranges[opus_sf_count] = (cursor, enc_len);
+                                    opus_sf_count += 1;
                                     cursor += enc_len;
                                 }
                             }
@@ -905,16 +935,23 @@ impl PhoneMicTransmitter {
                             };
 
                             if opus_primary {
-                                // Receivers heal Opus gaps with the codec's own
-                                // phase-aligned CELT PLC. A zero-lookahead ADPCM
-                                // backup would jump the waveform by one subframe,
-                                // so suppress it and save 248 bytes per packet.
+                                // A zero-lookahead ADPCM backup would jump the
+                                // waveform by one subframe, so suppress it.
+                                // The FEC slots instead carry the exact prior
+                                // Opus packets (see `f1` / `f2` below).
                                 fec_hist_len = 0;
                             } else {
                                 for frame in pcm_frames.iter().take(subframes_per_pkt) {
                                     push_fec_history(&mut fec_hist, &mut fec_hist_len, frame);
                                 }
                             }
+                        }
+                        // All `primary_bundle` writes are complete: borrow the
+                        // tagged Opus subframes for the RED packer.
+                        let mut opus_slices: [&[u8]; 4] = [&[]; 4];
+                        for i in 0..opus_sf_count {
+                            let (start, len) = opus_sf_ranges[i];
+                            opus_slices[i] = &primary_bundle[start..start + len];
                         }
                         // Group-sync alignment only makes sense with at least
                         // two distinct listeners; a single listener's two
@@ -978,8 +1015,20 @@ impl PhoneMicTransmitter {
                                 &mut fec_pair_2,
                             )
                         };
-                        let f1 = &fec_pair_1[..n1_len];
-                        let f2 = &fec_pair_2[..n2_len];
+                        // Opus RLD piggybacks the exact prior packets in the
+                        // FEC slots; a zero-lookahead ADPCM backup would jump
+                        // the waveform by one subframe. Non-Opus mode keeps
+                        // the existing 4-slot ADPCM FEC history layout.
+                        let (f1, f2): (&[u8], &[u8]) = if dtx {
+                            (&[], &[])
+                        } else if codec_mode == CodecMode::OpusRld {
+                            (
+                                &opus_red_prev1[..opus_red_prev1_len],
+                                &opus_red_prev2[..opus_red_prev2_len],
+                            )
+                        } else {
+                            (&fec_pair_1[..n1_len], &fec_pair_2[..n2_len])
+                        };
                         let packed = pack_datagram_with_key(
                             hdr,
                             primary,
@@ -989,9 +1038,10 @@ impl PhoneMicTransmitter {
                             &mut dgram,
                         )
                         .or_else(|_| {
-                            // Oversized lossless burst + FEC would otherwise
-                            // drop the whole datagram. Retry without the ADPCM
-                            // backups so loud audio still reaches listeners.
+                            // An oversized lossless burst + FEC would otherwise
+                            // drop the whole datagram. Retry without any FEC
+                            // backups (ADPCM or Opus RED) so loud audio still
+                            // reaches listeners.
                             pack_datagram_with_key(
                                 hdr,
                                 primary,
@@ -1006,6 +1056,21 @@ impl PhoneMicTransmitter {
                                 let _ = socket.send_to(&dgram[..pkt_len], *target);
                             }
                             last_tx = Some(Instant::now());
+
+                            // P becomes [P-1] for the next Opus packet and the
+                            // old [P-1] becomes [P-2]. A bitrate spike that
+                            // cannot fit in 255 B leaves [P-1] empty for one
+                            // packet instead of dropping the whole datagram.
+                            if !dtx && codec_mode == CodecMode::OpusRld {
+                                opus_red_prev2.copy_from_slice(&opus_red_prev1);
+                                opus_red_prev2_len = opus_red_prev1_len;
+                                opus_red_prev1_len = pack_opus_red_blob(
+                                    base_seq,
+                                    &opus_slices[..opus_sf_count],
+                                    &mut opus_red_prev1,
+                                )
+                                .unwrap_or(0);
+                            }
                         }
                     } else {
                         std::thread::sleep(Duration::from_micros(800));

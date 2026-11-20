@@ -14,9 +14,11 @@ use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
     decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
 };
-use audioshare_protocol::opus_codec::{OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, TAG_OPUS_RLD};
+use audioshare_protocol::opus_codec::{
+    unpack_opus_red_blob, OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, TAG_OPUS_RED, TAG_OPUS_RLD,
+};
 use audioshare_protocol::sequencer::{
-    ZeroJitterSequencer, RING_SLOTS, STATUS_EMPTY, STATUS_PRIMARY_LOSSLESS,
+    ZeroJitterSequencer, RING_SLOTS, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
 };
 use audioshare_protocol::sync_and_eq::GroupSyncEstimator;
 use audioshare_protocol::wire::{
@@ -238,6 +240,10 @@ struct OpusPacketSlot {
     seq: Option<u16>,
     len: u16,
     data: [u8; MAX_OPUS_SUBFRAME_BYTES],
+    /// True when this payload was recovered from an Opus RED redundancy blob
+    /// instead of arriving as a primary subframe. The playhead counts these as
+    /// FEC-healed, never as primary audio.
+    from_red: bool,
 }
 
 impl OpusPacketSlot {
@@ -245,7 +251,65 @@ impl OpusPacketSlot {
         seq: None,
         len: 0,
         data: [0u8; MAX_OPUS_SUBFRAME_BYTES],
+        from_red: false,
     };
+}
+
+/// Status for a successfully decoded Opus slot at the playhead.
+///
+/// RED-recovered frames carry real encoded audio, but they are recovered
+/// payloads, so they must be tallied as FEC-healed instead of primary. This
+/// receiver's only pop-time telemetry is the `fb_primary_frames` /
+/// `fb_recovered_or_lost` pair that feeds the Party Host FEC-permille feedback;
+/// every non-primary status lands in `fb_recovered_or_lost`. If a dedicated
+/// `HostTelemetry::fec_healed_frames` counter is added here later, `from_red`
+/// at this pop site is where to increment it.
+#[inline]
+fn opus_pop_status(from_red: bool) -> u32 {
+    if from_red {
+        STATUS_HEALED_BY_FEC
+    } else {
+        STATUS_PRIMARY_LOSSLESS
+    }
+}
+
+/// Heal missing `opus_ring` slots from one Opus RED blob carried in a
+/// `WireHeader` FEC field.
+///
+/// Mirrors the client engine's receiver: only slots at or ahead of the
+/// playhead, inside the ring window, not already backed by a primary frame,
+/// and small enough for the fixed slot buffer are filled. Inserted slots are
+/// flagged `from_red = true` so they are counted as FEC-healed, not primary,
+/// when the playhead pops them.
+fn heal_opus_red_slots(
+    red_blob: &[u8],
+    next_seq: u16,
+    sequencer: &ZeroJitterSequencer,
+    opus_ring: &mut [OpusPacketSlot],
+) {
+    if red_blob.first() != Some(&TAG_OPUS_RED) {
+        return;
+    }
+    let _ = unpack_opus_red_blob(red_blob, |red_seq, red_payload| {
+        let delta = red_seq.wrapping_sub(next_seq) as i16;
+        if delta < 0
+            || delta >= RING_SLOTS as i16
+            || red_payload.len() > MAX_OPUS_SUBFRAME_BYTES
+        {
+            return;
+        }
+        let slot = &mut opus_ring[(red_seq as usize) & (RING_SLOTS - 1)];
+        // A primary copy (or an earlier RED heal) already in the slot always
+        // wins: never overwrite it or count the same recovery twice.
+        if slot.seq == Some(red_seq) || sequencer.has_primary(red_seq) {
+            return;
+        }
+        let len = red_payload.len();
+        slot.data[..len].copy_from_slice(red_payload);
+        slot.len = len as u16;
+        slot.seq = Some(red_seq);
+        slot.from_red = true;
+    });
 }
 
 /// Track decoded PCM level and a returned latency-sonar chirp. Shared by the
@@ -402,7 +466,9 @@ fn push_one_subframe(
         // duplicate frame.
         let slot = &mut opus_ring[opus_idx];
         let len = slot.len as usize;
+        let from_red = slot.from_red;
         slot.seq = None;
+        slot.from_red = false; // clear so a future primary reusing this slot is not mis-tallied
         if opus_decoder.is_none() {
             *opus_decoder = OpusStreamDecoder::new();
         }
@@ -416,7 +482,7 @@ fn push_one_subframe(
             // Splice with the sequencer's predictor/history so a following
             // WSOLA or FEC frame does not click at the codec boundary.
             sequencer.finalize_external_frame(&mut frame, false);
-            STATUS_PRIMARY_LOSSLESS
+            opus_pop_status(from_red)
         } else {
             sequencer.pop_next(play_seq, &mut frame)
         }
@@ -961,6 +1027,9 @@ impl PhoneMicReceiver {
                                             slot.data[..len].copy_from_slice(&payload[..len]);
                                             slot.len = len as u16;
                                             slot.seq = Some(s);
+                                            // A primary always wins over any RED
+                                            // heal that previously occupied the slot.
+                                            slot.from_red = false;
                                         }
                                         if (s.wrapping_sub(opus_latest) as i16) > 0 {
                                             opus_latest = s;
@@ -973,6 +1042,27 @@ impl PhoneMicReceiver {
                             );
                             if (opus_latest.wrapping_sub(latest_seq) as i16) > 0 {
                                 latest_seq = opus_latest;
+                            }
+
+                            // Opus RED: the phone transmitter piggybacks the
+                            // exact prior packets ([P-1]/[P-2]) in the FEC
+                            // fields while OpusRld is active. Now that this
+                            // packet's primaries are buffered, heal any still
+                            // empty slots at or ahead of the playhead from
+                            // both blobs. A late primary still wins, and the
+                            // healed slots are flagged so they are counted as
+                            // FEC-healed (never primary) at pop time.
+                            if parsed.header.mode == CodecMode::OpusRld {
+                                for red_blob in
+                                    [parsed.fec_n1_payload, parsed.fec_n2_payload]
+                                {
+                                    heal_opus_red_slots(
+                                        red_blob,
+                                        next_seq,
+                                        &sequencer,
+                                        &mut opus_ring,
+                                    );
+                                }
                             }
 
                             // Keep only the planned cushion (one callback plus
@@ -2046,5 +2136,50 @@ mod tests {
         assert_eq!(buffered.len(), 1);
         assert_eq!(buffered[0].0, 55);
         assert_eq!(&buffered[0].1[..], &payload[..len]);
+    }
+
+    #[test]
+    fn test_opus_red_slots_are_inserted_and_counted_as_fec_healed() {
+        use audioshare_protocol::opus_codec::{pack_opus_red_blob, MAX_OPUS_RED_BYTES};
+
+        // The insertion test only checks slot bookkeeping, so the payload bytes
+        // need not be decodable Opus frames here.
+        let sf1: &[u8] = &[TAG_OPUS_RLD, 0x11, 0x22, 0x33];
+        let sf2: &[u8] = &[TAG_OPUS_RLD, 0x44, 0x55];
+        let mut blob = [0u8; MAX_OPUS_RED_BYTES];
+        let blob_len = pack_opus_red_blob(100, &[sf1, sf2], &mut blob)
+            .expect("two small subframes must fit in a RED blob");
+        assert_eq!(blob[0], TAG_OPUS_RED);
+
+        let sequencer = ZeroJitterSequencer::new();
+        let mut opus_ring = vec![OpusPacketSlot::EMPTY; RING_SLOTS];
+        let next_seq = 100u16;
+
+        heal_opus_red_slots(&blob[..blob_len], next_seq, &sequencer, &mut opus_ring);
+
+        for (i, expected) in [sf1, sf2].into_iter().enumerate() {
+            let seq = 100u16 + i as u16;
+            let slot = &opus_ring[(seq as usize) & (RING_SLOTS - 1)];
+            assert_eq!(slot.seq, Some(seq), "RED slot {seq} must be filled");
+            assert!(slot.from_red, "RED slot {seq} must be flagged from_red");
+            assert_eq!(&slot.data[..slot.len as usize], expected);
+            // At pop time a RED slot maps to FEC-healed, never primary.
+            assert_eq!(opus_pop_status(slot.from_red), STATUS_HEALED_BY_FEC);
+        }
+        assert_eq!(opus_pop_status(false), STATUS_PRIMARY_LOSSLESS);
+
+        // A non-RED FEC field is ignored, and a slot already holding a healed
+        // frame is never overwritten or double-counted.
+        heal_opus_red_slots(&[0x7E, 0x00], next_seq, &sequencer, &mut opus_ring);
+        assert_eq!(opus_ring[100 & (RING_SLOTS - 1)].seq, Some(100));
+        heal_opus_red_slots(&blob[..blob_len], next_seq, &sequencer, &mut opus_ring);
+        assert_eq!(opus_ring[100 & (RING_SLOTS - 1)].seq, Some(100));
+
+        // A sequence behind the playhead is rejected: that slot has already
+        // been played and must not be reinserted by a stale RED blob.
+        let mut old_blob = [0u8; MAX_OPUS_RED_BYTES];
+        let old_len = pack_opus_red_blob(99, &[sf2], &mut old_blob).unwrap();
+        heal_opus_red_slots(&old_blob[..old_len], next_seq, &sequencer, &mut opus_ring);
+        assert_ne!(opus_ring[99 & (RING_SLOTS - 1)].seq, Some(99));
     }
 }

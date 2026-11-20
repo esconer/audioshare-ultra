@@ -33,6 +33,87 @@ pub const MAX_OPUS_SUBFRAME_BYTES: usize = 241;
 /// Maximum Opus packet bytes after the tag.
 pub const MAX_OPUS_PACKET_BYTES: usize = MAX_OPUS_SUBFRAME_BYTES - 1;
 
+/// Magic tag identifying an exact Opus REDundancy blob stored inside
+/// `WireHeader::fec_n1` / `fec_n2` when `CodecMode::OpusRld` is active.
+/// Layout: `[TAG_OPUS_RED, base_seq_lo, base_seq_hi, sf_count, (len: u8, bytes[..len]) * sf_count]`
+/// Fits cleanly inside the existing `u8` (255 B) FEC length field with zero WireHeader change.
+pub const TAG_OPUS_RED: u8 = 0xF1;
+pub const MAX_OPUS_RED_BYTES: usize = u8::MAX as usize;
+
+/// Packs 1..=4 encoded Opus subframes from one packet into a self-describing
+/// redundancy blob (`<= 255` bytes). Returns `None` if a transient bitrate spike
+/// exceeds 255 bytes (gracefully skipping RED for that single packet).
+pub fn pack_opus_red_blob(
+    base_seq: u16,
+    subframes: &[&[u8]],
+    out: &mut [u8; MAX_OPUS_RED_BYTES],
+) -> Option<usize> {
+    if subframes.is_empty() || subframes.len() > 4 {
+        return None;
+    }
+    let [lo, hi] = base_seq.to_le_bytes();
+    out[0] = TAG_OPUS_RED;
+    out[1] = lo;
+    out[2] = hi;
+    out[3] = subframes.len() as u8;
+    let mut cursor = 4usize;
+    for sf in subframes {
+        if sf.is_empty() || sf.len() > u8::MAX as usize {
+            return None;
+        }
+        let needed = 1 + sf.len();
+        if cursor + needed > MAX_OPUS_RED_BYTES {
+            return None;
+        }
+        out[cursor] = sf.len() as u8;
+        cursor += 1;
+        out[cursor..cursor + sf.len()].copy_from_slice(sf);
+        cursor += sf.len();
+    }
+    Some(cursor)
+}
+
+/// Unpacks an Opus RED blob and invokes `on_subframe(seq, opus_payload)` for each
+/// validated subframe. Rejects truncated or trailing-garbage blobs cleanly.
+pub fn unpack_opus_red_blob<F>(blob: &[u8], mut on_subframe: F) -> bool
+where
+    F: FnMut(u16, &[u8]),
+{
+    if blob.len() < 5 || blob[0] != TAG_OPUS_RED {
+        return false;
+    }
+    let base_seq = u16::from_le_bytes([blob[1], blob[2]]);
+    let count = blob[3] as usize;
+    if count == 0 || count > 4 {
+        return false;
+    }
+    // Pass 1: exact-length validation before mutating receiver state.
+    let mut cursor = 4usize;
+    for _ in 0..count {
+        if cursor >= blob.len() {
+            return false;
+        }
+        let len = blob[cursor] as usize;
+        cursor += 1;
+        if len == 0 || cursor + len > blob.len() {
+            return false;
+        }
+        cursor += len;
+    }
+    if cursor != blob.len() {
+        return false;
+    }
+    // Pass 2: emit validated subframes in sequence order.
+    let mut cursor = 4usize;
+    for i in 0..count {
+        let len = blob[cursor] as usize;
+        cursor += 1;
+        on_subframe(base_seq.wrapping_add(i as u16), &blob[cursor..cursor + len]);
+        cursor += len;
+    }
+    true
+}
+
 /// Verified `OPUS_GET_LOOKAHEAD` for `RestrictedLowDelay` at 48 kHz.
 ///
 /// This is the only codec delay added by the Opus path. The lossless LPC and
@@ -753,6 +834,100 @@ mod tests {
         assert_eq!(encoder.lookahead_samples(), SUBFRAME_FRAMES);
         assert_eq!(OPUS_LOOKAHEAD_MS, 2.5);
         assert!(is_available());
+    }
+
+    #[test]
+    fn test_opus_red_blob_round_trip() {
+        let sf1 = [1u8, 2, 3, 4, 5];
+        let sf2 = [9u8, 8, 7];
+        let sf3 = [0xABu8];
+        let mut out = [0u8; MAX_OPUS_RED_BYTES];
+
+        let packed = pack_opus_red_blob(0x1234, &[&sf1, &sf2, &sf3], &mut out).expect("pack");
+        assert_eq!(out[0], TAG_OPUS_RED);
+        assert_eq!(out[1], 0x34);
+        assert_eq!(out[2], 0x12);
+        assert_eq!(out[3], 3);
+        assert!(packed <= MAX_OPUS_RED_BYTES);
+
+        let mut seen: Vec<(u16, Vec<u8>)> = Vec::new();
+        assert!(unpack_opus_red_blob(&out[..packed], |seq, payload| {
+            seen.push((seq, payload.to_vec()));
+        }));
+        assert_eq!(
+            seen,
+            vec![
+                (0x1234, sf1.to_vec()),
+                (0x1235, sf2.to_vec()),
+                (0x1236, sf3.to_vec()),
+            ]
+        );
+
+        // base_seq wraps cleanly at u16::MAX.
+        let packed = pack_opus_red_blob(u16::MAX, &[&sf1, &sf2], &mut out).expect("pack wrap");
+        let mut wrap_seqs = Vec::new();
+        assert!(unpack_opus_red_blob(&out[..packed], |seq, _| wrap_seqs.push(seq)));
+        assert_eq!(wrap_seqs, vec![u16::MAX, 0]);
+    }
+
+    #[test]
+    fn test_opus_red_blob_rejects_oversize() {
+        let mut out = [0u8; MAX_OPUS_RED_BYTES];
+
+        // A single subframe larger than u8::MAX cannot be length-prefixed.
+        let huge = vec![0x5Au8; MAX_OPUS_RED_BYTES + 1];
+        assert_eq!(pack_opus_red_blob(1, &[&huge], &mut out), None);
+
+        // Individually-valid subframes can still overflow the 255-byte budget.
+        let chunk = vec![0x5Au8; 100];
+        assert_eq!(pack_opus_red_blob(1, &[&chunk, &chunk, &chunk], &mut out), None);
+
+        // Empty blob, >4 subframes, and empty individual subframes are rejected.
+        assert_eq!(pack_opus_red_blob(1, &[], &mut out), None);
+        let one: &[u8] = &[1u8];
+        let five: Vec<&[u8]> = vec![one, one, one, one, one];
+        assert_eq!(pack_opus_red_blob(1, &five, &mut out), None);
+        assert_eq!(pack_opus_red_blob(1, &[&[]], &mut out), None);
+    }
+
+    #[test]
+    fn test_opus_red_blob_rejects_truncated_and_trailing() {
+        let sf1 = [1u8, 2, 3];
+        let sf2 = [4u8, 5];
+        let mut out = [0u8; MAX_OPUS_RED_BYTES];
+        let packed = pack_opus_red_blob(7, &[&sf1, &sf2], &mut out).unwrap();
+        let blob = out[..packed].to_vec();
+
+        // The well-formed blob emits exactly two subframes.
+        let mut valid_count = 0;
+        assert!(unpack_opus_red_blob(&blob, |_, _| valid_count += 1));
+        assert_eq!(valid_count, 2);
+
+        // No callback may ever fire for a rejected blob (2-pass validation).
+        let mut probes = 0u32;
+        // Payload truncated by one byte.
+        assert!(!unpack_opus_red_blob(&blob[..blob.len() - 1], |_, _| probes += 1));
+        // Trailing garbage byte after an otherwise complete blob.
+        let mut trailing = blob.clone();
+        trailing.push(0x00);
+        assert!(!unpack_opus_red_blob(&trailing, |_, _| probes += 1));
+        // Foreign tag and too-short header.
+        let mut foreign = blob.clone();
+        foreign[0] = 0x00;
+        assert!(!unpack_opus_red_blob(&foreign, |_, _| probes += 1));
+        assert!(!unpack_opus_red_blob(&blob[..4], |_, _| probes += 1));
+        // Invalid subframe counts (0 and >4).
+        let mut zero_count = blob.clone();
+        zero_count[3] = 0;
+        assert!(!unpack_opus_red_blob(&zero_count, |_, _| probes += 1));
+        let mut five_count = blob.clone();
+        five_count[3] = 5;
+        assert!(!unpack_opus_red_blob(&five_count, |_, _| probes += 1));
+        // A zero-length subframe in pass 1 is rejected.
+        let mut zero_len = blob.clone();
+        zero_len[4] = 0;
+        assert!(!unpack_opus_red_blob(&zero_len, |_, _| probes += 1));
+        assert_eq!(probes, 0);
     }
 }
 

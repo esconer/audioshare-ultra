@@ -24,7 +24,7 @@ use audioshare_protocol::lpc_lossless::{
     decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
 };
 use audioshare_protocol::opus_codec::{
-    OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, OPUS_LOOKAHEAD_MS, TAG_OPUS_RLD,
+    OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, OPUS_LOOKAHEAD_MS, TAG_OPUS_RED, TAG_OPUS_RLD,
 };
 use audioshare_protocol::sequencer::{
     ZeroJitterSequencer, RING_SLOTS, STATUS_EMPTY, STATUS_HEALED_BY_FEC, STATUS_PRIMARY_LOSSLESS,
@@ -1511,12 +1511,18 @@ impl ClientEngine {
             seq: Option<u16>,
             len: u16,
             data: [u8; MAX_OPUS_SUBFRAME_BYTES],
+            /// True when this subframe was recovered from an Opus RED blob in a
+            /// neighbour's FEC field instead of arriving as primary audio.
+            /// Pop-time accounting uses it to count recovery as FEC, never as
+            /// a played primary frame (mirrors the ADPCM FEC path).
+            from_red: bool,
         }
         let mut opus_ring = vec![
             OpusPacketSlot {
                 seq: None,
                 len: 0,
                 data: [0u8; MAX_OPUS_SUBFRAME_BYTES],
+                from_red: false,
             };
             RING_SLOTS
         ];
@@ -2212,6 +2218,9 @@ impl ClientEngine {
                                         slot.data[..sub_len].copy_from_slice(payload);
                                         slot.len = sub_len as u16;
                                         slot.seq = Some(s);
+                                        // A real primary always supersedes any
+                                        // earlier RED concealment in this slot.
+                                        slot.from_red = false;
                                     }
                                     if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                         latest_rx_seq = s;
@@ -2267,6 +2276,49 @@ impl ClientEngine {
                                 }
                             }
                             cursor += sub_len;
+                        }
+
+                        // Commit 2 (Phase 2b): Exact Opus RED [P-1]/[P-2].
+                        // On Wi-Fi the host piggybacks the two prior packed
+                        // Opus packets in the FEC fields. Unpack each tagged
+                        // blob into every slot still ahead of the playhead so
+                        // two consecutive 10 ms packets play back exactly
+                        // instead of falling back to phase-locked CELT PLC.
+                        // FEC accounting (loss window + fec_healed_frames) is
+                        // intentionally deferred to pop time below: counting
+                        // at insertion AND at pop would double-count, and
+                        // pop-time matches the ADPCM FEC path exactly.
+                        if parsed.header.mode == CodecMode::OpusRld {
+                            for red_blob in
+                                [parsed.fec_n1_payload, parsed.fec_n2_payload]
+                            {
+                                if red_blob.first() == Some(&TAG_OPUS_RED) {
+                                    let _ = audioshare_protocol::opus_codec::unpack_opus_red_blob(
+                                        red_blob,
+                                        |red_seq, red_payload| {
+                                            let delta =
+                                                red_seq.wrapping_sub(next_play_seq) as i16;
+                                            if delta >= 0
+                                                && delta < RING_SLOTS as i16
+                                                && !sequencer.has_primary(red_seq)
+                                                && red_payload.len() <= MAX_OPUS_SUBFRAME_BYTES
+                                            {
+                                                let slot = &mut opus_ring
+                                                    [(red_seq as usize) & (RING_SLOTS - 1)];
+                                                // Keep a genuine primary or an
+                                                // earlier RED copy in place.
+                                                if slot.seq != Some(red_seq) {
+                                                    slot.data[..red_payload.len()]
+                                                        .copy_from_slice(red_payload);
+                                                    slot.len = red_payload.len() as u16;
+                                                    slot.seq = Some(red_seq);
+                                                    slot.from_red = true;
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(WireError::AuthenticationFailed) => {
@@ -2470,9 +2522,14 @@ impl ClientEngine {
                     break;
                 }
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                // Set only when this slot's bytes were recovered from Opus RED
+                // so the STATUS_PRIMARY_LOSSLESS arm below can reclassify the
+                // frame as FEC recovery instead of new primary audio.
+                let mut played_from_red = false;
                 let status = if has_opus_slot {
                     let slot = &mut opus_ring[opus_slot_idx];
                     let len = slot.len as usize;
+                    let from_red = slot.from_red;
                     slot.seq = None;
                     if opus_decoder.is_none() {
                         opus_decoder = OpusStreamDecoder::new();
@@ -2488,6 +2545,7 @@ impl ClientEngine {
                         })
                         .unwrap_or(false);
                     if decoded_ok {
+                        played_from_red = from_red;
                         sequencer.finalize_external_frame(&mut raw_subframe, false);
                         STATUS_PRIMARY_LOSSLESS
                     } else {
@@ -2524,10 +2582,20 @@ impl ClientEngine {
                         next_play_seq = next_play_seq.wrapping_add(1);
                         consecutive_empty_ticks = 0;
                         last_plc_emit = None;
-                        window.record_primary();
-                        telemetry
-                            .primary_frames_played
-                            .fetch_add(1, Ordering::Relaxed);
+                        if played_from_red {
+                            // Exact Opus RED recovery is FEC, not a newly
+                            // received primary. Count it once here (the single
+                            // accounting point chosen for both RED and ADPCM
+                            // FEC) so `primary_frames_played` stays honest and
+                            // `fec_healed_frames` reflects real recovery.
+                            window.record_fec();
+                            telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            window.record_primary();
+                            telemetry
+                                .primary_frames_played
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     STATUS_HEALED_BY_FEC => {
                         next_play_seq = next_play_seq.wrapping_add(1);
@@ -3912,6 +3980,109 @@ mod tests {
                 "buffered frame {seq} must decode in stream order"
             );
         }
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    /// Two consecutive 10 ms Opus packets (8 x 2.5 ms = 20 ms of audio) are
+    /// dropped, and the next packet carries them as exact [P-1]/[P-2] RED
+    /// blobs. Unpacking + inserting them into the decode-at-pop ring must fill
+    /// every hole so playback needs zero PLC frames.
+    ///
+    /// Limitation: this exercises the deterministic unpack + insert +
+    /// in-order pop-decode logic, not the full UDP `ClientEngine` loop (there
+    /// is no host-side RED injection hook and this lane does not own builds).
+    /// The production insertion checks are mirrored exactly.
+    #[test]
+    fn test_opus_red_heals_two_consecutive_dropped_ten_ms_packets() {
+        use audioshare_protocol::opus_codec::{
+            pack_opus_red_blob, unpack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES,
+        };
+
+        #[derive(Clone)]
+        struct Slot {
+            seq: Option<u16>,
+            len: u16,
+            data: [u8; MAX_OPUS_SUBFRAME_BYTES],
+            from_red: bool,
+        }
+
+        const SF_PER_PKT: usize = 4; // 10 ms at 2.5 ms/subframe
+        let mut enc = OpusStreamEncoder::new(128).expect("opus encoder");
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..(SUBFRAME_STEREO_SAMPLES / 2) {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+            pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+        }
+
+        let mut payloads = [[0u8; MAX_OPUS_SUBFRAME_BYTES]; SF_PER_PKT * 2];
+        let mut lens = [0usize; SF_PER_PKT * 2];
+        for (buf, len) in payloads.iter_mut().zip(lens.iter_mut()) {
+            *len = enc.encode_subframe(&pcm, 128, buf).unwrap();
+            assert_eq!(buf[0], TAG_OPUS_RLD);
+        }
+
+        // P-2 = 96..=99 -> fec_n2, P-1 = 100..=103 -> fec_n1.
+        let p1: Vec<&[u8]> = (4usize..8).map(|i| &payloads[i][..lens[i]]).collect();
+        let p2: Vec<&[u8]> = (0usize..4).map(|i| &payloads[i][..lens[i]]).collect();
+        let mut blob_n1 = [0u8; MAX_OPUS_RED_BYTES];
+        let mut blob_n2 = [0u8; MAX_OPUS_RED_BYTES];
+        let n1_len = pack_opus_red_blob(100, &p1, &mut blob_n1).expect("pack P-1 RED");
+        let n2_len = pack_opus_red_blob(96, &p2, &mut blob_n2).expect("pack P-2 RED");
+        assert_eq!(blob_n1[0], TAG_OPUS_RED);
+        assert_eq!(blob_n2[0], TAG_OPUS_RED);
+
+        // Client RX: same checks as the live OpusRld unpack path.
+        let next_play_seq = 96u16;
+        let sequencer = ZeroJitterSequencer::new();
+        let mut ring = vec![
+            Slot {
+                seq: None,
+                len: 0,
+                data: [0u8; MAX_OPUS_SUBFRAME_BYTES],
+                from_red: false,
+            };
+            RING_SLOTS
+        ];
+        let mut inserted = 0usize;
+        for blob in [&blob_n1[..n1_len], &blob_n2[..n2_len]] {
+            if blob.first() == Some(&TAG_OPUS_RED) {
+                let _ = unpack_opus_red_blob(blob, |red_seq, red_payload| {
+                    let delta = red_seq.wrapping_sub(next_play_seq) as i16;
+                    if delta >= 0
+                        && delta < RING_SLOTS as i16
+                        && !sequencer.has_primary(red_seq)
+                        && red_payload.len() <= MAX_OPUS_SUBFRAME_BYTES
+                    {
+                        let slot = &mut ring[(red_seq as usize) & (RING_SLOTS - 1)];
+                        if slot.seq != Some(red_seq) {
+                            slot.data[..red_payload.len()].copy_from_slice(red_payload);
+                            slot.len = red_payload.len() as u16;
+                            slot.seq = Some(red_seq);
+                            slot.from_red = true;
+                            inserted += 1;
+                        }
+                    }
+                });
+            }
+        }
+        assert_eq!(inserted, SF_PER_PKT * 2, "both dropped packets must heal");
+
+        // Playhead pops 96..103 in order: every slot is present and marked RED,
+        // and the stateful CELT decoder accepts all eight, so no PLC is
+        // synthesized for the 20 ms blackout.
+        let mut decoder = OpusStreamDecoder::new().unwrap();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut plc_frames = 0usize;
+        for seq in 96u16..(96 + (SF_PER_PKT * 2) as u16) {
+            let slot = &ring[(seq as usize) & (RING_SLOTS - 1)];
+            assert_eq!(slot.seq, Some(seq));
+            assert!(slot.from_red, "seq {seq} must be marked RED-recovered");
+            if !decoder.decode_subframe_at_seq(seq, &slot.data[..slot.len as usize], &mut out) {
+                plc_frames += 1;
+            }
+        }
+        assert_eq!(plc_frames, 0, "RED recovery must avoid all PLC frames");
         assert!(out.iter().all(|s| s.is_finite()));
     }
 

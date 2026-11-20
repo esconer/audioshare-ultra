@@ -19,7 +19,9 @@ use audioshare_protocol::lpc_lossless::{
     encode_vbr_subframe, QualityProfile, ADPCM_FEC_BYTES, MAX_LOSSLESS_PCM24_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
+use audioshare_protocol::opus_codec::{
+    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES, MAX_OPUS_SUBFRAME_BYTES,
+};
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
     CONTROL_FEEDBACK_MAGIC, HEADER_LEN, MAC_TAG_LEN,
@@ -2592,6 +2594,14 @@ impl HostEngine {
         // so one lost 10 ms packet is fully healed by the next packet.
         let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
         let mut fec_hist_len: usize = 0;
+        // Opus RED [P-1]/[P-2]: exact previously-sent Opus packets piggybacked
+        // in `fec_n1`/`fec_n2` while the wire mode is `OpusRld` on a Wi-Fi
+        // stream. Written against A1's `pack_opus_red_blob` contract. Reset on
+        // DTX silence, codec-mode switch and pure-USB sessions (see below).
+        let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
+        let mut opus_red_prev1_len: usize = 0;
+        let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
+        let mut opus_red_prev2_len: usize = 0;
 
         let mut silent_subframes: u32 = 0;
         let mut tone_phase: f32 = 0.0;
@@ -3279,6 +3289,11 @@ impl HostEngine {
             if !has_targets || is_dtx_active {
                 opus_encoder = None;
                 fec_hist_len = 0;
+                // DTX silence entry (and zero-client standby) invalidates the
+                // Opus RED ring: receivers reset their sequencer on the silence
+                // heartbeat, so old blobs must never be replayed afterwards.
+                opus_red_prev1_len = 0;
+                opus_red_prev2_len = 0;
             }
             if !prefer_opus {
                 opus_encoder = None;
@@ -3457,6 +3472,19 @@ impl HostEngine {
                 .active_codec_mode
                 .store(dynamic_codec_mode as u8, Ordering::Relaxed);
 
+            // Opus RED [P-1]/[P-2] is attached only while the *effective wire*
+            // mode is OpusRld and at least one unmuted client is on Wi-Fi.
+            // `cached_all_usb` is derived from the live client map (no new
+            // telemetry field): wired USB has no 802.11 loss to heal. Clearing
+            // the ring whenever this gate is off also implements "reset on
+            // switching away from OpusRld" — a later return ramps up from an
+            // empty ring instead of replaying blobs from a stale session.
+            let opus_red_active = dynamic_codec_mode == CodecMode::OpusRld && !cached_all_usb;
+            if !opus_red_active {
+                opus_red_prev1_len = 0;
+                opus_red_prev2_len = 0;
+            }
+
             let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
             let mut datagram = [0u8; MAX_SAFE_UDP_PAYLOAD];
             let active_key = active_key_cache;
@@ -3551,19 +3579,27 @@ impl HostEngine {
                 let pair_fec = subframes_per_pkt == 4 && dynamic_codec_mode != CodecMode::OpusRld;
                 let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
                 let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
-                let (n1_len, n2_len) = if suppress_adpcm_fec {
-                    (0, 0)
+                // Non-Opus modes keep the existing ADPCM FEC packing exactly
+                // as before. OpusRld on Wi-Fi substitutes the exact prior Opus
+                // packets ([P-1] in fec_n1, [P-2] in fec_n2); OpusRld on a pure
+                // USB session leaves both slots empty.
+                let (full_n1, full_n2): (&[u8], &[u8]) = if opus_red_active {
+                    (
+                        &opus_red_prev1[..opus_red_prev1_len],
+                        &opus_red_prev2[..opus_red_prev2_len],
+                    )
+                } else if suppress_adpcm_fec {
+                    (&[], &[])
                 } else {
-                    pack_fec_history(
+                    let (n1_len, n2_len) = pack_fec_history(
                         pair_fec,
                         &prev_hist,
                         prev_hist_len,
                         &mut fec_pair_1,
                         &mut fec_pair_2,
-                    )
+                    );
+                    (&fec_pair_1[..n1_len], &fec_pair_2[..n2_len])
                 };
-                let full_n1 = &fec_pair_1[..n1_len];
-                let full_n2 = &fec_pair_2[..n2_len];
                 match plan_datagram_with_fec(
                     primary_cursor,
                     active_key.is_some(),
@@ -3637,6 +3673,47 @@ impl HostEngine {
                             );
                         }
                     }
+                }
+            }
+
+            // Store the just-sent packet P as the new [P-1] for the next OpusRld
+            // datagram: shift prev1 -> prev2, then pack P into prev1. The blob
+            // carries (base_seq, subframe_count) so the receiver can place
+            // recovered subframes at exact sequence numbers across framing
+            // transitions. A >255 B bitrate spike is skipped for that packet.
+            if opus_red_active && has_targets && !is_dtx_active && sent_any {
+                // The Opus payloads live in `primary_bundle`, each preceded by
+                // a 2-byte big-endian length. Rebuild exact slices from the
+                // recorded ranges (no allocation on the RT TX path).
+                let n = subframes_per_pkt.min(4);
+                let mut cur_opus_slices: [&[u8]; 4] = [&[]; 4];
+                let mut ranges_ok = true;
+                for sub_idx in 0..n {
+                    let (start, end) = subframe_ranges[sub_idx];
+                    if start + 2 <= end && end <= primary_cursor {
+                        cur_opus_slices[sub_idx] = &primary_bundle[start + 2..end];
+                    } else {
+                        ranges_ok = false;
+                        break;
+                    }
+                }
+                if ranges_ok {
+                    // [P-1] becomes [P-2]; P becomes the new [P-1].
+                    opus_red_prev2[..opus_red_prev2_len]
+                        .copy_from_slice(&opus_red_prev1[..opus_red_prev1_len]);
+                    opus_red_prev2_len = opus_red_prev1_len;
+                    match pack_opus_red_blob(
+                        base_seq,
+                        &cur_opus_slices[..n],
+                        &mut opus_red_prev1,
+                    ) {
+                        Some(len) => opus_red_prev1_len = len,
+                        None => opus_red_prev1_len = 0,
+                    }
+                } else {
+                    // Defensive: no usable Opus payloads -> drop both slots.
+                    opus_red_prev1_len = 0;
+                    opus_red_prev2_len = 0;
                 }
             }
 
