@@ -3119,6 +3119,27 @@ impl Drop for HostEngine {
 mod tests {
     use super::*;
 
+    /// Start a HostEngine on a fresh ephemeral UDP port. The probe/bind gap is
+    /// racy when tests run in parallel (including across test binaries), so
+    /// retry instead of failing CI on an ephemeral port collision.
+    fn start_test_host() -> (HostEngine, u16) {
+        for _ in 0..32 {
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let config = HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            };
+            if let Ok(engine) = HostEngine::start(config, vec![]) {
+                return (engine, port);
+            }
+        }
+        panic!("could not allocate a free UDP port for test HostEngine");
+    }
+
     #[test]
     fn test_opus_packets_carry_no_dead_adpcm_fec() {
         // BEFORE: up to 248 bytes of unused ADPCM FEC per Opus packet.
@@ -3302,20 +3323,7 @@ mod tests {
     /// registering one client through a bare HELLO.
     #[test]
     fn test_zero_client_idle_does_not_allocate_opus_encoder() {
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let mut engine = HostEngine::start(
-            HostConfig {
-                bind_port: port,
-                use_test_tone: true,
-                subframes_per_packet: 1,
-                enable_smart_dtx: false,
-            },
-            vec![],
-        )
-        .expect("start host engine");
+        let (mut engine, port) = start_test_host();
         engine.telemetry.quality_profile.store(
             QualityProfile::LowLatencyCompressed as u8,
             Ordering::Relaxed,
@@ -3371,20 +3379,7 @@ mod tests {
         use audioshare_protocol::crypto::AEAD_TAG_LEN;
         use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
 
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let mut engine = HostEngine::start(
-            HostConfig {
-                bind_port: port,
-                use_test_tone: true,
-                subframes_per_packet: 1,
-                enable_smart_dtx: false,
-            },
-            vec![],
-        )
-        .expect("start host engine");
+        let (mut engine, port) = start_test_host();
         let pin = "1234";
         engine.set_encryption_pin(Some(pin));
         let key = SessionKey::from_pin(pin);

@@ -2222,28 +2222,36 @@ impl Drop for ClientEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_adb_tcp_bridge_loopback_end_to_end() {
-        use audioshare_host_engine::discovery_and_os::AdbUsbWatcher;
+    /// Start a HostEngine on a fresh ephemeral UDP port. The probe/bind gap is
+    /// racy when tests run in parallel (including across test binaries), so
+    /// retry instead of failing CI on an ephemeral port collision.
+    fn start_test_host() -> (audioshare_host_engine::HostEngine, u16) {
         use audioshare_host_engine::{HostConfig, HostEngine};
-
-        // Reserve then release an ephemeral port so host UDP + bridge TCP can
-        // both own it (different protocol spaces). No physical device needed:
-        // the TCP leg stands in for `adb reverse tcp:P tcp:P`.
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let mut host = HostEngine::start(
-            HostConfig {
+        for _ in 0..32 {
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let config = HostConfig {
                 bind_port: port,
                 use_test_tone: true,
                 subframes_per_packet: 1,
                 enable_smart_dtx: false,
-            },
-            vec![],
-        )
-        .expect("start host engine");
+            };
+            if let Ok(engine) = HostEngine::start(config, vec![]) {
+                return (engine, port);
+            }
+        }
+        panic!("could not allocate a free UDP port for test HostEngine");
+    }
+
+    #[test]
+    fn test_adb_tcp_bridge_loopback_end_to_end() {
+        use audioshare_host_engine::discovery_and_os::AdbUsbWatcher;
+
+        // Reserve then release an ephemeral port so host UDP + bridge TCP can
+        // both own it (different protocol spaces). No physical device needed:
+        // the TCP leg stands in for `adb reverse tcp:P tcp:P`.
+        let (mut host, port) = start_test_host();
         let _adb = AdbUsbWatcher::start(port);
 
         let mut client = ClientEngine::connect(ClientConfig {
@@ -2272,21 +2280,7 @@ mod tests {
     /// permanently showing the "check matching PIN & app version" warning.
     #[test]
     fn test_valid_pin_connect_does_not_bump_rejected_handshakes() {
-        use audioshare_host_engine::{HostConfig, HostEngine};
-        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let mut host = HostEngine::start(
-            HostConfig {
-                bind_port: port,
-                use_test_tone: true,
-                subframes_per_packet: 1,
-                enable_smart_dtx: false,
-            },
-            vec![],
-        )
-        .expect("start host");
+        let (mut host, port) = start_test_host();
         host.set_encryption_pin(Some("4829"));
 
         let mut client = ClientEngine::connect_with_pin(
