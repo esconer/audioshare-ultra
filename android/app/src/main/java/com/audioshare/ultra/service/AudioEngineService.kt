@@ -205,6 +205,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // looper (startForegroundNotification itself always stays on main).
     private val engineExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    // Guards against a late native-start postback from a connection that was
+    // stopped or superseded while the blocking JNI call was in flight.
+    private val connectGen = java.util.concurrent.atomic.AtomicLong(0)
     private val sleepTickRunnable = object : Runnable {
         override fun run() {
             if (sleepRemainingMinutes <= 1) {
@@ -245,6 +248,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_STOP_CLIENT_ONLY) {
             val keepAlive = isPartyCasting || micCaptureActive
+            connectGen.incrementAndGet()
             runOnEngine {
                 nativeStopClient()
                 mainHandler.post {
@@ -391,6 +395,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val savedGain = prefs.getFloat("gain_db", 0.0f)
             isLocallyMuted = !isLocallyMuted
             nativeSetGainDb(if (isLocallyMuted) -96.0f else savedGain)
+            if (!isLocallyMuted) {
+                // Re-claim audio focus so the app that stole it pauses instead
+                // of playing over us after the user unmutes.
+                requestAudioFocus(dolbyEffects)
+            }
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
         }
@@ -442,19 +451,20 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // Creating the native AAudio client blocks while the stream is
         // negotiated. The foreground notification is already up (synchronously,
         // on main), so the blocking work can safely move to the engine thread.
+        val gen = connectGen.incrementAndGet()
         runOnEngine {
             val started = runCatching {
                 nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
             }.getOrDefault(false)
-            mainHandler.post { handleClientStartResult(started, hostAddr) }
+            mainHandler.post { handleClientStartResult(started, hostAddr, gen) }
         }
         return START_STICKY
     }
 
     /** Called on the main looper after the blocking native client start finishes. */
-    private fun handleClientStartResult(started: Boolean, hostAddr: String) {
-        // A teardown may have destroyed the service while JNI was blocking.
-        if (engineExecutor.isShutdown) return
+    private fun handleClientStartResult(started: Boolean, hostAddr: String, gen: Long) {
+        // A teardown or a newer connect may have happened while JNI was blocking.
+        if (engineExecutor.isShutdown || gen != connectGen.get()) return
         isStreaming = started
         if (!started) {
             if (!isPartyCasting && !micCaptureActive) {
@@ -1246,6 +1256,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun stopStreamAndService() {
+        // Invalidate any in-flight native-start postback before teardown.
+        connectGen.incrementAndGet()
         // Drop the caster before stopping the foreground service so a late
         // projection callback cannot re-enter teardown.
         val caster = activeCaster
