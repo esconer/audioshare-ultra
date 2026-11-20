@@ -636,6 +636,11 @@ impl PhoneMicReceiver {
                         local_delay_ms,
                     );
                     let target_depth = target_subframes.ceil() as i16;
+                    // BT Party group sync may inflate target_subframes up to 64,
+                    // but only the base cushion belongs in the sequencer. The
+                    // extra group-alignment depth is injected as a one-shot
+                    // FIFO pad once prebuffer completes, mirroring ClientEngine.
+                    let base_depth = base_target_subframes.ceil() as i16;
                     // In pull-sink mode the FIFO oscillates by one callback
                     // burst below `target_subframes`; center the clock-loop
                     // setpoint at the sawtooth midpoint so both +ppm and -ppm
@@ -685,7 +690,21 @@ impl PhoneMicReceiver {
                             // immediately instead of waiting for the playhead
                             // to walk through hundreds of empty subframes.
                             let seq_delta = base_seq.wrapping_sub(next_seq) as i16;
-                            if dtx_silent || seq_delta > 48 || seq_delta < -32 {
+                            // A BT peer with >130 ms group delay inflates the
+                            // sequencer target to ~64 subframes. A fixed 48
+                            // resync threshold would wipe the sequencer as soon
+                            // as packet 49 arrives, while prebuffer is still
+                            // waiting on base_depth -> permanent silence. Scale
+                            // the threshold with the live FIFO depth, capped to
+                            // the ring capacity so a stalled stream still
+                            // rebases rather than drifting into a wrap.
+                            let fifo_now_sf = resampler
+                                .samples_to_subframes(mic_fifo_thread.available_samples())
+                                as i16;
+                            let resync_ahead = 48i16
+                                .max(fifo_now_sf + 16)
+                                .min((audioshare_protocol::sequencer::RING_SLOTS as i16) - 4);
+                            if dtx_silent || seq_delta > resync_ahead || seq_delta < -32 {
                                 dtx_silent = false;
                                 sequencer.reset();
                                 opus_decoder = None;
@@ -777,14 +796,40 @@ impl PhoneMicReceiver {
                             // past it, then start playback once that cushion is
                             // actually buffered.
                             let buf_depth = buffered_subframes(latest_seq, next_seq);
-                            let max_depth = target_depth + 8;
+                            // Only the base cushion is held in the sequencer;
+                            // the BT group-sync extra is padded into the FIFO
+                            // after prebuffer so the seq_delta resync window is
+                            // never forced past the fixed 48-subframe guard.
+                            let max_depth = base_depth + 8;
                             if buf_depth > max_depth {
                                 next_seq = latest_seq
                                     .wrapping_add(1)
-                                    .wrapping_sub(target_depth as u16);
+                                    .wrapping_sub(base_depth as u16);
+                                sequencer.arm_declick();
                             }
-                            if buf_depth >= target_depth {
+                            if !prebuffer_ready && buf_depth >= base_depth {
                                 prebuffer_ready = true;
+                                sequencer.arm_fade_in();
+                                let group_extra = (target_depth - base_depth).max(0) as usize;
+                                if group_extra > 0 {
+                                    let mut rem = resampler.subframes_to_samples(group_extra);
+                                    let mut pad = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                                    let mut rng = 0x7F4A_7C15u32;
+                                    while rem > 0 {
+                                        let step = rem.min(pad.len()) & !1;
+                                        if step == 0 {
+                                            break;
+                                        }
+                                        audioshare_protocol::dsp::inject_bluetooth_keepalive_dither(
+                                            &mut pad[..step], &mut rng,
+                                        );
+                                        let pushed = mic_fifo_thread.push_samples(&pad[..step]);
+                                        rem = rem.saturating_sub(pushed);
+                                        if pushed < step {
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1542,6 +1587,76 @@ mod tests {
         assert_eq!(fb_fec_rate_permille(95, 5), 50);
         assert_eq!(fb_fec_rate_permille(0, 0), 0);
         assert_eq!(fb_fec_rate_permille(0, 1), 1000);
+    }
+
+    #[test]
+    fn test_pc_party_bt_group_sync_does_not_deadlock_resync() {
+        // Hardware-free regression: exercises the pure arithmetic that used to
+        // lock PC speakers in permanent silence when a BT earbud peer with a
+        // >130 ms group delay joined a Party. The full UDP/tick loop needs a
+        // live socket and audio sink, so only the decisive clamp/prebuffer
+        // behaviour is unit-tested here.
+        let ring_cap = audioshare_protocol::sequencer::RING_SLOTS as i16;
+        assert_eq!(ring_cap, 128);
+
+        let base_target = mic_fifo_target_subframes(240); // 6.0 (5 ms callback floor)
+        let base_depth = base_target.ceil() as i16;
+        assert_eq!(base_depth, 6);
+        let local_ms =
+            pc_receiver_effective_delay_ms(PhoneRxRoutingMode::PlayOnPcSpeakers, base_target);
+        let target_depth = aligned_pc_receiver_target_subframes(
+            PhoneRxRoutingMode::PlayOnPcSpeakers,
+            base_target,
+            150, // BT peer advertises 150 ms via stream_id * 2
+            local_ms,
+        )
+        .ceil() as i16;
+        assert_eq!(target_depth, 62);
+        assert!(
+            target_depth > 48,
+            "regression precondition: the stale 48-subframe guard would fire"
+        );
+
+        // Only the base cushion lives in the sequencer; the BT alignment extra
+        // is injected into the FIFO after prebuffer completes.
+        let group_extra = (target_depth - base_depth).max(0) as usize;
+        assert_eq!(group_extra, 56);
+
+        // Prebuffer must flip at base_depth (6), well before the old target
+        // (62) and before the 48-subframe resync guard could wipe the stream.
+        let mut prebuffer_ready = false;
+        for buf_depth in 0..=target_depth {
+            if !prebuffer_ready && buf_depth >= base_depth {
+                prebuffer_ready = true;
+            }
+            if buf_depth == base_depth || buf_depth == 48 {
+                assert!(
+                    prebuffer_ready,
+                    "prebuffer must be ready by buf_depth={buf_depth}"
+                );
+            }
+        }
+        assert!(prebuffer_ready);
+
+        // Clamped resync threshold: floor 48, scaled by the live FIFO depth,
+        // capped at RING_SLOTS - 4 so a stalled stream still rebases before a
+        // 16-bit sequence wrap.
+        let resync_ahead = |fifo_now_sf: i16| -> i16 {
+            48i16.max(fifo_now_sf + 16).min(ring_cap - 4)
+        };
+        assert_eq!(resync_ahead(0), 48);
+        assert_eq!(resync_ahead(20), 48);
+        assert_eq!(resync_ahead(40), 56);
+        assert_eq!(resync_ahead(60), 76);
+        assert!(
+            resync_ahead(60) >= target_depth,
+            "a deep BT cushion must not be resynced mid-prebuffer"
+        );
+        assert_eq!(resync_ahead(500), 124); // capped to ring capacity - 4
+
+        // At the base cushion the guard stays at the 48 floor, far above the
+        // 6-packet prebuffer, so the fill phase never trips a reset.
+        assert!(base_depth < resync_ahead(base_depth));
     }
 
     #[test]
