@@ -3,6 +3,7 @@ package com.audioshare.ultra.ui
 import android.Manifest
 import android.app.Activity
 import android.content.BroadcastReceiver
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -31,10 +32,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -424,7 +423,6 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         }
     }
 
-    val clipboard = LocalClipboardManager.current
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var showQrScanner by remember { mutableStateOf(false) }
@@ -1743,24 +1741,72 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                OutlinedButton(
-                    onClick = {
-                        val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                            .getOrDefault("Diagnostics unavailable")
-                        clipboard.setText(AnnotatedString(diag))
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Diagnostics copied to clipboard")
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Icon(
-                        Icons.Rounded.ContentCopy,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text("Copy Diagnostics Report")
+                    OutlinedButton(
+                        onClick = {
+                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                                .getOrNull()?.takeIf { it.isNotBlank() }
+                            // Dismiss first so the Snackbar is not hidden behind the sheet.
+                            showToolsSheet = false
+                            if (diag == null) {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Diagnostics unavailable")
+                                }
+                            } else {
+                                val diagChars = diag.length
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                    as? android.content.ClipboardManager
+                                if (cm != null) {
+                                    cm.setPrimaryClip(
+                                        ClipData.newPlainText("AudioShare Ultra diagnostics", diag)
+                                    )
+                                }
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Diagnostics copied ($diagChars chars)")
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            Icons.Rounded.ContentCopy,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Copy Diag", maxLines = 1)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+                                .getOrNull()?.takeIf { it.isNotBlank() }
+                            showToolsSheet = false
+                            if (diag != null) {
+                                val diagText: String = diag
+                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, diagText)
+                                }
+                                runCatching {
+                                    context.startActivity(
+                                        Intent.createChooser(sendIntent, "Share diagnostics")
+                                    )
+                                }
+                            }
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            Icons.Rounded.Share,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("Share Diag", maxLines = 1)
+                    }
                 }
                 Spacer(Modifier.height(12.dp))
             }

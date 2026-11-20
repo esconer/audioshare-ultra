@@ -138,7 +138,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativeGetRealtimeTids(): IntArray
 
         @JvmStatic
-        external fun nativeGetDiagnostics(): String
+        external fun nativeGetDiagnostics(): String?
+
+        @JvmStatic
+        external fun nativeLogEvent(level: Int, component: String, message: String)
 
         @JvmStatic
         external fun nativeSetScannerPaused(paused: Boolean)
@@ -153,6 +156,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var currentGainDb = 0.0f
     private var isLocallyMuted: Boolean = false
+    // Last value handed to native A/V sync. Device callbacks can re-report the
+    // same route repeatedly; log only real transitions to keep the report useful.
+    private var lastReportedBtDelayMs: Int = -1
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
@@ -256,6 +262,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private val becomingNoisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == AudioManager.ACTION_AUDIO_BECOMING_NOISY) {
+                runCatching {
+                    nativeLogEvent(1, "audio-noisy", "Audio becoming noisy - output auto-muted")
+                }
                 isLocallyMuted = true
                 nativeSetGainDb(-96.0f)
                 startForegroundNotification(currentHostAddr, currentIsUsb)
@@ -697,6 +706,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } else {
             fallbackBtDelayMs
         }
+        if (reportedDelayMs != lastReportedBtDelayMs) {
+            lastReportedBtDelayMs = reportedDelayMs
+            runCatching {
+                nativeLogEvent(0, "bt-route", "Bluetooth route delay changed to ${reportedDelayMs}ms")
+            }
+        }
         nativeReportBluetoothDelayMs(reportedDelayMs)
     }
 
@@ -945,6 +960,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 applyLocalPartySpeakerMute(true)
             }
             broadcastPartyCastState(true)
+            runCatching {
+                nativeLogEvent(0, "party-cast", "Party cast started (${targets.size} target(s))")
+            }
             // Re-publish the notification now isPartyCasting is true so the
             // Party Host actions (Mute Cast / Stop Party) replace Pause PC.
             startForegroundNotification(
@@ -968,6 +986,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun failPartyCastStart(): Int {
+        runCatching {
+            nativeLogEvent(2, "party-cast", "Party cast start failed")
+        }
         val caster = activeCaster
         activeCaster = null
         caster?.stopCasting()
@@ -994,6 +1015,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun stopPartyCast(): Int {
+        runCatching {
+            nativeLogEvent(0, "party-cast", "Party cast stopped (user request)")
+        }
         val caster = activeCaster
         activeCaster = null
         projectionActive = false
@@ -1019,6 +1043,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     private fun handlePartyCastStopped() {
+        runCatching {
+            nativeLogEvent(1, "party-cast", "Party cast ended (projection revoked or caster stopped)")
+        }
         projectionActive = false
         isPartyCastMuted = false
         runCatching { nativeSetPartyCastMuted(false) }
@@ -1237,6 +1264,20 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     override fun onAudioFocusChange(focusChange: Int) {
+        val focusLabel = when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> "GAIN"
+            AudioManager.AUDIOFOCUS_LOSS -> "LOSS"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "LOSS_TRANSIENT"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "LOSS_TRANSIENT_CAN_DUCK"
+            else -> "OTHER($focusChange)"
+        }
+        runCatching {
+            nativeLogEvent(
+                if (focusChange == AudioManager.AUDIOFOCUS_GAIN) 0 else 1,
+                "audio-focus",
+                "Audio focus change: $focusLabel"
+            )
+        }
         if (isLocallyMuted) {
             // Never unmute a user-muted or headphone-unplugged stream when a
             // transient notification finishes and returns AUDIOFOCUS_GAIN.
