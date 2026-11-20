@@ -141,7 +141,7 @@ impl SessionKey {
     #[inline]
     pub fn sign_feedback(&self, body_20: &[u8; 20], feedback_seq: u32) -> [u8; AEAD_TAG_LEN] {
         type HmacSha256 = Hmac<Sha256>;
-        let mut mac = HmacSha256::new_from_slice(&self.key).expect("32-byte key");
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.key).expect("32-byte key");
         mac.update(b"ASULCTR2-MAC");
         mac.update(&feedback_seq.to_be_bytes());
         mac.update(body_20);
