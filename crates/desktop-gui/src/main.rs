@@ -469,6 +469,13 @@ impl AudioShareApp {
     }
 
     fn save_persistent_config(&self) {
+        // Strip CR/LF from free-text fields so a pasted newline cannot inject
+        // additional config keys when the file is read back.
+        let clean = |s: &str| s.replace(['\r', '\n'], "");
+        let ssid = clean(&self.hotspot_ssid);
+        let pass = clean(&self.hotspot_pass);
+        let pin = clean(&self.pairing_pin);
+        let manual_ip = clean(&self.manual_server_ip);
         let content = format!(
             "dark_mode={}\n\
              minimize_on_close={}\n\
@@ -503,8 +510,8 @@ impl AudioShareApp {
             self.minimize_on_close,
             self.autostart_stream_on_launch,
             self.os_boot_autostart,
-            self.hotspot_ssid,
-            self.hotspot_pass,
+            ssid,
+            pass,
             self.quality_profile as u8,
             self.prefer_opus,
             self.target_bitrate_kbps,
@@ -516,8 +523,8 @@ impl AudioShareApp {
             self.group_sync_trim_ms,
             self.host_master_volume,
             self.enable_pin_encryption,
-            self.pairing_pin,
-            self.manual_server_ip,
+            pin,
+            manual_ip,
             self.preamp_gain_db,
             self.eq_bass_db,
             self.eq_presence_db,
@@ -529,7 +536,30 @@ impl AudioShareApp {
             self.gaming_hard_lock,
             self.phone_rx_mode as u8,
         );
-        let _ = std::fs::write(Self::config_file_path(), content);
+        // Write to a temp file then rename so a crash cannot truncate the live
+        // config, and keep the secrets owner-only on Unix.
+        let path = Self::config_file_path();
+        let tmp = path.with_extension("conf.tmp");
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                if f.write_all(content.as_bytes()).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        if std::fs::write(&tmp, content).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     fn load_persistent_config(&mut self) {
@@ -668,6 +698,10 @@ impl AudioShareApp {
                         .telemetry
                         .manual_group_sync_trim_ms
                         .store(self.group_sync_trim_ms, Ordering::Relaxed);
+                    engine
+                        .telemetry
+                        .host_volume
+                        .store(self.host_master_volume, Ordering::Relaxed);
                     self.os_guard = Some(guard);
                     // The beacon reads this atomic on every advertisement, so
                     // apply_pin_now can flip `enc` live without a restart.
@@ -801,7 +835,9 @@ impl eframe::App for AudioShareApp {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.force_quit
             && self.minimize_on_close
-            && (self.host_engine.is_some() || self.client_engine.is_some())
+            && (self.host_engine.is_some()
+                || self.client_engine.is_some()
+                || self.phone_mic_receiver.is_some())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -812,6 +848,9 @@ impl eframe::App for AudioShareApp {
         // Receive tab scans LAN beacons, 2 Hz while hidden/minimized, and
         // 4 Hz while a toast is visible so it expires promptly.
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        // Only scan LAN/USB beacons while the Receive tab is visible.
+        self.scanner
+            .set_paused(self.tab != AppTab::ClientReceiver || is_minimized);
         let streaming_active = self.host_engine.is_some()
             || self.client_engine.is_some()
             || self.phone_mic_receiver.is_some();
@@ -1173,8 +1212,9 @@ impl AudioShareApp {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(&ctx, |ui| {
                 uw::studio_card(ui, dark, |ui| {
-                    let pin_opt = if self.enable_pin_encryption {
-                        Some(self.pairing_pin.as_str())
+                    let pin = self.pairing_pin.trim();
+                    let pin_opt = if self.enable_pin_encryption && !pin.is_empty() {
+                        Some(pin)
                     } else {
                         None
                     };
@@ -1205,33 +1245,43 @@ impl AudioShareApp {
                             });
                             ui.add_space(6.0);
                         }
-                        let primary_ip = self
+                        if let Some(primary_ip) = self
                             .interfaces
                             .get(self.selected_qr_iface_idx)
                             .or_else(|| self.interfaces.first())
                             .map(|i| i.ip.to_string())
-                            .unwrap_or_else(|| "192.168.1.100".into());
-                        let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
-                        ui.label("Scan with your Android Camera or the AudioShare Ultra app:");
-                        ui.add_space(8.0);
-                        uw::draw_qr_code(ui, &uri);
-                        ui.add_space(8.0);
-                        uw::status_pill(
-                            ui,
-                            &uri,
-                            egui::Color32::from_rgb(15, 23, 42),
-                            egui::Color32::from_rgb(147, 197, 253),
-                        );
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy Connection URI").clicked() {
-                                ui.ctx().copy_text(uri.clone());
-                                // Disjoint field write: `pin_opt` still borrows
-                                // `self.pairing_pin` until the URI is built.
-                                self.toast =
-                                    Some(("Copied Connection URI".into(), Instant::now()));
-                            }
-                        });
+                        {
+                            let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
+                            ui.label("Scan with your Android Camera or the AudioShare Ultra app:");
+                            ui.add_space(8.0);
+                            uw::draw_qr_code(ui, &uri);
+                            ui.add_space(8.0);
+                            uw::status_pill(
+                                ui,
+                                &uri,
+                                egui::Color32::from_rgb(15, 23, 42),
+                                egui::Color32::from_rgb(147, 197, 253),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy Connection URI").clicked() {
+                                    ui.ctx().copy_text(uri.clone());
+                                    // Disjoint field write: `pin_opt` still borrows
+                                    // `self.pairing_pin` until the URI is built.
+                                    self.toast =
+                                        Some(("Copied Connection URI".into(), Instant::now()));
+                                }
+                            });
+                        } else {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "No active LAN or USB adapter found — connect a network adapter and reopen pairing.",
+                                )
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(253, 224, 71)),
+                            );
+                        }
                     });
                 });
             });

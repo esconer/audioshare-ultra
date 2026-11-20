@@ -71,10 +71,13 @@ fn latency_debug_enabled(args: &[String]) -> bool {
 }
 
 /// Returns the value immediately following `flag` (e.g. `--pin 4829` -> "4829").
+/// Trims whitespace and rejects empty or flag-like (`--...`) values so a
+/// missing PIN such as `--pin --test-tone` cannot become a bogus secret.
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|w| w[0] == flag)
-        .map(|w| w[1].as_str())
+        .map(|w| w[1].trim())
+        .filter(|v| !v.is_empty() && !v.starts_with("--"))
 }
 
 fn client_target(args: &[String]) -> &str {
