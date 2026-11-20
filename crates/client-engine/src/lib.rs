@@ -719,6 +719,51 @@ impl ClientTelemetry {
 /// hits EOF or an error (a USB cable yank silently kills `adb reverse`).
 const ADB_TCP_RECONNECT_INTERVAL: Duration = Duration::from_millis(400);
 
+/// Upper bound on completing one length-prefixed TCP frame. Each `read` on the
+/// tunnel is itself capped by the 200 ms socket read timeout, so the deadline
+/// must span several timeout cycles to tolerate a slow/stalled peer.
+const ADB_FRAME_READ_DEADLINE: Duration = Duration::from_millis(1_000);
+
+/// Fill `buf` completely from `reader`, tolerating `WouldBlock`/`TimedOut`
+/// without discarding bytes already read.
+///
+/// `Read::read_exact` returns on a timeout and leaves partially-filled bytes in
+/// `buf`; the old ADB reader ignored that error and restarted the frame into the
+/// same buffer, corrupting the big-endian `u16` length prefix. This loop keeps
+/// track of how many bytes are already in `buf` and resumes exactly where it stopped.
+fn read_exact_interruptible<T: Read>(
+    reader: &mut T,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB TCP peer closed mid-frame",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        "timed out waiting for the remainder of an ADB TCP frame",
+                    ));
+                }
+                // Retry, preserving `filled` bytes already in `buf`.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Loopback TCP↔UDP bridge for `adb reverse tcp:P tcp:P`. When the configured
 /// server is loopback and a TCP listener is reachable, ClientEngine's UDP
 /// datagrams are tunnelled over `TCP_NODELAY` to that listener instead of being
@@ -820,20 +865,27 @@ impl AdbTcpClientBridge {
                             let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
                             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed)
                             {
-                                match tcp_reader.read_exact(&mut len_buf) {
+                                match read_exact_interruptible(
+                                    &mut tcp_reader,
+                                    &mut len_buf,
+                                    Instant::now() + ADB_FRAME_READ_DEADLINE,
+                                ) {
                                     Ok(()) => {
                                         let len = u16::from_be_bytes(len_buf) as usize;
                                         if len == 0 || len > pkt.len() {
                                             break;
                                         }
-                                        if tcp_reader.read_exact(&mut pkt[..len]).is_err() {
+                                        if read_exact_interruptible(
+                                            &mut tcp_reader,
+                                            &mut pkt[..len],
+                                            Instant::now() + ADB_FRAME_READ_DEADLINE,
+                                        )
+                                        .is_err()
+                                        {
                                             break;
                                         }
                                         let _ = udp_tx.send_to(&pkt[..len], client_addr);
                                     }
-                                    Err(ref e)
-                                        if e.kind() == std::io::ErrorKind::WouldBlock
-                                            || e.kind() == std::io::ErrorKind::TimedOut => {}
                                     Err(_) => break,
                                 }
                             }
@@ -863,6 +915,11 @@ impl AdbTcpClientBridge {
                                     Err(_) => break,
                                 }
                             }
+                            // Session end: wake the paired reader, which may
+                            // still be parked in a bounded TCP read. Shutting
+                            // down the writer clone breaks that wait so the
+                            // supervisor can join and reconnect promptly.
+                            let _ = tcp_writer.shutdown(std::net::Shutdown::Both);
                             alive_out.store(false, Ordering::Release);
                         })
                         .ok();
@@ -1017,6 +1074,7 @@ impl ClientEngine {
                 Self::realtime_rx_and_dsp_loop(
                     socket,
                     effective_config,
+                    effective_config.server_addr,
                     burst_fifo,
                     #[cfg(not(target_os = "android"))]
                     &mut _audio_stream,
@@ -1216,6 +1274,7 @@ impl ClientEngine {
     fn realtime_rx_and_dsp_loop(
         socket: UdpSocket,
         config: ClientConfig,
+        effective_server_addr: SocketAddr,
         burst_fifo: Arc<BurstDecouplerRing>,
         #[cfg(not(target_os = "android"))] desktop_stream: &mut Option<(cpal::Stream, u32, Arc<AtomicBool>)>,
         #[cfg(target_os = "android")] aaudio_guard: &mut Option<android_aaudio::AAudioOutputGuard>,
@@ -1534,7 +1593,14 @@ impl ClientEngine {
             // "jitter" on a perfectly paced link.
             let mut audio_packets_drained = 0u8;
 
-            while let Ok((len, _)) = socket.recv_from(&mut recv_buf) {
+            while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
+                // Accept audio only from the effective server. In ADB USB mode
+                // that is the bridge's loopback UDP endpoint, not the raw
+                // `config.server_addr`; filtering against the latter would drop
+                // every tunneled packet.
+                if src_addr != effective_server_addr {
+                    continue;
+                }
                 if packets_drained == 0 {
                     let _ = socket.set_nonblocking(true);
                 }
@@ -3973,6 +4039,8 @@ pub mod android_aaudio {
         fn AAudioStreamBuilder_delete(builder: *mut AAudioStreamBuilder) -> i32;
         fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getFormat(stream: *mut AAudioStream) -> i32;
+        fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
         fn AAudioStream_setBufferSizeInFrames(stream: *mut AAudioStream, num_frames: i32) -> i32;
         fn AAudioStream_getFramesWritten(stream: *mut AAudioStream) -> i64;
         fn AAudioStream_getTimestamp(
@@ -4176,6 +4244,23 @@ pub mod android_aaudio {
                     return None;
                 }
 
+                // AAudio may grant a different format or channel layout than
+                // requested (e.g. a legacy HAL forcing PCM16 or mono). The
+                // output callback unconditionally casts `audio_data` to
+                // interleaved stereo f32, so a mismatch would read/write past
+                // the buffer. Reject such streams instead of corrupting memory.
+                let actual_format = AAudioStream_getFormat(stream);
+                let actual_channels = AAudioStream_getChannelCount(stream);
+                if actual_format != AAUDIO_FORMAT_PCM_FLOAT || actual_channels != 2 {
+                    eprintln!(
+                        "AAudio output: unexpected format={} channels={} (expected {} / 2); closing stream",
+                        actual_format, actual_channels, AAUDIO_FORMAT_PCM_FLOAT
+                    );
+                    AAudioStream_close(stream);
+                    let _ = Box::from_raw(ctx_ptr);
+                    return None;
+                }
+
                 let actual_rate = AAudioStream_getSampleRate(stream);
                 let actual_sample_rate = if actual_rate >= 8_000 {
                     actual_rate as u32
@@ -4336,6 +4421,22 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_delete(builder);
 
                 if res != 0 || stream.is_null() {
+                    let _ = Box::from_raw(ctx_ptr);
+                    return None;
+                }
+
+                // The input callback casts `audio_data` to a mono f32 slice
+                // sized by frame count. If the HAL granted PCM16 or more than
+                // one channel, that cast would decode garbage / overrun. Reject
+                // the stream rather than feeding invalid samples to the mic ring.
+                let actual_format = AAudioStream_getFormat(stream);
+                let actual_channels = AAudioStream_getChannelCount(stream);
+                if actual_format != AAUDIO_FORMAT_PCM_FLOAT || actual_channels != 1 {
+                    eprintln!(
+                        "AAudio input: unexpected format={} channels={} (expected {} / 1); closing stream",
+                        actual_format, actual_channels, AAUDIO_FORMAT_PCM_FLOAT
+                    );
+                    AAudioStream_close(stream);
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
                 }
