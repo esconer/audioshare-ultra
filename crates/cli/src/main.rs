@@ -831,7 +831,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "long 180s x4 soak SLA; run with cargo test -p audioshare-cli -- --ignored"]
+    // 180 s x4 is simulated time in a deterministic event-driven harness;
+    // the whole soak completes in ~7 s, so keep it in the normal CI suite.
     fn test_end_to_end_wifi_drift_and_loss_soak() {
         // 180 s of simulated time lets the 500 ms clock-loop windows fully
         // converge for both drift directions before the +/-60 ppm SLA is checked.
