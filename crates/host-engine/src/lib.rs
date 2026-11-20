@@ -204,6 +204,69 @@ fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
     }
 }
 
+/// Pure profile/framing/bitrate selector shared by `realtime_tx_loop` and unit tests.
+#[inline]
+fn select_tx_profile(
+    profile: QualityProfile,
+    configured_subframes: u8,
+    selected_kbps: u16,
+    worst_loss_permille: u16,
+    raw_gaming_lock: bool,
+    bt_active: bool,
+    any_wifi_client: bool,
+) -> (CodecMode, usize, u16) {
+    // Classic BT A2DP is ~185 ms regardless; forcing 400 pps (1 sf) over
+    // 2.4 GHz Wi-Fi only worsens single-antenna BT/Wi-Fi contention.
+    let gaming_lock = raw_gaming_lock && !bt_active;
+    let base_subframes = if gaming_lock {
+        1
+    } else {
+        configured_subframes.clamp(1, 2) as usize
+    };
+
+    match profile {
+        QualityProfile::StudioLossless | QualityProfile::StudioLossless24Bit => {
+            (CodecMode::StudioLosslessLpc, base_subframes, selected_kbps)
+        }
+        QualityProfile::LowLatencyCompressed => {
+            (CodecMode::CompressedLowDelay, base_subframes, selected_kbps)
+        }
+        QualityProfile::MaxStability24Ghz => {
+            // Never let gaming_lock halve 10 ms 2.4 GHz stability framing.
+            (
+                CodecMode::CompressedLowDelay,
+                4,
+                stability_bitrate_kbps(selected_kbps, worst_loss_permille),
+            )
+        }
+        QualityProfile::SmartAuto => {
+            if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+                (
+                    CodecMode::CompressedLowDelay,
+                    if gaming_lock { 2 } else { 4 },
+                    stability_bitrate_kbps(selected_kbps, worst_loss_permille),
+                )
+            } else if bt_active && any_wifi_client {
+                // Single-antenna Wi-Fi + A2DP link: stay on transparent Opus
+                // instead of probing 1+ Mbps lossless that A2DP re-encodes anyway.
+                (
+                    CodecMode::CompressedLowDelay,
+                    2,
+                    selected_kbps.clamp(96, 192),
+                )
+            } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+                (
+                    CodecMode::CompressedLowDelay,
+                    if gaming_lock { 1 } else { 2 },
+                    selected_kbps,
+                )
+            } else {
+                (CodecMode::StudioLosslessLpc, base_subframes, selected_kbps)
+            }
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 pub(crate) struct ClientPreviewSink;
 
@@ -714,9 +777,11 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     // datagrams while the Wi-Fi driver waits for a TXOP. The old tight 16 KB
     // also overflowed after only a few large fast-scene allocations, and
     // `send_to` runs on a non-blocking socket, so those drops were silent.
+    // 256 KB send buffer absorbs 250+ ms Wi-Fi driver TX stalls without
+    // silent non-blocking `send_to` drops (send_err).
     // 128 KB SO_RCVBUF ensures the receiver never drops Wi-Fi aggregation
     // bursts.
-    let _ = sock_ref.set_send_buffer_size(65_536);
+    let _ = sock_ref.set_send_buffer_size(262_144);
     let _ = sock_ref.set_recv_buffer_size(131_072);
 
     // Disable Winsock's legacy SIO_UDP_CONNRESET behavior: without this, one
@@ -1165,6 +1230,8 @@ pub struct HostTelemetry {
     /// The governor then drops to 1-subframe (2.5 ms) framing for normal
     /// profiles (2 subframes for lossy 2.4 GHz stability profiles).
     pub client_gaming_lock: AtomicBool,
+    /// True while at least one unmuted connected client is on Wi-Fi (!is_usb).
+    pub any_wifi_client: AtomicBool,
     pub enable_group_sync: AtomicBool,
     pub manual_group_sync_trim_ms: AtomicU16,
     pub target_bitrate_kbps: AtomicU16,
@@ -1213,6 +1280,7 @@ impl Default for HostTelemetry {
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
             prefer_opus: AtomicBool::new(true),
             client_gaming_lock: AtomicBool::new(false),
+            any_wifi_client: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(false),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -1494,6 +1562,9 @@ impl HostEngine {
             quality_profile: AtomicU8::new(QualityProfile::SmartAuto as u8),
             prefer_opus: AtomicBool::new(true),
             client_gaming_lock: AtomicBool::new(false),
+            any_wifi_client: AtomicBool::new(
+                initial_targets.iter().any(|a| !is_usb_subnet_ip(a.ip())),
+            ),
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -1702,6 +1773,10 @@ impl HostEngine {
         telemetry
             .client_gaming_lock
             .store(Self::any_client_gaming_lock(map), Ordering::Relaxed);
+        telemetry.any_wifi_client.store(
+            map.values().any(|c| !c.muted && !c.is_usb),
+            Ordering::Relaxed,
+        );
     }
 
     /// Pure computation behind [`Self::refresh_gaming_lock_telemetry`].
@@ -2986,71 +3061,25 @@ impl HostEngine {
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
                 .clamp(96, 320);
-            // A connected 5 ms hard-lock client requests the tightest framing
-            // the profile can sustain. Normal profiles drop to one subframe
-            // (2.5 ms packets); lossy 2.4 GHz stability profiles stay at two
-            // subframes so the doubled packet rate does not worsen contention.
-            let gaming_lock = telemetry.client_gaming_lock.load(Ordering::Relaxed);
-            let base_subframes = if gaming_lock {
-                1
-            } else {
-                telemetry
-                    .configured_subframes_per_packet
-                    .load(Ordering::Relaxed)
-                    .clamp(1, 2) as usize
-            };
-            // Tier selection uses the governor's paced estimate, not the raw
-            // last report, so a post-hold release walks through Tier 1 instead
-            // of jumping straight from Tier 2 back to lossless.
+            // Framing/profile/bitrate decisions are factored into
+            // `select_tx_profile` so the BT/gaming-lock guardrails are shared
+            // with unit tests. Tier selection uses the governor's paced
+            // estimate, not the raw last report, so a post-hold release walks
+            // through Tier 1 instead of jumping straight from Tier 2 back to
+            // lossless.
+            let raw_gaming_lock = telemetry.client_gaming_lock.load(Ordering::Relaxed);
+            let bt_active = telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0;
+            let any_wifi = telemetry.any_wifi_client.load(Ordering::Relaxed);
             let worst_loss_permille = loss_governor.value;
-            match profile {
-                QualityProfile::StudioLossless => {
-                    dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                    subframes_per_pkt = base_subframes;
-                    tx_bitrate_kbps = selected_kbps;
-                }
-                QualityProfile::LowLatencyCompressed => {
-                    dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = base_subframes;
-                    tx_bitrate_kbps = selected_kbps;
-                }
-                QualityProfile::MaxStability24Ghz => {
-                    // 4 x 2.5 ms = 10.0 ms framing (100 pps) as advertised by
-                    // the profile name. Longer packets cut MAC contention and
-                    // retransmit bursts on congested 2.4 GHz links; the client
-                    // WSOLA PLC covers subframes not carried by [N-1]/[N-2].
-                    // Gaming lock halves that to 5 ms instead of doubling the
-                    // packet rate to 400 pps on an already lossy link.
-                    dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                    subframes_per_pkt = if gaming_lock { 2 } else { 4 };
-                    tx_bitrate_kbps = stability_bitrate_kbps(selected_kbps, worst_loss_permille);
-                }
-                QualityProfile::StudioLossless24Bit => {
-                    // Two subframes halve MAC contention (200 packets/s).
-                    // A worst-case 24-bit subframe is huge, so the sender
-                    // drops FEC first and splits into per-subframe datagrams
-                    // only when the primary itself cannot fit the safe MTU.
-                    dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                    subframes_per_pkt = base_subframes;
-                    tx_bitrate_kbps = selected_kbps;
-                }
-                QualityProfile::SmartAuto => {
-                    if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
-                        dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = if gaming_lock { 2 } else { 4 };
-                        tx_bitrate_kbps =
-                            stability_bitrate_kbps(selected_kbps, worst_loss_permille);
-                    } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
-                        dynamic_codec_mode = CodecMode::CompressedLowDelay;
-                        subframes_per_pkt = if gaming_lock { 1 } else { 2 };
-                        tx_bitrate_kbps = selected_kbps;
-                    } else {
-                        dynamic_codec_mode = CodecMode::StudioLosslessLpc;
-                        subframes_per_pkt = base_subframes;
-                        tx_bitrate_kbps = selected_kbps;
-                    }
-                }
-            }
+            (dynamic_codec_mode, subframes_per_pkt, tx_bitrate_kbps) = select_tx_profile(
+                profile,
+                telemetry.configured_subframes_per_packet.load(Ordering::Relaxed),
+                selected_kbps,
+                worst_loss_permille,
+                raw_gaming_lock,
+                bt_active,
+                any_wifi,
+            );
             // Compressed-codec backend selection. Opus is opt-in and only
             // replaces the payload of compressed profiles; lossless and
             // 24-bit modes are untouched. If encoder creation fails we stay
@@ -4542,6 +4571,29 @@ mod tests {
         assert!(HostEngine::any_client_gaming_lock(&map));
         map.get_mut(&a).unwrap().gaming_lock = false;
         assert!(!HostEngine::any_client_gaming_lock(&map));
+    }
+
+    #[test]
+    fn test_select_tx_profile_bt_and_gaming_guardrails() {
+        // MaxStability24Ghz must stay 4 subframes (10 ms) even with gaming lock.
+        let (mode, sf, kbps) =
+            select_tx_profile(QualityProfile::MaxStability24Ghz, 2, 256, 0, true, false, true);
+        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 4, 160));
+
+        // Active Bluetooth suppresses 1-sf gaming lock (keeps 2 sf).
+        let (mode, sf, _) =
+            select_tx_profile(QualityProfile::StudioLossless, 2, 256, 0, true, true, true);
+        assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
+
+        // SmartAuto on Wi-Fi + BT stays compressed (192k, 2 sf) instead of probing lossless.
+        let (mode, sf, kbps) =
+            select_tx_profile(QualityProfile::SmartAuto, 2, 256, 0, false, true, true);
+        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 192));
+
+        // Clean wired/speaker SmartAuto still stays lossless.
+        let (mode, sf, _) =
+            select_tx_profile(QualityProfile::SmartAuto, 2, 256, 0, false, false, true);
+        assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
     }
 
     #[test]
