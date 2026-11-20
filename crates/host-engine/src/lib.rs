@@ -1433,6 +1433,7 @@ impl HostEngine {
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
         let mut guard = self.session_key.lock().unwrap();
         *guard = pin.map(SessionKey::from_pin);
+        self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
     }
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {

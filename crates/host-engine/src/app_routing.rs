@@ -294,7 +294,8 @@ pub fn spawn_windows_process_loopback(
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     start_epoch: std::time::Instant,
 ) -> Result<WindowsProcessLoopbackStream, String> {
-    use windows::core::{implement, AsImpl, IUnknown, Interface};
+    use windows::core::{implement, IUnknown, Interface};
+    use windows::core::PROPVARIANT;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
@@ -307,14 +308,30 @@ pub fn spawn_windows_process_loopback(
         AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
         VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
     };
-    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, IAgileObject, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
     use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
-    #[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
+    /// RAII wrapper around a Win32 event HANDLE so late COM callbacks after a
+    /// timeout never call `SetEvent` on a closed/recycled handle.
+    struct OwnedHandle(HANDLE);
+    unsafe impl Send for OwnedHandle {}
+    unsafe impl Sync for OwnedHandle {}
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    // `windows-implement` 0.58 answers `IAgileObject` automatically in QI;
+    // listing `IAgileObject` explicitly without `impl IAgileObject_Impl` fails compilation.
+    #[implement(IActivateAudioInterfaceCompletionHandler)]
     struct CompletionHandler {
-        event: HANDLE,
-        result: std::sync::Mutex<Option<Result<IAudioClient, String>>>,
+        event: std::sync::Arc<OwnedHandle>,
+        result: std::sync::Arc<std::sync::Mutex<Option<Result<IAudioClient, String>>>>,
     }
 
     impl IActivateAudioInterfaceCompletionHandler_Impl for CompletionHandler_Impl {
@@ -334,13 +351,14 @@ pub fn spawn_windows_process_loopback(
                     .map_err(|e| format!("Cast to IAudioClient failed: {e}"))
             })();
             *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(res);
-            unsafe { let _ = SetEvent(self.event); }
+            unsafe { let _ = SetEvent(self.event.0); }
             Ok(())
         }
     }
 
     let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let active_t = std::sync::Arc::clone(&active);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
     stream_error.store(false, std::sync::atomic::Ordering::Release);
 
     let handle = std::thread::Builder::new()
@@ -349,12 +367,16 @@ pub fn spawn_windows_process_loopback(
             let _rt = crate::RealtimeThreadGuard::enter();
             unsafe {
                 let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                let mut started_ok = false;
                 let res = (|| -> Result<(), String> {
-                    let done_evt = CreateEventW(None, true, false, None)
-                        .map_err(|e| format!("CreateEventW failed: {e}"))?;
+                    let done_evt = std::sync::Arc::new(OwnedHandle(
+                        CreateEventW(None, true, false, None)
+                            .map_err(|e| format!("CreateEventW failed: {e}"))?,
+                    ));
+                    let result_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
                     let handler_impl = CompletionHandler {
-                        event: done_evt,
-                        result: std::sync::Mutex::new(None),
+                        event: std::sync::Arc::clone(&done_evt),
+                        result: std::sync::Arc::clone(&result_slot),
                     };
                     let handler: IActivateAudioInterfaceCompletionHandler = handler_impl.into();
 
@@ -399,13 +421,10 @@ pub fn spawn_windows_process_loopback(
                     )
                     .map_err(|e| format!("ActivateAudioInterfaceAsync failed: {e}"))?;
 
-                    if WaitForSingleObject(done_evt, 3000) != WAIT_OBJECT_0 {
-                        let _ = CloseHandle(done_evt);
+                    if WaitForSingleObject(done_evt.0, 3000) != WAIT_OBJECT_0 {
                         return Err("Process loopback activation timed out".into());
                     }
-                    let _ = CloseHandle(done_evt);
-                    let client = handler.as_impl()
-                        .result
+                    let client = result_slot
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .take()
@@ -426,20 +445,24 @@ pub fn spawn_windows_process_loopback(
                         | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
                     client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None)
                         .map_err(|e| format!("IAudioClient::Initialize failed: {e}"))?;
-                    let sample_evt = CreateEventW(None, false, false, None)
-                        .map_err(|e| format!("CreateEventW(sample) failed: {e}"))?;
-                    client.SetEventHandle(sample_evt)
+                    let sample_evt = OwnedHandle(
+                        CreateEventW(None, false, false, None)
+                            .map_err(|e| format!("CreateEventW(sample) failed: {e}"))?,
+                    );
+                    client.SetEventHandle(sample_evt.0)
                         .map_err(|e| format!("SetEventHandle failed: {e}"))?;
                     let capture: IAudioCaptureClient = client
                         .GetService()
                         .map_err(|e| format!("GetService(IAudioCaptureClient) failed: {e}"))?;
                     client.Start().map_err(|e| format!("IAudioClient::Start failed: {e}"))?;
+                    started_ok = true;
+                    let _ = ready_tx.send(Ok(()));
 
                     let silence = [0.0f32; 2048];
-                    while active_t.load(std::sync::atomic::Ordering::Relaxed)
+                    'capture: while active_t.load(std::sync::atomic::Ordering::Relaxed)
                         && running.load(std::sync::atomic::Ordering::Relaxed)
                     {
-                        let _ = WaitForSingleObject(sample_evt, 20);
+                        let _ = WaitForSingleObject(sample_evt.0, 20);
                         while let Ok(pkt_frames) = capture.GetNextPacketSize() {
                             if pkt_frames == 0 { break; }
                             let mut data_ptr = core::ptr::null_mut();
@@ -447,7 +470,7 @@ pub fn spawn_windows_process_loopback(
                             let mut buf_flags = 0u32;
                             if capture.GetBuffer(&mut data_ptr, &mut frames, &mut buf_flags, None, None).is_err() {
                                 stream_error.store(true, std::sync::atomic::Ordering::Release);
-                                break;
+                                break 'capture;
                             }
                             heartbeat_ms.store(
                                 start_epoch.elapsed().as_millis() as u64,
@@ -469,11 +492,13 @@ pub fn spawn_windows_process_loopback(
                         }
                     }
                     let _ = client.Stop();
-                    let _ = CloseHandle(sample_evt);
                     Ok(())
                 })();
                 if let Err(err) = res {
-                    audioshare_protocol::diagnostics::warn("win-proc-loopback", err);
+                    audioshare_protocol::diagnostics::warn("win-proc-loopback", &err);
+                    if !started_ok {
+                        let _ = ready_tx.send(Err(err));
+                    }
                     stream_error.store(true, std::sync::atomic::Ordering::Release);
                 }
                 if com_ok { CoUninitialize(); }
@@ -481,7 +506,18 @@ pub fn spawn_windows_process_loopback(
         })
         .map_err(|e| format!("Failed to spawn process loopback thread: {e}"))?;
 
-    Ok(WindowsProcessLoopbackStream { active, handle: Some(handle) })
+    match ready_rx.recv_timeout(std::time::Duration::from_secs(4)) {
+        Ok(Ok(())) => Ok(WindowsProcessLoopbackStream { active, handle: Some(handle) }),
+        Ok(Err(err)) => {
+            active.store(false, std::sync::atomic::Ordering::Release);
+            let _ = handle.join();
+            Err(err)
+        }
+        Err(_) => {
+            active.store(false, std::sync::atomic::Ordering::Release);
+            Err("Process loopback startup timed out".into())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
