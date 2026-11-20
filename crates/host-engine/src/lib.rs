@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use audioshare_protocol::crypto::SessionKey;
@@ -206,6 +206,49 @@ fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
     }
 }
 
+/// Wait-free producer wakeup from OS audio capture callbacks to `realtime_tx_loop`.
+/// Never blocks the RT capture callback; falls back to a bounded timeout on rare
+/// lock contention so lost wakeups are impossible.
+pub(crate) struct CaptureWakeup {
+    seq: AtomicU64,
+    mu: Mutex<()>,
+    cv: Condvar,
+}
+
+impl CaptureWakeup {
+    pub fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            mu: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    #[inline]
+    pub fn notify(&self) {
+        self.seq.fetch_add(1, Ordering::Release);
+        if let Ok(_g) = self.mu.try_lock() {
+            self.cv.notify_one();
+        } else {
+            // Consumer is inside the ~50 ns check window; wake anyway.
+            self.cv.notify_one();
+        }
+    }
+
+    #[inline]
+    pub fn wait_bounded(&self, seen_seq: u64, max_wait: Duration) {
+        let guard = self.mu.lock().unwrap_or_else(|e| e.into_inner());
+        if self.seq.load(Ordering::Acquire) == seen_seq {
+            let _ = self.cv.wait_timeout(guard, max_wait);
+        }
+    }
+
+    #[inline]
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+}
+
 /// Pure profile/framing/bitrate selector shared by `realtime_tx_loop` and unit tests.
 #[inline]
 fn select_tx_profile(
@@ -216,11 +259,16 @@ fn select_tx_profile(
     raw_gaming_lock: bool,
     bt_active: bool,
     any_wifi_client: bool,
+    all_clients_usb: bool,
 ) -> (CodecMode, usize, u16) {
     // Classic BT A2DP is ~185 ms regardless; forcing 400 pps (1 sf) over
-    // 2.4 GHz Wi-Fi only worsens single-antenna BT/Wi-Fi contention.
+    // 2.4 GHz Wi-Fi only worsens single-antenna BT/Wi-Fi contention. The same
+    // guard applies to the auto-USB fast path: a wired tether has ample
+    // headroom and no 802.11 TX queue, so 2.5 ms packetization is free there,
+    // but an active BT link still needs the steadier 5 ms framing.
     let gaming_lock = raw_gaming_lock && !bt_active;
-    let base_subframes = if gaming_lock {
+    let usb_fast_path = all_clients_usb && !bt_active;
+    let base_subframes = if gaming_lock || usb_fast_path {
         1
     } else {
         configured_subframes.clamp(1, 2) as usize
@@ -1234,6 +1282,10 @@ pub struct HostTelemetry {
     pub client_gaming_lock: AtomicBool,
     /// True while at least one unmuted connected client is on Wi-Fi (!is_usb).
     pub any_wifi_client: AtomicBool,
+    /// True while every unmuted connected client is on a USB-tethered subnet.
+    /// Wired USB has no 802.11 contention, so the TX loop can select 1-subframe
+    /// (2.5 ms) framing and skip the `capture_min_gap_us` anti-burst sleep.
+    pub all_clients_usb: AtomicBool,
     pub enable_group_sync: AtomicBool,
     pub manual_group_sync_trim_ms: AtomicU16,
     pub target_bitrate_kbps: AtomicU16,
@@ -1283,6 +1335,7 @@ impl Default for HostTelemetry {
             prefer_opus: AtomicBool::new(true),
             client_gaming_lock: AtomicBool::new(false),
             any_wifi_client: AtomicBool::new(false),
+            all_clients_usb: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(false),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -1375,6 +1428,7 @@ impl HostTelemetry {
 fn pump_pcm_fd_nonblocking(
     fd: std::os::fd::RawFd,
     ring: &BurstDecouplerRing,
+    wakeup: &CaptureWakeup,
     heartbeat_ms: &AtomicU64,
     running: &AtomicBool,
     stream_active: &AtomicBool,
@@ -1449,6 +1503,7 @@ fn pump_pcm_fd_nonblocking(
                 *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             }
             ring.push_samples(&f32_buf);
+            wakeup.notify();
             continue;
         }
         if n == 0 {
@@ -1567,6 +1622,7 @@ impl HostEngine {
             any_wifi_client: AtomicBool::new(
                 initial_targets.iter().any(|a| !is_usb_subnet_ip(a.ip())),
             ),
+            all_clients_usb: AtomicBool::new(false),
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
@@ -1779,6 +1835,12 @@ impl HostEngine {
             map.values().any(|c| !c.muted && !c.is_usb),
             Ordering::Relaxed,
         );
+        // Reuse the same unmuted-client predicate the TX loop caches in
+        // `cached_all_usb`: an empty map or any Wi-Fi client disables the
+        // low-latency USB fast path.
+        telemetry
+            .all_clients_usb
+            .store(Self::all_active_targets_are_usb(map), Ordering::Relaxed);
     }
 
     /// Pure computation behind [`Self::refresh_gaming_lock_telemetry`].
@@ -1872,6 +1934,7 @@ impl HostEngine {
     #[cfg(target_os = "linux")]
     fn spawn_linux_parec_monitor(
         ring: Arc<BurstDecouplerRing>,
+        wakeup: Arc<CaptureWakeup>,
         heartbeat_ms: Arc<AtomicU64>,
         running: Arc<AtomicBool>,
         start_epoch: Instant,
@@ -1888,6 +1951,7 @@ impl HostEngine {
         let capture_exited = Arc::clone(&child_exited);
         let capture_running = Arc::clone(&running);
         let capture_ring = Arc::clone(&ring);
+        let capture_wakeup = Arc::clone(&wakeup);
         let capture_heartbeat = Arc::clone(&heartbeat_ms);
 
         let handle = std::thread::Builder::new()
@@ -1982,6 +2046,7 @@ impl HostEngine {
                                 pump_pcm_fd_nonblocking(
                                     stdout.as_raw_fd(),
                                     &capture_ring,
+                                    &capture_wakeup,
                                     &capture_heartbeat,
                                     &capture_running,
                                     &capture_active,
@@ -2004,6 +2069,7 @@ impl HostEngine {
                             if Self::try_inprocess_pulse_simple_capture(
                                 &current_monitor,
                                 &capture_ring,
+                                &capture_wakeup,
                                 &capture_heartbeat,
                                 &capture_running,
                                 &capture_active,
@@ -2042,6 +2108,7 @@ impl HostEngine {
     fn try_inprocess_pulse_simple_capture(
         monitor_name: &str,
         ring: &Arc<BurstDecouplerRing>,
+        wakeup: &Arc<CaptureWakeup>,
         heartbeat_ms: &Arc<AtomicU64>,
         running: &Arc<AtomicBool>,
         stream_active: &Arc<AtomicBool>,
@@ -2154,6 +2221,7 @@ impl HostEngine {
                 }
                 heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
                 ring.push_samples(&f32_buf);
+                wakeup.notify();
                 // The watcher thread resolves sink changes off this
                 // real-time path; reopening is cheap once it signals.
                 if sink_generation.load(Ordering::Acquire) != generation {
@@ -2168,6 +2236,7 @@ impl HostEngine {
     #[cfg(not(target_os = "android"))]
     fn spawn_loopback_capture(
         ring: Arc<BurstDecouplerRing>,
+        wakeup: Arc<CaptureWakeup>,
         heartbeat_ms: Arc<AtomicU64>,
         stream_error: Arc<AtomicBool>,
         running: Arc<AtomicBool>,
@@ -2180,6 +2249,7 @@ impl HostEngine {
             // Spawn native PipeWire / PulseAudio 3ms desktop speaker monitor stream (`@DEFAULT_MONITOR@`)
             if let Ok(stream) = Self::spawn_linux_parec_monitor(
                 Arc::clone(&ring),
+                Arc::clone(&wakeup),
                 Arc::clone(&heartbeat_ms),
                 Arc::clone(&running),
                 start_epoch,
@@ -2249,6 +2319,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let wakeup = Arc::clone(&wakeup);
                 let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
@@ -2283,6 +2354,7 @@ impl HostEngine {
                                 );
                                 ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
+                            wakeup.notify();
                             frame_offset += chunk_frames;
                         }
                     },
@@ -2296,6 +2368,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let wakeup = Arc::clone(&wakeup);
                 let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
@@ -2330,6 +2403,7 @@ impl HostEngine {
                                 );
                                 ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
+                            wakeup.notify();
                             frame_offset += chunk_frames;
                         }
                     },
@@ -2343,6 +2417,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let wakeup = Arc::clone(&wakeup);
                 let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
@@ -2377,6 +2452,7 @@ impl HostEngine {
                                 );
                                 ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
+                            wakeup.notify();
                             frame_offset += chunk_frames;
                         }
                     },
@@ -2390,6 +2466,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let wakeup = Arc::clone(&wakeup);
                 let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
@@ -2424,6 +2501,7 @@ impl HostEngine {
                                 );
                                 ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
+                            wakeup.notify();
                             frame_offset += chunk_frames;
                         }
                     },
@@ -2437,6 +2515,7 @@ impl HostEngine {
                 let heartbeat = Arc::clone(&heartbeat_ms);
                 let ring_buf = Arc::clone(&ring);
                 let err_flag = Arc::clone(&stream_error);
+                let wakeup = Arc::clone(&wakeup);
                 let mut scratch = LoopbackCaptureScratch::new();
                 device.build_input_stream(
                     &stream_cfg,
@@ -2465,6 +2544,7 @@ impl HostEngine {
                                 );
                                 ring_buf.push_samples(&scratch.resampled[..out_frames * 2]);
                             }
+                            wakeup.notify();
                             frame_offset += chunk_frames;
                         }
                     },
@@ -2502,6 +2582,10 @@ impl HostEngine {
         #[cfg(target_os = "android")]
         let _ = &capture_heartbeat_ms;
         let start_instant = Instant::now();
+        // Shared by every capture producer below. The RT callback only bumps
+        // an atomic and signals a condvar; the TX loop parks here instead of
+        // polling on a 500 us sleep (which averages ~1 ms on Windows timers).
+        let capture_wakeup = Arc::new(CaptureWakeup::new());
         #[cfg(not(target_os = "android"))]
         let capture_stream_error = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
@@ -2556,6 +2640,7 @@ impl HostEngine {
         let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
+                Arc::clone(&capture_wakeup),
                 Arc::clone(&capture_heartbeat_ms),
                 Arc::clone(&capture_stream_error),
                 Arc::clone(&running),
@@ -2572,6 +2657,7 @@ impl HostEngine {
         let mut active_stream = if !config.use_test_tone {
             Self::spawn_loopback_capture(
                 Arc::clone(&ring),
+                Arc::clone(&capture_wakeup),
                 Arc::clone(&capture_heartbeat_ms),
                 Arc::clone(&capture_stream_error),
                 Arc::clone(&running),
@@ -2675,6 +2761,7 @@ impl HostEngine {
             if !use_test_tone && active_stream.is_none() {
                 active_stream = Self::spawn_loopback_capture(
                     Arc::clone(&ring),
+                    Arc::clone(&capture_wakeup),
                     Arc::clone(&capture_heartbeat_ms),
                     Arc::clone(&capture_stream_error),
                     Arc::clone(&running),
@@ -2722,6 +2809,11 @@ impl HostEngine {
                     // producer on `ring` (Rust evaluates RHS first otherwise).
                     active_stream = None;
                     active_stream = if target_pid != 0 {
+                        // NOTE (B1 scope): this producer lives in
+                        // `app_routing.rs` and pushes straight into `ring`.
+                        // It cannot receive `capture_wakeup` without a
+                        // signature change in that module; until then this
+                        // path relies on `wait_bounded`'s 1500 us fallback.
                         app_routing::spawn_windows_process_loopback(
                             target_pid,
                             Arc::clone(&ring),
@@ -2734,6 +2826,7 @@ impl HostEngine {
                         .or_else(|_| {
                             Self::spawn_loopback_capture(
                                 Arc::clone(&ring),
+                                Arc::clone(&capture_wakeup),
                                 Arc::clone(&capture_heartbeat_ms),
                                 Arc::clone(&capture_stream_error),
                                 Arc::clone(&running),
@@ -2744,6 +2837,7 @@ impl HostEngine {
                     } else {
                         Self::spawn_loopback_capture(
                             Arc::clone(&ring),
+                            Arc::clone(&capture_wakeup),
                             Arc::clone(&capture_heartbeat_ms),
                             Arc::clone(&capture_stream_error),
                             Arc::clone(&running),
@@ -3089,6 +3183,7 @@ impl HostEngine {
                 raw_gaming_lock,
                 bt_active,
                 any_wifi,
+                cached_all_usb,
             );
             // Compressed-codec backend selection. Opus is opt-in and only
             // replaces the payload of compressed profiles; lossless and
@@ -3151,6 +3246,11 @@ impl HostEngine {
             // or fall back to silence synthesis only if capture endpoint is truly idle >80ms.
             let needed_samples = subframes_per_pkt * SUBFRAME_STEREO_SAMPLES;
             if !use_test_tone {
+                // Snapshot the wakeup sequence BEFORE reading the ring. A
+                // producer that pushes between this load and the availability
+                // check bumps the sequence, so `wait_bounded` sees the change
+                // and returns immediately instead of losing the wakeup.
+                let seen = capture_wakeup.current_seq();
                 let avail = ring.available_samples();
                 // Allow up to 24 subframes (60ms = 5760 samples) so normal 10-22ms OS callbacks
                 // on Windows WASAPI and Linux PipeWire are NEVER discarded mid-callback!
@@ -3164,16 +3264,19 @@ impl HostEngine {
                     let now_ms = start_instant.elapsed().as_millis() as u64;
                     let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
                     if now_ms.saturating_sub(last_cb) <= 80 {
-                        std::thread::sleep(Duration::from_micros(500));
+                        capture_wakeup.wait_bounded(seen, Duration::from_micros(1500));
                         continue;
                     }
-                } else {
+                } else if !cached_all_usb {
                     // Pace a multi-packet OS callback BEFORE popping and
                     // sending. This check must compare against the previous
                     // packet: running it after the send (and before updating
                     // `last_tx_instant`) let every packet produced by one
                     // 10-20 ms callback leave in a 20 us microburst, then
-                    // slept only after the ring was empty.
+                    // slept only after the ring was empty. Pure USB sessions
+                    // skip this anti-burst sleep: a wired tether has no 802.11
+                    // TX queue to overflow, so draining a callback burst at
+                    // full speed only lowers latency.
                     let remaining_subframes = avail / SUBFRAME_STEREO_SAMPLES;
                     let min_gap = Duration::from_micros(capture_min_gap_us(
                         subframes_per_pkt,
@@ -4653,24 +4756,199 @@ mod tests {
     #[test]
     fn test_select_tx_profile_bt_and_gaming_guardrails() {
         // MaxStability24Ghz must stay 4 subframes (10 ms) even with gaming lock.
-        let (mode, sf, kbps) =
-            select_tx_profile(QualityProfile::MaxStability24Ghz, 2, 256, 0, true, false, true);
+        let (mode, sf, kbps) = select_tx_profile(
+            QualityProfile::MaxStability24Ghz,
+            2,
+            256,
+            0,
+            true,
+            false,
+            true,
+            false,
+        );
         assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 4, 160));
 
         // Active Bluetooth suppresses 1-sf gaming lock (keeps 2 sf).
-        let (mode, sf, _) =
-            select_tx_profile(QualityProfile::StudioLossless, 2, 256, 0, true, true, true);
+        let (mode, sf, _) = select_tx_profile(
+            QualityProfile::StudioLossless,
+            2,
+            256,
+            0,
+            true,
+            true,
+            true,
+            false,
+        );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
 
         // SmartAuto on Wi-Fi + BT stays compressed (192k, 2 sf) instead of probing lossless.
-        let (mode, sf, kbps) =
-            select_tx_profile(QualityProfile::SmartAuto, 2, 256, 0, false, true, true);
+        let (mode, sf, kbps) = select_tx_profile(
+            QualityProfile::SmartAuto,
+            2,
+            256,
+            0,
+            false,
+            true,
+            true,
+            false,
+        );
         assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 192));
 
         // Clean wired/speaker SmartAuto still stays lossless.
-        let (mode, sf, _) =
-            select_tx_profile(QualityProfile::SmartAuto, 2, 256, 0, false, false, true);
+        let (mode, sf, _) = select_tx_profile(
+            QualityProfile::SmartAuto,
+            2,
+            256,
+            0,
+            false,
+            false,
+            true,
+            false,
+        );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
+    }
+
+    #[test]
+    fn test_select_tx_profile_auto_usb_one_subframe() {
+        // Pure USB, no Bluetooth: auto-fast-path to 2.5 ms framing even with no
+        // Gaming Lock requested.
+        let (mode, sf, _) = select_tx_profile(
+            QualityProfile::StudioLossless,
+            2,
+            256,
+            0,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 1));
+
+        // An active BT link suppresses the USB fast path just like gaming lock:
+        // A2DP needs the steadier 5 ms framing to avoid Wi-Fi/BT contention.
+        let (_, sf, _) = select_tx_profile(
+            QualityProfile::StudioLossless,
+            2,
+            256,
+            0,
+            false,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(sf, 2, "BT active must disable auto-USB 1-sf framing");
+
+        // A Wi-Fi client in the mix disables the fast path entirely.
+        let (_, sf, _) = select_tx_profile(
+            QualityProfile::StudioLossless,
+            2,
+            256,
+            0,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(sf, 2, "any Wi-Fi client must disable auto-USB 1-sf framing");
+
+        // Neither gaming lock nor auto-USB may halve 10 ms 2.4 GHz stability
+        // framing.
+        let (mode, sf, _) = select_tx_profile(
+            QualityProfile::MaxStability24Ghz,
+            1,
+            256,
+            0,
+            true,
+            false,
+            true,
+            true,
+        );
+        assert_eq!((mode, sf), (CodecMode::CompressedLowDelay, 4));
+    }
+
+    #[test]
+    fn test_capture_wakeup_notify_and_bounded_wait() {
+        let wakeup = Arc::new(CaptureWakeup::new());
+        let seen = wakeup.current_seq();
+
+        // notify() must release a thread parked in wait_bounded(), and the
+        // sequence it snapshots must advance exactly once.
+        let waiter = Arc::clone(&wakeup);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            waiter.wait_bounded(seen, Duration::from_secs(2));
+            let _ = done_tx.send(());
+        });
+        // Give the waiter a chance to park on the condvar before notifying.
+        // A notify that lands first simply makes the seq check return early,
+        // which is also a correct (lost-wakeup-free) outcome.
+        std::thread::sleep(Duration::from_millis(10));
+        let t0 = Instant::now();
+        wakeup.notify();
+        done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("wait_bounded did not return after notify()");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "notify() did not wake the waiter promptly: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(wakeup.current_seq(), seen + 1);
+        handle.join().expect("wakeup waiter thread panicked");
+
+        // With no producer notify the bounded wait still returns (no hang) and
+        // honours roughly the requested timeout.
+        let seen = wakeup.current_seq();
+        let t0 = Instant::now();
+        wakeup.wait_bounded(seen, Duration::from_millis(20));
+        let elapsed = t0.elapsed();
+        assert!(elapsed >= Duration::from_millis(15), "returned too early");
+        assert!(elapsed < Duration::from_secs(1), "bounded wait hung");
+    }
+
+    #[test]
+    fn test_refresh_gaming_lock_telemetry_tracks_all_clients_usb() {
+        fn client(addr: SocketAddr, is_usb: bool, muted: bool) -> ConnectedClient {
+            ConnectedClient {
+                addr,
+                last_seen: Instant::now(),
+                is_usb,
+                muted,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 0,
+                client_volume: 100,
+                gaming_lock: false,
+                feedback_window: FeedbackReplayWindow::default(),
+            }
+        }
+
+        let telemetry = HostTelemetry::new();
+        assert!(!telemetry.all_clients_usb.load(Ordering::Relaxed));
+
+        let usb_a: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let usb_b: SocketAddr = "127.0.0.1:1002".parse().unwrap();
+        let wifi: SocketAddr = "192.168.1.10:1003".parse().unwrap();
+        let mut map = HashMap::new();
+        map.insert(usb_a, client(usb_a, true, false));
+        map.insert(usb_b, client(usb_b, true, false));
+        HostEngine::refresh_gaming_lock_telemetry(&map, &telemetry);
+        assert!(telemetry.all_clients_usb.load(Ordering::Relaxed));
+
+        // One Wi-Fi client disables the fast path.
+        map.insert(wifi, client(wifi, false, false));
+        HostEngine::refresh_gaming_lock_telemetry(&map, &telemetry);
+        assert!(!telemetry.all_clients_usb.load(Ordering::Relaxed));
+
+        // A muted Wi-Fi client receives no audio and must not count.
+        map.get_mut(&wifi).unwrap().muted = true;
+        HostEngine::refresh_gaming_lock_telemetry(&map, &telemetry);
+        assert!(telemetry.all_clients_usb.load(Ordering::Relaxed));
+
+        // No clients at all must not enable the fast path.
+        map.clear();
+        HostEngine::refresh_gaming_lock_telemetry(&map, &telemetry);
+        assert!(!telemetry.all_clients_usb.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -5199,9 +5477,11 @@ mod tests {
         let run = Arc::clone(&running);
         let active = Arc::clone(&stream_active);
         let gen = Arc::clone(&sink_generation);
+        let wakeup = Arc::new(CaptureWakeup::new());
+        let pump_wakeup = Arc::clone(&wakeup);
         let thread = std::thread::spawn(move || {
             pump_pcm_fd_nonblocking(
-                read_fd, &pump_ring, &hb, &run, &active, &gen, generation, epoch,
+                read_fd, &pump_ring, &pump_wakeup, &hb, &run, &active, &gen, generation, epoch,
             );
             let _ = done_tx.send(());
         });
@@ -5270,8 +5550,12 @@ mod tests {
         let run = Arc::clone(&running);
         let active = Arc::clone(&stream_active);
         let gen = Arc::clone(&sink_generation);
+        let wakeup = Arc::new(CaptureWakeup::new());
+        let pump_wakeup = Arc::clone(&wakeup);
         let thread = std::thread::spawn(move || {
-            pump_pcm_fd_nonblocking(read_fd, &pump_ring, &hb, &run, &active, &gen, 0, epoch);
+            pump_pcm_fd_nonblocking(
+                read_fd, &pump_ring, &pump_wakeup, &hb, &run, &active, &gen, 0, epoch,
+            );
             let _ = done_tx.send(());
         });
 
@@ -5319,10 +5603,12 @@ mod tests {
         let stream_active = AtomicBool::new(true);
         let sink_generation = AtomicU64::new(0);
         let started = Instant::now();
+        let wakeup = CaptureWakeup::new();
 
         pump_pcm_fd_nonblocking(
             read_fd,
             &ring,
+            &wakeup,
             &heartbeat,
             &running,
             &stream_active,

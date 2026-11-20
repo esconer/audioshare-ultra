@@ -681,8 +681,9 @@ fn aaudio_buffer_frames_for_burst(burst: i32, capacity: i32) -> Option<i32> {
 /// Raw low-latency sizing policy, kept as the `normal_mixer = false` branch of
 /// [`aaudio_buffer_frames_for_profile`]. A2DP/Bluetooth bursts are commonly
 /// 480-960 frames (10-20 ms), so the old unconditional `burst * 3` turned them
-/// into 30-60 ms of output latency. Use one burst for large bursts and keep the
-/// verified 3x cushion (minimum 256 frames) for speaker/USB bursts.
+/// into 30-60 ms of output latency. Use one burst for large bursts and start
+/// small bursts at hardware double-buffering (2x, minimum 192 frames);
+/// `tune_buffer_on_xrun()` steps up by one burst on the first XRun.
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn aaudio_buffer_frames_for_raw_burst(burst: i32, capacity: i32) -> Option<i32> {
@@ -695,7 +696,13 @@ fn aaudio_buffer_frames_for_raw_burst(burst: i32, capacity: i32) -> Option<i32> 
         // single-buffered (XRuns on 240/256-frame Android devices).
         Some((burst * 2).min(capacity.max(burst)))
     } else {
-        Some((burst * 3).max(256).min(capacity.max(burst)))
+        // Start Exclusive/Low-Latency streams at hardware double-buffering (2x
+        // burst) instead of the old fixed 3x/256: on a 48 kHz phone a 96-frame
+        // burst becomes 192 frames (4.0 ms) and a 192-frame burst becomes 384
+        // frames (8.0 ms), instead of 288/576 frames. `tune_buffer_on_xrun()`
+        // grows by +1 burst up to 4x/effective capacity if the HAL ever reports
+        // an XRun, so the lower starting point stays safe.
+        Some((burst * 2).max(192).min(capacity.max(burst)))
     }
 }
 
@@ -712,6 +719,41 @@ fn aaudio_capacity_frames(normal_mixer: bool) -> i32 {
         1920
     } else {
         960
+    }
+}
+
+/// Pure decision core of the AAudio XRun-driven `LatencyTuner`.
+///
+/// Returns `(prev, target)` when a grown XRun count should step the buffer up
+/// by one burst, bounded by `max_auto_buf_frames`. `last_xrun_count` is always
+/// advanced to the latest observation (even when no growth is granted) so a
+/// single HAL counter jump cannot keep re-arming the tuner. Kept dependency-free
+/// so the growth policy is unit-testable off-device; the Android-only
+/// `android_aaudio::AAudioOutputGuard::tune_buffer_on_xrun` applies the returned
+/// target through AAudio.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_latency_tuner_growth(
+    xruns: u32,
+    last_xrun_count: &mut u32,
+    normal_mixer: bool,
+    burst_frames: i32,
+    current_buf_frames: i32,
+    max_auto_buf_frames: i32,
+) -> Option<(i32, i32)> {
+    let grew = xruns > *last_xrun_count;
+    *last_xrun_count = xruns;
+    if !grew || normal_mixer || burst_frames <= 0 {
+        return None;
+    }
+    if current_buf_frames >= max_auto_buf_frames {
+        return None;
+    }
+    let target = (current_buf_frames + burst_frames).min(max_auto_buf_frames);
+    if target > current_buf_frames {
+        Some((current_buf_frames, target))
+    } else {
+        None
     }
 }
 
@@ -1744,10 +1786,13 @@ impl ClientEngine {
                         .downstream_hw_delay_ms
                         .store(delay_ms, Ordering::Relaxed);
                 }
-                if let Some(guard) = aaudio_guard.as_ref() {
+                if let Some(guard) = aaudio_guard.as_mut() {
                     telemetry
                         .aaudio_xrun_count
                         .store(guard.xrun_count(), Ordering::Relaxed);
+                    // Low-latency streams start at 2x burst; grow by one burst
+                    // on a fresh XRun up to 4x/effective capacity.
+                    guard.tune_buffer_on_xrun();
                 }
             }
 
@@ -3782,16 +3827,70 @@ mod tests {
 
     #[test]
     fn test_aaudio_large_bluetooth_bursts_are_not_tripled() {
-        // Speaker/USB bursts keep the verified 3x cushion, minimum 256.
-        assert_eq!(aaudio_buffer_frames_for_burst(48, 960), Some(256));
-        assert_eq!(aaudio_buffer_frames_for_burst(96, 960), Some(288));
-        assert_eq!(aaudio_buffer_frames_for_burst(192, 960), Some(576));
+        // Small speaker/USB bursts now start at 2x with a 192-frame floor; the
+        // XRun tuner grows them if the HAL actually underruns.
+        assert_eq!(aaudio_buffer_frames_for_burst(48, 960), Some(192));
+        assert_eq!(aaudio_buffer_frames_for_burst(96, 960), Some(192));
+        assert_eq!(aaudio_buffer_frames_for_burst(192, 960), Some(384));
         // 240-frame speaker/USB bursts must double-buffer to avoid HAL XRuns.
         assert_eq!(aaudio_buffer_frames_for_burst(240, 960), Some(480));
         assert_eq!(aaudio_buffer_frames_for_burst(480, 960), Some(480));
         assert_eq!(aaudio_buffer_frames_for_burst(960, 960), Some(960));
         assert_eq!(aaudio_buffer_frames_for_burst(0, 960), None);
         assert_eq!(aaudio_buffer_frames_for_burst(-1, 960), None);
+    }
+
+    #[test]
+    fn test_aaudio_low_latency_2x_sizing() {
+        // Exclusive/Low-Latency streams start at hardware double-buffering:
+        // a 192-frame burst gets 384 frames (8.0 ms at 48 kHz) instead of the
+        // old 3x/576 (12.0 ms), and a 96-frame burst gets the 192-frame floor
+        // (4.0 ms) instead of the old 288 (6.0 ms).
+        assert_eq!(aaudio_buffer_frames_for_profile(192, 960, false), Some(384));
+        assert_eq!(aaudio_buffer_frames_for_profile(96, 960, false), Some(192));
+        // The granted capacity still caps the result.
+        assert_eq!(aaudio_buffer_frames_for_profile(192, 256, false), Some(256));
+        // The normal-mixer path keeps its exact 2x policy, unchanged.
+        assert_eq!(aaudio_buffer_frames_for_profile(192, 960, true), Some(384));
+    }
+
+    #[test]
+    fn test_aaudio_latency_tuner_growth() {
+        // Pure decision core of `AAudioOutputGuard::tune_buffer_on_xrun`:
+        // grows by one burst per fresh XRun up to 4x/effective capacity.
+        let mut last = 0u32;
+        assert_eq!(
+            aaudio_latency_tuner_growth(1, &mut last, false, 192, 384, 768),
+            Some((384, 576))
+        );
+        assert_eq!(last, 1);
+        // No new XRun: no growth, but the observation is still recorded.
+        assert_eq!(
+            aaudio_latency_tuner_growth(1, &mut last, false, 192, 576, 768),
+            None
+        );
+        assert_eq!(last, 1);
+        assert_eq!(
+            aaudio_latency_tuner_growth(2, &mut last, false, 192, 576, 768),
+            Some((576, 768))
+        );
+        assert_eq!(last, 2);
+        // At the ceiling further XRuns do nothing (but still advance `last`).
+        assert_eq!(
+            aaudio_latency_tuner_growth(3, &mut last, false, 192, 768, 768),
+            None
+        );
+        assert_eq!(last, 3);
+        // Normal mixer and non-positive bursts are never tuned.
+        assert_eq!(
+            aaudio_latency_tuner_growth(4, &mut last, true, 192, 384, 768),
+            None
+        );
+        assert_eq!(
+            aaudio_latency_tuner_growth(5, &mut last, false, 0, 384, 768),
+            None
+        );
+        assert_eq!(last, 5);
     }
 
     #[test]
@@ -5031,6 +5130,18 @@ pub mod android_aaudio {
         ctx_ptr: *mut CallbackContext,
         actual_sample_rate: u32,
         frames_per_burst: u32,
+        /// Last HAL XRun count observed by the tuner. Advanced on every poll so
+        /// one counter jump cannot re-trigger growth on subsequent polls.
+        last_xrun_count: u32,
+        /// Buffer size AAudio actually granted at open (and after each growth).
+        current_buf_frames: i32,
+        /// HAL burst used to size the initial buffer and to step the tuner.
+        burst_frames: i32,
+        /// Ceiling for automatic growth: 4x burst, capped by effective capacity.
+        max_auto_buf_frames: i32,
+        /// True when the HAL granted `PERFORMANCE_MODE_NONE` (normal mixer).
+        /// The tuner deliberately leaves that path at its double-buffered size.
+        normal_mixer: bool,
     }
 
     unsafe impl Send for AAudioOutputGuard {}
@@ -5064,6 +5175,38 @@ pub mod android_aaudio {
                 return 0;
             }
             unsafe { AAudioStream_getXRunCount(self.stream).max(0) as u32 }
+        }
+
+        /// XRun-driven low-latency buffer tuner.
+        ///
+        /// Low-latency streams open at 2x burst; the first HAL XRun grows the
+        /// buffer by one burst, repeated up to 4x/effective capacity. The normal
+        /// mixer path is left alone (its double-buffered size is already the
+        /// safe floor for Dolby/A2DP). Returns `(prev, granted, xruns)` only
+        /// when AAudio actually granted a larger buffer.
+        pub fn tune_buffer_on_xrun(&mut self) -> Option<(i32, i32, u32)> {
+            if self.stream.is_null() {
+                return None;
+            }
+            let xruns = self.xrun_count();
+            let (prev, target) = aaudio_latency_tuner_growth(
+                xruns,
+                &mut self.last_xrun_count,
+                self.normal_mixer,
+                self.burst_frames,
+                self.current_buf_frames,
+                self.max_auto_buf_frames,
+            )?;
+            let granted = unsafe { AAudioStream_setBufferSizeInFrames(self.stream, target) };
+            if granted > prev {
+                self.current_buf_frames = granted;
+                audioshare_protocol::diagnostics::info(
+                    "aaudio",
+                    format!("LatencyTuner grew buffer {prev} -> {granted} frames (xruns={xruns})"),
+                );
+                return Some((prev, granted, xruns));
+            }
+            None
         }
 
         /// Measure the downstream hardware/DAC pipeline latency from the
@@ -5212,8 +5355,9 @@ pub mod android_aaudio {
                 };
 
                 // A2DP bursts are already 10-20 ms. Use one burst there and
-                // keep the 3x speaker/USB cushion, otherwise the old code
-                // stacked another 30-60 ms of AAudio buffer on Bluetooth.
+                // start small speaker/USB bursts at 2x (the XRun tuner grows
+                // them if the HAL ever underruns), otherwise the old fixed 3x
+                // policy stacked another 30-60 ms of AAudio buffer on Bluetooth.
                 // Use the capacity the HAL actually granted, not just the
                 // requested one: a device that grants less than `capacity_frames`
                 // cannot honour the larger buffer size and rejects it.
@@ -5235,6 +5379,13 @@ pub mod android_aaudio {
                 {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
+
+                // Snapshot the live values the XRun tuner steps from. Read the
+                // size AAudio actually granted rather than trusting our request,
+                // and cap automatic growth at 4x burst / effective capacity.
+                let current_buf_frames = AAudioStream_getBufferSizeInFrames(stream);
+                let max_auto_buf_frames = raw_burst.saturating_mul(4).min(cap_for_burst);
+                let initial_xrun_count = AAudioStream_getXRunCount(stream).max(0) as u32;
 
                 if AAudioStream_requestStart(stream) != 0 {
                     AAudioStream_close(stream);
@@ -5278,6 +5429,11 @@ pub mod android_aaudio {
                     ctx_ptr,
                     actual_sample_rate,
                     frames_per_burst: raw_burst.max(0) as u32,
+                    last_xrun_count: initial_xrun_count,
+                    current_buf_frames,
+                    burst_frames: raw_burst,
+                    max_auto_buf_frames,
+                    normal_mixer: granted_normal_mixer,
                 })
             }
         }
