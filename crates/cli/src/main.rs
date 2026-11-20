@@ -53,8 +53,8 @@ fn install_shutdown_handler() {
             CLI_STOP.store(true, Ordering::Release);
         }
 
-        signal(SIGINT, on_signal as usize);
-        signal(SIGTERM, on_signal as usize);
+        signal(SIGINT, on_signal as *const () as usize);
+        signal(SIGTERM, on_signal as *const () as usize);
     }
     #[cfg(windows)]
     unsafe {
