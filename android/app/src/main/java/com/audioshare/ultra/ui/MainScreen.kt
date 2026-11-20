@@ -64,7 +64,7 @@ fun MainScreen() {
     var showQrScanner by remember { mutableStateOf(false) }
     var showToolsSheet by remember { mutableStateOf(false) }
     var showPartyQrDialog by remember { mutableStateOf(false) }
-    var partySilentTicks by remember { mutableIntStateOf(0) }
+    var partySilenceWarning by remember { mutableStateOf(false) }
     var pendingEncryptedHost by remember { mutableStateOf<String?>(null) }
     var promptPinInput by remember { mutableStateOf("") }
     var vuPeakHold by remember { mutableFloatStateOf(0f) }
@@ -151,7 +151,7 @@ fun MainScreen() {
     var forwardPartyToPc by remember { mutableStateOf(prefs.getBoolean("party_forward_pc", false)) }
     // Default ON to eliminate the ~60 ms same-room speaker slapback echo.
     var muteHostSpeakerInParty by remember { mutableStateOf(prefs.getBoolean("party_mute_local", true)) }
-    var sleepTimerMinutes by remember { mutableIntStateOf(0) } // 0=Off, 15, 30, 60m
+    var sleepTimerMinutes by remember { mutableIntStateOf(AudioEngineService.sleepRemainingMinutes) } // 0=Off, 15, 30, 60m
     // Index contract matches crates/android-jni/src/lib.rs:
     // 0..10 legacy counters, 11..21 live latency breakdown.
     var telemetry by remember { mutableStateOf(LongArray(25)) }
@@ -1460,8 +1460,13 @@ fun MainScreen() {
                             // means DRM/OEM mute is feeding silence to peers.
                             val partyVu = ((partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
 
-                            LaunchedEffect(partyVu) {
-                                partySilentTicks = if (partyVu == 0) (partySilentTicks + 1).coerceAtMost(100) else 0
+                            LaunchedEffect(partyVu == 0) {
+                                if (partyVu == 0) {
+                                    delay(3000)
+                                    partySilenceWarning = true
+                                } else {
+                                    partySilenceWarning = false
+                                }
                             }
 
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1477,7 +1482,7 @@ fun MainScreen() {
                                     color = StudioColors.Muted
                                 )
                                 FluidAudioVisualizer(vuPct = partyVu, isLive = partyVu > 0)
-                                if (partySilentTicks >= 12) {
+                                if (partySilenceWarning) {
                                     StatusBadge(
                                         text = "No app audio detected — start music or check DRM/mute",
                                         containerColor = StudioColors.WarnBg,
@@ -1594,8 +1599,12 @@ fun MainScreen() {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(0 to "Off", 15 to "15m", 30 to "30m", 60 to "60m").forEach { (mins, lbl) ->
                         FilterChip(
-                            selected = (mins == 0 && sleepTimerMinutes == 0) ||
-                                (mins > 0 && sleepTimerMinutes > 0 && sleepTimerMinutes <= mins),
+                            selected = when (mins) {
+                                0 -> sleepTimerMinutes == 0
+                                15 -> sleepTimerMinutes in 1..15
+                                30 -> sleepTimerMinutes in 16..30
+                                else -> sleepTimerMinutes > 30
+                            },
                             onClick = {
                                 runCatching {
                                     context.startService(

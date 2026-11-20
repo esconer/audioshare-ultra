@@ -61,7 +61,11 @@ fun listReachablePartyEndpoints(): List<PhoneNetEndpoint> {
             }
         }
     }
-    return result.sortedByDescending { it.isHotspot || it.ifaceName.startsWith("wlan") }
+    return result.sortedByDescending {
+        if (it.isHotspot) 2
+        else if (it.ifaceName.lowercase().startsWith("wlan")) 1
+        else 0
+    }
 }
 
 private fun renderQrBitmap(uri: String, sizePx: Int = 512): Bitmap? = runCatching {

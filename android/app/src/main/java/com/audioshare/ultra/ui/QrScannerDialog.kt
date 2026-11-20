@@ -91,11 +91,29 @@ fun QrScannerDialog(
                                         if (handled.get()) return@setAnalyzer
                                         val yPlane = proxy.planes[0]
                                         val yBuf = yPlane.buffer
-                                        val bytes = ByteArray(yBuf.remaining())
-                                        yBuf.get(bytes)
+                                        val w = proxy.width
+                                        val h = proxy.height
+                                        val rowStride = yPlane.rowStride
+                                        // CameraX may pad each scanline (rowStride > width) on
+                                        // Qualcomm/Samsung/MediaTek sensors. Strip padding into a
+                                        // tight width*height buffer so ZXing never skews a scanline.
+                                        val bytes = if (rowStride == w) {
+                                            ByteArray(w * h).also { yBuf.get(it, 0, minOf(it.size, yBuf.remaining())) }
+                                        } else {
+                                            val raw = ByteArray(yBuf.remaining())
+                                            yBuf.get(raw)
+                                            ByteArray(w * h).also { dst ->
+                                                for (row in 0 until h) {
+                                                    val srcOff = row * rowStride
+                                                    if (srcOff + w <= raw.size) {
+                                                        System.arraycopy(raw, srcOff, dst, row * w, w)
+                                                    }
+                                                }
+                                            }
+                                        }
                                         val src = PlanarYUVLuminanceSource(
-                                            bytes, proxy.width, proxy.height,
-                                            0, 0, proxy.width, proxy.height, false
+                                            bytes, w, h,
+                                            0, 0, w, h, false
                                         )
                                         val text = reader.decodeWithState(
                                             BinaryBitmap(HybridBinarizer(src))
