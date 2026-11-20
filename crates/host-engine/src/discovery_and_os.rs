@@ -560,6 +560,24 @@ impl DirectHotspotController {
     }
 }
 
+/// Returns `true` if Windows Defender Firewall already has the inbound
+/// `AudioShare_Ultra_UDP` allow rule (does not require Administrator rights).
+/// Always returns `true` on non-Windows platforms.
+pub fn is_windows_firewall_configured() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        silent_command("netsh")
+            .args(["advfirewall", "firewall", "show", "rule", "name=AudioShare_Ultra_UDP"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
+}
+
 /// Opens UDP ports 65530..65532 in Linux (ufw / firewalld) or Windows Defender Firewall
 pub fn open_os_firewall_ports() -> String {
     #[cfg(target_os = "linux")]
@@ -572,22 +590,35 @@ pub fn open_os_firewall_ports() -> String {
     }
     #[cfg(target_os = "windows")]
     {
-        let status = silent_command("netsh")
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().replace('\'', "''"))
+            .unwrap_or_default();
+        // Add BOTH a port rule AND a program allow rule across `profile=any`
+        // (Public/Hotspot + Private + Domain), deleting any duplicate rules
+        // first. Uses `Start-Process -Verb RunAs` to trigger a standard Windows
+        // UAC prompt instead of failing silently as a standard user.
+        let ps_inner = format!(
+            "netsh advfirewall firewall delete rule name='AudioShare_Ultra_UDP' | Out-Null; \
+             netsh advfirewall firewall delete rule name='AudioShare_Ultra_App' | Out-Null; \
+             netsh advfirewall firewall add rule name='AudioShare_Ultra_UDP' dir=in action=allow protocol=UDP localport=65530-65532 profile=any | Out-Null; \
+             if ('{exe}' -ne '') {{ netsh advfirewall firewall add rule name='AudioShare_Ultra_App' dir=in action=allow program='{exe}' profile=any | Out-Null }}",
+            exe = exe_path
+        );
+        let elevated = silent_command("powershell")
             .args([
-                "advfirewall",
-                "firewall",
-                "add",
-                "rule",
-                "name=AudioShare_Ultra_UDP",
-                "dir=in",
-                "action=allow",
-                "protocol=UDP",
-                "localport=65530-65532",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "Start-Process -FilePath 'powershell' -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-Command',\"{}\"",
+                    ps_inner.replace('"', "`\"")
+                ),
             ])
             .status();
-        match status {
-            Ok(s) if s.success() => "Windows Firewall UDP ports 65530-65532 opened!".into(),
-            _ => "Run as Administrator once to add Windows Firewall rule.".into(),
+        if elevated.map(|s| s.success()).unwrap_or(false) && is_windows_firewall_configured() {
+            "Windows Firewall opened (Private + Public/Hotspot UDP 65530-65532)!".into()
+        } else {
+            "UAC declined or blocked — allow UDP 65530-65532 (Private + Public) in Windows Firewall.".into()
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -960,7 +991,9 @@ pub struct VirtualSpeakerAndRadioGuard {
     #[cfg(target_os = "linux")]
     prev_default_source: Option<String>,
     #[cfg(target_os = "windows")]
-    prev_default_sink: Option<String>,
+    prev_default_sink_id: Option<Vec<u16>>,
+    #[cfg(target_os = "windows")]
+    virtual_sink_id: Option<Vec<u16>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1019,36 +1052,6 @@ fn disable_wifi_power_save() {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn windows_default_playback_name() -> Option<String> {
-    let output = silent_command("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "$d = Get-AudioDevice -List | Where-Object {$_.Default -eq $true} | Select-Object -First 1; if ($d) { $d.Name }",
-        ])
-        .output()
-        .ok()?;
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_set_playback_name(name: &str) {
-    let escaped = name.replace('\'', "''");
-    let script = format!(
-        "Get-AudioDevice -List | Where-Object {{$_.Name -eq '{}'}} | Set-AudioDevice",
-        escaped
-    );
-    let _ = silent_command("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output();
-}
-
 impl VirtualSpeakerAndRadioGuard {
     /// Register the virtual endpoint (if enabled) without changing the user's
     /// current default sink/source. Call `activate()` when a client connects.
@@ -1093,14 +1096,21 @@ impl VirtualSpeakerAndRadioGuard {
         {
             // Suppress Windows 60-second background Wi-Fi roaming/location channel scans
             set_windows_wlan_media_streaming_mode(true);
+            let virtual_sink_id = if enable_virtual_speaker {
+                crate::app_routing::windows_endpoint_switch::find_virtual_playback_id()
+            } else {
+                None
+            };
+            let prev_default_sink_id = if virtual_sink_id.is_some() {
+                crate::app_routing::windows_endpoint_switch::default_playback_id()
+            } else {
+                None
+            };
             Self {
-                enabled: enable_virtual_speaker,
+                enabled: virtual_sink_id.is_some(),
                 active: false,
-                prev_default_sink: if enable_virtual_speaker {
-                    windows_default_playback_name()
-                } else {
-                    None
-                },
+                prev_default_sink_id,
+                virtual_sink_id,
             }
         }
 
@@ -1128,20 +1138,9 @@ impl VirtualSpeakerAndRadioGuard {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = silent_command("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Input*' -or $_.Name -like '*Virtual*'} | Set-AudioDevice",
-                ])
-                .output();
-            let _ = silent_command("powershell")
-                .args([
-                    "-NoProfile",
-                    "-Command",
-                    "Get-AudioDevice -List | Where-Object {$_.Name -like '*CABLE Output*'} | Set-AudioDevice",
-                ])
-                .output();
+            if let Some(ref id) = self.virtual_sink_id {
+                crate::app_routing::windows_endpoint_switch::set_default_endpoint(id);
+            }
             self.active = true;
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1166,8 +1165,8 @@ impl VirtualSpeakerAndRadioGuard {
         }
         #[cfg(target_os = "windows")]
         {
-            if let Some(ref sink) = self.prev_default_sink {
-                windows_set_playback_name(sink);
+            if let Some(ref id) = self.prev_default_sink_id {
+                crate::app_routing::windows_endpoint_switch::set_default_endpoint(id);
             }
         }
         self.active = false;
