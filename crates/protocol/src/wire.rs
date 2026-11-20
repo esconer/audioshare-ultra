@@ -138,6 +138,61 @@ pub fn feedback_is_replay(authenticated: bool, seq: u32, last_seq: u32) -> bool 
     authenticated && seq <= last_seq
 }
 
+/// Sliding replay window for authenticated feedback sequence numbers.
+///
+/// Tracks the highest accepted sequence (`max_seq`) plus a 64-bit bitmap of
+/// the 63 sequence numbers immediately preceding it (bit 0 == `max_seq`).
+/// This accepts bounded reordering while rejecting duplicates and packets
+/// older than the window. Replaces the single `last_seq` scalar so a single
+/// out-of-order delivery no longer permanently blocks later in-order packets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeedbackReplayWindow {
+    max_seq: u32,
+    bitmap: u64,
+}
+
+impl FeedbackReplayWindow {
+    /// Returns `true` if `seq` is fresh and should be accepted, `false` if it
+    /// is a replay, duplicate, or stale packet that must be dropped.
+    pub fn check_and_accept(&mut self, authenticated: bool, seq: u32) -> bool {
+        // Unencrypted LAN/party feedback carries no sequence guarantee and is
+        // intentionally never replay-checked (backward compatibility).
+        if !authenticated {
+            return true;
+        }
+        // Sequence 0 is reserved/invalid; never let it advance the window.
+        if seq == 0 {
+            return false;
+        }
+        if seq > self.max_seq {
+            let delta = seq - self.max_seq;
+            // Shift the window forward by the jump. A delta of 64 or more
+            // subsumes the entire bitmap, so start from a clean one.
+            if delta >= 64 {
+                self.bitmap = 0;
+            } else {
+                self.bitmap <<= delta;
+            }
+            self.bitmap |= 1; // bit 0 records the new maximum
+            self.max_seq = seq;
+            return true;
+        }
+        // seq <= max_seq: accept only if it is within the last 63 numbers and
+        // has not already been seen.
+        let delta = self.max_seq - seq;
+        if delta < 64 {
+            let bit = 1u64 << delta;
+            if self.bitmap & bit != 0 {
+                return false; // already accepted (duplicate/replay)
+            }
+            self.bitmap |= bit;
+            return true;
+        }
+        // Older than the window.
+        false
+    }
+}
+
 /// 16-Byte Wire Header (64-bit aligned, big-endian network serialization)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireHeader {
@@ -680,6 +735,82 @@ mod tests {
         assert!(!feedback_is_replay(true, 6, 5));
         // Unencrypted LAN/party feedback is intentionally not replay-checked.
         assert!(!feedback_is_replay(false, 1, 5));
+    }
+
+    #[test]
+    fn test_feedback_replay_window_in_order_and_duplicates() {
+        let mut w = FeedbackReplayWindow::default();
+        assert_eq!(w.max_seq, 0);
+        assert_eq!(w.bitmap, 0);
+        for seq in 1..=4 {
+            assert!(w.check_and_accept(true, seq), "fresh seq {seq} must pass");
+        }
+        assert_eq!(w.max_seq, 4);
+        // Replays of any already-seen sequence are rejected, including the max.
+        for seq in [4, 3, 2, 1] {
+            assert!(!w.check_and_accept(true, seq), "duplicate seq {seq} must fail");
+        }
+        assert_eq!(w.max_seq, 4, "rejects must not move the window");
+    }
+
+    #[test]
+    fn test_feedback_replay_window_reorder_within_63() {
+        let mut w = FeedbackReplayWindow::default();
+        assert!(w.check_and_accept(true, 100));
+        // 100 - 37 == 63: the oldest sequence still inside the window.
+        assert!(w.check_and_accept(true, 37));
+        // Everything between is out of order but still fresh.
+        for seq in (38..100).rev() {
+            assert!(
+                w.check_and_accept(true, seq),
+                "reordered in-window seq {seq} must pass"
+            );
+        }
+        // Once seen, each is a duplicate.
+        for seq in [50, 37, 100] {
+            assert!(!w.check_and_accept(true, seq), "seen seq {seq} must fail");
+        }
+        assert_eq!(w.max_seq, 100);
+    }
+
+    #[test]
+    fn test_feedback_replay_window_rejects_older_than_63() {
+        let mut w = FeedbackReplayWindow::default();
+        assert!(w.check_and_accept(true, 100));
+        // 100 - 36 == 64: outside the 63-slot history.
+        assert!(!w.check_and_accept(true, 36));
+        // Rejecting a too-old packet must not disturb state.
+        assert!(w.check_and_accept(true, 101));
+        assert!(!w.check_and_accept(true, 100), "101's predecessor was seen");
+    }
+
+    #[test]
+    fn test_feedback_replay_window_large_forward_jump_clears_bitmap() {
+        let mut w = FeedbackReplayWindow::default();
+        assert!(w.check_and_accept(true, 10));
+        assert!(w.check_and_accept(true, 20));
+        // A jump >= 64 zeroes the bitmap, so old sequences are fully forgotten.
+        assert!(w.check_and_accept(true, 200));
+        assert_eq!(w.max_seq, 200);
+        assert_eq!(w.bitmap, 1);
+        assert!(!w.check_and_accept(true, 10), "seq 10 is now >63 old");
+        assert!(w.check_and_accept(true, 199), "within 63 of the new max");
+    }
+
+    #[test]
+    fn test_feedback_replay_window_unauthenticated_bypasses_and_zero_rejected() {
+        let mut w = FeedbackReplayWindow::default();
+        // Unauthenticated feedback is never checked: even seq 0 and repeats.
+        for seq in [0, 42, 42, 7] {
+            assert!(w.check_and_accept(false, seq), "unauth seq {seq} must pass");
+        }
+        assert_eq!(w.max_seq, 0, "unauthenticated packets must not move state");
+        // Authenticated seq 0 is always rejected and does not advance state.
+        assert!(!w.check_and_accept(true, 0));
+        assert_eq!(w.max_seq, 0);
+        assert!(w.check_and_accept(true, 1));
+        assert!(!w.check_and_accept(true, 0));
+        assert_eq!(w.max_seq, 1);
     }
 
     #[test]

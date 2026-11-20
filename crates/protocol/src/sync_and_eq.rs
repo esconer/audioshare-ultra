@@ -204,6 +204,10 @@ impl StereoBiquad {
     }
 
     pub fn set_peaking_eq(&mut self, freq_hz: f32, q: f32, gain_db: f32) {
+        // UI/prefs may carry an out-of-range or stale gain (e.g. a clamped
+        // slider rounded past its limit). Bound it before the exponent so the
+        // biquad coefficients can never blow up from an unbounded boost/cut.
+        let gain_db = gain_db.clamp(-24.0, 24.0);
         if gain_db.abs() < 0.05 {
             self.b0 = 1.0;
             self.b1 = 0.0;
@@ -283,17 +287,21 @@ impl StudioEqualizer {
 
     #[inline]
     pub fn update_if_changed(&mut self, bass_tenths: i32, pres_tenths: i32, treb_tenths: i32) {
-        if bass_tenths != self.last_bass_tenths
-            || pres_tenths != self.last_pres_tenths
-            || treb_tenths != self.last_treb_tenths
-        {
+        // Recompute each band independently. `set_peaking_eq` resets that
+        // band's delay state when it goes flat, so touching a band the user
+        // did not change would discharge stale history as an audible click.
+        if bass_tenths != self.last_bass_tenths {
             self.last_bass_tenths = bass_tenths;
-            self.last_pres_tenths = pres_tenths;
-            self.last_treb_tenths = treb_tenths;
             self.bass
                 .set_peaking_eq(90.0, 0.707, (bass_tenths as f32) / 10.0);
+        }
+        if pres_tenths != self.last_pres_tenths {
+            self.last_pres_tenths = pres_tenths;
             self.presence
                 .set_peaking_eq(2500.0, 1.0, (pres_tenths as f32) / 10.0);
+        }
+        if treb_tenths != self.last_treb_tenths {
+            self.last_treb_tenths = treb_tenths;
             self.treble
                 .set_peaking_eq(10000.0, 0.707, (treb_tenths as f32) / 10.0);
         }
@@ -593,7 +601,10 @@ impl MicRumbleAndNoiseGate {
             self.hp_y1_r = hp_r;
 
             let peak = hp_l.abs().max(hp_r.abs());
-            let coeff = if peak > self.gate_env { 0.25 } else { 0.002 };
+            // Fast attack opens the gate on speech transients; the much slower
+            // release (0.00025 ~= 80 ms at 48 kHz) keeps it open across natural
+            // pauses instead of gating each syllable and pumping the noise floor.
+            let coeff = if peak > self.gate_env { 0.25 } else { 0.00025 };
             self.gate_env += coeff * (peak - self.gate_env);
 
             let gate_gain = (self.gate_env / GATE_THRESH).clamp(0.05, 1.0);

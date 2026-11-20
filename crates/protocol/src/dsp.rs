@@ -287,28 +287,89 @@ impl ClockDriftResampler {
         out_idx
     }
 
+    /// Shift exactly one interleaved stereo frame from the batched ring
+    /// scratch into the resampler history.
+    ///
+    /// `scratch_pos`/`scratch_len` track the unconsumed tail of the last ring
+    /// read, and `to_pop` the number of input frames this call still intends to
+    /// pull. Requesting only what will actually be consumed (in <=64-frame
+    /// chunks) is essential: the scratch is stack-local, so any surplus read
+    /// would be silently dropped when `process_from_ring` returns.
+    #[inline(always)]
+    fn shift_one_from_ring(
+        &mut self,
+        ring: &BurstDecouplerRing,
+        dither_rng: &mut u32,
+        scratch: &mut [f32; 128],
+        scratch_pos: &mut usize,
+        scratch_len: &mut usize,
+        to_pop: &mut usize,
+    ) {
+        if *scratch_pos >= *scratch_len {
+            let frames = (*to_pop).min(64);
+            let read_len = if frames > 0 {
+                frames * 2
+            } else {
+                // Defensive FP-boundary guard: the phase-driven loop asked for
+                // one more frame than `needed_input_frames` predicted. Never
+                // reuse stale scratch; pull exactly that one frame instead.
+                2
+            };
+            // `pop_exact_or_dither` leaves the whole requested slice populated
+            // on every path: a full read copies real data, a partial read fades
+            // the tail and zero-fills, and a fully empty ring gets -90 dBFS
+            // comfort dither. Its return value is ignored here exactly as it
+            // was with the old per-frame pops (fade/dither behavior preserved).
+            ring.pop_exact_or_dither(&mut scratch[..read_len], dither_rng);
+            *to_pop = (*to_pop).saturating_sub(frames);
+            *scratch_pos = 0;
+            *scratch_len = read_len;
+        }
+        let in_l = scratch[*scratch_pos];
+        let in_r = scratch[*scratch_pos + 1];
+        *scratch_pos += 2;
+        self.hist_l.copy_within(1..4, 0);
+        self.hist_r.copy_within(1..4, 0);
+        let (fl, fr) = self.filter_input_pair(in_l, in_r);
+        self.hist_l[3] = fl;
+        self.hist_r[3] = fr;
+    }
+
     /// Pull-mode resampler driven directly by a [`BurstDecouplerRing`].
     ///
-    /// Pops an input stereo frame from `ring` if and only if `self.phase >= 1.0`,
+    /// Pops input from `ring` if and only if `self.phase >= 1.0`,
     /// eliminating any IEEE-754 rounding discrepancy between `floor(phase + N*ratio)`
     /// and repeated `phase += ratio` additions. Guarantees that every sample in
     /// `out_stereo` is filled and zero popped input frames are ever discarded.
+    /// Input is pulled in batches of at most 64 stereo frames (128 samples) to
+    /// keep the ring access count low; the fade/dither behavior of
+    /// `pop_exact_or_dither` is preserved unchanged.
     pub fn process_from_ring(
         &mut self,
         ring: &BurstDecouplerRing,
         dither_rng: &mut u32,
         out_stereo: &mut [f32],
     ) {
+        // Stack-only batch scratch: at most 64 stereo frames per ring access,
+        // no heap. The phase invariant makes the total input-frame count for
+        // this call exactly `floor(phase + out_frames * ratio)`; popping only
+        // that many (in batches) leaves no surplus in the stack scratch.
+        let mut scratch = [0.0f32; 128];
+        let mut scratch_pos = 0usize;
+        let mut scratch_len = 0usize;
         let out_frames = out_stereo.len() / 2;
-        let mut in_frame = [0.0f32; 2];
+        let mut to_pop = self.needed_input_frames(out_frames);
+
         for out_idx in 0..out_frames {
             while self.phase >= 1.0 {
-                ring.pop_exact_or_dither(&mut in_frame, dither_rng);
-                self.hist_l.copy_within(1..4, 0);
-                self.hist_r.copy_within(1..4, 0);
-                let (fl, fr) = self.filter_input_pair(in_frame[0], in_frame[1]);
-                self.hist_l[3] = fl;
-                self.hist_r[3] = fr;
+                self.shift_one_from_ring(
+                    ring,
+                    dither_rng,
+                    &mut scratch,
+                    &mut scratch_pos,
+                    &mut scratch_len,
+                    &mut to_pop,
+                );
                 self.phase -= 1.0;
             }
             let f = self.phase as f32;
@@ -328,13 +389,17 @@ impl ClockDriftResampler {
             );
             self.phase += self.ratio;
         }
+        // Drain any trailing whole input frames implied by the final phase,
+        // keeping the history window identical to the per-frame pop version.
         while self.phase >= 1.0 {
-            ring.pop_exact_or_dither(&mut in_frame, dither_rng);
-            self.hist_l.copy_within(1..4, 0);
-            self.hist_r.copy_within(1..4, 0);
-            let (fl, fr) = self.filter_input_pair(in_frame[0], in_frame[1]);
-            self.hist_l[3] = fl;
-            self.hist_r[3] = fr;
+            self.shift_one_from_ring(
+                ring,
+                dither_rng,
+                &mut scratch,
+                &mut scratch_pos,
+                &mut scratch_len,
+                &mut to_pop,
+            );
             self.phase -= 1.0;
         }
     }
@@ -389,10 +454,21 @@ impl BurstDecouplerRing {
         // subsequent Left/Right pair by one sample, so always write whole frames.
         let to_write = samples.len().min(free) & !1;
 
+        // Copy in at most two contiguous runs: one up to the physical end of
+        // the buffer, then the wrapped remainder at the start. This replaces a
+        // per-element RMW loop with two memcpy-class operations while keeping
+        // the Release store below as the single publication point.
         let buf_ptr = self.buf.get() as *mut f32;
-        for (i, &s) in samples[..to_write].iter().enumerate() {
-            unsafe {
-                *buf_ptr.add((w.wrapping_add(i)) & FIFO_MASK) = s;
+        let first_off = w & FIFO_MASK;
+        let first_len = to_write.min(FIFO_CAPACITY - first_off);
+        unsafe {
+            core::ptr::copy_nonoverlapping(samples.as_ptr(), buf_ptr.add(first_off), first_len);
+            if first_len < to_write {
+                core::ptr::copy_nonoverlapping(
+                    samples.as_ptr().add(first_len),
+                    buf_ptr,
+                    to_write - first_len,
+                );
             }
         }
         self.write_idx.0
@@ -413,10 +489,20 @@ impl BurstDecouplerRing {
         let req_even = out.len() & !1;
 
         if req_even > 0 && avail >= req_even {
+            // Mirror `push_samples`: two contiguous runs instead of a
+            // per-element read loop, published by the Release store below
+            // after the copy has completed.
             let buf_ptr = self.buf.get() as *const f32;
-            for (i, dst) in out[..req_even].iter_mut().enumerate() {
-                unsafe {
-                    *dst = *buf_ptr.add((r.wrapping_add(i)) & FIFO_MASK);
+            let first_off = r & FIFO_MASK;
+            let first_len = req_even.min(FIFO_CAPACITY - first_off);
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf_ptr.add(first_off), out.as_mut_ptr(), first_len);
+                if first_len < req_even {
+                    core::ptr::copy_nonoverlapping(
+                        buf_ptr,
+                        out.as_mut_ptr().add(first_len),
+                        req_even - first_len,
+                    );
                 }
             }
             if req_even < out.len() {
@@ -431,6 +517,12 @@ impl BurstDecouplerRing {
             // a callback only one frame short would leave the output near
             // full-scale, and the next (empty) callback starts at -90 dBFS
             // comfort dither: an audible step into the DAC.
+            //
+            // The faded/zero-filled audio is still delivered so the DAC sees
+            // no discontinuity, but we report `false`: the caller did NOT get
+            // the exact burst it asked for, so this counts as an underrun for
+            // telemetry and any latency bookkeeping. Only a completely full
+            // read reports `true`.
             let safe_avail = (avail & !1).min(req_even); // Keep stereo L/R alignment
             let fade_frames = (safe_avail / 2).min(16);
             let fade_samples = fade_frames * 2;
@@ -455,7 +547,7 @@ impl BurstDecouplerRing {
             self.read_idx.0
                 .store(r.wrapping_add(safe_avail), Ordering::Release);
             out[safe_avail..].fill(0.0);
-            true
+            false
         } else {
             // Inject -90 dBFS TPDF comfort dither so Bluetooth earbuds never sleep during DTX silence
             inject_bluetooth_keepalive_dither(out, dither_rng);
@@ -771,8 +863,9 @@ mod tests {
 
         // Third pull: only 192 samples remaining (< 384 request).
         // The ring cross-fades the last 16 stereo frames to zero so the next
-        // callback starts from silence instead of a full-scale step.
-        assert!(ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
+        // callback starts from silence instead of a full-scale step, and now
+        // reports `false` because the exact burst was not available.
+        assert!(!ring.pop_exact_or_dither(&mut aaudio_burst, &mut rng));
         assert_eq!(aaudio_burst[0], 0.42);
         assert_eq!(aaudio_burst[159], 0.42); // last sample before the fade
         assert!((aaudio_burst[160] - 0.42).abs() < 1.0e-6); // fade starts at unity
@@ -1115,7 +1208,9 @@ mod tests {
 
         let mut out = [0.0f32; 384];
         let mut rng = 7u32;
-        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        // Only 382 of 384 samples are available: the faded audio is delivered
+        // but a partial read now reports an underrun.
+        assert!(!ring.pop_exact_or_dither(&mut out, &mut rng));
         assert_eq!(out[0], 0.5);
         // The old 0.985 tail left the final sample at ~98.5% amplitude and
         // the next empty callback clicked at -90 dBFS comfort dither.
@@ -1282,6 +1377,35 @@ mod tests {
             for _ in 0..5 {
                 resampler.process_from_ring(&ring, &mut rng, &mut output);
                 assert!(output.iter().all(|s| s.is_finite()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_process_from_ring_batch_pop_discards_no_samples() {
+        // The 128-sample stack scratch must be refilled with only the frames
+        // this call will actually consume. A naive fixed-size batch would read
+        // 64 frames even when the phase invariant needs fewer, silently
+        // stranding the surplus when the scratch goes out of scope.
+        for &rate in &[44_100u32, 48_000, 96_000] {
+            let mut resampler = ClockDriftResampler::new();
+            resampler.set_output_sample_rate(rate);
+            let ring = BurstDecouplerRing::new();
+            let chunk = [0.25f32; 3000]; // 1500 stereo frames
+            assert_eq!(ring.push_samples(&chunk), 3000);
+            let mut expected = ring.available_samples();
+            let mut rng = 1234u32;
+
+            for &frames in &[100usize, 37, 191] {
+                let needed = resampler.needed_input_frames(frames);
+                let mut out = vec![0.0f32; frames * 2];
+                resampler.process_from_ring(&ring, &mut rng, &mut out);
+                expected -= needed * 2;
+                assert_eq!(
+                    ring.available_samples(),
+                    expected,
+                    "rate {rate}: batched pop consumed a different count than the phase invariant"
+                );
             }
         }
     }
