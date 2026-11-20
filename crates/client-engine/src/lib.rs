@@ -436,7 +436,7 @@ fn effective_wifi_ceiling(
     shield_until: &mut Option<Instant>,
     shield_subframes: &mut f32,
 ) -> f32 {
-    let base_cap = if bt_active || pkt_subframes >= 4 {
+    let base_cap: f32 = if bt_active || pkt_subframes >= 4 {
         28.0
     } else {
         24.0
