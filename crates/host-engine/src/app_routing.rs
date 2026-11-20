@@ -292,7 +292,7 @@ impl Drop for WindowsProcessLoopbackStream {
 
 #[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_windows_process_loopback(
+pub(crate) fn spawn_windows_process_loopback(
     target_pid: u32,
     ring: std::sync::Arc<audioshare_protocol::dsp::BurstDecouplerRing>,
     wakeup: std::sync::Arc<crate::CaptureWakeup>,

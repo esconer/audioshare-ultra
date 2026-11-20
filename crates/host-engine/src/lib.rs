@@ -2806,8 +2806,8 @@ impl HostEngine {
                 {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
                     // Drop the previous stream BEFORE creating a new SPSC
-                    // producer on `ring` (Rust evaluates RHS first otherwise).
-                    active_stream = None;
+                    // producer so two backends never share the audio device.
+                    drop(active_stream.take());
                     active_stream = if target_pid != 0 {
                         app_routing::spawn_windows_process_loopback(
                             target_pid,
