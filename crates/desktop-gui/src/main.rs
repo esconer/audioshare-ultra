@@ -1643,7 +1643,11 @@ impl AudioShareApp {
         } else {
             "16-Bit"
         };
-        let smooth_badge = format!("Opus {}k", self.target_bitrate_kbps);
+        let smooth_badge = format!(
+            "{} {}k",
+            if self.prefer_opus { "Opus" } else { "VBR" },
+            self.target_bitrate_kbps
+        );
         if let Some(idx) = uw::segmented_mode_bar(
             ui,
             dark,
@@ -1934,23 +1938,6 @@ impl AudioShareApp {
                                     .enable_smart_dtx
                                     .store(self.enable_smart_dtx, Ordering::Relaxed);
                             }
-                        }
-                        if uw::setting_switch_row(
-                            ui,
-                            dark,
-                            "Auto Virtual Speaker & Scan Lock",
-                            "Switches PC output on connect & suppresses 60s Wi-Fi scans",
-                            &mut self.enable_virtual_speaker,
-                        ) && self.host_engine.is_some()
-                        {
-                            // Drop the previous guard first: its Drop restores
-                            // the old default sink/source. Reassigning without
-                            // this lets the stale restore race with the new
-                            // guard and leaves duplicate virtual sinks.
-                            let _ = self.os_guard.take();
-                            self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
-                                self.enable_virtual_speaker,
-                            ));
                         }
                     });
                     cols[1].vertical(|ui| {
