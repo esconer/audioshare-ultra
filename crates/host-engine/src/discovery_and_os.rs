@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::io::BufRead;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::process::{Child, Stdio};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
@@ -19,6 +21,12 @@ pub const DISCOVERY_PORT: u16 = 65531;
 /// Wi-Fi nodes drop directed/limited broadcasts but still forward multicast.
 pub const DISCOVERY_MULTICAST_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 const BEACON_PREFIX: &str = "ASULTRA_BEACON|";
+/// Bound the scanner's host map so a spoofed/stale beacon flood cannot grow it
+/// without limit. The oldest entry is evicted when a new host pushes past it.
+const MAX_DISCOVERED_HOSTS: usize = 64;
+/// Refresh cached broadcast targets at most once every 5 s instead of walking
+/// the OS interface table on every 250 ms beacon tick.
+const BEACON_IFACE_REFRESH: Duration = Duration::from_secs(5);
 /// Ports advertised by a discovery beacon. Port 0 is not connectable, so a
 /// malformed or truncated beacon must not add a host at `IP:0`.
 fn beacon_port(raw: &str) -> u16 {
@@ -49,7 +57,21 @@ fn parse_beacon_fields(rest: &str) -> Option<(&str, u16, bool)> {
     Some((hostname, port, encrypted))
 }
 
-
+/// Docker/WSL/VMware/VirtualBox and Linux bridge interfaces are virtual links,
+/// not real LAN segments. Broadcasting discovery beacons on them leaks traffic
+/// into virtual subnets and makes phones advertise phantom hosts.
+fn is_virtual_interface_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("docker")
+        || lower.contains("wsl")
+        || lower.contains("vethernet")
+        || lower.contains("vmware")
+        || lower.contains("vmnet")
+        || lower.contains("vbox")
+        || lower.contains("virtualbox")
+        || lower.contains("virbr")
+        || lower.contains("br-")
+}
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -108,6 +130,10 @@ impl DiscoveryBeacon {
                 let _ = sock.set_broadcast(true);
                 // Link-local scope: never leak discovery beacons past the LAN.
                 let _ = sock.set_multicast_ttl_v4(1);
+                // Interface enumeration is comparatively expensive. Cache the
+                // per-interface broadcast targets and refresh only every 5 s.
+                let mut broadcast_targets: Vec<SocketAddr> = Vec::new();
+                let mut last_iface_scan: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
                     let payload = beacon_payload(
                         &host_label,
@@ -123,25 +149,35 @@ impl DiscoveryBeacon {
                         SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT)),
                     );
 
-                    // Use the OS-reported broadcast address (correct for /16,
-                    // /23, point-to-point and USB-tethering links) instead of
-                    // assuming /24. Fall back to the legacy x.y.z.255 form.
-                    if let Ok(ifaces) = if_addrs::get_if_addrs() {
-                        for iface in ifaces {
-                            if iface.is_loopback() {
-                                continue;
-                            }
-                            if let if_addrs::IfAddr::V4(v4) = iface.addr {
-                                let bcast = v4.broadcast.unwrap_or_else(|| {
-                                    let o = v4.ip.octets();
-                                    Ipv4Addr::new(o[0], o[1], o[2], 255)
-                                });
-                                let _ = sock.send_to(
-                                    payload.as_bytes(),
-                                    SocketAddr::from((bcast, DISCOVERY_PORT)),
-                                );
+                    if last_iface_scan
+                        .map(|t| t.elapsed() >= BEACON_IFACE_REFRESH)
+                        .unwrap_or(true)
+                    {
+                        last_iface_scan = Some(Instant::now());
+                        broadcast_targets.clear();
+                        // Use the OS-reported broadcast address (correct for
+                        // /16, /23, point-to-point and USB tethering links)
+                        // instead of assuming /24. Fall back to the legacy
+                        // x.y.z.255 form. Virtual NICs (Docker/WSL/VMware/
+                        // VBox/virbr/br-) are skipped: they are not real LANs.
+                        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+                            for iface in ifaces {
+                                if iface.is_loopback() || is_virtual_interface_name(&iface.name) {
+                                    continue;
+                                }
+                                if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                                    let bcast = v4.broadcast.unwrap_or_else(|| {
+                                        let o = v4.ip.octets();
+                                        Ipv4Addr::new(o[0], o[1], o[2], 255)
+                                    });
+                                    broadcast_targets
+                                        .push(SocketAddr::from((bcast, DISCOVERY_PORT)));
+                                }
                             }
                         }
+                    }
+                    for target in &broadcast_targets {
+                        let _ = sock.send_to(payload.as_bytes(), *target);
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
@@ -240,7 +276,22 @@ impl DiscoveryScanner {
                                     let host_addr = SocketAddr::new(src.ip(), port);
                                     let is_usb = crate::is_usb_subnet_ip(src.ip());
 
-                                    hosts_clone.lock().unwrap().insert(
+                                    let mut hosts = hosts_clone.lock().unwrap();
+                                    // Bound the map against beacon floods /
+                                    // stale entries: evict the least recently
+                                    // seen host before adding a new one.
+                                    if !hosts.contains_key(&host_addr)
+                                        && hosts.len() >= MAX_DISCOVERED_HOSTS
+                                    {
+                                        if let Some(oldest) = hosts
+                                            .iter()
+                                            .min_by_key(|(_, v)| v.last_seen)
+                                            .map(|(addr, _)| *addr)
+                                        {
+                                            hosts.remove(&oldest);
+                                        }
+                                    }
+                                    hosts.insert(
                                         host_addr,
                                         DiscoveredHost {
                                             hostname: hostname.to_string(),
@@ -625,16 +676,54 @@ impl DirectHotspotController {
                  $cred.Password = '{}'; \
                  $legacy.Passphrase = $cred; \
                  $pub.Start(); \
+                 Write-Output 'ASULTRA_SOFTAP_READY'; \
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
-            let child = silent_command("powershell")
+            let mut child = silent_command("powershell")
                 .args(["-NoProfile", "-NonInteractive", "-Command", &script])
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| format!("Failed to launch WinRT SoftAP host: {}", e))?;
+            // `$pub.Start()` is asynchronous. Returning before the SoftAP is
+            // actually up makes the phone's first connection fail, so wait
+            // for the sentinel emitted by the script (or kill + fail).
+            let stdout = child.stdout.take();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+            let _ = std::thread::Builder::new()
+                .name("as-ultra-softap-ready".into())
+                .spawn(move || {
+                    if let Some(pipe) = stdout {
+                        let mut reader = std::io::BufReader::new(pipe);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {
+                                    if line.contains("ASULTRA_SOFTAP_READY") {
+                                        let _ = ready_tx.send(true);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = ready_tx.send(false);
+                });
+            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(true) => {}
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Wi-Fi Direct SoftAP '{}' did not become ready within 3 s",
+                        ssid
+                    ));
+                }
+            }
             *windows_hotspot_holder().lock().unwrap() = Some(child);
             Ok(format!(
                 "1-Hop Direct Link '{}' Active (IP: 192.168.137.1)",
@@ -719,8 +808,11 @@ pub fn open_os_firewall_ports() -> String {
     }
     #[cfg(target_os = "windows")]
     {
+        // PowerShell single-quoted strings only treat '' as an escaped quote;
+        // `$`, backticks and double quotes stay literal. Doubling `'` keeps a
+        // path with quotes from terminating the literal and expanding code.
         let exe_path = std::env::current_exe()
-            .map(|p| p.to_string_lossy().replace('"', ""))
+            .map(|p| p.to_string_lossy().replace('\'', "''"))
             .unwrap_or_default();
         // Add BOTH a port rule AND a program allow rule across `profile=any`
         // (Public/Hotspot + Private + Domain), deleting any duplicate rules
@@ -734,8 +826,10 @@ pub fn open_os_firewall_ports() -> String {
              netsh advfirewall firewall add rule name=\"AudioShare_Ultra_UDP\" dir=in action=allow protocol=UDP localport=65530-65532 profile=any | Out-Null\n",
         );
         if !exe_path.is_empty() {
+            // `$exe` is assigned with a single-quoted literal (see above) and
+            // expanded by PowerShell into the quoted netsh `program=` value.
             script.push_str(&format!(
-                "netsh advfirewall firewall add rule name=\"AudioShare_Ultra_App\" dir=in action=allow program=\"{exe_path}\" profile=any | Out-Null\n"
+                "$exe = '{exe_path}'; netsh advfirewall firewall add rule name=\"AudioShare_Ultra_App\" dir=in action=allow program=\"$exe\" profile=any | Out-Null\n"
             ));
         }
         let encoded = encode_powershell_utf16le_base64(&script);
@@ -863,16 +957,9 @@ impl HostVolumeMonitor {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    let mut last_os_volume: Option<u8> = None;
-                    while run_clone.load(Ordering::Relaxed) {
-                        if let Some(volume) = read_windows_master_volume() {
-                            if last_os_volume != Some(volume) {
-                                telemetry.host_volume.store(volume, Ordering::Relaxed);
-                                last_os_volume = Some(volume);
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
+                    // A single COM apartment + IMMDeviceEnumerator for the
+                    // whole thread (not one per 500 ms poll).
+                    run_windows_volume_monitor(&telemetry, &run_clone);
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
@@ -931,9 +1018,13 @@ fn read_linux_master_volume() -> Option<u8> {
     parse_pactl_volume_percent(&String::from_utf8_lossy(&volume.stdout))
 }
 
-/// Zero-dependency Windows CoreAudio COM reader for master speaker volume & mute.
+/// Zero-dependency Windows CoreAudio COM monitor for master speaker volume.
+///
+/// COM initialization and the `IMMDeviceEnumerator` are created once and kept
+/// for the whole monitor thread lifetime. Rebuilding them on every 500 ms poll
+/// repeatedly tore down COM apartment state and cost far more than the read.
 #[cfg(target_os = "windows")]
-fn read_windows_master_volume() -> Option<u8> {
+fn run_windows_volume_monitor(telemetry: &HostTelemetry, running: &AtomicBool) {
     use core::ffi::c_void;
 
     #[repr(C)]
@@ -1066,44 +1157,53 @@ fn read_windows_master_volume() -> Option<u8> {
         ) < 0
             || enumerator.is_null()
         {
-            return None;
+            return;
         }
-        let mut device: *mut IMMDevice = core::ptr::null_mut();
-        let hr_dev = ((*(*enumerator).lp_vtbl).get_default_audio_endpoint)(
-            enumerator,
-            0, // eRender
-            0, // eConsole
-            &mut device,
-        );
+        let mut last_os_volume: Option<u8> = None;
+        while running.load(Ordering::Relaxed) {
+            let mut device: *mut IMMDevice = core::ptr::null_mut();
+            let hr_dev = ((*(*enumerator).lp_vtbl).get_default_audio_endpoint)(
+                enumerator,
+                0, // eRender
+                0, // eConsole
+                &mut device,
+            );
+            if hr_dev >= 0 && !device.is_null() {
+                let mut ep_vol: *mut IAudioEndpointVolume = core::ptr::null_mut();
+                let hr_act = ((*(*device).lp_vtbl).activate)(
+                    device,
+                    &IID_IAUDIO_ENDPOINT_VOLUME,
+                    1,
+                    core::ptr::null(),
+                    &mut ep_vol,
+                );
+                ((*(*device).lp_vtbl).release)(device);
+                if hr_act >= 0 && !ep_vol.is_null() {
+                    let mut muted: i32 = 0;
+                    let mut scalar: f32 = 1.0;
+                    let ok_mute = ((*(*ep_vol).lp_vtbl).get_mute)(ep_vol, &mut muted) >= 0;
+                    let ok_vol =
+                        ((*(*ep_vol).lp_vtbl).get_master_volume_level_scalar)(ep_vol, &mut scalar)
+                            >= 0;
+                    ((*(*ep_vol).lp_vtbl).release)(ep_vol);
+                    let volume = if ok_mute && muted != 0 {
+                        Some(0u8)
+                    } else if ok_vol {
+                        Some((scalar.clamp(0.0, 1.0) * 100.0).round() as u8)
+                    } else {
+                        None
+                    };
+                    if let Some(volume) = volume {
+                        if last_os_volume != Some(volume) {
+                            telemetry.host_volume.store(volume, Ordering::Relaxed);
+                            last_os_volume = Some(volume);
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
         ((*(*enumerator).lp_vtbl).release)(enumerator);
-        if hr_dev < 0 || device.is_null() {
-            return None;
-        }
-        let mut ep_vol: *mut IAudioEndpointVolume = core::ptr::null_mut();
-        let hr_act = ((*(*device).lp_vtbl).activate)(
-            device,
-            &IID_IAUDIO_ENDPOINT_VOLUME,
-            1,
-            core::ptr::null(),
-            &mut ep_vol,
-        );
-        ((*(*device).lp_vtbl).release)(device);
-        if hr_act < 0 || ep_vol.is_null() {
-            return None;
-        }
-        let mut muted: i32 = 0;
-        let mut scalar: f32 = 1.0;
-        let ok_mute = ((*(*ep_vol).lp_vtbl).get_mute)(ep_vol, &mut muted) >= 0;
-        let ok_vol =
-            ((*(*ep_vol).lp_vtbl).get_master_volume_level_scalar)(ep_vol, &mut scalar) >= 0;
-        ((*(*ep_vol).lp_vtbl).release)(ep_vol);
-        if ok_mute && muted != 0 {
-            Some(0)
-        } else if ok_vol {
-            Some((scalar.clamp(0.0, 1.0) * 100.0).round() as u8)
-        } else {
-            None
-        }
     }
 }
 
@@ -1149,6 +1249,23 @@ fn pactl_get_default(kind: &str) -> Option<String> {
 fn pactl_set_default(kind: &str, value: &str) {
     let arg = format!("set-default-{}", kind);
     let _ = Command::new("pactl").args([arg.as_str(), value]).output();
+}
+
+/// True when a PulseAudio sink with this exact name is already registered.
+#[cfg(target_os = "linux")]
+fn pactl_sink_exists(name: &str) -> bool {
+    let Ok(output) = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(name))
 }
 
 /// Linux names wireless NICs `wl*` (e.g. `wlan0`, `wlp2s0`, `wlo1`).
@@ -1197,28 +1314,38 @@ impl VirtualSpeakerAndRadioGuard {
             let prev_default_source =
                 pactl_get_default("source").filter(|s| s != "AudioShare_Ultra.monitor");
             let mut pactl_module_id = None;
-            if enable_virtual_speaker {
-                if let Ok(output) = Command::new("pactl")
-                    .args([
-                        "load-module",
-                        "module-null-sink",
-                        "sink_name=AudioShare_Ultra",
-                        "sink_properties=device.description=AudioShare_Wireless_Speaker",
-                    ])
-                    .output()
-                {
-                    if output.status.success() {
-                        let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if !id.is_empty() {
-                            pactl_module_id = Some(id);
+            let sink_ready = if enable_virtual_speaker {
+                if pactl_sink_exists("AudioShare_Ultra") {
+                    // A previous session (or another guard) already registered
+                    // this sink. Reuse it, but never unload a module we did
+                    // not create in Drop.
+                    true
+                } else {
+                    if let Ok(output) = Command::new("pactl")
+                        .args([
+                            "load-module",
+                            "module-null-sink",
+                            "sink_name=AudioShare_Ultra",
+                            "sink_properties=device.description=AudioShare_Wireless_Speaker",
+                        ])
+                        .output()
+                    {
+                        if output.status.success() {
+                            let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if !id.is_empty() {
+                                pactl_module_id = Some(id);
+                            }
                         }
                     }
+                    pactl_module_id.is_some()
                 }
-            }
+            } else {
+                false
+            };
             disable_wifi_power_save();
 
             Self {
-                enabled: pactl_module_id.is_some(),
+                enabled: sink_ready,
                 active: false,
                 pactl_module_id,
                 prev_default_sink,
@@ -1463,6 +1590,28 @@ mod tests {
         assert_eq!(encode_powershell_utf16le_base64("hi"), "aABpAA==");
         // Non-ASCII: "é" (U+00E9) -> UTF-16LE `E9 00` -> base64.
         assert_eq!(encode_powershell_utf16le_base64("é"), "6QA=");
+    }
+
+    #[test]
+    fn test_virtual_interface_names_are_filtered() {
+        for name in [
+            "docker0",
+            "veth1234",
+            "vEthernet (WSL)",
+            "vmnet1",
+            "VMware Network Adapter VMnet8",
+            "VirtualBox Host-Only Network",
+            "virbr0",
+            "br-abc123",
+        ] {
+            assert!(is_virtual_interface_name(name), "expected virtual: {name}");
+        }
+        for name in ["eth0", "wlan0", "enp3s0", "Wi-Fi", "lo"] {
+            assert!(
+                !is_virtual_interface_name(name),
+                "expected physical: {name}"
+            );
+        }
     }
 
     #[test]

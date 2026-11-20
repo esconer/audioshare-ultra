@@ -12,10 +12,12 @@ use audioshare_protocol::dsp::{BurstDecouplerRing, ClockDriftResampler, TruePeak
 use audioshare_protocol::latency::DESKTOP_OUTPUT_BUFFER_MS;
 use audioshare_protocol::lpc_lossless::{
     decode_fec_subframe_to_f32, decode_lossless_pcm24_to_f32, decode_lossless_subframe,
-    decode_vbr_subframe_to_f32, TAG_VBR_BFP,
+    decode_vbr_subframe_to_f32, ADPCM_FEC_BYTES, TAG_VBR_BFP,
 };
-use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
-use audioshare_protocol::sequencer::{ZeroJitterSequencer, STATUS_PRIMARY_LOSSLESS};
+use audioshare_protocol::opus_codec::{OpusStreamDecoder, MAX_OPUS_SUBFRAME_BYTES, TAG_OPUS_RLD};
+use audioshare_protocol::sequencer::{
+    ZeroJitterSequencer, RING_SLOTS, STATUS_EMPTY, STATUS_PRIMARY_LOSSLESS,
+};
 use audioshare_protocol::sync_and_eq::GroupSyncEstimator;
 use audioshare_protocol::wire::{
     ClientFeedbackPacket, CodecMode, ParsedPacket, CONTROL_FEEDBACK_LEN,
@@ -171,6 +173,104 @@ fn primary_bundle_is_opus(primary: &[u8]) -> bool {
     primary.get(2) == Some(&TAG_OPUS_RLD)
 }
 
+/// Heal one sequencer slot from a 124-byte ADPCM FEC frame. Only slots still
+/// ahead of the playhead and genuinely missing are touched; a late primary
+/// copy can always replace the concealment afterwards.
+#[inline]
+fn heal_fec_slot(sequencer: &ZeroJitterSequencer, seq: u16, next_seq: u16, payload: &[u8]) {
+    if (seq.wrapping_sub(next_seq) as i16).is_negative() || !sequencer.is_slot_missing(seq) {
+        return;
+    }
+    let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+    if decode_fec_subframe_to_f32(payload, &mut pcm_f32) {
+        sequencer.try_heal_with_fec(seq, &pcm_f32);
+    }
+}
+
+/// Heal every complete 124-byte frame in one FEC field. `first_back` is the
+/// distance of the first frame from the packet base and `step` is the distance
+/// between frames (1 for a legacy single-frame field, 2 for paired fields). A
+/// trailing partial frame is ignored.
+fn heal_fec_field(
+    sequencer: &ZeroJitterSequencer,
+    base_seq: u16,
+    next_seq: u16,
+    payload: &[u8],
+    first_back: u16,
+    step: u16,
+) {
+    let mut remaining = payload;
+    let mut back = first_back;
+    while remaining.len() >= ADPCM_FEC_BYTES {
+        let (chunk, tail) = remaining.split_at(ADPCM_FEC_BYTES);
+        heal_fec_slot(sequencer, base_seq.wrapping_sub(back), next_seq, chunk);
+        remaining = tail;
+        back = back.wrapping_add(step);
+    }
+}
+
+/// Heal the slots covered by a packet's two FEC fields.
+///
+/// Normal framing carries one 124-byte frame per field (`N-1` and `N-2`).
+/// Four-subframe 2.4 GHz framing carries 248 bytes per field, interleaved:
+/// `fec_n1 = [N-1, N-3]` and `fec_n2 = [N-2, N-4]`, so losing one whole 10 ms
+/// packet no longer leaves all four subframes unrecoverable. The interleaving
+/// is a compatibility contract: the first frame of each field keeps its legacy
+/// N-1/N-2 meaning, so older receivers still heal the correct slots.
+fn heal_packet_fec(
+    base_seq: u16,
+    next_seq: u16,
+    fec_n1: &[u8],
+    fec_n2: &[u8],
+    sequencer: &ZeroJitterSequencer,
+) {
+    let paired = fec_n1.len() >= ADPCM_FEC_BYTES * 2;
+    let step = if paired { 2 } else { 1 };
+    heal_fec_field(sequencer, base_seq, next_seq, fec_n1, 1, step);
+    heal_fec_field(sequencer, base_seq, next_seq, fec_n2, 2, step);
+}
+
+/// Raw Opus payload buffered by sequence number. Decoding happens at playhead
+/// pop time so a reordered Wi-Fi packet is never fed out of order into the
+/// stateful CELT MDCT/PLC predictor (mirrors the client engine's `opus_ring`).
+#[derive(Clone, Copy)]
+struct OpusPacketSlot {
+    seq: Option<u16>,
+    len: u16,
+    data: [u8; MAX_OPUS_SUBFRAME_BYTES],
+}
+
+impl OpusPacketSlot {
+    const EMPTY: Self = Self {
+        seq: None,
+        len: 0,
+        data: [0u8; MAX_OPUS_SUBFRAME_BYTES],
+    };
+}
+
+/// Track decoded PCM level and a returned latency-sonar chirp. Shared by the
+/// arrival-time (non-Opus) and pop-time (Opus) decode paths so peak metering
+/// stays correct when Opus frames are decoded at the playhead.
+#[inline]
+fn note_pcm_level(
+    pcm: &[f32; SUBFRAME_STEREO_SAMPLES],
+    peak: &std::sync::AtomicU64,
+    chirp: &std::sync::AtomicU64,
+) {
+    let mut max_peak = 0.0f32;
+    for &v in pcm.iter() {
+        max_peak = max_peak.max(v.abs());
+    }
+    peak.store((max_peak * 100.0).min(100.0) as u64, Ordering::Relaxed);
+    if audioshare_protocol::sync_and_eq::LatencySonar::detect_chirp_return(pcm) {
+        let now_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        chirp.store(now_us, Ordering::Relaxed);
+    }
+}
+
 /// Decode every length-prefixed subframe in a primary bundle.
 ///
 /// The phone transmitter may bundle up to four 2.5 ms subframes per datagram.
@@ -187,6 +287,11 @@ fn primary_bundle_is_opus(primary: &[u8]) -> bool {
 /// phase-aligned with the Opus lookahead, so the caller can heal empty
 /// sequencer slots. It must run before `on_subframe` for the frame that
 /// exposed the gap; the packet's own audio is reported afterwards.
+///
+/// `on_opus` receives `(seq, raw_payload)` before any stateful decoding. When
+/// it returns `true` the frame has been buffered for decode-at-pop (or is a
+/// late duplicate that must be dropped) and is skipped here; returning `false`
+/// keeps the original decode-immediately behaviour used by the unit tests.
 fn decode_primary_bundle(
     primary: &[u8],
     subframe_count: u8,
@@ -194,6 +299,7 @@ fn decode_primary_bundle(
     mut opus_decoder: Option<&mut Option<OpusStreamDecoder>>,
     mut on_plc: impl FnMut(u16, &[f32; SUBFRAME_STEREO_SAMPLES]),
     mut on_subframe: impl FnMut(usize, &[f32; SUBFRAME_STEREO_SAMPLES]),
+    mut on_opus: impl FnMut(u16, &[u8]) -> bool,
 ) -> usize {
     let mut cursor = 0usize;
     let mut decoded = 0usize;
@@ -211,6 +317,13 @@ fn decode_primary_bundle(
         let mut pcm_f32 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         let seq = base_seq.wrapping_add(sub_idx as u16);
         let ok = if payload.first() == Some(&TAG_OPUS_RLD) {
+            // Decode-at-pop: hand raw Opus bytes to the caller before touching
+            // the stateful CELT decoder. A buffered (or deliberately dropped
+            // late) frame must never advance the MDCT predictor out of order.
+            if on_opus(seq, payload) {
+                cursor += sub_len;
+                continue;
+            }
             // Opus is stateful, so a decoder must be supplied. Without one,
             // treat the frame as undecodable instead of guessing a codec.
             if let Some(decoder_slot) = opus_decoder.as_deref_mut() {
@@ -273,11 +386,68 @@ fn push_one_subframe(
     resampler: &mut ClockDriftResampler,
     resampled_out: &mut [f32],
     mic_fifo: &BurstDecouplerRing,
+    opus_decoder: &mut Option<OpusStreamDecoder>,
+    opus_ring: &mut [OpusPacketSlot],
+    opus_stream_active: &mut bool,
+    peak: &AtomicU64,
+    chirp: &AtomicU64,
 ) -> u32 {
     let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-    let status = sequencer.pop_next(*next_seq, &mut frame);
-    if should_advance_mic_playhead(status, latest_seq, *next_seq) {
-        *next_seq = next_seq.wrapping_add(1);
+    let play_seq = *next_seq;
+    let opus_idx = (play_seq as usize) & (RING_SLOTS - 1);
+    let has_opus_slot = opus_ring[opus_idx].seq == Some(play_seq);
+    let status = if has_opus_slot {
+        // Strict in-order decode at the playhead. Raw payloads were buffered
+        // on arrival, so the stateful CELT decoder never sees a reordered or
+        // duplicate frame.
+        let slot = &mut opus_ring[opus_idx];
+        let len = slot.len as usize;
+        slot.seq = None;
+        if opus_decoder.is_none() {
+            *opus_decoder = OpusStreamDecoder::new();
+        }
+        let decoded_ok = opus_decoder
+            .as_mut()
+            .map(|decoder| decoder.decode_subframe_at_seq(play_seq, &slot.data[..len], &mut frame))
+            .unwrap_or(false);
+        *opus_stream_active = true;
+        if decoded_ok {
+            note_pcm_level(&frame, peak, chirp);
+            // Splice with the sequencer's predictor/history so a following
+            // WSOLA or FEC frame does not click at the codec boundary.
+            sequencer.finalize_external_frame(&mut frame, false);
+            STATUS_PRIMARY_LOSSLESS
+        } else {
+            sequencer.pop_next(play_seq, &mut frame)
+        }
+    } else if *opus_stream_active && sequencer.is_slot_missing(play_seq) && opus_decoder.is_some() {
+        // Playhead miss on an Opus stream: phase-locked CELT PLC instead of
+        // WSOLA, which would jump timbre on a CELT-encoded stream.
+        let plc_ok = opus_decoder
+            .as_mut()
+            .map(|decoder| decoder.decode_plc(play_seq, &mut frame))
+            .unwrap_or(false);
+        if plc_ok {
+            note_pcm_level(&frame, peak, chirp);
+            sequencer.finalize_external_frame(&mut frame, true);
+            STATUS_EMPTY
+        } else {
+            sequencer.pop_next(play_seq, &mut frame)
+        }
+    } else {
+        // Existing single-codec rebuild path (lossless / VBR / ADPCM FEC):
+        // the sequencer holds the decoded PCM produced on arrival.
+        let st = sequencer.pop_next(play_seq, &mut frame);
+        if st != STATUS_EMPTY {
+            // Rebuilding a non-Opus frame closes the Opus epoch; drop stale
+            // MDCT state so a later switch cannot hit the 16-bit wrap lockout.
+            *opus_stream_active = false;
+            *opus_decoder = None;
+        }
+        st
+    };
+    if should_advance_mic_playhead(status, latest_seq, play_seq) {
+        *next_seq = play_seq.wrapping_add(1);
     }
     if mode == PhoneRxRoutingMode::VirtualMicForCalls {
         mic_gate.process_in_place(&mut frame);
@@ -590,6 +760,14 @@ impl PhoneMicReceiver {
                 let mut next_tick = Instant::now() + Duration::from_micros(2500);
                 let mut resampler = ClockDriftResampler::new();
                 let mut opus_decoder: Option<OpusStreamDecoder> = None;
+                // Raw Opus payloads are buffered by sequence and decoded at
+                // playhead pop time, mirroring ClientEngine, so Wi-Fi
+                // reordering cannot desynchronise the stateful CELT decoder.
+                let mut opus_ring = vec![OpusPacketSlot::EMPTY; RING_SLOTS];
+                let mut opus_stream_active = false;
+                // Peak meter falls back to zero once no audio has arrived for
+                // a quarter second (DTX, disconnect, or stalled sender).
+                let mut last_packet_arrival = Instant::now();
                 let mut resampled_out = [0.0f32; SUBFRAME_STEREO_SAMPLES + 16];
                 // Party Host feedback: remember where audio came from, the
                 // group delay advertised in its stream_id, and the per-window
@@ -663,6 +841,7 @@ impl PhoneMicReceiver {
                             last_sender_addr = Some(src_addr);
                             max_group_delay_ms = (parsed.header.stream_id as u16) * 2;
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
+                            last_packet_arrival = Instant::now();
                             let base_seq = parsed.header.sequence;
                             if !initialized {
                                 next_seq = base_seq;
@@ -678,6 +857,11 @@ impl PhoneMicReceiver {
                             if parsed.header.mode == CodecMode::SilenceHeartbeat {
                                 sequencer.reset();
                                 opus_decoder = None;
+                                for slot in &mut opus_ring {
+                                    slot.seq = None;
+                                }
+                                opus_stream_active = false;
+                                peak_clone.store(0, Ordering::Relaxed);
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
@@ -708,6 +892,10 @@ impl PhoneMicReceiver {
                                 dtx_silent = false;
                                 sequencer.reset();
                                 opus_decoder = None;
+                                for slot in &mut opus_ring {
+                                    slot.seq = None;
+                                }
+                                opus_stream_active = false;
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
                                 prebuffer_ready = false;
@@ -716,35 +904,26 @@ impl PhoneMicReceiver {
                             // Opus carries its own lookahead/PLC state; an
                             // ADPCM FEC backup is phase-shifted by one
                             // subframe, so only heal VBR/lossless streams.
+                            // Four-subframe framing sends 248-byte paired
+                            // fields `[N-1,N-3]` / `[N-2,N-4]`; the legacy
+                            // 124-byte layout heals just N-1/N-2.
                             if !primary_bundle_is_opus(parsed.primary_payload) {
-                                if !parsed.fec_n1_payload.is_empty() {
-                                    let s1 = base_seq.wrapping_sub(1);
-                                    if (s1.wrapping_sub(next_seq) as i16) >= 0
-                                        && sequencer.is_slot_missing(s1)
-                                    {
-                                        let mut f1 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                        if decode_fec_subframe_to_f32(parsed.fec_n1_payload, &mut f1) {
-                                            sequencer.try_heal_with_fec(s1, &f1);
-                                        }
-                                    }
-                                }
-                                if !parsed.fec_n2_payload.is_empty() {
-                                    let s2 = base_seq.wrapping_sub(2);
-                                    if (s2.wrapping_sub(next_seq) as i16) >= 0
-                                        && sequencer.is_slot_missing(s2)
-                                    {
-                                        let mut f2 = [0.0f32; SUBFRAME_STEREO_SAMPLES];
-                                        if decode_fec_subframe_to_f32(parsed.fec_n2_payload, &mut f2) {
-                                            sequencer.try_heal_with_fec(s2, &f2);
-                                        }
-                                    }
-                                }
+                                heal_packet_fec(
+                                    base_seq,
+                                    next_seq,
+                                    parsed.fec_n1_payload,
+                                    parsed.fec_n2_payload,
+                                    &sequencer,
+                                );
                             }
 
                             // Decode every bundled subframe, not just index 0.
                             // Party Mode / PhoneAudioCaster sends two
                             // subframes per datagram; reading only the first
                             // one discarded 50% of the audio.
+                            let bundle_is_opus = primary_bundle_is_opus(parsed.primary_payload);
+                            opus_stream_active = bundle_is_opus;
+                            let mut opus_latest = latest_seq;
                             decode_primary_bundle(
                                 parsed.primary_payload,
                                 parsed.header.subframe_count,
@@ -762,25 +941,7 @@ impl PhoneMicReceiver {
                                     }
                                 },
                                 |sub_idx, pcm_f32| {
-                                    let mut max_peak = 0.0f32;
-                                    for &v in pcm_f32.iter() {
-                                        let a = v.abs();
-                                        if a > max_peak {
-                                            max_peak = a;
-                                        }
-                                    }
-                                    peak_clone.store(
-                                        ((max_peak * 100.0).min(100.0)) as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                    if audioshare_protocol::sync_and_eq::LatencySonar::detect_chirp_return(pcm_f32) {
-                                        let now_us = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_micros() as u64;
-                                        chirp_clone.store(now_us, Ordering::Relaxed);
-                                    }
-
+                                    note_pcm_level(pcm_f32, &peak_clone, &chirp_clone);
                                     let s = base_seq.wrapping_add(sub_idx as u16);
                                     if (s.wrapping_sub(next_seq) as i16) >= 0 {
                                         sequencer.push_primary(s, pcm_f32);
@@ -789,7 +950,31 @@ impl PhoneMicReceiver {
                                         latest_seq = s;
                                     }
                                 },
+                                |s, payload| {
+                                    // Buffer raw Opus payloads by sequence for
+                                    // strict in-order decode at the playhead.
+                                    // A late packet must never rewind the CELT
+                                    // predictor, so drop it here.
+                                    if (s.wrapping_sub(next_seq) as i16) >= 0 {
+                                        let slot = &mut opus_ring[(s as usize) & (RING_SLOTS - 1)];
+                                        if slot.seq != Some(s) {
+                                            let len = payload.len().min(MAX_OPUS_SUBFRAME_BYTES);
+                                            slot.data[..len].copy_from_slice(&payload[..len]);
+                                            slot.len = len as u16;
+                                            slot.seq = Some(s);
+                                        }
+                                        if (s.wrapping_sub(opus_latest) as i16) > 0 {
+                                            opus_latest = s;
+                                        }
+                                    }
+                                    // Opus is always handled here (buffered or
+                                    // dropped), never decoded on arrival.
+                                    true
+                                },
                             );
+                            if (opus_latest.wrapping_sub(latest_seq) as i16) > 0 {
+                                latest_seq = opus_latest;
+                            }
 
                             // Keep only the planned cushion (one callback plus
                             // jitter margin) if a burst pushed the backlog far
@@ -862,6 +1047,12 @@ impl PhoneMicReceiver {
                         }
                     }
 
+                    // A silent sender (or a disconnected phone) must not leave
+                    // the peak meter frozen at the last real audio level.
+                    if last_packet_arrival.elapsed() >= Duration::from_millis(250) {
+                        peak_clone.store(0, Ordering::Relaxed);
+                    }
+
                     let now = Instant::now();
                     // Do not let `next_tick` accumulate while the receiver is
                     // still prebuffering. Otherwise the first ready loop can
@@ -874,10 +1065,14 @@ impl PhoneMicReceiver {
                     if initialized && prebuffer_ready && pull_sink_active {
                         // When a hardware-clocked CPAL sink is pulling bursts
                         // from `mic_fifo_thread`, immediately transfer ready
-                        // subframes from `sequencer` so the decoupler holds the
-                        // full `fifo_watermark` cushion before the next callback.
+                        // subframes so the decoupler holds the full
+                        // `fifo_watermark` cushion before the next callback.
+                        // Opus frames live in the decode-at-pop ring, not in
+                        // the sequencer, so check both sources here.
                         while mic_fifo_thread.available_samples() < fifo_watermark
-                            && !sequencer.is_slot_missing(next_seq)
+                            && (!sequencer.is_slot_missing(next_seq)
+                                || opus_ring[(next_seq as usize) & (RING_SLOTS - 1)].seq
+                                    == Some(next_seq))
                         {
                             let st = push_one_subframe(
                                 &mut next_seq,
@@ -889,6 +1084,11 @@ impl PhoneMicReceiver {
                                 &mut resampler,
                                 &mut resampled_out,
                                 &mic_fifo_thread,
+                                &mut opus_decoder,
+                                &mut opus_ring,
+                                &mut opus_stream_active,
+                                &peak_clone,
+                                &chirp_clone,
                             );
                             if st == STATUS_PRIMARY_LOSSLESS {
                                 fb_primary_frames += 1;
@@ -903,6 +1103,13 @@ impl PhoneMicReceiver {
                         }
                     }
 
+                    // A long stall (thread suspend, blocked sink, GC pause)
+                    // must not release a catch-up burst of PLC subframes at
+                    // CPU speed. Re-anchor instead of banking stale ticks.
+                    if now.duration_since(next_tick) > Duration::from_millis(25) {
+                        next_tick = now;
+                    }
+
                     while now >= next_tick {
                         next_tick += Duration::from_micros(2500);
                         if initialized && prebuffer_ready {
@@ -913,9 +1120,12 @@ impl PhoneMicReceiver {
                                 next_tick = now + Duration::from_micros(2500);
                                 break;
                             }
+                            let play_slot_missing = sequencer.is_slot_missing(next_seq)
+                                && opus_ring[(next_seq as usize) & (RING_SLOTS - 1)].seq
+                                    != Some(next_seq);
                             if should_hold_mic_live_edge(
                                 pull_sink_active,
-                                sequencer.is_slot_missing(next_seq),
+                                play_slot_missing,
                                 latest_seq,
                                 next_seq,
                                 mic_fifo_thread.available_samples(),
@@ -933,6 +1143,11 @@ impl PhoneMicReceiver {
                                 &mut resampler,
                                 &mut resampled_out,
                                 &mic_fifo_thread,
+                                &mut opus_decoder,
+                                &mut opus_ring,
+                                &mut opus_stream_active,
+                                &peak_clone,
+                                &chirp_clone,
                             );
                             if st == STATUS_PRIMARY_LOSSLESS {
                                 fb_primary_frames += 1;
@@ -975,6 +1190,16 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = session_key_from_pin(pin);
+    }
+
+    /// Install an already-derived session key (e.g. the single key shared by
+    /// all engines from the GUI). The RX thread snapshots it once per tick, so
+    /// this takes effect within one subframe without restarting the receiver.
+    pub fn set_session_key(&self, key: Option<SessionKey>) {
+        *self
+            .session_key
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = key;
     }
 
     pub fn stop(&mut self) {
@@ -1104,6 +1329,7 @@ mod tests {
                 }
                 decoded.push((idx, samples));
             },
+            |_, _| false,
         );
 
         assert_eq!(count, 2);
@@ -1166,6 +1392,7 @@ mod tests {
             None,
             |_, _| {},
             |_, _| decoded += 1,
+            |_, _| false,
         );
         assert_eq!(decoded, 1);
     }
@@ -1181,6 +1408,7 @@ mod tests {
             None,
             |_, _| {},
             |_, _| panic!("must not decode"),
+            |_, _| false,
         );
         assert_eq!(count, 0);
     }
@@ -1221,6 +1449,7 @@ mod tests {
             Some(&mut decoder),
             |_, _| {},
             |_, _| {},
+            |_, _| false,
         );
         assert_eq!(count, 1, "VBR payload must still decode");
         assert!(
@@ -1259,6 +1488,7 @@ mod tests {
                     peak = peak.max(v.abs());
                 }
             },
+            |_, _| false,
         );
         assert_eq!(count, 1, "tagged VBR payload must decode");
         assert!(peak > 0.05, "decoded music must not be silence");
@@ -1297,6 +1527,7 @@ mod tests {
                 assert_eq!(idx, 0);
                 decoded = *pcm;
             },
+            |_, _| false,
         );
         assert_eq!(count, 1, "24-bit payload must decode");
         for (i, (&got, &source)) in decoded.iter().zip(pcm_f32.iter()).enumerate() {
@@ -1353,6 +1584,7 @@ mod tests {
             Some(&mut decoder),
             |_, _| {},
             |idx, pcm| frames.push((idx, *pcm)),
+            |_, _| false,
         );
         assert_eq!(
             count, 2,
@@ -1417,6 +1649,7 @@ mod tests {
             Some(&mut decoder),
             |missed_seq, pcm| plc.push((missed_seq, *pcm)),
             |idx, pcm| decoded.push((idx, *pcm)),
+            |_, _| false,
         );
 
         assert_eq!(count, 1);
@@ -1723,5 +1956,96 @@ mod tests {
         ));
         // Unencrypted LAN feedback carries no sequence guarantee.
         assert!(!feedback_is_replay(false, 1, 5));
+    }
+
+    #[test]
+    fn test_heal_packet_fec_interleaved_paired_fields() {
+        use audioshare_protocol::lpc_lossless::encode_fec_subframe;
+        use audioshare_protocol::sequencer::STATUS_HEALED_BY_FEC;
+
+        fn tone(seed: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                let freq = 220.0 + seed as f32 * 110.0;
+                let v = ((t * freq * std::f32::consts::TAU).sin() * 14_000.0) as i16;
+                pcm[i * 2] = v;
+                pcm[i * 2 + 1] = v;
+            }
+            pcm
+        }
+
+        let mut sequencer = ZeroJitterSequencer::new();
+        // Playhead at 100, packet base 104: heal N-1..N-4 (103..100).
+        let base_seq = 104u16;
+        let next_seq = 100u16;
+        let mut n1 = [0u8; ADPCM_FEC_BYTES * 2];
+        let mut n2 = [0u8; ADPCM_FEC_BYTES * 2];
+        let mut e3 = [0u8; ADPCM_FEC_BYTES];
+        let mut e2 = [0u8; ADPCM_FEC_BYTES];
+        let mut e1 = [0u8; ADPCM_FEC_BYTES];
+        let mut e0 = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&tone(3), &mut e3);
+        encode_fec_subframe(&tone(2), &mut e2);
+        encode_fec_subframe(&tone(1), &mut e1);
+        encode_fec_subframe(&tone(0), &mut e0);
+        // fec_n1 = [N-1, N-3] = [103, 101]
+        n1[..ADPCM_FEC_BYTES].copy_from_slice(&e3);
+        n1[ADPCM_FEC_BYTES..].copy_from_slice(&e1);
+        // fec_n2 = [N-2, N-4] = [102, 100]
+        n2[..ADPCM_FEC_BYTES].copy_from_slice(&e2);
+        n2[ADPCM_FEC_BYTES..].copy_from_slice(&e0);
+
+        heal_packet_fec(base_seq, next_seq, &n1, &n2, &sequencer);
+
+        for seq in next_seq..base_seq {
+            assert!(!sequencer.is_slot_missing(seq), "slot {seq} was not healed");
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(sequencer.pop_next(seq, &mut out), STATUS_HEALED_BY_FEC);
+            let peak = out.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            assert!(peak > 0.01, "healed slot {seq} must not be silent");
+        }
+    }
+
+    #[test]
+    fn test_decode_primary_bundle_defers_opus_payload_to_ring() {
+        fn tone() -> [i16; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                pcm[i * 2] = ((t * 440.0 * std::f32::consts::TAU).sin() * 8000.0) as i16;
+                pcm[i * 2 + 1] = pcm[i * 2];
+            }
+            pcm
+        }
+
+        let mut encoder = OpusStreamEncoder::new(128).expect("create Opus encoder");
+        let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let len = encoder
+            .encode_subframe(&tone(), 128, &mut payload)
+            .expect("encode Opus subframe");
+        let mut bundle = [0u8; MAX_OPUS_SUBFRAME_BYTES + 2];
+        bundle[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        bundle[2..2 + len].copy_from_slice(&payload[..len]);
+
+        let mut buffered: Vec<(u16, Vec<u8>)> = Vec::new();
+        let mut pcm_calls = 0usize;
+        let decoded = decode_primary_bundle(
+            &bundle[..2 + len],
+            1,
+            55,
+            None,
+            |_, _| {},
+            |_, _| pcm_calls += 1,
+            |seq, raw| {
+                buffered.push((seq, raw.to_vec()));
+                true
+            },
+        );
+        assert_eq!(decoded, 0, "deferred Opus frame must not decode on arrival");
+        assert_eq!(pcm_calls, 0);
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(buffered[0].0, 55);
+        assert_eq!(&buffered[0].1[..], &payload[..len]);
     }
 }
