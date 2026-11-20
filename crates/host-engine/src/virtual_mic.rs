@@ -254,8 +254,8 @@ impl OpusPacketSlot {
 #[inline]
 fn note_pcm_level(
     pcm: &[f32; SUBFRAME_STEREO_SAMPLES],
-    peak: &std::sync::AtomicU64,
-    chirp: &std::sync::AtomicU64,
+    peak: &std::sync::atomic::AtomicU64,
+    chirp: &std::sync::atomic::AtomicU64,
 ) {
     let mut max_peak = 0.0f32;
     for &v in pcm.iter() {

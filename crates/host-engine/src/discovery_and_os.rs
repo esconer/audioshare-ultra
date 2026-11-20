@@ -208,7 +208,7 @@ impl DiscoveryScanner {
     pub fn start() -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let paused = Arc::new(AtomicBool::new(false));
-        let hosts = Arc::new(Mutex::new(HashMap::new()));
+        let hosts = Arc::new(Mutex::new(HashMap::<SocketAddr, DiscoveredHost>::new()));
         let run_clone = Arc::clone(&running);
         let paused_clone = Arc::clone(&paused);
         let hosts_clone = Arc::clone(&hosts);
