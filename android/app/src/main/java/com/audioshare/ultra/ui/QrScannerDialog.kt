@@ -5,6 +5,8 @@ import android.util.Size
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
@@ -46,10 +48,16 @@ fun QrScannerDialog(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val handled = remember { AtomicBoolean(false) }
+    val disposed = remember { AtomicBoolean(false) }
+    var boundProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     val executor = remember { Executors.newSingleThreadExecutor() }
 
     DisposableEffect(Unit) {
-        onDispose { executor.shutdownNow() }
+        onDispose {
+            disposed.set(true)
+            runCatching { boundProvider?.unbindAll() }
+            executor.shutdownNow()
+        }
     }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -78,14 +86,26 @@ fun QrScannerDialog(
                         providerFuture.addListener({
                             runCatching {
                                 val provider = providerFuture.get()
+                                if (disposed.get()) return@addListener
+                                boundProvider = provider
                                 val preview = Preview.Builder().build().also {
                                     it.setSurfaceProvider(previewView.surfaceProvider)
                                 }
-                                @Suppress("DEPRECATION")
+                                val resSelector = ResolutionSelector.Builder()
+                                    .setResolutionStrategy(
+                                        ResolutionStrategy(
+                                            Size(960, 720),
+                                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                                        )
+                                    )
+                                    .build()
                                 val analysis = ImageAnalysis.Builder()
-                                    .setTargetResolution(Size(960, 720))
+                                    .setResolutionSelector(resSelector)
                                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                                     .build()
+                                // Reused across frames; the analyzer executor is single-threaded.
+                                var tightlyPacked = ByteArray(0)
+                                var rawPlane = ByteArray(0)
                                 analysis.setAnalyzer(executor) { proxy ->
                                     try {
                                         if (handled.get()) return@setAnalyzer
@@ -97,19 +117,24 @@ fun QrScannerDialog(
                                         // CameraX may pad each scanline (rowStride > width) on
                                         // Qualcomm/Samsung/MediaTek sensors. Strip padding into a
                                         // tight width*height buffer so ZXing never skews a scanline.
+                                        // Scratch buffers are reused and only resized when needed.
+                                        val tightLen = w * h
+                                        if (tightlyPacked.size != tightLen) tightlyPacked = ByteArray(tightLen)
+                                        val dst = tightlyPacked
                                         val bytes = if (rowStride == w) {
-                                            ByteArray(w * h).also { yBuf.get(it, 0, minOf(it.size, yBuf.remaining())) }
+                                            yBuf.get(dst, 0, minOf(dst.size, yBuf.remaining()))
+                                            dst
                                         } else {
-                                            val raw = ByteArray(yBuf.remaining())
-                                            yBuf.get(raw)
-                                            ByteArray(w * h).also { dst ->
-                                                for (row in 0 until h) {
-                                                    val srcOff = row * rowStride
-                                                    if (srcOff + w <= raw.size) {
-                                                        System.arraycopy(raw, srcOff, dst, row * w, w)
-                                                    }
+                                            val rawLen = yBuf.remaining()
+                                            if (rawPlane.size != rawLen) rawPlane = ByteArray(rawLen)
+                                            yBuf.get(rawPlane)
+                                            for (row in 0 until h) {
+                                                val srcOff = row * rowStride
+                                                if (srcOff + w <= rawPlane.size) {
+                                                    System.arraycopy(rawPlane, srcOff, dst, row * w, w)
                                                 }
                                             }
+                                            dst
                                         }
                                         val src = PlanarYUVLuminanceSource(
                                             bytes, w, h,

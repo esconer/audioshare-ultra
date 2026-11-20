@@ -1,6 +1,7 @@
 package com.audioshare.ultra.ui
 
 import android.graphics.Bitmap
+import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -95,13 +96,19 @@ fun PartyQrDialog(
     val endpoints = remember { listReachablePartyEndpoints() }
     var selectedIdx by remember { mutableIntStateOf(0) }
     val activeEndpoint = endpoints.getOrNull(selectedIdx)
-    val ip = activeEndpoint?.ip ?: "192.168.43.1"
+    val ip = activeEndpoint?.ip
     val uri = remember(ip, partyPort, pinCode) {
+        if (ip == null) return@remember null
         val cleanPin = pinCode.trim()
-        if (cleanPin.isNotEmpty()) "asultra://connect?host=$ip:$partyPort&pin=$cleanPin"
-        else "asultra://connect?host=$ip:$partyPort"
+        Uri.Builder()
+            .scheme("asultra")
+            .authority("connect")
+            .appendQueryParameter("host", "$ip:$partyPort")
+            .apply { if (cleanPin.isNotEmpty()) appendQueryParameter("pin", cleanPin) }
+            .build()
+            .toString()
     }
-    val qrBitmap = remember(uri) { renderQrBitmap(uri) }
+    val qrBitmap = remember(uri) { uri?.let { renderQrBitmap(it) } }
 
     Dialog(onDismissRequest = onDismiss) {
         StudioCard {
@@ -148,20 +155,33 @@ fun PartyQrDialog(
                     }
                 }
             }
-            Text(
-                uri,
-                fontFamily = FontFamily.Monospace,
-                style = MaterialTheme.typography.labelSmall,
-                color = StudioColors.AccentSoft
-            )
+            if (uri == null) {
+                Text(
+                    "Enable Wi-Fi or Mobile Hotspot to generate a Party QR",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            } else {
+                Text(
+                    uri,
+                    fontFamily = FontFamily.Monospace,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StudioColors.AccentSoft
+                )
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                OutlinedButton(onClick = {
-                    clipboard.setText(AnnotatedString(uri))
-                    onCopied()
-                }) {
+                OutlinedButton(
+                    onClick = {
+                        uri?.let {
+                            clipboard.setText(AnnotatedString(it))
+                            onCopied()
+                        }
+                    },
+                    enabled = uri != null
+                ) {
                     Icon(Icons.Rounded.ContentCopy, null, Modifier.size(15.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Copy Link")
