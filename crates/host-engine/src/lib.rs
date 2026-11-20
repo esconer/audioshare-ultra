@@ -62,6 +62,14 @@ const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
 /// feedback tick and immediately re-congesting the link.
 const SMART_AUTO_RELEASE_STEP_PERMILLE: u16 = 25;
 const SMART_AUTO_RELEASE_INTERVAL: Duration = Duration::from_millis(500);
+/// A loss report within this window of a release below threshold is the
+/// fast-flapping pattern seen on congested 2.4 GHz links; it escalates the
+/// hold window instead of re-using the base 5 s every time.
+const SMART_AUTO_RELEASE_REARM_WINDOW: Duration = Duration::from_secs(15);
+/// Continuous sub-threshold operation this long clears an escalated hold.
+const SMART_AUTO_HOLD_RESET_AFTER: Duration = Duration::from_secs(60);
+/// Ceiling for the escalated hold window (5 -> 15 -> 45 s).
+const SMART_AUTO_MAX_HOLD_SECS: u64 = 45;
 
 /// Fast-attack / paced-release governor for Smart Auto.
 ///
@@ -74,10 +82,23 @@ const SMART_AUTO_RELEASE_INTERVAL: Duration = Duration::from_millis(500);
 /// connected client sends its own feedback packet: a per-call subtraction
 /// would make a multi-client session release several times faster than a
 /// single-client one.
+///
+/// On a congested 2.4 GHz link the estimate can flap between lossless and
+/// compressed every few seconds. Every time loss returns within
+/// `SMART_AUTO_RELEASE_REARM_WINDOW` of a release, the hold backs off
+/// (`hold_secs`) 5 -> 15 -> 45 s, so repeated oscillations progressively slow
+/// the codec churn instead of recreating Opus at a fixed 5 s cadence. A long,
+/// uninterrupted sub-threshold stretch (`SMART_AUTO_HOLD_RESET_AFTER`) clears
+/// the back-off back to the base 5 s hold.
 struct LossGovernor {
     value: u16,
     hold_until: Instant,
     last_step: Instant,
+    /// Instant the estimate last crossed from compressed to sub-threshold.
+    /// `None` while compressed or before the first release.
+    last_release_at: Option<Instant>,
+    /// Length of the current hold window in seconds (5 -> 15 -> 45).
+    hold_secs: u64,
 }
 
 impl LossGovernor {
@@ -86,12 +107,26 @@ impl LossGovernor {
             value: 0,
             hold_until: now,
             last_step: now,
+            last_release_at: None,
+            hold_secs: SMART_AUTO_LOSS_HOLD.as_secs(),
         }
     }
 
     fn update(&mut self, raw: u16, now: Instant) -> u16 {
         if raw > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
-            self.hold_until = now + SMART_AUTO_LOSS_HOLD;
+            // Loss returned shortly after a release: that is the flapping
+            // pattern the plain 5 s hold could not damp. Back the hold window
+            // off and consume the release so a burst of high reports in one
+            // episode only escalates once.
+            if self
+                .last_release_at
+                .map(|t| now.saturating_duration_since(t) < SMART_AUTO_RELEASE_REARM_WINDOW)
+                .unwrap_or(false)
+            {
+                self.hold_secs = (self.hold_secs * 3).min(SMART_AUTO_MAX_HOLD_SECS);
+            }
+            self.last_release_at = None;
+            self.hold_until = now + Duration::from_secs(self.hold_secs);
             self.last_step = now;
             self.value = self.value.max(raw);
             return self.value;
@@ -103,11 +138,10 @@ impl LossGovernor {
         // Below the compression threshold the exact value no longer changes
         // the tier, so snap to the fresh report instead of stretching a
         // harmless 4% blip across the release interval.
+        let was_compressed = self.value > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE;
         if self.value <= SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
             self.value = raw;
-            return self.value;
-        }
-        if now.saturating_duration_since(self.last_step) >= SMART_AUTO_RELEASE_INTERVAL {
+        } else if now.saturating_duration_since(self.last_step) >= SMART_AUTO_RELEASE_INTERVAL {
             self.value = self
                 .value
                 .saturating_sub(SMART_AUTO_RELEASE_STEP_PERMILLE)
@@ -115,6 +149,22 @@ impl LossGovernor {
             self.last_step = now;
         } else {
             self.value = self.value.max(raw);
+        }
+
+        // Record the release the instant the estimate falls back into the
+        // lossless tier, so a quick re-exceedance is recognised as flapping.
+        if was_compressed && self.value <= SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+            self.last_release_at = Some(now);
+        }
+        // A long, uninterrupted sub-threshold stretch clears any back-off.
+        if self.value <= SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+            if self
+                .last_release_at
+                .map(|t| now.saturating_duration_since(t) >= SMART_AUTO_HOLD_RESET_AFTER)
+                .unwrap_or(false)
+            {
+                self.hold_secs = SMART_AUTO_LOSS_HOLD.as_secs();
+            }
         }
         self.value
     }
@@ -4549,8 +4599,10 @@ mod tests {
         assert_eq!(governor.update(0, base + Duration::from_millis(5_001)), 0);
 
         // A high-loss burst re-arms the window and walks Tier 2 -> Tier 1 ->
-        // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump.
-        let t = base + Duration::from_millis(5_500);
+        // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump. Start
+        // it past the 15 s flapping window so this asserts paced release only
+        // (a quick re-exceedance would escalate the hold instead).
+        let t = base + Duration::from_millis(21_000);
         assert_eq!(governor.update(130, t), 130);
         assert_eq!(governor.update(0, t + Duration::from_millis(4_900)), 130);
         assert_eq!(governor.update(0, t + Duration::from_millis(5_000)), 105);
@@ -4567,6 +4619,62 @@ mod tests {
         let mut governor = LossGovernor::new(base);
         assert_eq!(governor.update(40, base), 40);
         assert_eq!(governor.update(0, base + Duration::from_millis(1)), 0);
+    }
+
+    #[test]
+    fn test_smart_auto_loss_governor_exponential_holdoff() {
+        let base = Instant::now();
+        let mut governor = LossGovernor::new(base);
+
+        // Baseline: an attack uses the 5 s hold, then steps 50 -> 25. That
+        // step is the release back below the compression threshold.
+        assert_eq!(governor.update(50, base), 50);
+        assert_eq!(governor.hold_secs, 5);
+        assert_eq!(governor.update(0, base + Duration::from_secs(5)), 25);
+        assert_eq!(
+            governor.update(0, base + Duration::from_secs(5) + Duration::from_millis(1)),
+            0
+        );
+        assert_eq!(
+            governor.last_release_at,
+            Some(base + Duration::from_secs(5))
+        );
+
+        // Loss returns 1 s after the release: flapping. The hold backs off
+        // 5 -> 15 s and the estimate stays pinned past the old 5 s window.
+        let t1 = base + Duration::from_secs(6);
+        assert_eq!(governor.update(50, t1), 50);
+        assert_eq!(governor.hold_secs, 15);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(14)), 50);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(15)), 25);
+        assert_eq!(
+            governor.update(0, t1 + Duration::from_secs(15) + Duration::from_millis(1)),
+            0
+        );
+
+        // A second quick re-exceedance backs off 15 -> 45 s (the cap).
+        let t2 = t1 + Duration::from_secs(16);
+        assert_eq!(governor.update(50, t2), 50);
+        assert_eq!(governor.hold_secs, 45);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(30)), 50);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(45)), 25);
+        assert_eq!(
+            governor.update(0, t2 + Duration::from_secs(45) + Duration::from_millis(1)),
+            0
+        );
+
+        // Further flapping stays capped at 45 s.
+        let t3 = t2 + Duration::from_secs(46);
+        assert_eq!(governor.update(50, t3), 50);
+        assert_eq!(governor.hold_secs, 45);
+        let released_at = t3 + Duration::from_secs(45);
+        assert_eq!(governor.update(0, released_at), 25);
+        assert_eq!(governor.update(0, released_at + Duration::from_millis(1)), 0);
+        assert_eq!(governor.hold_secs, 45);
+
+        // A long, uninterrupted sub-threshold stretch clears the back-off.
+        assert_eq!(governor.update(0, released_at + Duration::from_secs(60)), 0);
+        assert_eq!(governor.hold_secs, 5);
     }
 
     #[test]
