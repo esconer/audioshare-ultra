@@ -3,9 +3,9 @@
 mod ui_widgets;
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use audioshare_client_engine::{ClientConfig, ClientEngine};
@@ -28,11 +28,64 @@ use audioshare_host_engine::{
     is_usb_subnet_ip, list_valid_host_interfaces, HostConfig, HostEngine, NetworkInterfaceInfo,
     DEFAULT_PORT,
 };
+use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::latency::{codec_mode_name, DESKTOP_OUTPUT_BUFFER_MS, SUBFRAME_MS};
 use audioshare_protocol::lpc_lossless::QualityProfile;
 use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
 use ui_widgets as uw;
+
+// ---------------------------------------------------------------------------
+// Compile-time bridge for the session-key API supplied by lanes A/D/E.
+// ---------------------------------------------------------------------------
+// Those lanes add `set_session_key(Option<SessionKey>)` to HostEngine,
+// ClientEngine and PhoneMicReceiver. Until they land this local trait keeps the
+// desktop crate compiling and preserves the old `set_encryption_pin` behavior.
+// Rust always prefers an inherent method over a same-named trait method, so
+// once the lanes merge the calls in `apply_pin_now` transparently switch to the
+// optimized single-derivation path without any further edits here.
+thread_local! {
+    static FALLBACK_PIN: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn set_fallback_pin(pin: Option<&str>) {
+    FALLBACK_PIN.with(|slot| *slot.borrow_mut() = pin.map(str::to_owned));
+}
+
+#[allow(dead_code)] // only reached by the pre-merge fallback impls
+fn fallback_pin() -> Option<String> {
+    FALLBACK_PIN.with(|slot| slot.borrow().clone())
+}
+
+#[allow(dead_code)]
+trait SetSessionKeyCompat {
+    fn set_session_key(&self, key: Option<SessionKey>);
+}
+
+#[allow(dead_code)]
+impl SetSessionKeyCompat for HostEngine {
+    fn set_session_key(&self, _key: Option<SessionKey>) {
+        let pin = fallback_pin();
+        self.set_encryption_pin(pin.as_deref());
+    }
+}
+
+#[allow(dead_code)]
+impl SetSessionKeyCompat for ClientEngine {
+    fn set_session_key(&self, _key: Option<SessionKey>) {
+        let pin = fallback_pin();
+        self.set_encryption_pin(pin.as_deref());
+    }
+}
+
+#[allow(dead_code)]
+impl SetSessionKeyCompat for PhoneMicReceiver {
+    fn set_session_key(&self, _key: Option<SessionKey>) {
+        let pin = fallback_pin();
+        self.set_encryption_pin(pin.as_deref());
+    }
+}
 
 fn main() -> eframe::Result<()> {
     // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
@@ -221,6 +274,17 @@ enum SettingsTab {
     GeneralAndDiagnostics,
 }
 
+/// Results sent back from detached workers that run blocking OS operations
+/// (firewall / hotspot). `logic()` drains the channel every frame so the egui
+/// thread never stalls on `pkexec`, `netsh`, `nmcli`, or `netsh wlan`.
+enum BgTaskResult {
+    Firewall { msg: String, firewall_ok: bool },
+    HotspotStart {
+        result: Result<String, String>,
+    },
+    HotspotStop,
+}
+
 struct AudioShareApp {
     tab: AppTab,
     interfaces: Vec<NetworkInterfaceInfo>,
@@ -229,12 +293,19 @@ struct AudioShareApp {
     /// `list_valid_host_interfaces()` sorts first.
     selected_qr_iface_idx: usize,
     show_qr_modal: bool,
+    /// QR PNG re-encoding/upload cache, keyed by the connection URI. Without
+    /// this the modal re-encodes a QR at every repaint (~16 Hz while streaming).
+    qr_cache: uw::QrTextureCache,
     show_settings_modal: bool,
     settings_tab: SettingsTab,
     pin_dirty: bool,
     vu_peak_hold: f32,
     /// Transient banner text plus the instant it was raised. Cleared after 2.5 s.
     toast: Option<(String, Instant)>,
+    /// Detached worker results (firewall / hotspot) are marshalled back here
+    /// and applied from `logic()` so the UI thread never blocks.
+    bg_task_tx: mpsc::Sender<BgTaskResult>,
+    bg_task_rx: mpsc::Receiver<BgTaskResult>,
     #[cfg(target_os = "windows")]
     windows_firewall_ok: bool,
     dark_mode: bool,
@@ -293,7 +364,9 @@ struct AudioShareApp {
     phone_rx_mode: PhoneRxRoutingMode,
 
     // Client & Studio DSP State
-    scanner: DiscoveryScanner,
+    /// `None` in the side-effect-free test instance (no UDP bind). Started in
+    /// `new()` before the first frame is drawn.
+    scanner: Option<DiscoveryScanner>,
     client_engine: Option<ClientEngine>,
     manual_server_ip: String,
     preamp_gain_db: f32,
@@ -309,6 +382,9 @@ struct AudioShareApp {
     gaming_hard_lock: bool,
     usb_buffer_mode: bool,
     drift_history: VecDeque<f32>,
+    /// Fixed-rate (100 ms) oscilloscope sampling clock, driven from `logic()`
+    /// rather than from render code (which ran at an arbitrary frame rate).
+    last_drift_sample: Instant,
     client_status_msg: String,
 }
 
@@ -363,21 +439,27 @@ fn refreshed_qr_iface_index(interfaces: &[NetworkInterfaceInfo], selected: usize
 }
 
 impl AudioShareApp {
-    fn new() -> Self {
-        let interfaces = list_valid_host_interfaces();
-        let selected_qr_iface_idx = default_qr_iface_index(&interfaces);
-        let mut app = Self {
+    /// Side-effect-free construction shared by `new()` and the config unit
+    /// tests. Deliberately does **not** enumerate NICs, bind the discovery UDP
+    /// socket, read the on-disk config, or auto-start the host engine — tests
+    /// that call this get a deterministic clean slate.
+    fn blank() -> Self {
+        let (bg_task_tx, bg_task_rx) = mpsc::channel();
+        Self {
             tab: AppTab::HostSender,
-            interfaces,
-            selected_qr_iface_idx,
+            interfaces: Vec::new(),
+            selected_qr_iface_idx: 0,
             show_qr_modal: false,
+            qr_cache: uw::QrTextureCache::default(),
             show_settings_modal: false,
             settings_tab: SettingsTab::NetworkAndSecurity,
             pin_dirty: false,
             vu_peak_hold: 0.0,
             toast: None,
+            bg_task_tx,
+            bg_task_rx,
             #[cfg(target_os = "windows")]
-            windows_firewall_ok: is_windows_firewall_configured(),
+            windows_firewall_ok: false,
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
@@ -417,12 +499,12 @@ impl AudioShareApp {
             enable_pin_encryption: false,
             beacon_encrypted: Arc::new(AtomicBool::new(false)),
             pairing_pin: "4829".into(),
-            audio_apps: list_active_audio_apps(),
+            audio_apps: Vec::new(),
             selected_app_idx: None,
             app_route_status: "Capturing Full System Audio".into(),
             phone_mic_receiver: None,
             phone_rx_mode: PhoneRxRoutingMode::VirtualMicForCalls,
-            scanner: DiscoveryScanner::start(),
+            scanner: None,
             client_engine: None,
             manual_server_ip: format!("127.0.0.1:{}", DEFAULT_PORT),
             preamp_gain_db: 0.0,
@@ -438,14 +520,32 @@ impl AudioShareApp {
             gaming_hard_lock: false,
             usb_buffer_mode: false,
             drift_history: VecDeque::from(vec![0.0; 120]),
+            last_drift_sample: Instant::now(),
             client_status_msg: "Idle. Select a discovered host or enter IP.".into(),
-        };
+        }
+    }
+
+    fn new() -> Self {
+        let mut app = Self::blank();
+        app.interfaces = list_valid_host_interfaces();
+        app.selected_qr_iface_idx = default_qr_iface_index(&app.interfaces);
+        app.audio_apps = list_active_audio_apps();
+        app.scanner = Some(DiscoveryScanner::start());
+        #[cfg(target_os = "windows")]
+        {
+            app.windows_firewall_ok = is_windows_firewall_configured();
+        }
         app.load_persistent_config();
         let launched_via_autostart = std::env::args().any(|a| a == "--autostart");
         if app.autostart_stream_on_launch || launched_via_autostart {
             app.toggle_host();
         }
         app
+    }
+
+    #[cfg(test)]
+    fn test_instance() -> Self {
+        Self::blank()
     }
 
     fn config_file_path() -> std::path::PathBuf {
@@ -793,21 +893,120 @@ impl AudioShareApp {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
+    // ---------------------------------------------------------------------
+    // Background worker dispatch. Each helper clones the mpsc sender into a
+    // detached thread so pkexec/netsh/nmcli never block the UI. Results are
+    // applied in `logic()` (see `drain_bg_tasks`).
+    // ---------------------------------------------------------------------
+
+    fn dispatch_open_firewall(&mut self) {
+        let tx = self.bg_task_tx.clone();
+        std::thread::spawn(move || {
+            let msg = open_os_firewall_ports();
+            #[cfg(target_os = "windows")]
+            let firewall_ok = is_windows_firewall_configured();
+            #[cfg(not(target_os = "windows"))]
+            let firewall_ok = true;
+            let _ = tx.send(BgTaskResult::Firewall { msg, firewall_ok });
+        });
+        self.hotspot_status = "Opening firewall ports (65530-65532/UDP)…".into();
+    }
+
+    fn dispatch_hotspot_start(&mut self) {
+        let tx = self.bg_task_tx.clone();
+        let clean = |s: &str| s.replace(['\r', '\n'], "");
+        let ssid = clean(&self.hotspot_ssid);
+        let pass = clean(&self.hotspot_pass);
+        std::thread::spawn(move || {
+            let result = DirectHotspotController::start_direct_5ghz_hotspot(&ssid, &pass);
+            let _ = tx.send(BgTaskResult::HotspotStart { result });
+        });
+        self.hotspot_status = "Starting 1-Hop Direct Hotspot…".into();
+    }
+
+    fn dispatch_hotspot_stop(&mut self) {
+        let tx = self.bg_task_tx.clone();
+        std::thread::spawn(move || {
+            DirectHotspotController::stop_direct_hotspot();
+            let _ = tx.send(BgTaskResult::HotspotStop);
+        });
+        self.hotspot_status = "Stopping 1-Hop Direct Hotspot…".into();
+    }
+
+    /// Drain all worker results delivered since the previous frame and turn
+    /// them into the same status text / toasts the old synchronous calls set.
+    fn drain_bg_tasks(&mut self, ctx: &egui::Context) {
+        while let Ok(result) = self.bg_task_rx.try_recv() {
+            match result {
+                BgTaskResult::Firewall { msg, firewall_ok } => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.windows_firewall_ok = firewall_ok;
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = firewall_ok;
+                    self.hotspot_status = msg.clone();
+                    self.show_toast(msg);
+                }
+                BgTaskResult::HotspotStart { result } => match result {
+                    Ok(msg) => {
+                        self.direct_hotspot_active = true;
+                        self.hotspot_status = msg.clone();
+                        self.show_toast(msg);
+                    }
+                    Err(e) => {
+                        self.hotspot_status = format!("Hotspot notice: {}", e);
+                        self.show_toast(format!("Hotspot notice: {}", e));
+                    }
+                },
+                BgTaskResult::HotspotStop => {
+                    self.direct_hotspot_active = false;
+                    self.hotspot_status = "Router LAN Mode".into();
+                    self.show_toast("1-Hop Direct Hotspot stopped");
+                }
+            }
+            // A result may have arrived while the idle Host tab had no
+            // repaint scheduled; make sure the banner gets drawn.
+            ctx.request_repaint();
+        }
+    }
+
     /// Push the current PIN setting into every live engine at once.
     fn apply_pin_now(&mut self) {
         let pin = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-            Some(self.pairing_pin.as_str())
+            Some(self.pairing_pin.trim())
         } else {
             None
         };
+
+        // Derive the expensive PBKDF2 key exactly ONCE on this UI thread and
+        // share the resulting SessionKey (Copy) with all three engines. The old
+        // path called set_encryption_pin() three times, re-running 65,536
+        // PBKDF2 rounds per engine (~3x) on every PIN apply.
+        //
+        // `set_session_key(Option<SessionKey>)` is supplied by the
+        // client-engine / host-engine / virtual-mic lanes (A/D/E). Until those
+        // inherent methods exist, the local SetSessionKeyCompat trait above
+        // routes the call through `set_encryption_pin` (and the one PBKDF2
+        // derivation we just did is discarded — a correctness-only fallback).
+        // After merge the inherent method wins and the single derived key is
+        // used directly on all three engines.
+        let key = pin.map(|p| {
+            let mut derived = SessionKey::from_pin(p);
+            // Fresh nonce salt so a live re-apply never reuses a keystream.
+            derived.rotate_session_salt();
+            derived
+        });
+        set_fallback_pin(pin);
+
         if let Some(ref host) = self.host_engine {
-            host.set_encryption_pin(pin);
+            host.set_session_key(key);
         }
         if let Some(ref client) = self.client_engine {
-            client.set_encryption_pin(pin);
+            client.set_session_key(key);
         }
         if let Some(ref mic) = self.phone_mic_receiver {
-            mic.set_encryption_pin(pin);
+            mic.set_session_key(key);
         }
         // Advertise the new state on the very next beacon without restarting
         // the host/beacon thread.
@@ -825,6 +1024,11 @@ impl AudioShareApp {
 impl eframe::App for AudioShareApp {
     /// Runs every frame AND while the window is hidden in the tray (no GPU pass).
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply results from detached firewall / hotspot workers. This must run
+        // in logic() (not in a render closure) so a background UAC prompt never
+        // blocks the UI and its toast shows up on the very next frame.
+        self.drain_bg_tasks(ctx);
+
         // Expire the transient toast banner after 2.5 seconds.
         if let Some((_, created)) = &self.toast {
             if created.elapsed() >= Duration::from_millis(2500) {
@@ -849,8 +1053,9 @@ impl eframe::App for AudioShareApp {
         // 4 Hz while a toast is visible so it expires promptly.
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         // Only scan LAN/USB beacons while the Receive tab is visible.
-        self.scanner
-            .set_paused(self.tab != AppTab::ClientReceiver || is_minimized);
+        if let Some(ref scanner) = self.scanner {
+            scanner.set_paused(self.tab != AppTab::ClientReceiver || is_minimized);
+        }
         let streaming_active = self.host_engine.is_some()
             || self.client_engine.is_some()
             || self.phone_mic_receiver.is_some();
@@ -861,6 +1066,17 @@ impl eframe::App for AudioShareApp {
             ctx.request_repaint_after(Duration::from_millis(1000));
         } else if self.toast.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+
+        // Sample the clock-drift scope on a fixed 100 ms cadence in logic()
+        // instead of at the arbitrary (frame-rate dependent) render rate.
+        if let Some(ref client) = self.client_engine {
+            if self.last_drift_sample.elapsed() >= Duration::from_millis(100) {
+                let drift_now = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
+                self.drift_history.pop_front();
+                self.drift_history.push_back(drift_now as f32);
+                self.last_drift_sample = Instant::now();
+            }
         }
 
         if let Some(ref host) = self.host_engine {
@@ -928,6 +1144,7 @@ impl eframe::App for AudioShareApp {
         }
 
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
 
         // =========================================================================
         // 1. TOP NAVIGATION BAR (Minimalist & Intent-Driven)
@@ -1078,7 +1295,7 @@ impl eframe::App for AudioShareApp {
                                 codec_label, self.live_kbps, self.live_pps, kb, clients
                             ))
                             .size(11.5)
-                            .color(egui::Color32::from_rgb(134, 239, 172)),
+                            .color(p.ok_fg),
                         );
                     } else if let Some(ref client) = self.client_engine {
                         let prim = client.telemetry.primary_frames_played.load(Ordering::Relaxed);
@@ -1111,7 +1328,7 @@ impl eframe::App for AudioShareApp {
                                 primary_ip
                             ))
                             .size(11.5)
-                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                            .color(p.muted_text),
                         );
                     }
 
@@ -1204,6 +1421,7 @@ impl eframe::App for AudioShareApp {
 impl AudioShareApp {
     fn render_qr_modal(&mut self, ctx: &egui::Context) {
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
         let mut open = self.show_qr_modal;
         egui::Window::new("Pair Android Phone via QR Code")
             .open(&mut open)
@@ -1254,7 +1472,7 @@ impl AudioShareApp {
                             let uri = build_qr_connect_uri(&primary_ip, DEFAULT_PORT, pin_opt);
                             ui.label("Scan with your Android Camera or the AudioShare Ultra app:");
                             ui.add_space(8.0);
-                            uw::draw_qr_code(ui, &uri);
+                            uw::draw_qr_code(ui, &uri, &mut self.qr_cache);
                             ui.add_space(8.0);
                             uw::status_pill(
                                 ui,
@@ -1279,7 +1497,7 @@ impl AudioShareApp {
                                     "No active LAN or USB adapter found — connect a network adapter and reopen pairing.",
                                 )
                                 .size(12.0)
-                                .color(egui::Color32::from_rgb(253, 224, 71)),
+                                .color(p.warn_fg),
                             );
                         }
                     });
@@ -1290,6 +1508,7 @@ impl AudioShareApp {
 
     fn render_settings_modal(&mut self, ctx: &egui::Context) {
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
         let mut open = self.show_settings_modal;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -1378,37 +1597,22 @@ impl AudioShareApp {
                                 "Start 1-Hop 5GHz Link"
                             };
                             if ui.button(hs_btn).clicked() {
+                                // nmcli / netsh can take seconds; run off the UI
+                                // thread and flip state when the result arrives.
                                 if self.direct_hotspot_active {
-                                    DirectHotspotController::stop_direct_hotspot();
-                                    self.direct_hotspot_active = false;
-                                    self.hotspot_status = "Router LAN Mode".into();
+                                    self.dispatch_hotspot_stop();
                                 } else {
-                                    match DirectHotspotController::start_direct_5ghz_hotspot(
-                                        &self.hotspot_ssid,
-                                        &self.hotspot_pass,
-                                    ) {
-                                        Ok(msg) => {
-                                            self.direct_hotspot_active = true;
-                                            self.hotspot_status = msg;
-                                        }
-                                        Err(e) => {
-                                            self.hotspot_status = format!("Hotspot notice: {}", e)
-                                        }
-                                    }
+                                    self.dispatch_hotspot_start();
                                 }
                             }
                             if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
-                                self.hotspot_status = open_os_firewall_ports();
-                                #[cfg(target_os = "windows")]
-                                {
-                                    self.windows_firewall_ok = is_windows_firewall_configured();
-                                }
+                                self.dispatch_open_firewall();
                             }
                         });
                         ui.label(
                             egui::RichText::new(&self.hotspot_status)
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(130, 144, 168)),
+                                .color(p.muted_text),
                         );
 
                         ui.separator();
@@ -1517,6 +1721,7 @@ impl AudioShareApp {
     fn render_host_tab(&mut self, ui: &mut egui::Ui) {
         let is_running = self.host_engine.is_some();
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
         let vu_pct = self
             .host_engine
             .as_ref()
@@ -1546,9 +1751,9 @@ impl AudioShareApp {
                             .size(13.5)
                             .strong()
                             .color(if is_running {
-                                egui::Color32::from_rgb(134, 239, 172)
+                                p.ok_fg
                             } else {
-                                egui::Color32::from_rgb(148, 163, 184)
+                                p.muted_text
                             }),
                     );
                     let usb_connected = self
@@ -1563,7 +1768,7 @@ impl AudioShareApp {
                             "Wireless LAN Ready • Plug in USB cable anytime for instant wired failover"
                         })
                         .size(11.5)
-                        .color(egui::Color32::from_rgb(130, 144, 168)),
+                        .color(p.muted_text),
                     );
                 });
             });
@@ -1630,8 +1835,8 @@ impl AudioShareApp {
                         "Phone Bluetooth Active (A2DP {} ms -> Total Video Offset +{} ms)",
                         bt_delay, total_lipsync
                     ),
-                    egui::Color32::from_rgb(66, 32, 6),
-                    egui::Color32::from_rgb(253, 224, 71),
+                    p.warn_bg,
+                    p.warn_fg,
                 );
             }
 
@@ -1643,14 +1848,13 @@ impl AudioShareApp {
                         uw::status_pill(
                             ui,
                             "Windows Firewall may block phone connections (especially on Public/Hotspot)",
-                            egui::Color32::from_rgb(66, 32, 6),
-                            egui::Color32::from_rgb(253, 224, 71),
+                            p.warn_bg,
+                            p.warn_fg,
                         );
                         if ui.button("Allow Through Firewall (UAC)").clicked() {
-                            let msg = open_os_firewall_ports();
-                            self.windows_firewall_ok = is_windows_firewall_configured();
-                            self.hotspot_status = msg.clone();
-                            self.show_toast(msg);
+                            // pkexec/netsh can block for seconds — dispatch to
+                            // a worker; logic() applies the result + toast.
+                            self.dispatch_open_firewall();
                         }
                     });
                 }
@@ -1666,8 +1870,8 @@ impl AudioShareApp {
                     uw::status_pill(
                         ui,
                         "Virtual Speaker not found — install VB-Cable (CABLE Input) or mute PC speakers",
-                        egui::Color32::from_rgb(66, 32, 6),
-                        egui::Color32::from_rgb(253, 224, 71),
+                        p.warn_bg,
+                        p.warn_fg,
                     );
                 }
             }
@@ -1685,8 +1889,8 @@ impl AudioShareApp {
                         "Rejected {} client handshake(s) — check matching PIN & app version (v2)",
                         rejected
                     ),
-                    egui::Color32::from_rgb(66, 32, 6),
-                    egui::Color32::from_rgb(253, 224, 71),
+                    p.warn_bg,
+                    p.warn_fg,
                 );
             }
         });
@@ -1716,6 +1920,7 @@ impl AudioShareApp {
             if self.prefer_opus { "Opus" } else { "VBR" },
             self.target_bitrate_kbps
         );
+        let mode_bar_id = ui.make_persistent_id("host_quality_mode_bar");
         if let Some(idx) = uw::segmented_mode_bar(
             ui,
             dark,
@@ -1726,6 +1931,7 @@ impl AudioShareApp {
                 ("Smooth Wi-Fi", &smooth_badge),
                 ("Max Range", "10 ms Walls"),
             ],
+            mode_bar_id,
         ) {
             match idx {
                 0 => self.quality_profile = QualityProfile::SmartAuto,
@@ -1780,7 +1986,7 @@ impl AudioShareApp {
                         "No receivers connected — tap this PC in the Android app or click 'Pair New Phone (QR)'.",
                     )
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                    .color(p.muted_text),
                 );
             } else if let Some(ref host) = self.host_engine {
                 ui.separator();
@@ -1970,7 +2176,7 @@ impl AudioShareApp {
                                 "2.4G stability caps the target at 160 kbps and steps down to 96 kbps above 200‰ loss.",
                             )
                             .size(11.0)
-                            .color(egui::Color32::from_rgb(130, 144, 168)),
+                            .color(p.muted_text),
                         );
                     }
                 }
@@ -2146,7 +2352,7 @@ impl AudioShareApp {
                         ui.label(
                             egui::RichText::new(&self.app_route_status)
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(130, 144, 168)),
+                                .color(p.muted_text),
                         );
                     });
 
@@ -2192,12 +2398,17 @@ impl AudioShareApp {
                             } else {
                                 None
                             };
-                            self.phone_mic_receiver = PhoneMicReceiver::start_with_mode_and_pin(
+                            match PhoneMicReceiver::start_with_mode_and_pin(
                                 PHONE_MIC_PORT,
                                 self.phone_rx_mode,
                                 phone_pin.as_deref(),
-                            )
-                            .ok();
+                            ) {
+                                Ok(rx) => self.phone_mic_receiver = Some(rx),
+                                Err(e) => self.show_toast(format!(
+                                    "Phone receiver could not restart: {}",
+                                    e
+                                )),
+                            }
                         }
 
                         ui.horizontal_wrapped(|ui| {
@@ -2205,7 +2416,7 @@ impl AudioShareApp {
                             let (btn_label, btn_col) = if mic_active {
                                 (
                                     "■  Stop Phone Receiver",
-                                    egui::Color32::from_rgb(185, 28, 28),
+                                    p.danger,
                                 )
                             } else {
                                 (
@@ -2230,14 +2441,16 @@ impl AudioShareApp {
                                     } else {
                                         None
                                     };
-                                    if let Ok(rx) =
-                                        PhoneMicReceiver::start_with_mode_and_pin(
-                                            PHONE_MIC_PORT,
-                                            self.phone_rx_mode,
-                                            phone_pin.as_deref(),
-                                        )
-                                    {
-                                        self.phone_mic_receiver = Some(rx);
+                                    match PhoneMicReceiver::start_with_mode_and_pin(
+                                        PHONE_MIC_PORT,
+                                        self.phone_rx_mode,
+                                        phone_pin.as_deref(),
+                                    ) {
+                                        Ok(rx) => self.phone_mic_receiver = Some(rx),
+                                        Err(e) => self.show_toast(format!(
+                                            "Phone receiver could not start: {}",
+                                            e
+                                        )),
                                     }
                                 }
                             }
@@ -2248,8 +2461,8 @@ impl AudioShareApp {
                                 uw::status_pill(
                                     ui,
                                     &format!("RX: {} pkts • Peak: {}%", pkts, peak),
-                                    egui::Color32::from_rgb(20, 83, 45),
-                                    egui::Color32::from_rgb(134, 239, 172),
+                                    p.ok_bg,
+                                    p.ok_fg,
                                 );
 
                                 if let Some(ref host) = self.host_engine {
@@ -2279,8 +2492,8 @@ impl AudioShareApp {
                                 uw::status_pill(
                                     ui,
                                     &format!("Measured One-Way: {:.1} ms ({}s ago)", ms, age_s),
-                                    egui::Color32::from_rgb(20, 83, 45),
-                                    egui::Color32::from_rgb(134, 239, 172),
+                                    p.ok_bg,
+                                    p.ok_fg,
                                 );
                             }
                         });
@@ -2292,12 +2505,17 @@ impl AudioShareApp {
 
     fn render_client_tab(&mut self, ui: &mut egui::Ui) {
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
 
         // =========================================================================
         // 1. SIMPLE CONNECTION CONSOLE (Auto-Discovered Hosts + 1-Click Connect)
         // =========================================================================
         uw::studio_card(ui, dark, |ui| {
-            let discovered = self.scanner.discovered_hosts();
+            let discovered = self
+                .scanner
+                .as_ref()
+                .map(|s| s.discovered_hosts())
+                .unwrap_or_default();
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Available AudioShare Hosts")
@@ -2311,7 +2529,7 @@ impl AudioShareApp {
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         )
-                        .fill(egui::Color32::from_rgb(185, 28, 28));
+                        .fill(p.danger);
                         if ui.add(disc_btn).clicked() {
                             if let Some(mut c) = self.client_engine.take() {
                                 c.stop();
@@ -2334,9 +2552,9 @@ impl AudioShareApp {
                 egui::RichText::new(&self.client_status_msg)
                     .size(12.0)
                     .color(if self.client_engine.is_some() {
-                        egui::Color32::from_rgb(134, 239, 172)
+                        p.ok_fg
                     } else {
-                        egui::Color32::from_rgb(130, 144, 168)
+                        p.muted_text
                     }),
             );
 
@@ -2351,8 +2569,29 @@ impl AudioShareApp {
                             egui::Color32::from_rgb(30, 58, 138),
                             egui::Color32::WHITE,
                         );
+                        // Surface the beacon's `enc=1` bit so the operator knows
+                        // this host needs a matching PIN before connecting.
+                        if host.encrypted {
+                            let (lock_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(10.0, 12.0),
+                                egui::Sense::hover(),
+                            );
+                            uw::paint_lock_icon(ui.painter(), lock_rect.center(), p.ok_fg);
+                            ui.label(
+                                egui::RichText::new("PIN").size(10.5).strong().color(p.ok_fg),
+                            )
+                            .on_hover_text("Host requires a matching pairing PIN");
+                        }
                         ui.monospace(format!("{} ({})", host.hostname, host.addr));
                         if ui.button("▶  Connect Now").clicked() {
+                            if host.encrypted
+                                && !(self.enable_pin_encryption
+                                    && !self.pairing_pin.trim().is_empty())
+                            {
+                                self.show_toast(
+                                    "Encrypted host — enable PIN encryption in Settings and use the same PIN",
+                                );
+                            }
                             self.usb_buffer_mode = host.is_usb;
                             self.connect_client(host.addr);
                         }
@@ -2364,7 +2603,7 @@ impl AudioShareApp {
                         "Scanning LAN & USB for beacons... Click 'Manual IP / USB' to enter an address directly.",
                     )
                     .size(11.5)
-                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                    .color(p.muted_text),
                 );
             }
 
@@ -2383,15 +2622,25 @@ impl AudioShareApp {
                     )
                     .fill(egui::Color32::from_rgb(22, 163, 74));
                     if ui.add(connect_btn).clicked() {
-                        if let Ok(addr) = self.manual_server_ip.parse::<SocketAddr>() {
-                            self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                            self.connect_client(addr);
-                        } else if let Ok(addr) =
-                            format!("{}:{}", self.manual_server_ip, DEFAULT_PORT)
-                                .parse::<SocketAddr>()
-                        {
-                            self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                            self.connect_client(addr);
+                        let raw = self.manual_server_ip.trim();
+                        // Full IP:PORT first, then a bare IP (including a bare
+                        // IPv6 literal, which must NOT be split on ':') with
+                        // the default stream port appended.
+                        let parsed = raw.parse::<SocketAddr>().or_else(|_| {
+                            raw.parse::<IpAddr>()
+                                .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
+                        });
+                        match parsed {
+                            Ok(addr) => {
+                                self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
+                                self.connect_client(addr);
+                            }
+                            Err(_) => {
+                                self.client_status_msg = format!(
+                                    "Invalid host address '{}' — use IP or IP:PORT (e.g. 192.168.1.5:{})",
+                                    raw, DEFAULT_PORT
+                                );
+                            }
                         }
                     }
                     if ui.button("USB Localhost").clicked() {
@@ -2609,9 +2858,9 @@ impl AudioShareApp {
         // =========================================================================
         let (pkts, prim, fec, plc, auth_err, drift, dtx, host_vol, group_ms, idle_secs) =
             if let Some(ref client) = self.client_engine {
+                // Scope history is sampled on a fixed timer in logic(); here we
+                // only read the current value for the numeric tile.
                 let drift_now = client.telemetry.clock_drift_ppm.load(Ordering::Relaxed);
-                self.drift_history.pop_front();
-                self.drift_history.push_back(drift_now as f32);
                 (
                     client.telemetry.packets_received.load(Ordering::Relaxed),
                     client
@@ -2657,8 +2906,8 @@ impl AudioShareApp {
                             "No packets from Host for {}s — Waiting for automatic reconnect...",
                             idle_secs
                         ),
-                        egui::Color32::from_rgb(66, 32, 6),
-                        egui::Color32::from_rgb(253, 224, 71),
+                        p.warn_bg,
+                        p.warn_fg,
                     );
                 }
 
@@ -2704,12 +2953,13 @@ impl AudioShareApp {
 
     fn render_latency_debug(&mut self, ui: &mut egui::Ui) {
         let dark = self.dark_mode;
+        let p = uw::Palette::for_mode(dark);
         ui.label(
             egui::RichText::new(
                 "Live values are published by the audio threads. The estimate is not an acoustic measurement.",
             )
             .size(11.5)
-            .color(egui::Color32::from_rgb(130, 144, 168)),
+            .color(p.muted_text),
         );
         ui.add_space(4.0);
 
@@ -2842,8 +3092,8 @@ impl AudioShareApp {
                     uw::status_pill(
                         ui,
                         &format!("Estimated One-Way: {:.1} ms", snap.estimated_one_way_ms()),
-                        egui::Color32::from_rgb(20, 83, 45),
-                        egui::Color32::from_rgb(134, 239, 172),
+                        p.ok_bg,
+                        p.ok_fg,
                     );
                     uw::status_pill(
                         ui,
@@ -2973,7 +3223,7 @@ impl AudioShareApp {
                          Group sync is already inside the target FIFO. Excludes one-way network transit and the acoustic air path; use the sonar for end-to-end.",
                     )
                     .size(11.0)
-                    .color(egui::Color32::from_rgb(130, 144, 168)),
+                    .color(p.muted_text),
                 );
             });
         }
@@ -3063,7 +3313,7 @@ mod tests {
 
     #[test]
     fn test_desktop_config_string_parser() {
-        let mut app = AudioShareApp::new();
+        let mut app = AudioShareApp::test_instance();
         let config_sample = "\
 dark_mode=false
 minimize_on_close=true
@@ -3128,7 +3378,7 @@ phone_rx_mode=1
 
     #[test]
     fn test_prefer_opus_config_only_false_disables() {
-        let mut app = AudioShareApp::new();
+        let mut app = AudioShareApp::test_instance();
         // Explicit opt-out disables Opus.
         app.parse_config_string("prefer_opus=false\n");
         assert!(!app.prefer_opus);
@@ -3144,7 +3394,7 @@ phone_rx_mode=1
 
     #[test]
     fn test_desktop_config_string_parser_bitrate_clamping() {
-        let mut app = AudioShareApp::new();
+        let mut app = AudioShareApp::test_instance();
         // Lower bound clamp (min 96)
         app.parse_config_string("target_bitrate_kbps=32\n");
         assert_eq!(app.target_bitrate_kbps, 96);

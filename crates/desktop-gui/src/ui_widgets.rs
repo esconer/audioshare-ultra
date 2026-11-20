@@ -298,8 +298,12 @@ pub fn segmented_mode_bar(
     dark_mode: bool,
     selected_idx: usize,
     items: &[(&str, &str)],
+    id_salt: egui::Id,
 ) -> Option<usize> {
     let p = Palette::for_mode(dark_mode);
+    // All animation / interaction ids hang off a caller-scoped base id so two
+    // bars (or a bar inside a modal) never share egui state.
+    let anim_id = id_salt.with("mode_seg_anim");
     let mut clicked = None;
     egui::Frame::NONE
         .fill(p.inner_fill)
@@ -311,11 +315,9 @@ pub fn segmented_mode_bar(
             let seg_w = total_w / (items.len().max(1) as f32);
             let (full_rect, _) =
                 ui.allocate_exact_size(egui::vec2(total_w, 46.0), egui::Sense::hover());
-            let anim_idx = ui.ctx().animate_value_with_time(
-                ui.make_persistent_id("mode_seg_anim"),
-                selected_idx as f32,
-                0.16,
-            );
+            let anim_idx =
+                ui.ctx()
+                    .animate_value_with_time(anim_id, selected_idx as f32, 0.16);
             let pill_rect = egui::Rect::from_min_size(
                 egui::pos2(full_rect.left() + anim_idx * seg_w, full_rect.top()),
                 egui::vec2(seg_w, full_rect.height()),
@@ -335,7 +337,7 @@ pub fn segmented_mode_bar(
                     egui::vec2(seg_w, full_rect.height()),
                 );
                 if ui
-                    .interact(r, ui.scope_id().with(("seg", idx)), egui::Sense::click())
+                    .interact(r, id_salt.with(("seg", idx)), egui::Sense::click())
                     .clicked()
                 {
                     clicked = Some(idx);
@@ -490,87 +492,6 @@ pub fn pill_choice(ui: &mut egui::Ui, dark_mode: bool, selected: bool, label: &s
             .corner_radius(egui::CornerRadius::same(7)),
     )
     .clicked()
-}
-
-#[allow(dead_code)]
-pub fn mode_preset_card(
-    ui: &mut egui::Ui,
-    dark_mode: bool,
-    selected: bool,
-    title: &str,
-    subtitle: &str,
-    badge: &str,
-) -> bool {
-    let p = Palette::for_mode(dark_mode);
-    let (fill, stroke, title_col) = if selected {
-        (
-            if dark_mode {
-                egui::Color32::from_rgb(23, 37, 68)
-            } else {
-                egui::Color32::from_rgb(219, 234, 254)
-            },
-            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(59, 130, 246)),
-            if dark_mode {
-                egui::Color32::WHITE
-            } else {
-                egui::Color32::from_rgb(30, 58, 138)
-            },
-        )
-    } else {
-        (
-            p.inner_fill,
-            egui::Stroke::new(1.0_f32, p.card_stroke),
-            if dark_mode {
-                egui::Color32::from_rgb(226, 232, 240)
-            } else {
-                egui::Color32::from_rgb(15, 23, 42)
-            },
-        )
-    };
-
-    let resp = egui::Frame::NONE
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 3.0;
-                ui.horizontal(|ui| {
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    let dot_col = if selected {
-                        egui::Color32::from_rgb(59, 130, 246)
-                    } else {
-                        egui::Color32::from_rgb(100, 116, 139)
-                    };
-                    ui.painter().circle_filled(dot_rect.center(), 4.0, dot_col);
-                    ui.label(egui::RichText::new(title).size(13.5).strong().color(title_col));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        status_pill(
-                            ui,
-                            badge,
-                            if selected {
-                                egui::Color32::from_rgb(37, 99, 235)
-                            } else {
-                                egui::Color32::from_rgb(26, 33, 48)
-                            },
-                            if selected {
-                                egui::Color32::WHITE
-                            } else {
-                                egui::Color32::from_rgb(148, 163, 184)
-                            },
-                        );
-                    });
-                });
-                ui.label(egui::RichText::new(subtitle).size(11.0).color(p.muted_text));
-            });
-        })
-        .response;
-
-    ui.interact(resp.rect, resp.id.with("mode_click"), egui::Sense::click())
-        .clicked()
 }
 
 pub fn drawer_header(
@@ -814,31 +735,64 @@ pub fn draw_drift_oscilloscope(ui: &mut egui::Ui, history: &VecDeque<f32>) {
     ));
 }
 
-pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str) {
-    let Ok(code) = QrCode::new(uri.as_bytes()) else {
-        return;
-    };
+/// Cached GPU texture for the pairing QR. Re-encoding a QR and uploading a new
+/// texture every frame (the modal repaints at ~16 Hz while streaming) is pure
+/// waste; the encoded image only changes when the URI changes.
+pub struct QrTextureCache {
+    uri: String,
+    texture: Option<egui::TextureHandle>,
+}
+
+impl Default for QrTextureCache {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            texture: None,
+        }
+    }
+}
+
+/// Build the QR as a single nearest-filtered RGBA texture (white quiet zone +
+/// black modules). Kept separate from drawing so the encoding happens only on a
+/// cache miss.
+fn build_qr_texture(ctx: &egui::Context, uri: &str) -> Option<egui::TextureHandle> {
+    let code = QrCode::new(uri.as_bytes()).ok()?;
     let width = code.width();
-    let module_px = 5.0f32;
-    let quiet_zone = 4;
-    let size_px = (width + quiet_zone * 2) as f32 * module_px;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size_px, size_px), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::WHITE);
+    const QUIET_ZONE: usize = 4;
+    let dim = width + QUIET_ZONE * 2;
+    // 0xFF everywhere = opaque white background; dark modules are zeroed below.
+    let mut rgba = vec![0xFFu8; dim * dim * 4];
     for y in 0..width {
         for x in 0..width {
             if code[(x, y)] == QrColor::Dark {
-                let min = rect.min
-                    + egui::vec2(
-                        (x + quiet_zone) as f32 * module_px,
-                        (y + quiet_zone) as f32 * module_px,
-                    );
-                painter.rect_filled(
-                    egui::Rect::from_min_size(min, egui::vec2(module_px, module_px)),
-                    egui::CornerRadius::ZERO,
-                    egui::Color32::BLACK,
-                );
+                let idx = ((y + QUIET_ZONE) * dim + (x + QUIET_ZONE)) * 4;
+                rgba[idx] = 0;
+                rgba[idx + 1] = 0;
+                rgba[idx + 2] = 0;
             }
         }
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([dim, dim], &rgba);
+    Some(ctx.load_texture(
+        "audioshare_pairing_qr",
+        image,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
+/// Draw the pairing QR, rebuilding the cached texture only when `uri` changes.
+pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str, cache: &mut QrTextureCache) {
+    if cache.texture.is_none() || cache.uri != uri {
+        match build_qr_texture(ui.ctx(), uri) {
+            Some(tex) => {
+                cache.texture = Some(tex);
+                cache.uri = uri.to_string();
+            }
+            None => return,
+        }
+    }
+    if let Some(ref tex) = cache.texture {
+        let size = tex.size_vec2();
+        ui.image((tex.id(), size));
     }
 }

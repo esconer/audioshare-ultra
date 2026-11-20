@@ -200,7 +200,18 @@ fn run_host(args: &[String]) {
     };
 
     let mut os_guard = VirtualSpeakerAndRadioGuard::acquire(virtual_speaker);
-    let host = HostEngine::start(cfg, vec![]).expect("Failed to start HostEngine");
+    let host = match HostEngine::start(cfg, vec![]) {
+        Ok(engine) => engine,
+        Err(e) => {
+            // Startup failures are operator errors (missing capture device,
+            // port already bound, ...). Print a clean diagnostic and exit
+            // non-zero instead of unwinding through the OS guard with a panic.
+            eprintln!("Failed to start HostEngine: {}", e);
+            // `exit` skips destructors, so restore the OS audio state by hand.
+            drop(os_guard);
+            std::process::exit(1);
+        }
+    };
     host.telemetry.prefer_opus.store(use_opus, Ordering::Relaxed);
     let beacon_encrypted = Arc::new(AtomicBool::new(false));
     if let Some(pin) = pin {
@@ -318,7 +329,13 @@ fn run_client(args: &[String]) {
     let pin = flag_value(args, "--pin");
     // Allow `client --latency-debug 192.168.1.5` as well as the address first.
     let raw_target = client_target(args);
-    let server_addr = parse_client_target(raw_target).unwrap_or_else(|e| panic!("{}", e));
+    let server_addr = match parse_client_target(raw_target) {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Loopback + legacy and randomized Android USB-tethering subnets.
     let is_usb_or_local = is_usb_subnet_ip(server_addr.ip());
@@ -334,7 +351,13 @@ fn run_client(args: &[String]) {
     println!("  AudioShare Ultra Client — Connecting to {}", server_addr);
     println!("================================================================");
 
-    let client = ClientEngine::connect_with_pin(cfg, pin).expect("Failed to start ClientEngine");
+    let client = match ClientEngine::connect_with_pin(cfg, pin) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("Failed to start ClientEngine: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     while !CLI_STOP.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(250));
