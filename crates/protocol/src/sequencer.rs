@@ -123,7 +123,11 @@ impl ZeroJitterSequencer {
     /// (decode-at-pop Opus / CELT PLC), keeping history and crossfades coherent.
     #[inline]
     pub fn finalize_external_frame(&mut self, out: &mut [f32; SUBFRAME_STEREO_SAMPLES], is_plc: bool) {
-        if !is_plc && self.consecutive_plc_count > 0 {
+        if is_plc {
+            // CELT PLC maintains its own MDCT overlap; discard any older WSOLA
+            // tail so the next real Opus frame does not splice against stale PCM.
+            self.consecutive_plc_count = 0;
+        } else if self.consecutive_plc_count > 0 {
             for i in 0..CROSSFADE_FRAMES {
                 let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
                 let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
@@ -614,5 +618,25 @@ mod tests {
         assert_eq!(seq.pop_next(3, &mut out), STATUS_PRIMARY_LOSSLESS);
         assert_eq!(out[0], fourth[0]);
         assert_eq!(out[1], fourth[1]);
+    }
+
+    #[test]
+    fn test_finalize_external_plc_clears_stale_wsola_tail() {
+        let mut seq = ZeroJitterSequencer::new();
+        let loud = [0.8f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &loud));
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        seq.pop_next(0, &mut out);
+        // Trigger WSOLA PLC -> consecutive_plc_count == 1, tail holds ~0.72
+        seq.pop_next(1, &mut out);
+        assert_eq!(seq.consecutive_plc_count(), 1);
+        // CELT PLC takes over
+        let mut celt_plc = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        seq.finalize_external_frame(&mut celt_plc, true);
+        assert_eq!(seq.consecutive_plc_count(), 0);
+        // Subsequent silent real Opus frame must not inherit the old 0.72 WSOLA tail
+        let mut real_silent = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        seq.finalize_external_frame(&mut real_silent, false);
+        assert!(real_silent[0].abs() < 1e-6);
     }
 }
