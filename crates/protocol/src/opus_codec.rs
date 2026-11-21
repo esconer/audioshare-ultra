@@ -114,6 +114,53 @@ where
     true
 }
 
+/// Zero-allocation 2-slot history for `[P-1]` / `[P-2]` Opus REDundancy blobs.
+/// Uses `std::mem::swap` so shifting `prev1 -> prev2` can never panic on
+/// slice-length mismatches when starting from empty state (`len == 0`) or when
+/// consecutive VBR Opus packets differ in byte length.
+pub struct OpusRedHistory {
+    prev1: [u8; MAX_OPUS_RED_BYTES],
+    prev1_len: usize,
+    prev2: [u8; MAX_OPUS_RED_BYTES],
+    prev2_len: usize,
+}
+
+impl Default for OpusRedHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpusRedHistory {
+    pub const fn new() -> Self {
+        Self {
+            prev1: [0u8; MAX_OPUS_RED_BYTES],
+            prev1_len: 0,
+            prev2: [0u8; MAX_OPUS_RED_BYTES],
+            prev2_len: 0,
+        }
+    }
+
+    #[inline]
+    pub fn fec_slices(&self) -> (&[u8], &[u8]) {
+        (&self.prev1[..self.prev1_len], &self.prev2[..self.prev2_len])
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.prev1_len = 0;
+        self.prev2_len = 0;
+    }
+
+    /// Rotates `prev1 -> prev2` and packs the newly sent packet into `prev1`.
+    #[inline]
+    pub fn push_packet(&mut self, base_seq: u16, subframes: &[&[u8]]) {
+        std::mem::swap(&mut self.prev1, &mut self.prev2);
+        self.prev2_len = self.prev1_len;
+        self.prev1_len = pack_opus_red_blob(base_seq, subframes, &mut self.prev1).unwrap_or(0);
+    }
+}
+
 /// Verified `OPUS_GET_LOOKAHEAD` for `RestrictedLowDelay` at 48 kHz.
 ///
 /// This is the only codec delay added by the Opus path. The lossless LPC and
@@ -928,6 +975,51 @@ mod tests {
         zero_len[4] = 0;
         assert!(!unpack_opus_red_blob(&zero_len, |_, _| probes += 1));
         assert_eq!(probes, 0);
+    }
+
+    #[test]
+    fn test_opus_red_history_shifts_from_empty_without_panic() {
+        let mut hist = OpusRedHistory::new();
+        assert_eq!(hist.fec_slices(), (&[][..], &[][..]));
+
+        // Simulate 5 consecutive 4-subframe Opus RLD packets (each 24 bytes packed:
+        // 4-byte header + 4 * (1-byte len + 4-byte quiet frame)).
+        let sf = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let sfs: [&[u8]; 4] = [&sf, &sf, &sf, &sf];
+
+        for pkt in 0..5u16 {
+            let base_seq = pkt * 4;
+            let (n1, n2) = hist.fec_slices();
+            match pkt {
+                0 => {
+                    assert!(n1.is_empty());
+                    assert!(n2.is_empty());
+                }
+                1 => {
+                    assert_eq!(n1.len(), 24);
+                    assert!(n2.is_empty());
+                }
+                _ => {
+                    assert_eq!(n1.len(), 24);
+                    assert_eq!(n2.len(), 24);
+                }
+            }
+            hist.push_packet(base_seq, &sfs);
+        }
+
+        // Varying packet sizes (VBR bitrate changes) must shift cleanly too.
+        let larger = [0x55u8; 18];
+        let larger_sfs: [&[u8]; 4] = [&larger, &larger, &larger, &larger];
+        hist.push_packet(20, &larger_sfs);
+        assert_eq!(hist.fec_slices().0.len(), 4 + 4 * 19);
+        assert_eq!(hist.fec_slices().1.len(), 24);
+
+        // Verify clear() -> push cycle also works cleanly from len == 0.
+        hist.clear();
+        assert_eq!(hist.fec_slices(), (&[][..], &[][..]));
+        hist.push_packet(100, &sfs);
+        assert_eq!(hist.fec_slices().0.len(), 24);
+        assert!(hist.fec_slices().1.is_empty());
     }
 }
 

@@ -170,9 +170,11 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
             if (it == 96 || it == 160 || it == 256 || it == 320) it else 256
         }
         val hud = prefs.getBoolean("latency_debug", false)
+        val savedHost =
+            prefs.getString("last_host_addr", "192.168.42.129:65530") ?: "192.168.42.129:65530"
         return AudioShareUiState(
-            hostAddress = prefs.getString("last_host_addr", "192.168.42.129:65530") ?: "192.168.42.129:65530",
-            pinCode = prefs.getString("pin_code", "") ?: "",
+            hostAddress = savedHost,
+            pinCode = HostPinStore.getPin(prefs, savedHost),
             isConnected = AudioEngineService.isStreaming,
             sharePhoneMic = AudioEngineService.isPhoneMicActive,
             castPhoneInternalAudio = AudioEngineService.isPartyCasting,

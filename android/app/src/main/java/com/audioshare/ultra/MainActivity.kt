@@ -16,6 +16,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.graphics.Color
 import com.audioshare.ultra.service.AudioEngineService
+import com.audioshare.ultra.ui.HostPinStore
 import com.audioshare.ultra.ui.MainScreen
 
 private val StudioDarkColors = darkColorScheme(
@@ -112,16 +113,17 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
                     val pinExplicitlyPresent = uri.queryParameterNames.contains("pin")
-                    val savedPin = prefs.getString("pin_code", "") ?: ""
+                    val savedPin = HostPinStore.getPin(prefs, scannedHost)
                     val effectivePin = if (pinExplicitlyPresent) {
-                        uri.getQueryParameter("pin") ?: ""
+                        (uri.getQueryParameter("pin") ?: "").trim()
                     } else {
                         savedPin
                     }
 
-                    val editor = prefs.edit().putString("last_host_addr", scannedHost)
-                    if (pinExplicitlyPresent) editor.putString("pin_code", effectivePin)
-                    editor.apply()
+                    prefs.edit().putString("last_host_addr", scannedHost).apply()
+                    if (pinExplicitlyPresent) {
+                        HostPinStore.savePin(prefs, scannedHost, effectivePin)
+                    }
 
                     val svcIntent = Intent(this, AudioEngineService::class.java).apply {
                         putExtra("HOST_ADDR", scannedHost)

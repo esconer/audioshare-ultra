@@ -27,6 +27,7 @@ import android.view.KeyEvent
 import androidx.core.app.NotificationCompat
 import com.audioshare.ultra.MainActivity
 import com.audioshare.ultra.R
+import com.audioshare.ultra.ui.HostPinStore
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
@@ -139,6 +140,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeGetDiagnostics(): String?
+
+        @JvmStatic
+        external fun nativeGetAuthFailures(): Long
 
         @JvmStatic
         external fun nativeLogEvent(level: Int, component: String, message: String)
@@ -468,7 +472,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
         } ?: isUsbHost(hostAddr)
         val gainDb = intent?.getFloatExtra("GAIN_DB", prefs.getFloat("gain_db", 0.0f)) ?: 0.0f
-        val pin = intent?.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: ""
+        val pin = intent?.getStringExtra("PIN") ?: HostPinStore.getPin(prefs, hostAddr)
         dolbyEffects = prefs.getBoolean("dolby_fx", false)
         currentGainDb = gainDb
         currentHostAddr = hostAddr

@@ -752,22 +752,32 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         }
     }
 
+    var showPinMismatchDialog by remember { mutableStateOf(false) }
+    var pinMismatchDraft by remember { mutableStateOf("") }
+    var lastHandledAuthFailures by remember { mutableLongStateOf(0L) }
+    var connectAttemptId by remember { mutableIntStateOf(0) }
+    var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
+    var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
+
     // Route every "connect" gesture through one place. True connection state
     // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
     fun connectToHost(addr: String, isUsb: Boolean? = null, pin: String) {
+        val cleanPin = pin.trim()
         hostAddress = addr
-        pinCode = pin
-        prefs.edit()
-            .putString("last_host_addr", addr)
-            .putString("pin_code", pin)
-            .apply()
+        pinCode = cleanPin
+        lastConnectIsUsb = isUsb
+        connectAttemptId += 1
+        lastHandledAuthFailures = 0L
+        showPinMismatchDialog = false
+        prefs.edit().putString("last_host_addr", addr).apply()
+        HostPinStore.savePin(prefs, addr, cleanPin)
         val intent = Intent(context, AudioEngineService::class.java).apply {
             putExtra("HOST_ADDR", addr)
             // A null value omits IS_USB so the service falls back to
             // auto-detecting RNDIS/USB hosts from the address.
             if (isUsb != null) putExtra("IS_USB", isUsb)
             putExtra("GAIN_DB", preampGainDb)
-            putExtra("PIN", pin)
+            putExtra("PIN", cleanPin)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
@@ -878,6 +888,39 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         }
     }
 
+    // Reset auth-mismatch baseline whenever disconnecting or switching targets.
+    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
+        if (!isConnected) {
+            lastHandledAuthFailures = 0L
+            showPinMismatchDialog = false
+        }
+    }
+
+    // Encrypted hosts drop feedback packets whose PIN/MAC does not verify,
+    // sending zero datagrams back. If the target host is visibly advertising
+    // `enc=1` on the LAN and 2.5 s pass with zero packets received, prompt for
+    // its PIN once for this connect attempt.
+    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
+        if (!isConnected) return@LaunchedEffect
+        val attempt = connectAttemptId
+        delay(2500)
+        if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
+            return@LaunchedEffect
+        }
+        val targetNorm = hostAddress.trim().lowercase()
+        val targetEncryptedOnLan = discoveredHosts.any { entry ->
+            val parts = entry.split("|")
+            val addr = parts.getOrNull(1)?.trim()?.lowercase()
+            val enc = parts.getOrNull(3) == "1"
+            addr == targetNorm && enc
+        }
+        if (targetEncryptedOnLan && telemetry.rxPackets == 0L) {
+            promptedSilentRejectAttempt = attempt
+            pinMismatchDraft = ""
+            showPinMismatchDialog = true
+        }
+    }
+
     // Poll native telemetry (4 Hz idle / ~16 Hz live). Remote Party media keys
     // are dispatched by AudioEngineService, which owns the single media receiver.
     // The 300 s silence auto-disconnect now lives in the service watchdog so it
@@ -888,10 +931,22 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 if (isConnected && !AudioEngineService.isStreaming) {
                     isConnected = false
                 }
-                val raw = withContext(Dispatchers.IO) {
-                    AudioEngineService.nativeGetTelemetry()
+                val (raw, nativeAuthFailures) = withContext(Dispatchers.IO) {
+                    val stats = AudioEngineService.nativeGetTelemetry()
+                    val authFails = runCatching { AudioEngineService.nativeGetAuthFailures() }
+                        .getOrDefault(stats.getOrElse(5) { 0L })
+                    stats to authFails
                 }
                 vm.updateTelemetry(raw)
+
+                val currentAuthFailures = maxOf(raw.getOrElse(5) { 0L }, nativeAuthFailures)
+                if (isConnected && currentAuthFailures > lastHandledAuthFailures) {
+                    lastHandledAuthFailures = currentAuthFailures
+                    if (!showPinMismatchDialog) {
+                        pinMismatchDraft = ""
+                        showPinMismatchDialog = true
+                    }
+                }
 
                 if (!isConnected) {
                     delay(250)
@@ -1075,15 +1130,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val kind = if (name.contains("Party")) "Party Phone" else "PC"
                             FilledTonalButton(
                                 onClick = {
-                                    if (encrypted && pinCode.isBlank()) {
+                                    val savedPinForHost = HostPinStore.getSavedPinForHost(prefs, addr)
+                                    val isUsbMode = mode.equals("USB", ignoreCase = true)
+                                    if (encrypted && savedPinForHost.isNullOrBlank()) {
                                         pendingEncryptedHost = entry
                                         promptPinInput = ""
                                     } else {
-                                        connectToHost(
-                                            addr,
-                                            mode.equals("USB", ignoreCase = true),
-                                            pinCode
-                                        )
+                                        val effectivePin = if (encrypted) savedPinForHost.orEmpty() else ""
+                                        connectToHost(addr, isUsbMode, effectivePin)
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
@@ -1159,10 +1213,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     ) {
                         FilledTonalButton(
                             onClick = {
+                                val usbAddr = "127.0.0.1:65530"
+                                val usbPin = HostPinStore.getPin(prefs, usbAddr)
                                 if (!isConnected) {
-                                    connectToHost("127.0.0.1:65530", true, pinCode)
+                                    connectToHost(usbAddr, true, usbPin)
                                 } else {
-                                    hostAddress = "127.0.0.1:65530"
+                                    hostAddress = usbAddr
+                                    pinCode = usbPin
                                 }
                             },
                             shape = RoundedCornerShape(14.dp),
@@ -1202,7 +1259,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             if (showManualConnect || discoveredHosts.isEmpty()) {
                                 OutlinedTextField(
                                     value = hostAddress,
-                                    onValueChange = { hostAddress = it },
+                                    onValueChange = { nextAddr ->
+                                        hostAddress = nextAddr
+                                        HostPinStore.getSavedPinForHost(prefs, nextAddr)?.let { saved ->
+                                            pinCode = saved
+                                        }
+                                    },
                                     label = { Text("Host IP:Port (USB RNDIS or Wi-Fi)") },
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth()
@@ -1213,7 +1275,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 onValueChange = {
                                     pinCode = it
                                     showManualConnect = true
-                                    prefs.edit().putString("pin_code", it).apply()
+                                    HostPinStore.savePin(prefs, hostAddress, it)
                                 },
                                 label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                                 singleLine = true,
@@ -1830,7 +1892,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 SectionEyebrow("Manual Host IP & PIN")
                 OutlinedTextField(
                     value = hostAddress,
-                    onValueChange = { hostAddress = it },
+                    onValueChange = { nextAddr ->
+                        hostAddress = nextAddr
+                        HostPinStore.getSavedPinForHost(prefs, nextAddr)?.let { saved ->
+                            pinCode = saved
+                        }
+                    },
                     label = { Text("Host IP:Port") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -1839,7 +1906,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     value = pinCode,
                     onValueChange = {
                         pinCode = it
-                        prefs.edit().putString("pin_code", it).apply()
+                        HostPinStore.savePin(prefs, hostAddress, it)
                     },
                     label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                     singleLine = true,
@@ -1901,6 +1968,56 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             },
             dismissButton = {
                 TextButton(onClick = { pendingEncryptedHost = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Automatically prompt when the target host rejects the active PIN.
+    if (showPinMismatchDialog) {
+        val targetNorm = hostAddress.trim().lowercase()
+        val hostLabel = discoveredHosts.firstNotNullOfOrNull { entry ->
+            val parts = entry.split("|")
+            val name = parts.getOrNull(0)
+            val addr = parts.getOrNull(1)
+            if (addr?.trim()?.lowercase() == targetNorm && !name.isNullOrBlank()) {
+                "$name ($hostAddress)"
+            } else {
+                null
+            }
+        } ?: hostAddress
+
+        AlertDialog(
+            onDismissRequest = { showPinMismatchDialog = false },
+            title = { Text("Authentication Failed — Enter Host PIN") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Authentication failed for $hostLabel. " +
+                            "Enter the PIN shown on this PC (or leave blank if PIN is disabled)."
+                    )
+                    OutlinedTextField(
+                        value = pinMismatchDraft,
+                        onValueChange = { pinMismatchDraft = it },
+                        label = { Text("Host PIN") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val newPin = pinMismatchDraft.trim()
+                    showPinMismatchDialog = false
+                    HostPinStore.savePin(prefs, hostAddress, newPin)
+                    connectToHost(hostAddress, lastConnectIsUsb, newPin)
+                }) {
+                    Text("Connect")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPinMismatchDialog = false }) {
+                    Text("Cancel")
+                }
             }
         )
     }

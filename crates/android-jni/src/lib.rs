@@ -21,9 +21,7 @@ use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::opus_codec::{
-    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES,
-};
+use audioshare_protocol::opus_codec::{OpusRedHistory, OpusStreamEncoder};
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
     CONTROL_FEEDBACK_MAGIC,
@@ -549,13 +547,10 @@ impl PhoneMicTransmitter {
                 let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
                 let mut fec_hist_len = 0usize;
                 // Exact Opus RED ring ([P-1] / [P-2]) for `OpusRld` packets.
-                // Self-describing blobs from `pack_opus_red_blob` ride in
+                // Self-describing blobs from `OpusRedHistory` ride in
                 // `WireHeader::fec_n1` / `fec_n2`, so two consecutive dropped
                 // 10 ms Opus packets heal with zero CELT PLC frames.
-                let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
-                let mut opus_red_prev1_len: usize = 0;
-                let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
-                let mut opus_red_prev2_len: usize = 0;
+                let mut opus_red = OpusRedHistory::new();
                 let mut dither_rng = 1u32;
                 let mut noise_shaper =
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
@@ -743,8 +738,7 @@ impl PhoneMicTransmitter {
                             opus_encoder = None;
                             fec_hist_len = 0;
                             // No listener means no Opus chain to continue.
-                            opus_red_prev1_len = 0;
-                            opus_red_prev2_len = 0;
+                            opus_red.clear();
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -824,8 +818,7 @@ impl PhoneMicTransmitter {
                             fec_hist_len = 0;
                             // Silence breaks the exact-Opus chain: the next
                             // real Opus packet starts with no prior blobs.
-                            opus_red_prev1_len = 0;
-                            opus_red_prev2_len = 0;
+                            opus_red.clear();
                             let now = Instant::now();
                             if !party_dtx_heartbeat_due(last_party_dtx_heartbeat, now) {
                                 // Nothing goes out: leave last_tx at the last
@@ -864,8 +857,7 @@ impl PhoneMicTransmitter {
                                 opus_encoder = None;
                                 // Leaving Opus invalidates the exact-Opus RED
                                 // history; ADPCM FEC takes over again.
-                                opus_red_prev1_len = 0;
-                                opus_red_prev2_len = 0;
+                                opus_red.clear();
                             } else if opus_encoder.is_none() && opus_available {
                                 opus_encoder = OpusStreamEncoder::new(target_kbps);
                                 opus_available = opus_encoder.is_some();
@@ -896,8 +888,7 @@ impl PhoneMicTransmitter {
                                         opus_available = false;
                                         opus_primary = false;
                                         opus_sf_count = 0;
-                                        opus_red_prev1_len = 0;
-                                        opus_red_prev2_len = 0;
+                                        opus_red.clear();
                                         break;
                                     };
                                     let len_be = (enc_len as u16).to_be_bytes();
@@ -1022,10 +1013,7 @@ impl PhoneMicTransmitter {
                         let (f1, f2): (&[u8], &[u8]) = if dtx {
                             (&[], &[])
                         } else if codec_mode == CodecMode::OpusRld {
-                            (
-                                &opus_red_prev1[..opus_red_prev1_len],
-                                &opus_red_prev2[..opus_red_prev2_len],
-                            )
+                            opus_red.fec_slices()
                         } else {
                             (&fec_pair_1[..n1_len], &fec_pair_2[..n2_len])
                         };
@@ -1062,14 +1050,7 @@ impl PhoneMicTransmitter {
                             // cannot fit in 255 B leaves [P-1] empty for one
                             // packet instead of dropping the whole datagram.
                             if !dtx && codec_mode == CodecMode::OpusRld {
-                                opus_red_prev2.copy_from_slice(&opus_red_prev1);
-                                opus_red_prev2_len = opus_red_prev1_len;
-                                opus_red_prev1_len = pack_opus_red_blob(
-                                    base_seq,
-                                    &opus_slices[..opus_sf_count],
-                                    &mut opus_red_prev1,
-                                )
-                                .unwrap_or(0);
+                                opus_red.push_packet(base_seq, &opus_slices[..opus_sf_count]);
                             }
                         }
                     } else {
@@ -1310,7 +1291,7 @@ pub fn android_get_discovered_hosts_csv() -> String {
 pub mod android_native {
     use super::*;
     use jni::objects::{JClass, JString};
-    use jni::sys::{jboolean, jfloat, jint, jintArray, jlongArray, jstring};
+    use jni::sys::{jboolean, jfloat, jint, jintArray, jlong, jlongArray, jstring};
     use jni::JNIEnv;
 
     #[no_mangle]
@@ -1650,6 +1631,20 @@ pub mod android_native {
         match env.new_string(report) {
             Ok(value) => value.into_raw(),
             Err(_) => std::ptr::null_mut(),
+        }
+    }
+
+    /// Return the current client authentication failure count so Android UI
+    /// can prompt for a corrected host PIN on mismatch.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetAuthFailures(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jlong {
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
+            client.telemetry.auth_failures.load(Ordering::Relaxed) as jlong
+        } else {
+            0
         }
     }
 

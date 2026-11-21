@@ -20,7 +20,7 @@ use audioshare_protocol::lpc_lossless::{
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::opus_codec::{
-    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES, MAX_OPUS_SUBFRAME_BYTES,
+    OpusRedHistory, OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
@@ -2682,12 +2682,8 @@ impl HostEngine {
         let mut fec_hist_len: usize = 0;
         // Opus RED [P-1]/[P-2]: exact previously-sent Opus packets piggybacked
         // in `fec_n1`/`fec_n2` while the wire mode is `OpusRld` on a Wi-Fi
-        // stream. Written against A1's `pack_opus_red_blob` contract. Reset on
-        // DTX silence, codec-mode switch and pure-USB sessions (see below).
-        let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
-        let mut opus_red_prev1_len: usize = 0;
-        let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
-        let mut opus_red_prev2_len: usize = 0;
+        // stream. Reset on DTX silence, codec-mode switch and pure-USB sessions.
+        let mut opus_red = OpusRedHistory::new();
 
         let mut silent_subframes: u32 = 0;
         let mut tone_phase: f32 = 0.0;
@@ -3391,8 +3387,7 @@ impl HostEngine {
                 // DTX silence entry (and zero-client standby) invalidates the
                 // Opus RED ring: receivers reset their sequencer on the silence
                 // heartbeat, so old blobs must never be replayed afterwards.
-                opus_red_prev1_len = 0;
-                opus_red_prev2_len = 0;
+                opus_red.clear();
             }
             if !prefer_opus {
                 opus_encoder = None;
@@ -3580,8 +3575,7 @@ impl HostEngine {
             // empty ring instead of replaying blobs from a stale session.
             let opus_red_active = dynamic_codec_mode == CodecMode::OpusRld && !cached_all_usb;
             if !opus_red_active {
-                opus_red_prev1_len = 0;
-                opus_red_prev2_len = 0;
+                opus_red.clear();
             }
 
             let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
@@ -3683,10 +3677,7 @@ impl HostEngine {
                 // packets ([P-1] in fec_n1, [P-2] in fec_n2); OpusRld on a pure
                 // USB session leaves both slots empty.
                 let (full_n1, full_n2): (&[u8], &[u8]) = if opus_red_active {
-                    (
-                        &opus_red_prev1[..opus_red_prev1_len],
-                        &opus_red_prev2[..opus_red_prev2_len],
-                    )
+                    opus_red.fec_slices()
                 } else if suppress_adpcm_fec {
                     (&[], &[])
                 } else {
@@ -3798,21 +3789,10 @@ impl HostEngine {
                 }
                 if ranges_ok {
                     // [P-1] becomes [P-2]; P becomes the new [P-1].
-                    opus_red_prev2[..opus_red_prev2_len]
-                        .copy_from_slice(&opus_red_prev1[..opus_red_prev1_len]);
-                    opus_red_prev2_len = opus_red_prev1_len;
-                    match pack_opus_red_blob(
-                        base_seq,
-                        &cur_opus_slices[..n],
-                        &mut opus_red_prev1,
-                    ) {
-                        Some(len) => opus_red_prev1_len = len,
-                        None => opus_red_prev1_len = 0,
-                    }
+                    opus_red.push_packet(base_seq, &cur_opus_slices[..n]);
                 } else {
                     // Defensive: no usable Opus payloads -> drop both slots.
-                    opus_red_prev1_len = 0;
-                    opus_red_prev2_len = 0;
+                    opus_red.clear();
                 }
             }
 
@@ -5721,6 +5701,103 @@ mod tests {
         assert!(
             !resampled.stereo_out.is_empty(),
             "resampling needs scratch"
+        );
+    }
+
+    /// P0 regression: driving >= 5 consecutive 4-subframe Opus RLD packets
+    /// through the live `HostEngine::realtime_tx_loop` starting from empty
+    /// RED history (`prev1_len = 0, prev2_len = 0`) must never panic on
+    /// shifting `[P-1] -> [P-2]`, and must attach valid `TAG_OPUS_RED` blobs
+    /// on packets 2..5.
+    #[test]
+    fn test_host_tx_opus_rld_max_stability_red_shift_no_panic() {
+        use audioshare_protocol::opus_codec::{unpack_opus_red_blob, TAG_OPUS_RED};
+        use audioshare_protocol::wire::ParsedPacket;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind loopback rx");
+        rx.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        let rx_addr = rx.local_addr().expect("rx local addr");
+        // Include one non-USB/non-loopback target (RFC 5737 TEST-NET-1) so
+        // `cached_all_usb` is false and `opus_red_active` stays enabled on the
+        // live TX loop while `rx_addr` receives every datagram locally.
+        let wifi_dummy = SocketAddr::from(([192, 0, 2, 1], 65530));
+
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 4,
+            enable_smart_dtx: false,
+        };
+        let mut engine =
+            HostEngine::start(config, vec![rx_addr, wifi_dummy]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::MaxStability24Ghz as u8, Ordering::Relaxed);
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        let mut opus_packets_seen = 0usize;
+        let mut saw_n1_only = false;
+        let mut saw_both_red = 0usize;
+        let mut buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while opus_packets_seen < 6 && Instant::now() < deadline {
+            match rx.recv(&mut buf) {
+                Ok(len) => {
+                    let Ok(parsed) = ParsedPacket::parse_and_decrypt(&mut buf[..len], None) else {
+                        continue;
+                    };
+                    if parsed.header.mode != CodecMode::OpusRld
+                        || parsed.header.subframe_count != 4
+                    {
+                        continue;
+                    }
+                    let n1 = parsed.fec_n1_payload;
+                    let n2 = parsed.fec_n2_payload;
+                    if !n1.is_empty() {
+                        assert_eq!(n1[0], TAG_OPUS_RED, "fec_n1 must be TAG_OPUS_RED");
+                        let mut sf_count = 0usize;
+                        assert!(
+                            unpack_opus_red_blob(n1, |_, _| sf_count += 1),
+                            "fec_n1 RED blob must unpack cleanly"
+                        );
+                        assert_eq!(sf_count, 4);
+                        if n2.is_empty() {
+                            saw_n1_only = true;
+                        }
+                    }
+                    if !n2.is_empty() {
+                        assert_eq!(n2[0], TAG_OPUS_RED, "fec_n2 must be TAG_OPUS_RED");
+                        let mut sf_count = 0usize;
+                        assert!(
+                            unpack_opus_red_blob(n2, |_, _| sf_count += 1),
+                            "fec_n2 RED blob must unpack cleanly"
+                        );
+                        assert_eq!(sf_count, 4);
+                        if !n1.is_empty() {
+                            saw_both_red += 1;
+                        }
+                    }
+                    opus_packets_seen += 1;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        engine.stop();
+        assert!(
+            opus_packets_seen >= 5,
+            "expected >= 5 consecutive 4-subframe Opus RLD packets, got {opus_packets_seen}"
+        );
+        assert!(
+            saw_n1_only,
+            "expected ramp-up packet with [P-1] RED present and [P-2] empty"
+        );
+        assert!(
+            saw_both_red >= 3,
+            "expected steady-state packets with both [P-1] and [P-2] RED blobs, got {saw_both_red}"
         );
     }
 }

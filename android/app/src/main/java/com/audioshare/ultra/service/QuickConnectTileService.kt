@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import com.audioshare.ultra.ui.HostPinStore
 
 class QuickConnectTileService : TileService() {
 
@@ -25,7 +26,7 @@ class QuickConnectTileService : TileService() {
             syncTileState(false)
         } else {
             intent.putExtra("HOST_ADDR", lastHost)
-            intent.putExtra("PIN", prefs.getString("pin_code", "") ?: "")
+            intent.putExtra("PIN", HostPinStore.getPin(prefs, lastHost))
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
             } else {
