@@ -114,17 +114,16 @@ impl ZeroJitterSequencer {
         } else if self.pending_declick {
             let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
             let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
-            let dl = last_l - out[0];
-            let dr = last_r - out[1];
-            // 48 frames = 1.0 ms C1-continuous raised-cosine splice: hides
-            // both DC steps and lookahead/phase jumps across codec transitions
-            // (e.g. Lossless 0 ms <-> Opus 2.5 ms) without a slope kink.
+            // 48 frames = 1.0 ms C1-continuous convex raised-cosine crossfade:
+            // hides both DC steps and lookahead/phase jumps across codec
+            // transitions (e.g. Lossless 0 ms <-> Opus 2.5 ms) or post-stall
+            // skips without ever overshooting ±1.0 and slamming the limiter.
             const SPLICE_FRAMES: usize = 48;
             for i in 0..SPLICE_FRAMES {
                 let alpha = (i as f32) / (SPLICE_FRAMES as f32);
                 let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
-                out[i * 2] += dl * w;
-                out[i * 2 + 1] += dr * w;
+                out[i * 2] = last_l * w + out[i * 2] * (1.0 - w);
+                out[i * 2 + 1] = last_r * w + out[i * 2 + 1] * (1.0 - w);
             }
             self.pending_declick = false;
         }
@@ -724,5 +723,37 @@ mod tests {
         for i in 48..SUBFRAME_FRAMES {
             assert_eq!(out[i * 2], -0.5, "splice leaked past frame {i}");
         }
+    }
+
+    #[test]
+    fn test_arm_declick_never_overshoots_on_ac_phase_flip() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Previous frame ends at +0.95.
+        let prev = [0.95f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &prev));
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(seq.push_primary(1, &prev));
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Next frame starts at -0.95 then swings to +0.95 within 12 frames (a
+        // 2 kHz full-scale tone). The old additive `out + dl * w` pushed peaks
+        // to +2.45 and slammed the limiter; convex blending stays strictly <= 0.95.
+        let mut ac = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let v = -((i as f32) * std::f32::consts::TAU * 2000.0 / 48_000.0).cos() * 0.95;
+            ac[i * 2] = v;
+            ac[i * 2 + 1] = v;
+        }
+        seq.arm_declick();
+        assert!(seq.push_primary(2, &ac));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak <= 0.95 + 1e-5,
+            "convex declick overshot input peak: {peak}"
+        );
     }
 }

@@ -84,8 +84,25 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
     if target_buffer_subframes <= 2.5 {
         4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
     } else {
-        target_buffer_subframes.max(6.0)
+        target_buffer_subframes.max(8.0) // 20.0ms baseline on Wi-Fi absorbs minor 802.11 retries
     }
+}
+
+/// Fast-attack cushion expansion for single-packet Wi-Fi stalls (signal-bar
+/// drops, 802.11 MCS rate shifts, and AP recovery bursts).
+///
+/// Standard RFC 3550 EWMA (1/16 gain) barely moves on an isolated 35-80 ms
+/// signal drop, leaving the cushion too small when the AP dumps the queued
+/// recovery burst right afterwards (which tripped `trim_post_stall_backlog`
+/// and skipped live audio). Expanding immediately on any >=12 ms stall lets
+/// the recovery burst land cleanly inside the buffer with zero crack.
+#[inline]
+fn spike_cushion_subframes(initial_floor: f32, raw_transit_delta_us: f32, ceiling: f32) -> f32 {
+    if raw_transit_delta_us < 12_000.0 {
+        return initial_floor;
+    }
+    let spike_sf = (raw_transit_delta_us.min(150_000.0) / 2500.0) * 1.15;
+    (initial_floor + spike_sf).clamp(initial_floor, ceiling)
 }
 
 /// Floor that covers one sender packet plus one subframe of margin.
@@ -1910,11 +1927,11 @@ impl ClientEngine {
 
                     // Decay the Wi-Fi cushion only after the stability hold
                     // expires and the link is healthy enough that FEC is
-                    // keeping up. Holding for 10 s after any burst eliminates
+                    // keeping up. Holding for 15 s after any burst eliminates
                     // periodic sawtooth underrun crackles on fluctuating Wi-Fi.
                     let now_fb = Instant::now();
                     if closed > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
-                        cushion_hold_until = now_fb + Duration::from_secs(10);
+                        cushion_hold_until = now_fb + Duration::from_secs(15);
                     } else if now_fb >= cushion_hold_until {
                         adaptive_wifi_subframes = decay_adaptive_cushion(
                             adaptive_wifi_subframes,
@@ -2032,18 +2049,19 @@ impl ClientEngine {
                 }
             }
 
-            // 2.4 GHz cushion ceiling. A Bluetooth route or the 10 ms / 4-subframe
-            // framing needs a deeper burst cushion than the old 14-subframe
-            // (35 ms) cap allowed; the extra headroom is what keeps a large
-            // A-MPDU burst from turning into PLC. Recomputed once per pass so
-            // every use below shares the same branch (no hot-path allocation).
-            let adaptive_ceiling = if telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0
-                || last_pkt_subframe_count >= 4
-            {
-                28.0
-            } else {
-                24.0
-            };
+            // Route-aware Wi-Fi cushion ceiling (40 sf = 100 ms wired, 48 sf =
+            // 120 ms BT/10ms, or up to 110 sf during an active scan-burst shield).
+            // Recomputed via `effective_wifi_ceiling` so FEC/RED heals and ring
+            // underruns never clamp a grown cushion down to a stale lower cap.
+            let bt_pass = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
+            let adaptive_ceiling = effective_wifi_ceiling(
+                bt_pass,
+                last_pkt_subframe_count,
+                Instant::now(),
+                &mut scan_shield_until,
+                &mut scan_shield_subframes,
+            )
+            .max(initial_wifi_floor);
 
             let mut packets_drained = 0u8;
             // Only the first audio packet of a drain pass feeds the RFC 3550
@@ -2155,11 +2173,14 @@ impl ClientEngine {
                         audio_packets_drained = audio_packets_drained.saturating_add(1);
                         let rx_now_us = start_instant.elapsed().as_micros() as u32;
                         let tx_now_us = parsed.header.tx_timestamp_us;
+                        let mut raw_spike_us = 0.0f32;
                         if audio_packets_drained == 1 {
                             if let Some(last_r) = prev_rx_us {
                                 let d_rx = rx_now_us.wrapping_sub(last_r) as i32;
                                 let d_tx = tx_now_us.wrapping_sub(prev_tx_us) as i32;
-                                let transit_delta = (d_rx - d_tx).unsigned_abs().min(50_000) as f32;
+                                let raw_delta = (d_rx - d_tx).unsigned_abs();
+                                raw_spike_us = raw_delta.min(150_000) as f32;
+                                let transit_delta = raw_delta.min(50_000) as f32;
                                 jitter_estimate_us +=
                                     (transit_delta - jitter_estimate_us) * (1.0 / 16.0);
                             }
@@ -2190,18 +2211,32 @@ impl ClientEngine {
                         };
                         initial_wifi_floor =
                             wifi_floor_for_packet(bt_coex_floor, last_pkt_subframe_count);
-                        // Proactively cushion buffer to >= 2.6x measured network jitter (in 2500us subframes)
+                        // Proactively cushion buffer to >= 2.6x measured network jitter
+                        // AND react immediately to single-packet >=12 ms Wi-Fi bar-drop
+                        // stalls so the arriving recovery burst lands inside the cushion
+                        // instead of triggering a post-stall audio skip.
+                        let now_rx = Instant::now();
                         let wifi_ceiling = effective_wifi_ceiling(
                             bt_now,
                             last_pkt_subframe_count,
-                            Instant::now(),
+                            now_rx,
                             &mut scan_shield_until,
                             &mut scan_shield_subframes,
                         )
                         .max(initial_wifi_floor);
                         let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.6)
                             .clamp(initial_wifi_floor, wifi_ceiling);
-                        adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
+                        let spike_floor = spike_cushion_subframes(
+                            initial_wifi_floor,
+                            raw_spike_us,
+                            wifi_ceiling,
+                        );
+                        if spike_floor > adaptive_wifi_subframes + 0.1 {
+                            cushion_hold_until = now_rx + Duration::from_secs(15);
+                        }
+                        adaptive_wifi_subframes = adaptive_wifi_subframes
+                            .max(proactive_floor)
+                            .max(spike_floor);
 
                         if !stream_initialized {
                             next_play_seq = base_seq;
@@ -2519,8 +2554,8 @@ impl ClientEngine {
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
             {
                 sequencer.arm_fade_in();
-                adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.5).min(adaptive_ceiling);
-                cushion_hold_until = Instant::now() + Duration::from_secs(10);
+                adaptive_wifi_subframes = (adaptive_wifi_subframes + 2.0).min(adaptive_ceiling);
+                cushion_hold_until = Instant::now() + Duration::from_secs(15);
             }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
             let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
@@ -2635,12 +2670,15 @@ impl ClientEngine {
                 .subframes_to_samples(target_fifo_subframes)
                 .max(hal_burst_samples + one_subframe_samples * 3)
                 .min(fifo_capacity);
-            // Deliberately NOT scaled by `hal_burst_samples`: tying the
-            // emergency watermark to a whole HAL burst made every callback
-            // drain dip below it, so unpaced WSOLA ran at CPU speed and the
-            // playhead raced tens of subframes ahead of the network.
+            // Keep emergency PLC watermark >= one normal wired HAL burst
+            // (capped at 2 subframes = 5.0 ms) so a 192/256-frame Android fast
+            // callback never hits a raw zero-fill ring underrun before paced
+            // PLC can conceal a Wi-Fi dip, while huge Dolby/BT callbacks
+            // (which leave 3 subframes = 7.5 ms after drain) stay safely above
+            // the emergency watermark during healthy playback.
             let plc_emergency_watermark = resampler
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                .max(hal_burst_samples.min(one_subframe_samples * 2))
                 .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
             last_fifo_watermark = fifo_watermark;
             last_plc_watermark = plc_emergency_watermark;
@@ -2767,9 +2805,13 @@ impl ClientEngine {
                             // Exact Opus RED recovery is FEC, not a newly
                             // received primary. Count it once here (the single
                             // accounting point chosen for both RED and ADPCM
-                            // FEC) so `primary_frames_played` stays honest and
-                            // `fec_healed_frames` reflects real recovery.
+                            // FEC) and grow/hold the jitter cushion just like
+                            // ADPCM FEC so fluctuating Wi-Fi never shrinks back
+                            // into hard dropouts while RED is working.
                             window.record_fec();
+                            adaptive_wifi_subframes =
+                                (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
+                            cushion_hold_until = Instant::now() + Duration::from_secs(15);
                             telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                         } else {
                             window.record_primary();
@@ -2784,11 +2826,11 @@ impl ClientEngine {
                         last_plc_emit = None;
                         window.record_fec();
                         // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by
-                        // +0.35 subframes, clamped to the route-aware ceiling,
+                        // +0.45 subframes, clamped to the route-aware ceiling,
                         // and hold the grown cushion against premature decay.
                         adaptive_wifi_subframes =
-                            (adaptive_wifi_subframes + 0.35).min(adaptive_ceiling);
-                        cushion_hold_until = Instant::now() + Duration::from_secs(10);
+                            (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
+                        cushion_hold_until = Instant::now() + Duration::from_secs(15);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
@@ -2812,10 +2854,10 @@ impl ClientEngine {
                             .fetch_max(consecutive_empty_ticks, Ordering::Relaxed);
                         window.record_fec();
                         // 2.4GHz burst delay exceeded cushion: expand cushion by
-                        // +0.75 subframes, clamped to the route-aware ceiling.
+                        // +1.0 subframe, clamped to the route-aware ceiling.
                         let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                         let now_empty = Instant::now();
-                        cushion_hold_until = now_empty + Duration::from_secs(10);
+                        cushion_hold_until = now_empty + Duration::from_secs(15);
                         let shield_armed = update_scan_shield(
                             bt_now,
                             last_pkt_subframe_count,
@@ -2832,7 +2874,7 @@ impl ClientEngine {
                             &mut scan_shield_subframes,
                         )
                         .max(initial_wifi_floor);
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 0.75).min(wifi_ceiling);
+                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.0).min(wifi_ceiling);
                         if shield_armed {
                             // Grow cushion immediately so Hit #1's arriving packet clump is
                             // retained in the FIFO and shields Hits #2..#12 of the scan.
@@ -4898,35 +4940,56 @@ mod tests {
             .capacity_samples()
             .saturating_sub(2);
 
-        for hal_frames in [1280usize, 882] {
+        for hal_frames in [192usize, 256, 882, 1280] {
             let hal_burst_samples = hal_frames * 2;
             let fifo_watermark = resampler
-                .subframes_to_samples(fifo_target_subframes(6.0))
-                .max(hal_burst_samples + one_subframe_samples * 2)
+                .subframes_to_samples(fifo_target_subframes(8.0))
+                .max(hal_burst_samples + one_subframe_samples * 3)
                 .min(fifo_capacity);
             let after_drain = fifo_watermark.saturating_sub(hal_burst_samples);
 
             let plc_watermark = resampler
                 .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                .max(hal_burst_samples.min(one_subframe_samples * 2))
                 .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
             assert!(
-                plc_watermark <= one_subframe_samples,
-                "hal={hal_frames}: PLC watermark {plc_watermark} must not scale with the HAL burst"
+                plc_watermark <= one_subframe_samples * 2,
+                "hal={hal_frames}: PLC watermark {plc_watermark} must stay capped at 2 subframes"
             );
             assert!(
                 after_drain >= plc_watermark,
                 "hal={hal_frames}: drain left {after_drain} samples below PLC watermark {plc_watermark}"
             );
-            // The old formula would have tripped PLC on every single drain.
-            let old_watermark = resampler
-                .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
-                .max(hal_burst_samples)
-                .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
-            assert!(
-                after_drain < old_watermark,
-                "hal={hal_frames}: test must exercise the old failure mode"
-            );
+            if hal_frames <= 240 {
+                assert!(
+                    plc_watermark >= hal_burst_samples,
+                    "hal={hal_frames}: fast wired burst must trigger PLC before ring empties"
+                );
+            }
+            if hal_frames >= 882 {
+                // The old un-capped burst watermark would have tripped PLC on every drain.
+                let old_watermark = resampler
+                    .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
+                    .max(hal_burst_samples)
+                    .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
+                assert!(
+                    after_drain < old_watermark,
+                    "hal={hal_frames}: test must exercise the old failure mode"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_spike_cushion_expands_immediately_on_wifi_signal_drop() {
+        // Normal jitter < 12 ms leaves floor untouched.
+        assert_eq!(spike_cushion_subframes(8.0, 5_000.0, 40.0), 8.0);
+        // A 40 ms signal-bar stall immediately expands cushion to absorb the
+        // arriving recovery burst (8 + 16*1.15 = 26.4 sf = 66 ms).
+        let grown = spike_cushion_subframes(8.0, 40_000.0, 40.0);
+        assert!(grown >= 26.0 && grown <= 27.0, "got {grown}");
+        // Respects ceiling on huge stalls.
+        assert_eq!(spike_cushion_subframes(8.0, 150_000.0, 40.0), 40.0);
     }
 
     #[test]

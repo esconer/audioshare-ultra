@@ -61,16 +61,17 @@ const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
 /// Sustained spotless lossless operation required before SmartAuto promotes
 /// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
 /// (~2.8-4.5+ Mbps) on Wi-Fi links.
-const SMART_AUTO_MASTER_PROMOTE_SECS: u64 = 15;
+const SMART_AUTO_MASTER_PROMOTE_SECS: u64 = 30;
 /// Spotless loss threshold (0.2%) required to arm/hold 24-bit Master promotion.
 const SMART_AUTO_MASTER_PROMOTE_MAX_LOSS_PERMILLE: u16 = 2;
 /// Any loss above 0.5% immediately steps back from 24-bit Master to 16-bit
 /// Lossless (zero-click, identical CodecMode::StudioLosslessLpc & 0 ms lookahead).
 const SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE: u16 = 5;
-/// Keep compressed mode for this long after the last high-loss report. Without
-/// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
-/// encoder every 500 ms.
-const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
+/// Keep compressed mode for this long after the last high-loss report. A 12 s
+/// base hold (backing off 12 -> 36 -> 90 s on repeat dips) prevents SmartAuto
+/// from flapping back into Lossless every time Wi-Fi regains a bar for a few
+/// seconds.
+const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(12);
 /// Release pace after the hold expires. The estimate steps down by this much
 /// at most once per interval, so a 130 permille report walks
 /// Tier 2 -> Tier 1 -> Tier 0 instead of jumping back to lossless in one
@@ -78,13 +79,13 @@ const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
 const SMART_AUTO_RELEASE_STEP_PERMILLE: u16 = 25;
 const SMART_AUTO_RELEASE_INTERVAL: Duration = Duration::from_millis(500);
 /// A loss report within this window of a release below threshold is the
-/// fast-flapping pattern seen on congested 2.4 GHz links; it escalates the
-/// hold window instead of re-using the base 5 s every time.
-const SMART_AUTO_RELEASE_REARM_WINDOW: Duration = Duration::from_secs(15);
+/// fast-flapping pattern seen on fluctuating Wi-Fi links; it escalates the
+/// hold window instead of re-using the base 12 s every time.
+const SMART_AUTO_RELEASE_REARM_WINDOW: Duration = Duration::from_secs(20);
 /// Continuous sub-threshold operation this long clears an escalated hold.
-const SMART_AUTO_HOLD_RESET_AFTER: Duration = Duration::from_secs(60);
-/// Ceiling for the escalated hold window (5 -> 15 -> 45 s).
-const SMART_AUTO_MAX_HOLD_SECS: u64 = 45;
+const SMART_AUTO_HOLD_RESET_AFTER: Duration = Duration::from_secs(90);
+/// Ceiling for the escalated hold window (12 -> 36 -> 90 s).
+const SMART_AUTO_MAX_HOLD_SECS: u64 = 90;
 
 /// Fast-attack / paced-release governor for Smart Auto.
 ///
@@ -3808,14 +3809,21 @@ impl HostEngine {
                     },
                     header_crc16: 0,
                 };
-                // 2.4 GHz 10 ms framing carries the previous four subframes
-                // across the two FEC fields: [N-1,N-3] and [N-2,N-4]. Each
-                // field stays <= 255 bytes, so the wire header is unchanged;
-                // old clients decode the first 124-byte frame of each field
-                // (N-1/N-2) and ignore the rest. Opus skips ADPCM FEC on the
-                // client, so the pair is only packed for the pure-Rust VBR
-                // backend.
-                let pair_fec = subframes_per_pkt == 4 && dynamic_codec_mode != CodecMode::OpusRld;
+                // Pack paired 4-subframe ADPCM FEC ([N-1,N-3] + [N-2,N-4]) on
+                // 4-sf framing AND opportunistically on 2-sf framing whenever
+                // the full 496-byte pair fits inside the safe UDP MTU (e.g.
+                // LPC-compressed 16-bit Lossless and Adaptive VBR). That lets a
+                // Wi-Fi signal dip drop two consecutive 5 ms packets (10 ms)
+                // and still heal every subframe cleanly without PLC or extra
+                // packet splitting.
+                let pair_fec = dynamic_codec_mode != CodecMode::OpusRld
+                    && (subframes_per_pkt == 4
+                        || (subframes_per_pkt >= 2
+                            && datagram_fits(
+                                primary_cursor,
+                                active_key.is_some(),
+                                ADPCM_FEC_BYTES * 4,
+                            )));
                 let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
                 let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
                 // Non-Opus modes keep the existing ADPCM FEC packing exactly
@@ -5121,31 +5129,31 @@ mod tests {
 
         // 5% loss arms compressed mode.
         assert_eq!(governor.update(50, base), 50);
-        // The next 0% report cannot step back up while the hold is open.
+        // The next 0% report cannot step back up while the 12 s hold is open.
         assert_eq!(governor.update(0, base + Duration::from_millis(500)), 50);
-        assert_eq!(governor.update(0, base + Duration::from_millis(4_999)), 50);
+        assert_eq!(governor.update(0, base + Duration::from_millis(11_999)), 50);
         // The hold expires: first 25-permille step instead of a cliff to 0.
-        assert_eq!(governor.update(0, base + Duration::from_millis(5_000)), 25);
+        assert_eq!(governor.update(0, base + Duration::from_millis(12_000)), 25);
         // Once below the 4.5% tier boundary the residual estimate no longer
         // changes the profile, so the next report snaps to the live value.
-        assert_eq!(governor.update(0, base + Duration::from_millis(5_001)), 0);
+        assert_eq!(governor.update(0, base + Duration::from_millis(12_001)), 0);
 
         // A high-loss burst re-arms the window and walks Tier 2 -> Tier 1 ->
         // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump. Start
-        // it past the 15 s flapping window so this asserts paced release only
-        // (a quick re-exceedance would escalate the hold instead).
-        let t = base + Duration::from_millis(21_000);
+        // it past the 20 s flapping window (12 s + 20 s = 32 s) so this asserts
+        // paced release only (a quick re-exceedance would escalate the hold).
+        let t = base + Duration::from_secs(40);
         assert_eq!(governor.update(130, t), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(4_900)), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_000)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(11_900)), 130);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_000)), 105);
         // Several clients may report inside one 500 ms interval; the decay
         // must not run once per call.
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_001)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_400)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_500)), 80);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_000)), 55);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_500)), 30);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_501)), 0);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_001)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_400)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_500)), 80);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_000)), 55);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_500)), 30);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_501)), 0);
 
         // Sub-threshold noise never arms the hold and does not linger.
         let mut governor = LossGovernor::new(base);
@@ -5158,55 +5166,55 @@ mod tests {
         let base = Instant::now();
         let mut governor = LossGovernor::new(base);
 
-        // Baseline: an attack uses the 5 s hold, then steps 50 -> 25. That
+        // Baseline: an attack uses the 12 s hold, then steps 50 -> 25. That
         // step is the release back below the compression threshold.
         assert_eq!(governor.update(50, base), 50);
-        assert_eq!(governor.hold_secs, 5);
-        assert_eq!(governor.update(0, base + Duration::from_secs(5)), 25);
+        assert_eq!(governor.hold_secs, 12);
+        assert_eq!(governor.update(0, base + Duration::from_secs(12)), 25);
         assert_eq!(
-            governor.update(0, base + Duration::from_secs(5) + Duration::from_millis(1)),
+            governor.update(0, base + Duration::from_secs(12) + Duration::from_millis(1)),
             0
         );
         assert_eq!(
             governor.last_release_at,
-            Some(base + Duration::from_secs(5))
+            Some(base + Duration::from_secs(12))
         );
 
         // Loss returns 1 s after the release: flapping. The hold backs off
-        // 5 -> 15 s and the estimate stays pinned past the old 5 s window.
-        let t1 = base + Duration::from_secs(6);
+        // 12 -> 36 s and the estimate stays pinned past the old 12 s window.
+        let t1 = base + Duration::from_secs(13);
         assert_eq!(governor.update(50, t1), 50);
-        assert_eq!(governor.hold_secs, 15);
-        assert_eq!(governor.update(0, t1 + Duration::from_secs(14)), 50);
-        assert_eq!(governor.update(0, t1 + Duration::from_secs(15)), 25);
+        assert_eq!(governor.hold_secs, 36);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(35)), 50);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(36)), 25);
         assert_eq!(
-            governor.update(0, t1 + Duration::from_secs(15) + Duration::from_millis(1)),
+            governor.update(0, t1 + Duration::from_secs(36) + Duration::from_millis(1)),
             0
         );
 
-        // A second quick re-exceedance backs off 15 -> 45 s (the cap).
-        let t2 = t1 + Duration::from_secs(16);
+        // A second quick re-exceedance backs off 36 -> 90 s (the cap).
+        let t2 = t1 + Duration::from_secs(37);
         assert_eq!(governor.update(50, t2), 50);
-        assert_eq!(governor.hold_secs, 45);
-        assert_eq!(governor.update(0, t2 + Duration::from_secs(30)), 50);
-        assert_eq!(governor.update(0, t2 + Duration::from_secs(45)), 25);
+        assert_eq!(governor.hold_secs, 90);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(60)), 50);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(90)), 25);
         assert_eq!(
-            governor.update(0, t2 + Duration::from_secs(45) + Duration::from_millis(1)),
+            governor.update(0, t2 + Duration::from_secs(90) + Duration::from_millis(1)),
             0
         );
 
-        // Further flapping stays capped at 45 s.
-        let t3 = t2 + Duration::from_secs(46);
+        // Further flapping stays capped at 90 s.
+        let t3 = t2 + Duration::from_secs(91);
         assert_eq!(governor.update(50, t3), 50);
-        assert_eq!(governor.hold_secs, 45);
-        let released_at = t3 + Duration::from_secs(45);
+        assert_eq!(governor.hold_secs, 90);
+        let released_at = t3 + Duration::from_secs(90);
         assert_eq!(governor.update(0, released_at), 25);
         assert_eq!(governor.update(0, released_at + Duration::from_millis(1)), 0);
-        assert_eq!(governor.hold_secs, 45);
+        assert_eq!(governor.hold_secs, 90);
 
-        // A long, uninterrupted sub-threshold stretch clears the back-off.
-        assert_eq!(governor.update(0, released_at + Duration::from_secs(60)), 0);
-        assert_eq!(governor.hold_secs, 5);
+        // A long, uninterrupted 90 s sub-threshold stretch clears the back-off.
+        assert_eq!(governor.update(0, released_at + Duration::from_secs(90)), 0);
+        assert_eq!(governor.hold_secs, 12);
     }
 
     #[test]
@@ -5952,21 +5960,21 @@ mod tests {
         let mut promoter = CleanLinkPromoter::new();
         let t0 = Instant::now();
 
-        // Wi-Fi link stays 16-bit before 15 s of spotless reception.
+        // Wi-Fi link stays 16-bit before 30 s of spotless reception.
         assert!(!promoter.update(0, 0, false, false, true, t0));
-        assert!(!promoter.update(2, 2, false, false, true, t0 + Duration::from_secs(14)));
-        // At 15 s spotless, promotes to 24-bit Studio Master (~2.8-4.5+ Mbps).
-        assert!(promoter.update(1, 1, false, false, true, t0 + Duration::from_secs(15)));
+        assert!(!promoter.update(2, 2, false, false, true, t0 + Duration::from_secs(29)));
+        // At 30 s spotless, promotes to 24-bit Studio Master (~2.8-4.5+ Mbps).
+        assert!(promoter.update(1, 1, false, false, true, t0 + Duration::from_secs(30)));
         assert!(promoter.is_master_24bit());
 
         // Minor 4‰ blip holds 24-bit (hysteresis <= 5‰), >5‰ steps cleanly back to 16-bit.
-        assert!(promoter.update(4, 4, false, false, true, t0 + Duration::from_secs(16)));
-        assert!(!promoter.update(6, 6, false, false, true, t0 + Duration::from_secs(17)));
+        assert!(promoter.update(4, 4, false, false, true, t0 + Duration::from_secs(31)));
+        assert!(!promoter.update(6, 6, false, false, true, t0 + Duration::from_secs(32)));
 
         // Pure USB promotes immediately with zero wait.
-        assert!(promoter.update(0, 0, false, true, true, t0 + Duration::from_secs(18)));
+        assert!(promoter.update(0, 0, false, true, true, t0 + Duration::from_secs(33)));
         // Active Bluetooth never promotes to 24-bit Master.
-        assert!(!promoter.update(0, 0, true, true, true, t0 + Duration::from_secs(19)));
+        assert!(!promoter.update(0, 0, true, true, true, t0 + Duration::from_secs(34)));
     }
 
     #[test]
