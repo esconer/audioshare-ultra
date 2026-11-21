@@ -923,9 +923,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 sharePhoneMic = AudioEngineService.isPhoneMicActive
                 sleepTimerMinutes = AudioEngineService.sleepRemainingMinutes
                 if (!isConnected && !castPhoneInternalAudio && !sharePhoneMic &&
-                    (telemetry.rxPackets != 0L || telemetry.partyListeners != 0L || telemetry.clientVuPeakPct != 0)
+                    (telemetry.rxPackets != 0L || telemetry.partyPacked != 0L || telemetry.vuPeak != 0L)
                 ) {
-                    telemetry = TelemetrySnapshot.EMPTY
+                    telemetry = TelemetrySnapshot()
                 }
                 discoveredHosts = withContext(Dispatchers.IO) {
                     runCatching { AudioEngineService.nativeGetDiscoveredHosts() }
