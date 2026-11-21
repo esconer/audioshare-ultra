@@ -146,10 +146,21 @@ impl ZeroJitterSequencer {
                     out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * (1.0 - w_in);
             }
             self.consecutive_plc_count = 0;
+            self.pending_declick = false;
         }
         self.apply_boundary_ramps(out);
         self.last_pop_was_fec = false;
         self.append_to_history(out);
+    }
+
+    /// Invalidate a single ring slot if it currently belongs to `target_seq`
+    /// (or unconditionally for that ring index) so skipped or Opus-superseded
+    /// subframes can never resurface 65,536 subframes (~2.73 min) later after a
+    /// 16-bit sequence wraparound.
+    #[inline]
+    pub fn clear_slot(&self, seq: u16) {
+        let slot = &self.slots[(seq as usize) & RING_MASK];
+        slot.state.store(STATUS_EMPTY, Ordering::Release);
     }
 
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing

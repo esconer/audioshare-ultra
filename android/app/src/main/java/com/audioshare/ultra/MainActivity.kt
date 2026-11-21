@@ -112,27 +112,33 @@ class MainActivity : ComponentActivity() {
                     scannedHost.matches(Regex("^[0-9a-fA-F.:\\[\\]]+$"))
                 ) {
                     val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
-                    val pinExplicitlyPresent = uri.queryParameterNames.contains("pin")
-                    val savedPin = HostPinStore.getPin(prefs, scannedHost)
-                    val effectivePin = if (pinExplicitlyPresent) {
-                        (uri.getQueryParameter("pin") ?: "").trim()
-                    } else {
-                        savedPin
-                    }
+                    // Desktop `build_qr_connect_uri` and Android `PartyQrDialog`
+                    // omit `&pin=` when PIN encryption is OFF. Clear any stale
+                    // saved PIN for that host when `pin` is omitted so scanning
+                    // an unencrypted QR code never fails with a stale old PIN.
+                    val effectivePin = (uri.getQueryParameter("pin") ?: "").trim()
 
                     prefs.edit().putString("last_host_addr", scannedHost).apply()
-                    if (pinExplicitlyPresent) {
-                        HostPinStore.savePin(prefs, scannedHost, effectivePin)
-                    }
+                    HostPinStore.savePin(prefs, scannedHost, effectivePin)
+
+                    sendBroadcast(
+                        Intent(AudioEngineService.ACTION_DEEP_LINK_HOST).apply {
+                            setPackage(packageName)
+                            putExtra("HOST_ADDR", scannedHost)
+                            putExtra("PIN", effectivePin)
+                        }
+                    )
 
                     val svcIntent = Intent(this, AudioEngineService::class.java).apply {
                         putExtra("HOST_ADDR", scannedHost)
                         putExtra("PIN", effectivePin)
                     }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(svcIntent)
-                    } else {
-                        startService(svcIntent)
+                    runCatching {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(svcIntent)
+                        } else {
+                            startService(svcIntent)
+                        }
                     }
                 }
             }

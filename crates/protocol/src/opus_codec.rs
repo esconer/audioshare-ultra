@@ -153,11 +153,36 @@ impl OpusRedHistory {
     }
 
     /// Rotates `prev1 -> prev2` and packs the newly sent packet into `prev1`.
+    ///
+    /// When a high-bitrate multi-subframe packet (e.g., 510 kbps 2-subframe
+    /// Opus = ~326 bytes) exceeds the 255-byte single-FEC-slot limit, splits
+    /// `[P-1]` evenly across BOTH independent 255-byte FEC slots (`fec_n1` and
+    /// `fec_n2`) so single-packet Wi-Fi drops still heal with exact Opus frames
+    /// instead of silently sending zero redundancy.
     #[inline]
     pub fn push_packet(&mut self, base_seq: u16, subframes: &[&[u8]]) {
-        std::mem::swap(&mut self.prev1, &mut self.prev2);
-        self.prev2_len = self.prev1_len;
-        self.prev1_len = pack_opus_red_blob(base_seq, subframes, &mut self.prev1).unwrap_or(0);
+        let mut packed = [0u8; MAX_OPUS_RED_BYTES];
+        if let Some(packed_len) = pack_opus_red_blob(base_seq, subframes, &mut packed) {
+            std::mem::swap(&mut self.prev1, &mut self.prev2);
+            self.prev2_len = self.prev1_len;
+            self.prev1[..packed_len].copy_from_slice(&packed[..packed_len]);
+            self.prev1_len = packed_len;
+        } else if subframes.len() >= 2 {
+            let mid = subframes.len() / 2;
+            let len1 = pack_opus_red_blob(base_seq, &subframes[..mid], &mut self.prev1).unwrap_or(0);
+            let len2 = pack_opus_red_blob(
+                base_seq.wrapping_add(mid as u16),
+                &subframes[mid..],
+                &mut self.prev2,
+            )
+            .unwrap_or(0);
+            self.prev1_len = len1;
+            self.prev2_len = len2;
+        } else {
+            std::mem::swap(&mut self.prev1, &mut self.prev2);
+            self.prev2_len = self.prev1_len;
+            self.prev1_len = 0;
+        }
     }
 }
 
@@ -291,11 +316,18 @@ impl OpusStreamEncoder {
         if out.len() < MAX_OPUS_SUBFRAME_BYTES {
             return None;
         }
+        // RestrictedLowDelay bypasses `opus-rs`'s internal delay-history NaN
+        // scrubber; sanitize capture floats before CELT sees them so a single
+        // driver glitch cannot poison MDCT overlap memory or panic PVQ sorting.
+        let mut clean = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for (dst, &s) in clean.iter_mut().zip(pcm_f32.iter()) {
+            *dst = if s.is_finite() { s.clamp(-16.0, 16.0) } else { 0.0 };
+        }
         self.set_bitrate_kbps(kbps);
         out[0] = TAG_OPUS_RLD;
         let written = self
             .inner
-            .encode(pcm_f32, SUBFRAME_FRAMES, &mut out[1..1 + MAX_OPUS_PACKET_BYTES])
+            .encode(&clean, SUBFRAME_FRAMES, &mut out[1..1 + MAX_OPUS_PACKET_BYTES])
             .ok()?;
         if written == 0 || written > MAX_OPUS_PACKET_BYTES {
             return None;
@@ -1021,6 +1053,19 @@ mod tests {
         hist.push_packet(100, &sfs);
         assert_eq!(hist.fec_slices().0.len(), 24);
         assert!(hist.fec_slices().1.is_empty());
+
+        // High-bitrate 510 kbps 2-subframe Opus (~160 B/subframe -> 326 B total > 255 B)
+        // must split [P-1] across both fec_n1 and fec_n2 instead of dropping RED to zero.
+        let sf_hi_0 = [0x11u8; 160];
+        let sf_hi_1 = [0x22u8; 160];
+        hist.push_packet(500, &[&sf_hi_0, &sf_hi_1]);
+        let (n1, n2) = hist.fec_slices();
+        assert_eq!(n1.len(), 4 + 1 + 160);
+        assert_eq!(n2.len(), 4 + 1 + 160);
+        let mut recovered = Vec::new();
+        assert!(unpack_opus_red_blob(n1, |seq, p| recovered.push((seq, p[0]))));
+        assert!(unpack_opus_red_blob(n2, |seq, p| recovered.push((seq, p[0]))));
+        assert_eq!(recovered, vec![(500, 0x11), (501, 0x22)]);
     }
 }
 

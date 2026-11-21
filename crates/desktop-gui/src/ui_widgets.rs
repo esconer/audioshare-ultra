@@ -367,7 +367,11 @@ pub fn segmented_mode_bar(
                     *sub,
                     egui::FontId::proportional(10.5),
                     if is_sel {
-                        egui::Color32::from_rgb(191, 219, 254)
+                        if dark_mode {
+                            egui::Color32::from_rgb(191, 219, 254)
+                        } else {
+                            egui::Color32::from_rgb(37, 99, 235)
+                        }
                     } else {
                         p.muted_text
                     },
@@ -450,11 +454,16 @@ pub fn setting_switch_row(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.5;
-                    ui.label(egui::RichText::new(title).size(13.0).strong());
-                    ui.label(egui::RichText::new(subtitle).size(11.0).color(p.muted_text));
-                });
+                let text_w = (ui.available_width() - 48.0).max(80.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(text_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.5;
+                        ui.label(egui::RichText::new(title).size(13.0).strong());
+                        ui.label(egui::RichText::new(subtitle).size(11.0).color(p.muted_text));
+                    },
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if pill_switch(ui, value).changed() {
                         changed = true;
@@ -738,18 +747,10 @@ pub fn draw_drift_oscilloscope(ui: &mut egui::Ui, history: &VecDeque<f32>) {
 /// Cached GPU texture for the pairing QR. Re-encoding a QR and uploading a new
 /// texture every frame (the modal repaints at ~16 Hz while streaming) is pure
 /// waste; the encoded image only changes when the URI changes.
+#[derive(Default)]
 pub struct QrTextureCache {
     uri: String,
     texture: Option<egui::TextureHandle>,
-}
-
-impl Default for QrTextureCache {
-    fn default() -> Self {
-        Self {
-            uri: String::new(),
-            texture: None,
-        }
-    }
 }
 
 /// Build the QR as a single nearest-filtered RGBA texture (white quiet zone +
@@ -792,7 +793,11 @@ pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str, cache: &mut QrTextureCache) {
         }
     }
     if let Some(ref tex) = cache.texture {
-        let size = tex.size_vec2();
+        // Scale 1-texel-per-module texture by 5.0 logical points per module
+        // (~185-205 pt square with NEAREST filtering) so phone cameras scan
+        // it instantaneously.
+        const MODULE_PX: f32 = 5.0;
+        let size = tex.size_vec2() * MODULE_PX;
         ui.image((tex.id(), size));
     }
 }

@@ -15,7 +15,19 @@ internal object HostPinStore {
     private const val LEGACY_KEY = "pin_code"
     private const val LAST_HOST_KEY = "last_host_addr"
 
-    private fun normalizeHost(host: String): String = host.trim().lowercase()
+    internal fun normalizeHost(host: String): String {
+        val raw = host.trim().lowercase()
+        if (raw.isEmpty()) return ""
+        if (raw.startsWith("[")) {
+            return if (raw.contains("]:")) raw else "$raw:65530"
+        }
+        val colonCount = raw.count { it == ':' }
+        return when {
+            colonCount == 0 -> "$raw:65530"
+            colonCount == 1 -> raw
+            else -> "[$raw]:65530"
+        }
+    }
 
     private fun keyFor(host: String): String = PREFIX + normalizeHost(host)
 

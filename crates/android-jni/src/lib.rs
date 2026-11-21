@@ -37,6 +37,10 @@ static GLOBAL_SCANNER: OnceLock<DiscoveryScanner> = OnceLock::new();
 static PARTY_DESIRED_CODEC_PROFILE: AtomicU8 = AtomicU8::new(0);
 /// User-selected Party compressed bitrate in kbps (64..=320, default 256).
 static PARTY_DESIRED_BITRATE_KBPS: AtomicU16 = AtomicU16::new(256);
+/// Last Bluetooth downstream delay reported by Android AudioManager. Stored
+/// globally so a route report that runs before `android_start_stream` still
+/// seeds the new `ClientEngine` immediately.
+static LAST_REPORTED_BT_DELAY_MS: AtomicU16 = AtomicU16::new(0);
 
 pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
     GLOBAL_SCANNER.get_or_init(DiscoveryScanner::start)
@@ -136,9 +140,13 @@ fn trim_phone_mic_backlog(
 const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 
 const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
 const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
 const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
+/// Periodic AEAD session salt rotation interval so >71-minute encrypted Party
+/// casts never wrap the 32-bit `tx_timestamp_us` nonce on the same salt.
+const PARTY_SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Hard cap on distinct Party listener IPs. An unbounded unicast fan-out from a
 /// phone host saturates its 2.4 GHz TX queue; 16 is the tested ceiling.
 const MAX_PARTY_PEERS: usize = 16;
@@ -247,6 +255,7 @@ fn db_to_tenths(db: f32, min: f32, max: f32) -> i32 {
 struct PartyPeerState {
     last_seen: Instant,
     delay_ms: u16,
+    #[cfg_attr(not(test), allow(dead_code))]
     fec_permille: u16,
     /// Anti-replay sliding window for authenticated Party feedback (AEAD v2).
     /// Unencrypted LAN feedback has no sequence guarantee, so the gate is a
@@ -283,9 +292,10 @@ fn parse_target_endpoints_with_locals(
         let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
 
         // A unicast phone-to-phone transmitter must never send to a broadcast,
-        // multicast or unspecified address: 802.11 transmits those at the
-        // mandatory basic rate, which can consume the entire channel airtime.
-        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        // multicast, loopback or unspecified address: 802.11 transmits
+        // broadcast/multicast at the mandatory basic rate, and loopback
+        // (127.0.0.1:65532) is the phone's own localhost, not a PC receiver.
+        if addr.ip().is_unspecified() || addr.ip().is_multicast() || addr.ip().is_loopback() {
             continue;
         }
         if let IpAddr::V4(ipv4) = addr.ip() {
@@ -537,7 +547,7 @@ impl PhoneMicTransmitter {
             bound_port,
             rt_thread_tid: AtomicI32::new(0),
         });
-        let session_key = pin
+        let mut session_key = pin
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(SessionKey::from_pin);
@@ -625,6 +635,7 @@ impl PhoneMicTransmitter {
                 // cannot reset the anti-replay watermark.
                 let mut last_sweep = Instant::now();
                 let mut last_iface_refresh = Instant::now();
+                let mut last_salt_rotation = Instant::now();
                 let mut silent_subframes: u32 = 0;
                 // Keep 2.5 ms (400 pps) single-subframe mic pacing only on USB;
                 // bundle 5.0 ms (200 pps) over Wi-Fi to avoid 802.11 TX saturation.
@@ -672,7 +683,7 @@ impl PhoneMicTransmitter {
                         while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
                             // A phone that receives its own beacon/feedback
                             // must never register itself as a listener.
-                            if local_ips.contains(&src_addr.ip()) {
+                            if local_ips.contains(&src_addr.ip()) || src_addr.ip().is_loopback() {
                                 continue;
                             }
                             if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
@@ -734,6 +745,12 @@ impl PhoneMicTransmitter {
                                 .map(|iface| iface.ip)
                                 .collect();
                         }
+                        if last_salt_rotation.elapsed() >= PARTY_SALT_ROTATION_INTERVAL {
+                            last_salt_rotation = Instant::now();
+                            if let Some(ref mut key) = session_key {
+                                key.rotate_session_salt();
+                            }
+                        }
                     }
 
                     // A single listener may be registered on two ports (a
@@ -775,6 +792,16 @@ impl PhoneMicTransmitter {
                         party_telem_clone
                             .max_group_delay_ms
                             .store(0, Ordering::Relaxed);
+                        let idle_mode = if use_hardware_mic {
+                            CodecMode::StudioLosslessLpc
+                        } else if party_prefer_opus {
+                            CodecMode::OpusRld
+                        } else {
+                            party_packet_codec
+                        };
+                        party_telem_clone
+                            .active_codec_mode
+                            .store(idle_mode as u8, Ordering::Relaxed);
                         silent_subframes = 0;
                         has_prev_subframe = false;
                         prev_f32_subframe.fill(0.0);
@@ -1192,6 +1219,13 @@ pub fn android_start_stream(
         );
         e
     })?;
+    let initial_bt_delay = LAST_REPORTED_BT_DELAY_MS.load(Ordering::Relaxed);
+    if initial_bt_delay > 0 {
+        client
+            .telemetry
+            .downstream_bt_delay_ms
+            .store(initial_bt_delay, Ordering::Relaxed);
+    }
     // Log the parsed host/port, never the raw input or PIN: the PIN is a
     // separate argument and must not end up in a pasteable diagnostics bundle.
     diagnostics::info(
@@ -1272,6 +1306,7 @@ pub fn android_set_gain_db(gain_db: f32) {
 }
 
 pub fn android_report_bt_delay_ms(delay_ms: u16) {
+    LAST_REPORTED_BT_DELAY_MS.store(delay_ms, Ordering::Relaxed);
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
@@ -1798,14 +1833,14 @@ mod tests {
     #[test]
     fn test_party_targets_filter_self_broadcast_and_legacy_rndis() {
         let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
-        let input = "192.168.1.50, 192.168.1.60, 255.255.255.255, \
-                     255.255.255.255:65530, 239.255.77.77, 0.0.0.0, \
+        let input = "192.168.1.50, 192.168.1.60, 127.0.0.1, 127.0.0.1:65530, [::1]:65530, \
+                     255.255.255.255, 255.255.255.255:65530, 239.255.77.77, 0.0.0.0, \
                      0.0.0.0:65530, [ff02::1]:65530, 192.168.42.129:65530";
         let targets = parse_target_endpoints_with_locals(input, &[local], false);
         assert_eq!(
             targets,
             vec!["192.168.1.60:65532".parse().unwrap()],
-            "self, broadcast, multicast, unspecified and dead RNDIS hosts must be dropped"
+            "self, loopback, broadcast, multicast, unspecified and dead RNDIS hosts must be dropped"
         );
 
         // A real USB tethering interface makes the legacy RNDIS target reachable.

@@ -689,11 +689,12 @@ impl ClientPreviewSink {
     ) -> Result<cpal::Stream, String> {
         let host = cpal::default_host();
         let preferred = preferred_name.and_then(|needle| {
+            let needle_lower = needle.to_ascii_lowercase();
             host.output_devices().ok().and_then(|mut devices| {
                 devices.find(|device| {
                     device
                         .name()
-                        .map(|name| name.contains(needle))
+                        .map(|name| name.to_ascii_lowercase().contains(&needle_lower))
                         .unwrap_or(false)
                 })
             })
@@ -849,11 +850,13 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
             }
             let lower = iface.name.to_lowercase();
             let is_virtual = lower.contains("docker")
+                || lower.starts_with("veth")
                 || lower.contains("wsl")
                 || lower.contains("vethernet")
                 || lower.contains("vmware")
                 || lower.contains("vmnet")
                 || lower.contains("vbox")
+                || lower.contains("virtualbox")
                 || lower.contains("virbr")
                 || lower.contains("br-");
             if is_virtual {
@@ -861,9 +864,12 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
             }
 
             let ip_str = ip.to_string();
-            let is_usb = is_usb_interface_name(&iface.name)
-                || ip_str.starts_with("192.168.42.")
-                || ip_str.starts_with("192.168.137.");
+            // Do NOT hardcode 192.168.137.* as USB: on Windows 10/11 that is
+            // Microsoft's Wi-Fi Direct SoftAP / Mobile Hotspot subnet (802.11),
+            // so treating it as wired USB disabled Opus RED, pacing, and the
+            // BT+Wi-Fi guardrail. Real USB RNDIS/NCM adapters are caught by
+            // `is_usb_interface_name` or Android's legacy 192.168.42.* subnet.
+            let is_usb = is_usb_interface_name(&iface.name) || ip_str.starts_with("192.168.42.");
 
             valid.push(NetworkInterfaceInfo {
                 name: iface.name,
@@ -876,13 +882,15 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
     valid
 }
 
-/// Returns `true` for loopback, the legacy Android RNDIS subnets, or any IPv4
-/// address in the same `/24` as a local USB-tethering interface.
+/// Returns `true` for loopback, the legacy Android RNDIS subnet (`192.168.42.*`),
+/// or any IPv4 address in the same `/24` as a local USB-tethering interface.
 ///
 /// Android 11+ randomizes the RNDIS subnet for each tethering session, so a
-/// fixed `192.168.42.x` / `192.168.137.x` prefix check is not sufficient. The
-/// local interface list is queried on demand because USB tethering can be
-/// enabled after the host engine starts.
+/// fixed `192.168.42.x` prefix check is not sufficient. The local interface
+/// list is queried on demand because USB tethering can be enabled after the
+/// host engine starts. Windows Wi-Fi Direct SoftAP (`192.168.137.x`) is
+/// deliberately NOT hardcoded here so wireless hotspot clients keep full Wi-Fi
+/// FEC/RED and pacing protections.
 pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
     if addr_ip.is_loopback() {
         return true;
@@ -891,7 +899,7 @@ pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
         return false;
     };
     let t = target.octets();
-    if t[0] == 192 && t[1] == 168 && (t[2] == 42 || t[2] == 137) {
+    if t[0] == 192 && t[1] == 168 && t[2] == 42 {
         return true;
     }
 
@@ -1682,6 +1690,10 @@ pub struct HostEngine {
     running: Arc<AtomicBool>,
     pub telemetry: Arc<HostTelemetry>,
     clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+    /// Bumped whenever `clients` is mutated from outside the TX loop (mute,
+    /// kick, or PIN change) so `cached_targets` refreshes on the very next
+    /// 2.5 ms tick instead of waiting up to 1 second for the periodic sweep.
+    clients_version: Arc<AtomicU64>,
     session_key: Arc<Mutex<Option<SessionKey>>>,
     /// Bumped whenever `session_key` is swapped (or its nonce salt rotated).
     /// The real-time TX loop only re-locks the key mutex when this changes.
@@ -1692,6 +1704,20 @@ pub struct HostEngine {
 
 impl HostEngine {
     pub fn start(config: HostConfig, initial_targets: Vec<SocketAddr>) -> Result<Self, String> {
+        Self::start_with_pin(config, initial_targets, None)
+    }
+
+    /// Start the host engine with an optional pairing PIN already active before
+    /// the UDP listener thread begins accepting handshakes/feedback.
+    pub fn start_with_pin(
+        config: HostConfig,
+        initial_targets: Vec<SocketAddr>,
+        pin: Option<&str>,
+    ) -> Result<Self, String> {
+        let initial_key = pin
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(SessionKey::from_pin);
         let running = Arc::new(AtomicBool::new(true));
         let telemetry = Arc::new(HostTelemetry {
             packets_sent: AtomicU64::new(0),
@@ -1760,7 +1786,8 @@ impl HostEngine {
             Ordering::Relaxed,
         );
         let clients = Arc::new(Mutex::new(client_map));
-        let session_key = Arc::new(Mutex::new(None));
+        let clients_version = Arc::new(AtomicU64::new(0));
+        let session_key = Arc::new(Mutex::new(initial_key));
         let key_version = Arc::new(AtomicU64::new(0));
 
         // Poll the OS master sink volume/mute state on a dedicated, non-RT
@@ -1781,6 +1808,7 @@ impl HostEngine {
         let running_clone = Arc::clone(&running);
         let telemetry_clone = Arc::clone(&telemetry);
         let clients_clone = Arc::clone(&clients);
+        let clients_version_clone = Arc::clone(&clients_version);
         let key_clone = Arc::clone(&session_key);
         let key_version_clone = Arc::clone(&key_version);
 
@@ -1797,6 +1825,7 @@ impl HostEngine {
                     running_clone,
                     telemetry_clone,
                     clients_clone,
+                    clients_version_clone,
                     key_clone,
                     key_version_clone,
                 );
@@ -1819,6 +1848,7 @@ impl HostEngine {
             running,
             telemetry,
             clients,
+            clients_version,
             session_key,
             key_version,
             worker_handle: Some(worker_handle),
@@ -1827,11 +1857,11 @@ impl HostEngine {
     }
 
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
-        let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = pin.map(SessionKey::from_pin);
-        drop(guard);
-        self.key_version.fetch_add(1, Ordering::AcqRel);
-        self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
+        let key = pin
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(SessionKey::from_pin);
+        self.set_session_key(key);
     }
 
     /// Replace the session key directly (e.g. one derived from a QR token)
@@ -1839,10 +1869,33 @@ impl HostEngine {
     /// cache instead of locking the key mutex on every packet.
     pub fn set_session_key(&self, key: Option<SessionKey>) {
         let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *guard != key;
         *guard = key;
         drop(guard);
         self.key_version.fetch_add(1, Ordering::AcqRel);
         self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
+        if changed {
+            // Reset per-client replay windows so a legitimate client reconnecting
+            // with the updated PIN from the same socket at `feedback_seq = 1`
+            // is accepted immediately instead of rejected as a replay until idle
+            // expiry; when enabling/changing encryption, also clear stale
+            // previously-unauthenticated peers so they must re-authenticate.
+            let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+            if key.is_some() {
+                map.clear();
+                self.telemetry
+                    .active_clients_count
+                    .store(0, Ordering::Relaxed);
+                Self::refresh_client_delay_telemetry(&map, &self.telemetry);
+                Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
+            } else {
+                for client in map.values_mut() {
+                    client.feedback_window = FeedbackReplayWindow::default();
+                }
+            }
+            drop(map);
+            self.clients_version.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {
@@ -1972,16 +2025,18 @@ impl HostEngine {
     }
 
     pub fn set_client_muted(&self, addr: SocketAddr, muted: bool) {
-        let mut map = self.clients.lock().unwrap();
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(client) = map.get_mut(&addr) {
             client.muted = muted;
         }
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
+        drop(map);
+        self.clients_version.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn kick_client(&self, addr: SocketAddr) {
-        let mut map = self.clients.lock().unwrap();
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let removed = map.remove(&addr).is_some();
         self.telemetry
             .active_clients_count
@@ -1990,6 +2045,7 @@ impl HostEngine {
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
         drop(map);
         if removed {
+            self.clients_version.fetch_add(1, Ordering::AcqRel);
             audioshare_protocol::diagnostics::info(
                 "host-clients",
                 format!(
@@ -2034,6 +2090,7 @@ impl HostEngine {
         let capture_active = Arc::clone(&stream_active);
         let capture_pid = Arc::clone(&child_pid);
         let capture_exited = Arc::clone(&child_exited);
+        let capture_nonblocking = Arc::clone(&uses_nonblocking_poll);
         let capture_running = Arc::clone(&running);
         let capture_ring = Arc::clone(&ring);
         let capture_wakeup = Arc::clone(&wakeup);
@@ -2125,7 +2182,10 @@ impl HostEngine {
 
                     match child {
                         Ok(mut child) => {
+                            capture_nonblocking.store(true, Ordering::Release);
                             capture_pid.store(child.id(), Ordering::Relaxed);
+                            let spawned_at = Instant::now();
+                            let hb_before = capture_heartbeat.load(Ordering::Relaxed);
                             if let Some(stdout) = child.stdout.take() {
                                 use std::os::fd::AsRawFd;
                                 pump_pcm_fd_nonblocking(
@@ -2146,11 +2206,37 @@ impl HostEngine {
                             let _ = child.kill();
                             let _ = child.wait();
                             capture_exited.store(true, Ordering::Release);
+                            // If `parec` died immediately without emitting any
+                            // samples (e.g. broken pipewire-pulse shim), try
+                            // the in-process libpulse-simple fallback instead
+                            // of tight-loop respawning `parec` 20x/sec.
+                            if spawned_at.elapsed() < Duration::from_millis(200)
+                                && capture_heartbeat.load(Ordering::Relaxed) == hb_before
+                                && capture_active.load(Ordering::Relaxed)
+                                && capture_running.load(Ordering::Relaxed)
+                                && sink_generation.load(Ordering::Acquire) == generation
+                            {
+                                capture_nonblocking.store(false, Ordering::Release);
+                                let _ = Self::try_inprocess_pulse_simple_capture(
+                                    &current_monitor,
+                                    &capture_ring,
+                                    &capture_wakeup,
+                                    &capture_heartbeat,
+                                    &capture_running,
+                                    &capture_active,
+                                    start_epoch,
+                                    &sink_generation,
+                                    generation,
+                                );
+                            }
                         }
                         Err(_) => {
                             // 2. Fallback: direct in-process
                             //    libpulse-simple.so.0 only when `parec` could
-                            //    not be spawned at all.
+                            //    not be spawned at all. `pa_simple_read` is
+                            //    blocking on a silent sink, so mark the thread
+                            //    non-joinable on Drop to prevent stop() deadlock.
+                            capture_nonblocking.store(false, Ordering::Release);
                             if Self::try_inprocess_pulse_simple_capture(
                                 &current_monitor,
                                 &capture_ring,
@@ -2661,6 +2747,7 @@ impl HostEngine {
         running: Arc<AtomicBool>,
         telemetry: Arc<HostTelemetry>,
         clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+        clients_version: Arc<AtomicU64>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
         key_version: Arc<AtomicU64>,
     ) {
@@ -2723,15 +2810,41 @@ impl HostEngine {
         let mut bound_target_pid: u32 = app_routing::windows_target_capture_pid();
         #[cfg(target_os = "windows")]
         let mut active_stream = if !config.use_test_tone {
-            Self::spawn_loopback_capture(
-                Arc::clone(&ring),
-                Arc::clone(&capture_wakeup),
-                Arc::clone(&capture_heartbeat_ms),
-                Arc::clone(&capture_stream_error),
-                Arc::clone(&running),
-                start_instant,
-            )
-            .ok()
+            if bound_target_pid != 0 {
+                match app_routing::spawn_windows_process_loopback(
+                    bound_target_pid,
+                    Arc::clone(&ring),
+                    Arc::clone(&capture_wakeup),
+                    Arc::clone(&capture_heartbeat_ms),
+                    Arc::clone(&capture_stream_error),
+                    Arc::clone(&running),
+                    start_instant,
+                ) {
+                    Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
+                    Err(_) => {
+                        bound_target_pid = 0;
+                        Self::spawn_loopback_capture(
+                            Arc::clone(&ring),
+                            Arc::clone(&capture_wakeup),
+                            Arc::clone(&capture_heartbeat_ms),
+                            Arc::clone(&capture_stream_error),
+                            Arc::clone(&running),
+                            start_instant,
+                        )
+                        .ok()
+                    }
+                }
+            } else {
+                Self::spawn_loopback_capture(
+                    Arc::clone(&ring),
+                    Arc::clone(&capture_wakeup),
+                    Arc::clone(&capture_heartbeat_ms),
+                    Arc::clone(&capture_stream_error),
+                    Arc::clone(&running),
+                    start_instant,
+                )
+                .ok()
+            }
         } else {
             None
         };
@@ -2803,6 +2916,7 @@ impl HostEngine {
         // `set_session_key`/`set_encryption_pin`, which bump `key_version`; the
         // loop only re-locks the key mutex when the version actually changes.
         let mut key_version_seen = key_version.load(Ordering::Acquire);
+        let mut clients_version_seen = clients_version.load(Ordering::Acquire);
         let mut active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
         let mut last_salt_rotation = Instant::now();
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -2824,6 +2938,22 @@ impl HostEngine {
             if current_key_version != key_version_seen {
                 active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
                 key_version_seen = current_key_version;
+            }
+            let current_clients_version = clients_version.load(Ordering::Acquire);
+            if current_clients_version != clients_version_seen {
+                if let Ok(map) = clients.lock() {
+                    cached_targets.clear();
+                    for c in map.values() {
+                        if !c.muted {
+                            cached_targets.push(c.addr);
+                        }
+                    }
+                    cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    if map.is_empty() {
+                        loss_governor = LossGovernor::new(Instant::now());
+                    }
+                }
+                clients_version_seen = current_clients_version;
             }
             // Long-lived encrypted sessions rotate the 4-byte nonce salt so a
             // 32-bit salt cannot be reused into a two-time-pad. The salt travels
@@ -3051,147 +3181,145 @@ impl HostEngine {
                         Self::note_rejected_handshake(&telemetry, "invalid feedback MAC");
                         continue;
                     };
-                    // Reject replayed authenticated feedback BEFORE any command
-                    // side effect. The sequence is nonce-bound, so an attacker
-                    // cannot simply bump it on a captured packet. `check_and_accept`
-                    // both filters the replay and records the newly accepted seq;
-                    // for a not-yet-registered peer we seed a temporary window and
-                    // carry it into the entry created below. Kicking a peer drops
-                    // its window, so a reconnect may legitimately restart at 1.
-                    let mut accepted_window = FeedbackReplayWindow::default();
-                    let replay = {
-                        let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
-                        match map.get_mut(&src_addr) {
-                            Some(entry) => !entry.feedback_window.check_and_accept(
-                                active_key.is_some(),
-                                fb.feedback_seq,
-                            ),
-                            None => !accepted_window.check_and_accept(
-                                active_key.is_some(),
-                                fb.feedback_seq,
-                            ),
-                        }
+                    // Atomically verify admission, check the replay window, and
+                    // insert/update the client under one lock so neither an
+                    // unadmitted peer at MAX_CONNECTED_CLIENTS nor a kicked/muted
+                    // peer can bypass replay tracking or issue global commands.
+                    let gaming_lock_update = match fb.requested_mode {
+                        40 => Some(false),
+                        41 => Some(true),
+                        _ => None,
                     };
-                    if replay {
-                        continue;
-                    }
-                    let mut gaming_lock_update: Option<bool> = None;
+                    let mut newly_joined = false;
+                    let allow_remote_commands: bool;
+                    {
+                        let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+                        Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                        if !Self::can_admit_client(&map, src_addr) {
+                            // At capacity: feedback from an unknown peer must not
+                            // grow the map or execute any remote commands.
+                            continue;
+                        }
+                        if let Some(entry) = map.get_mut(&src_addr) {
+                            if !entry.feedback_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ) {
+                                continue;
+                            }
+                            entry.last_seen = Instant::now();
+                            entry.fec_rate_permille = fb.fec_rate_permille;
+                            entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                            entry.hardware_delay_ms = fb.hardware_delay_ms;
+                            entry.client_volume = fb.client_volume;
+                            if let Some(gaming_lock) = gaming_lock_update {
+                                entry.gaming_lock = gaming_lock;
+                            }
+                            allow_remote_commands = !entry.muted;
+                        } else {
+                            let mut accepted_window = FeedbackReplayWindow::default();
+                            if !accepted_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ) {
+                                continue;
+                            }
+                            newly_joined = true;
+                            allow_remote_commands = true;
+                            map.insert(
+                                src_addr,
+                                ConnectedClient {
+                                    addr: src_addr,
+                                    last_seen: Instant::now(),
+                                    is_usb,
+                                    muted: false,
+                                    fec_rate_permille: fb.fec_rate_permille,
+                                    bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                                    hardware_delay_ms: fb.hardware_delay_ms,
+                                    client_volume: fb.client_volume,
+                                    gaming_lock: gaming_lock_update.unwrap_or(false),
+                                    feedback_window: accepted_window,
+                                },
+                            );
+                        }
 
-                    // Compressed-codec backend selection from the phone UI:
-                    // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
-                    // This is separate from the quality profile and only
-                    // affects compressed modes.
-                    // 40/41 carry the client's 5 ms hard-lock state so the
-                    // host can tighten packetization for the session.
-                    match fb.requested_mode {
-                        20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
-                        21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
-                        40 => gaming_lock_update = Some(false),
-                        41 => gaming_lock_update = Some(true),
-                        _ => {}
-                    }
-
-                    // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
-                    // Keep this range below 20 so codec-backend commands are
-                    // not mistaken for transport commands.
-                    if (10..20).contains(&fb.requested_mode) {
-                        let cmd = match fb.requested_mode {
-                            10 => bt_optimization::RemoteMediaCommand::PlayPause,
-                            11 => bt_optimization::RemoteMediaCommand::NextTrack,
-                            12 => bt_optimization::RemoteMediaCommand::PrevTrack,
-                            _ => bt_optimization::RemoteMediaCommand::None,
-                        };
-                        bt_optimization::execute_remote_media_command(cmd);
-                    }
-
-                    // Remote quality-mode selection from the phone UI:
-                    // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
-                    // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                    // Bitrate selections are 30=96, 31=160, 32=256, 33=320, 34=510 kbps.
-                    // Other values are media transport or codec-backend
-                    // commands handled above.
-                    if (1..=5).contains(&fb.requested_mode) {
                         telemetry
-                            .quality_profile
-                            .store(fb.requested_mode - 1, Ordering::Relaxed);
-                    } else {
-                        let kbps = match fb.requested_mode {
-                            30 => Some(96u16),
-                            31 => Some(160),
-                            32 => Some(256),
-                            33 => Some(320),
-                            34 => Some(510),
-                            _ => None,
-                        };
-                        if let Some(kbps) = kbps {
-                            telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                            .active_clients_count
+                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
+
+                        // Fast attack / paced release. A borderline link
+                        // that alternates between 5% and 0% loss must not
+                        // recreate the Opus encoder every 500 ms. Muted
+                        // clients do not receive audio, so they cannot drive
+                        // the governor.
+                        let raw_worst = map
+                            .values()
+                            .filter(|c| !c.muted)
+                            .map(|c| c.fec_rate_permille)
+                            .max()
+                            .unwrap_or(0);
+                        let now_fb = Instant::now();
+                        loss_governor.update(raw_worst, now_fb);
+                        Self::refresh_client_delay_telemetry(&map, &telemetry);
+                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
+
+                        cached_targets.clear();
+                        for c in map.values() {
+                            if !c.muted {
+                                cached_targets.push(c.addr);
+                            }
+                        }
+                        cached_all_usb = Self::all_active_targets_are_usb(&map);
+                        clean_link_promoter.update(
+                            raw_worst,
+                            loss_governor.value,
+                            telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
+                            cached_all_usb,
+                            !cached_targets.is_empty(),
+                            now_fb,
+                        );
+                    }
+
+                    if allow_remote_commands {
+                        // Compressed-codec backend selection from the phone UI:
+                        // 20 = pure-Rust VBR, 21 = bundled Opus RLD.
+                        match fb.requested_mode {
+                            20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
+                            21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
+                            _ => {}
+                        }
+
+                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
+                        if (10..20).contains(&fb.requested_mode) {
+                            let cmd = match fb.requested_mode {
+                                10 => bt_optimization::RemoteMediaCommand::PlayPause,
+                                11 => bt_optimization::RemoteMediaCommand::NextTrack,
+                                12 => bt_optimization::RemoteMediaCommand::PrevTrack,
+                                _ => bt_optimization::RemoteMediaCommand::None,
+                            };
+                            bt_optimization::execute_remote_media_command(cmd);
+                        }
+
+                        // Remote quality-mode (1..=5) and bitrate (30..=34) selection.
+                        if (1..=5).contains(&fb.requested_mode) {
+                            telemetry
+                                .quality_profile
+                                .store(fb.requested_mode - 1, Ordering::Relaxed);
+                        } else {
+                            let kbps = match fb.requested_mode {
+                                30 => Some(96u16),
+                                31 => Some(160),
+                                32 => Some(256),
+                                33 => Some(320),
+                                34 => Some(510),
+                                _ => None,
+                            };
+                            if let Some(kbps) = kbps {
+                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                            }
                         }
                     }
 
-                    let mut map = clients.lock().unwrap();
-                    Self::evict_same_ip_stale_ports(&mut map, src_addr);
-                    if !Self::can_admit_client(&map, src_addr) {
-                        // At capacity: feedback from an unknown peer must not
-                        // grow the map beyond the u8-safe cap.
-                        continue;
-                    }
-                    let newly_joined = !map.contains_key(&src_addr);
-                    let entry = map.entry(src_addr).or_insert(ConnectedClient {
-                        addr: src_addr,
-                        last_seen: Instant::now(),
-                        is_usb,
-                        muted: false,
-                        fec_rate_permille: fb.fec_rate_permille,
-                        bluetooth_delay_ms: fb.bluetooth_delay_ms,
-                        hardware_delay_ms: fb.hardware_delay_ms,
-                        client_volume: fb.client_volume,
-                        gaming_lock: false,
-                        feedback_window: accepted_window,
-                    });
-                    entry.last_seen = Instant::now();
-                    entry.fec_rate_permille = fb.fec_rate_permille;
-                    entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
-                    entry.hardware_delay_ms = fb.hardware_delay_ms;
-                    entry.client_volume = fb.client_volume;
-                    if let Some(gaming_lock) = gaming_lock_update {
-                        entry.gaming_lock = gaming_lock;
-                    }
-                    telemetry
-                        .active_clients_count
-                        .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
-
-                    // Fast attack / paced release. A borderline link
-                    // that alternates between 5% and 0% loss must not
-                    // recreate the Opus encoder every 500 ms. Muted
-                    // clients do not receive audio, so they cannot drive
-                    // the governor.
-                    let raw_worst = map
-                        .values()
-                        .filter(|c| !c.muted)
-                        .map(|c| c.fec_rate_permille)
-                        .max()
-                        .unwrap_or(0);
-                    let now_fb = Instant::now();
-                    loss_governor.update(raw_worst, now_fb);
-                    Self::refresh_client_delay_telemetry(&map, &telemetry);
-                    Self::refresh_gaming_lock_telemetry(&map, &telemetry);
-
-                    cached_targets.clear();
-                    for c in map.values() {
-                        if !c.muted {
-                            cached_targets.push(c.addr);
-                        }
-                    }
-                    cached_all_usb = Self::all_active_targets_are_usb(&map);
-                    clean_link_promoter.update(
-                        raw_worst,
-                        loss_governor.value,
-                        telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
-                        cached_all_usb,
-                        !cached_targets.is_empty(),
-                        now_fb,
-                    );
-                    drop(map);
                     if newly_joined {
                         audioshare_protocol::diagnostics::info(
                             "host-clients",
@@ -3230,14 +3358,31 @@ impl HostEngine {
                             ),
                         );
                     }
-                    let raw_worst = map
+                    let now_sweep = Instant::now();
+                    if map.is_empty() {
+                        // Reset the loss governor once all clients have left so
+                        // a new clean session never inherits a stale 12-90 s hold.
+                        loss_governor = LossGovernor::new(now_sweep);
+                    } else {
+                        // Only include clients with fresh feedback (< 3 s) so a
+                        // crashed/disconnecting lossy peer cannot re-arm a 90 s
+                        // hold for 9 seconds while waiting for the 10 s expiry.
+                        let raw_worst = map
+                            .values()
+                            .filter(|c| {
+                                !c.muted && c.last_seen.elapsed() < Duration::from_secs(3)
+                            })
+                            .map(|c| c.fec_rate_permille)
+                            .max()
+                            .unwrap_or(0);
+                        loss_governor.update(raw_worst, now_sweep);
+                    }
+                    let raw_worst_for_promo = map
                         .values()
-                        .filter(|c| !c.muted)
+                        .filter(|c| !c.muted && c.last_seen.elapsed() < Duration::from_secs(3))
                         .map(|c| c.fec_rate_permille)
                         .max()
                         .unwrap_or(0);
-                    let now_sweep = Instant::now();
-                    loss_governor.update(raw_worst, now_sweep);
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
@@ -3248,7 +3393,7 @@ impl HostEngine {
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
                     clean_link_promoter.update(
-                        raw_worst,
+                        raw_worst_for_promo,
                         loss_governor.value,
                         telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
                         cached_all_usb,
@@ -3780,7 +3925,7 @@ impl HostEngine {
                         &telemetry,
                     );
                 }
-            } else {
+            } else if has_targets {
                 let hdr = WireHeader {
                     mode: dynamic_codec_mode,
                     subframe_count: subframes_per_pkt as u8,
@@ -4523,7 +4668,9 @@ mod tests {
     fn test_is_usb_subnet_ip_recognizes_loopback_and_legacy_rndis() {
         assert!(is_usb_subnet_ip("127.0.0.1".parse().unwrap()));
         assert!(is_usb_subnet_ip("192.168.42.7".parse().unwrap()));
-        assert!(is_usb_subnet_ip("192.168.137.7".parse().unwrap()));
+        // Windows Wi-Fi Direct SoftAP / Mobile Hotspot uses 192.168.137.0/24
+        // and must NOT be hardcoded as wired USB (wireless clients need RED/pacing).
+        assert!(!is_usb_subnet_ip("192.168.137.7".parse().unwrap()));
         // TEST-NET-3 is never a local tethering subnet.
         assert!(!is_usb_subnet_ip("203.0.113.7".parse().unwrap()));
         assert!(!is_usb_subnet_ip("2001:db8::1".parse().unwrap()));

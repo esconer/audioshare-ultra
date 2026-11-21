@@ -317,6 +317,8 @@ struct AudioShareApp {
     /// and applied from `logic()` so the UI thread never blocks.
     bg_task_tx: mpsc::Sender<BgTaskResult>,
     bg_task_rx: mpsc::Receiver<BgTaskResult>,
+    firewall_task_in_flight: bool,
+    hotspot_task_in_flight: bool,
     #[cfg(target_os = "windows")]
     windows_firewall_ok: bool,
     dark_mode: bool,
@@ -389,6 +391,7 @@ struct AudioShareApp {
     night_mode_drc: bool,
     measured_sonar_ms: Option<f32>,
     measured_sonar_at: Option<Instant>,
+    last_sonar_pair: (u64, u64),
     latency_debug: bool,
     gaming_hard_lock: bool,
     usb_buffer_mode: bool,
@@ -469,6 +472,8 @@ impl AudioShareApp {
             toast: None,
             bg_task_tx,
             bg_task_rx,
+            firewall_task_in_flight: false,
+            hotspot_task_in_flight: false,
             #[cfg(target_os = "windows")]
             windows_firewall_ok: false,
             dark_mode: true,
@@ -478,7 +483,7 @@ impl AudioShareApp {
             force_quit: false,
             host_pro_codec_open: false,
             host_routing_mic_open: false,
-            client_manual_ip_open: false,
+            client_manual_ip_open: true,
             client_eq_drawer_open: false,
             client_telemetry_drawer_open: false,
             host_engine: None,
@@ -527,6 +532,7 @@ impl AudioShareApp {
             night_mode_drc: false,
             measured_sonar_ms: None,
             measured_sonar_at: None,
+            last_sonar_pair: (0, 0),
             latency_debug: false,
             gaming_hard_lock: false,
             usb_buffer_mode: false,
@@ -560,6 +566,13 @@ impl AudioShareApp {
     }
 
     fn config_file_path() -> std::path::PathBuf {
+        #[cfg(target_os = "windows")]
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let p = std::path::Path::new(&appdata);
+            if p.is_dir() {
+                return p.join("audioshare-ultra.conf");
+            }
+        }
         if let Ok(cfg_dir) = std::env::var("XDG_CONFIG_HOME") {
             let p = std::path::PathBuf::from(cfg_dir);
             if p.is_dir() {
@@ -722,22 +735,30 @@ impl AudioShareApp {
                     "manual_server_ip" => self.manual_server_ip = v.trim().to_string(),
                     "preamp_gain_db" => {
                         if let Ok(f) = v.trim().parse::<f32>() {
-                            self.preamp_gain_db = f.clamp(-12.0, 24.0);
+                            if f.is_finite() {
+                                self.preamp_gain_db = f.clamp(-12.0, 24.0);
+                            }
                         }
                     }
                     "eq_bass_db" => {
                         if let Ok(f) = v.trim().parse::<f32>() {
-                            self.eq_bass_db = f.clamp(-12.0, 12.0);
+                            if f.is_finite() {
+                                self.eq_bass_db = f.clamp(-12.0, 12.0);
+                            }
                         }
                     }
                     "eq_presence_db" => {
                         if let Ok(f) = v.trim().parse::<f32>() {
-                            self.eq_presence_db = f.clamp(-12.0, 12.0);
+                            if f.is_finite() {
+                                self.eq_presence_db = f.clamp(-12.0, 12.0);
+                            }
                         }
                     }
                     "eq_treble_db" => {
                         if let Ok(f) = v.trim().parse::<f32>() {
-                            self.eq_treble_db = f.clamp(-12.0, 12.0);
+                            if f.is_finite() {
+                                self.eq_treble_db = f.clamp(-12.0, 12.0);
+                            }
                         }
                     }
                     "channel_role" => {
@@ -769,11 +790,24 @@ impl AudioShareApp {
                 apply_automatic_video_lipsync_offset_ms(0);
                 self.last_applied_bt_delay = 0;
             }
+            if self.selected_app_idx.is_some() {
+                let _ = restore_all_apps_to_default_sink();
+                self.selected_app_idx = None;
+                self.app_route_status = "Capturing Full System Audio".into();
+            }
+            self.prev_bytes_sent = 0;
+            self.prev_pkts_sent = 0;
+            self.live_kbps = 0;
+            self.live_pps = 0;
+            self.vu_peak_hold = 0.0;
             self.beacon = None;
             self.adb_watcher = None;
             self.os_guard = None;
             self.host_status_msg = "Host stopped.".into();
         } else {
+            if self.pin_dirty {
+                self.apply_pin_now();
+            }
             self.interfaces = list_valid_host_interfaces();
             let cfg = HostConfig {
                 bind_port: DEFAULT_PORT,
@@ -783,12 +817,15 @@ impl AudioShareApp {
             };
 
             let guard = VirtualSpeakerAndRadioGuard::acquire(self.enable_virtual_speaker);
+            let effective_pin = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty()
+            {
+                Some(self.pairing_pin.trim())
+            } else {
+                None
+            };
 
-            match HostEngine::start(cfg, vec![]) {
+            match HostEngine::start_with_pin(cfg, vec![], effective_pin) {
                 Ok(engine) => {
-                    if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-                        engine.set_encryption_pin(Some(&self.pairing_pin));
-                    }
                     engine
                         .telemetry
                         .quality_profile
@@ -817,7 +854,7 @@ impl AudioShareApp {
                     // The beacon reads this atomic on every advertisement, so
                     // apply_pin_now can flip `enc` live without a restart.
                     self.beacon_encrypted.store(
-                        self.enable_pin_encryption && !self.pairing_pin.trim().is_empty(),
+                        effective_pin.is_some(),
                         Ordering::Relaxed,
                     );
                     self.beacon = Some(DiscoveryBeacon::start_with_encryption_flag(
@@ -838,9 +875,13 @@ impl AudioShareApp {
     }
 
     fn connect_client(&mut self, addr: SocketAddr) {
+        if self.pin_dirty {
+            self.apply_pin_now();
+        }
         if let Some(mut c) = self.client_engine.take() {
             c.stop();
         }
+        self.drift_history = VecDeque::from(vec![0.0; 120]);
         let cfg = ClientConfig {
             server_addr: addr,
             target_buffer_subframes: if self.usb_buffer_mode || self.gaming_hard_lock {
@@ -852,7 +893,7 @@ impl AudioShareApp {
             dolby_effects: false,
         };
         let pin_opt = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-            Some(self.pairing_pin.as_str())
+            Some(self.pairing_pin.trim())
         } else {
             None
         };
@@ -910,8 +951,13 @@ impl AudioShareApp {
     // applied in `logic()` (see `drain_bg_tasks`).
     // ---------------------------------------------------------------------
 
-    fn dispatch_open_firewall(&mut self) {
+    fn dispatch_open_firewall(&mut self, ctx: &egui::Context) {
+        if self.firewall_task_in_flight {
+            return;
+        }
+        self.firewall_task_in_flight = true;
         let tx = self.bg_task_tx.clone();
+        let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
             let msg = open_os_firewall_ports();
             #[cfg(target_os = "windows")]
@@ -919,27 +965,40 @@ impl AudioShareApp {
             #[cfg(not(target_os = "windows"))]
             let firewall_ok = true;
             let _ = tx.send(BgTaskResult::Firewall { msg, firewall_ok });
+            ctx_clone.request_repaint();
         });
         self.hotspot_status = "Opening firewall ports (65530-65532/UDP)…".into();
     }
 
-    fn dispatch_hotspot_start(&mut self) {
+    fn dispatch_hotspot_start(&mut self, ctx: &egui::Context) {
+        if self.hotspot_task_in_flight {
+            return;
+        }
+        self.hotspot_task_in_flight = true;
         let tx = self.bg_task_tx.clone();
+        let ctx_clone = ctx.clone();
         let clean = |s: &str| s.replace(['\r', '\n'], "");
         let ssid = clean(&self.hotspot_ssid);
         let pass = clean(&self.hotspot_pass);
         std::thread::spawn(move || {
             let result = DirectHotspotController::start_direct_5ghz_hotspot(&ssid, &pass);
             let _ = tx.send(BgTaskResult::HotspotStart { result });
+            ctx_clone.request_repaint();
         });
         self.hotspot_status = "Starting 1-Hop Direct Hotspot…".into();
     }
 
-    fn dispatch_hotspot_stop(&mut self) {
+    fn dispatch_hotspot_stop(&mut self, ctx: &egui::Context) {
+        if self.hotspot_task_in_flight {
+            return;
+        }
+        self.hotspot_task_in_flight = true;
         let tx = self.bg_task_tx.clone();
+        let ctx_clone = ctx.clone();
         std::thread::spawn(move || {
             DirectHotspotController::stop_direct_hotspot();
             let _ = tx.send(BgTaskResult::HotspotStop);
+            ctx_clone.request_repaint();
         });
         self.hotspot_status = "Stopping 1-Hop Direct Hotspot…".into();
     }
@@ -950,6 +1009,7 @@ impl AudioShareApp {
         while let Ok(result) = self.bg_task_rx.try_recv() {
             match result {
                 BgTaskResult::Firewall { msg, firewall_ok } => {
+                    self.firewall_task_in_flight = false;
                     #[cfg(target_os = "windows")]
                     {
                         self.windows_firewall_ok = firewall_ok;
@@ -959,19 +1019,33 @@ impl AudioShareApp {
                     self.hotspot_status = msg.clone();
                     self.show_toast(msg);
                 }
-                BgTaskResult::HotspotStart { result } => match result {
-                    Ok(msg) => {
-                        self.direct_hotspot_active = true;
-                        self.hotspot_status = msg.clone();
-                        self.show_toast(msg);
+                BgTaskResult::HotspotStart { result } => {
+                    self.hotspot_task_in_flight = false;
+                    match result {
+                        Ok(msg) => {
+                            self.direct_hotspot_active = true;
+                            self.interfaces = list_valid_host_interfaces();
+                            self.selected_qr_iface_idx = refreshed_qr_iface_index(
+                                &self.interfaces,
+                                self.selected_qr_iface_idx,
+                            );
+                            self.hotspot_status = msg.clone();
+                            self.show_toast(msg);
+                        }
+                        Err(e) => {
+                            self.hotspot_status = format!("Hotspot notice: {}", e);
+                            self.show_toast(format!("Hotspot notice: {}", e));
+                        }
                     }
-                    Err(e) => {
-                        self.hotspot_status = format!("Hotspot notice: {}", e);
-                        self.show_toast(format!("Hotspot notice: {}", e));
-                    }
-                },
+                }
                 BgTaskResult::HotspotStop => {
+                    self.hotspot_task_in_flight = false;
                     self.direct_hotspot_active = false;
+                    self.interfaces = list_valid_host_interfaces();
+                    self.selected_qr_iface_idx = refreshed_qr_iface_index(
+                        &self.interfaces,
+                        self.selected_qr_iface_idx,
+                    );
                     self.hotspot_status = "Router LAN Mode".into();
                     self.show_toast("1-Hop Direct Hotspot stopped");
                 }
@@ -984,8 +1058,9 @@ impl AudioShareApp {
 
     /// Push the current PIN setting into every live engine at once.
     fn apply_pin_now(&mut self) {
-        let pin = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-            Some(self.pairing_pin.trim())
+        self.pairing_pin = self.pairing_pin.trim().to_string();
+        let pin = if self.enable_pin_encryption && !self.pairing_pin.is_empty() {
+            Some(self.pairing_pin.as_str())
         } else {
             None
         };
@@ -1075,7 +1150,10 @@ impl eframe::App for AudioShareApp {
             ctx.request_repaint_after(Duration::from_millis(interval_ms));
         } else if self.tab == AppTab::ClientReceiver && !is_minimized {
             ctx.request_repaint_after(Duration::from_millis(1000));
-        } else if self.toast.is_some() {
+        } else if self.toast.is_some()
+            || self.firewall_task_in_flight
+            || self.hotspot_task_in_flight
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
 
@@ -1091,6 +1169,22 @@ impl eframe::App for AudioShareApp {
         }
 
         if let Some(ref host) = self.host_engine {
+            if let Some(ref mic) = self.phone_mic_receiver {
+                let tx_us = host
+                    .telemetry
+                    .sonar_tx_timestamp_us
+                    .load(Ordering::Relaxed);
+                let rx_us = mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
+                if (tx_us, rx_us) != self.last_sonar_pair
+                    && rx_us > tx_us
+                    && (rx_us - tx_us) < 500_000
+                {
+                    self.last_sonar_pair = (tx_us, rx_us);
+                    self.measured_sonar_ms = Some(((rx_us - tx_us) as f32) / 2000.0);
+                    self.measured_sonar_at = Some(Instant::now());
+                }
+            }
+
             let client_count = host.telemetry.active_clients_count.load(Ordering::Relaxed);
             self.host_master_volume = host.telemetry.host_volume.load(Ordering::Relaxed);
             self.quality_profile =
@@ -1143,11 +1237,28 @@ impl eframe::App for AudioShareApp {
         // Keyboard shortcuts: Esc closes modals, Ctrl+, toggles Settings,
         // F12 toggles the latency HUD.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.show_qr_modal = false;
-            self.show_settings_modal = false;
+            if self.show_settings_modal {
+                if self.pin_dirty {
+                    self.apply_pin_now();
+                } else {
+                    self.save_persistent_config();
+                }
+                self.show_settings_modal = false;
+            } else if self.show_qr_modal {
+                self.show_qr_modal = false;
+            } else if self.latency_debug {
+                self.latency_debug = false;
+            }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
             self.interfaces = list_valid_host_interfaces();
+            if self.show_settings_modal {
+                if self.pin_dirty {
+                    self.apply_pin_now();
+                } else {
+                    self.save_persistent_config();
+                }
+            }
             self.show_settings_modal = !self.show_settings_modal;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
@@ -1216,9 +1327,19 @@ impl eframe::App for AudioShareApp {
                         }
                         if uw::pill_choice(ui, dark, self.show_settings_modal, "Settings") {
                             self.interfaces = list_valid_host_interfaces();
+                            if self.show_settings_modal {
+                                if self.pin_dirty {
+                                    self.apply_pin_now();
+                                } else {
+                                    self.save_persistent_config();
+                                }
+                            }
                             self.show_settings_modal = !self.show_settings_modal;
                         }
                         if uw::pill_choice(ui, dark, self.show_qr_modal, "Pair Phone QR") {
+                            if self.pin_dirty {
+                                self.apply_pin_now();
+                            }
                             self.interfaces = list_valid_host_interfaces();
                             self.selected_qr_iface_idx = refreshed_qr_iface_index(
                                 &self.interfaces,
@@ -1325,7 +1446,11 @@ impl eframe::App for AudioShareApp {
                                 drift
                             ))
                             .size(11.5)
-                            .color(egui::Color32::from_rgb(147, 197, 253)),
+                            .color(if dark {
+                                egui::Color32::from_rgb(147, 197, 253)
+                            } else {
+                                egui::Color32::from_rgb(29, 78, 216)
+                            }),
                         );
                     } else {
                         let primary_ip = self
@@ -1376,11 +1501,15 @@ impl eframe::App for AudioShareApp {
         }
 
         if self.latency_debug {
+            let mut open = self.latency_debug;
             egui::Window::new("Live Stage-by-Stage Latency Breakdown")
+                .open(&mut open)
                 .default_width(600.0)
                 .default_height(460.0)
+                .vscroll(true)
                 .resizable(true)
                 .show(&ctx, |ui| self.render_latency_debug(ui));
+            self.latency_debug = open;
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1400,6 +1529,9 @@ impl eframe::App for AudioShareApp {
     /// eframe 0.37 defaults to the wgpu backend (no `glow` feature), so
     /// `on_exit` no longer receives a glow context.
     fn on_exit(&mut self) {
+        if self.pin_dirty {
+            self.pairing_pin = self.pairing_pin.trim().to_string();
+        }
         self.save_persistent_config();
         if self.last_applied_bt_delay != 0 {
             // Synchronous reset: a detached thread would be killed by process
@@ -1407,9 +1539,10 @@ impl eframe::App for AudioShareApp {
             reset_video_lipsync_offset_blocking();
             self.last_applied_bt_delay = 0;
         }
-        if self.direct_hotspot_active {
+        if self.direct_hotspot_active || self.hotspot_task_in_flight {
             DirectHotspotController::stop_direct_hotspot();
             self.direct_hotspot_active = false;
+            self.hotspot_task_in_flight = false;
         }
         if self.selected_app_idx.is_some() {
             let _ = restore_all_apps_to_default_sink();
@@ -1431,6 +1564,9 @@ impl eframe::App for AudioShareApp {
 
 impl AudioShareApp {
     fn render_qr_modal(&mut self, ctx: &egui::Context) {
+        if self.pin_dirty {
+            self.apply_pin_now();
+        }
         let dark = self.dark_mode;
         let p = uw::Palette::for_mode(dark);
         let mut open = self.show_qr_modal;
@@ -1439,7 +1575,7 @@ impl AudioShareApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(&ctx, |ui| {
+            .show(ctx, |ui| {
                 uw::studio_card(ui, dark, |ui| {
                     let pin = self.pairing_pin.trim();
                     let pin_opt = if self.enable_pin_encryption && !pin.is_empty() {
@@ -1529,7 +1665,7 @@ impl AudioShareApp {
             .default_width(560.0)
             .max_height((ctx.content_rect().height() - 64.0).max(260.0))
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(&ctx, |ui| {
+            .show(ctx, |ui| {
                 // Two-tab modal replaces the old single scrolling settings wall.
                 ui.horizontal(|ui| {
                     if uw::pill_choice(
@@ -1602,22 +1738,38 @@ impl AudioShareApp {
                             );
                         });
                         ui.horizontal_wrapped(|ui| {
-                            let hs_btn = if self.direct_hotspot_active {
+                            let hs_btn = if self.hotspot_task_in_flight {
+                                "Working on 1-Hop Hotspot…"
+                            } else if self.direct_hotspot_active {
                                 "Stop 1-Hop Direct Hotspot"
                             } else {
                                 "Start 1-Hop 5GHz Link"
                             };
-                            if ui.button(hs_btn).clicked() {
+                            if ui
+                                .add_enabled(!self.hotspot_task_in_flight, egui::Button::new(hs_btn))
+                                .clicked()
+                            {
                                 // nmcli / netsh can take seconds; run off the UI
                                 // thread and flip state when the result arrives.
                                 if self.direct_hotspot_active {
-                                    self.dispatch_hotspot_stop();
+                                    self.dispatch_hotspot_stop(ctx);
                                 } else {
-                                    self.dispatch_hotspot_start();
+                                    self.dispatch_hotspot_start(ctx);
                                 }
                             }
-                            if ui.button("1-Click Open Firewall (65530-65532)").clicked() {
-                                self.dispatch_open_firewall();
+                            let fw_btn = if self.firewall_task_in_flight {
+                                "Opening Firewall…"
+                            } else {
+                                "1-Click Open Firewall (65530-65532)"
+                            };
+                            if ui
+                                .add_enabled(
+                                    !self.firewall_task_in_flight,
+                                    egui::Button::new(fw_btn),
+                                )
+                                .clicked()
+                            {
+                                self.dispatch_open_firewall(ctx);
                             }
                         });
                         ui.label(
@@ -1682,7 +1834,8 @@ impl AudioShareApp {
                             "Register AudioShare Ultra in desktop session startup",
                             &mut self.os_boot_autostart,
                         ) {
-                            self.host_status_msg = set_os_boot_autostart(self.os_boot_autostart);
+                            let msg = set_os_boot_autostart(self.os_boot_autostart);
+                            self.show_toast(msg);
                         }
                         uw::setting_switch_row(
                             ui,
@@ -1744,7 +1897,11 @@ impl AudioShareApp {
                 });
             });
         if !open && self.show_settings_modal {
-            self.save_persistent_config();
+            if self.pin_dirty {
+                self.apply_pin_now();
+            } else {
+                self.save_persistent_config();
+            }
         }
         self.show_settings_modal = open;
     }
@@ -1860,15 +2017,22 @@ impl AudioShareApp {
 
             if bt_delay > 40 {
                 ui.add_space(2.0);
-                uw::status_pill(
-                    ui,
-                    &format!(
+                #[cfg(target_os = "linux")]
+                let bt_pill_text = if self.auto_bt_video_lipsync {
+                    format!(
                         "Phone Bluetooth Active (A2DP {} ms -> Total Video Offset +{} ms)",
                         bt_delay, total_lipsync
-                    ),
-                    p.warn_bg,
-                    p.warn_fg,
+                    )
+                } else {
+                    format!("Phone Bluetooth Active (A2DP {} ms)", bt_delay)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let bt_pill_text = format!(
+                    "Phone Bluetooth Active (A2DP {} ms • Total Stream Delay ~{} ms)",
+                    bt_delay, total_lipsync
                 );
+                let _ = total_lipsync;
+                uw::status_pill(ui, &bt_pill_text, p.warn_bg, p.warn_fg);
             }
 
             #[cfg(target_os = "windows")]
@@ -1882,10 +2046,19 @@ impl AudioShareApp {
                             p.warn_bg,
                             p.warn_fg,
                         );
-                        if ui.button("Allow Through Firewall (UAC)").clicked() {
+                        let fw_lbl = if self.firewall_task_in_flight {
+                            "Opening Firewall…"
+                        } else {
+                            "Allow Through Firewall (UAC)"
+                        };
+                        if ui
+                            .add_enabled(!self.firewall_task_in_flight, egui::Button::new(fw_lbl))
+                            .clicked()
+                        {
                             // pkexec/netsh can block for seconds — dispatch to
                             // a worker; logic() applies the result + toast.
-                            self.dispatch_open_firewall();
+                            let ctx = ui.ctx().clone();
+                            self.dispatch_open_firewall(&ctx);
                         }
                     });
                 }
@@ -2042,19 +2215,21 @@ impl AudioShareApp {
                             egui::Color32::WHITE,
                         );
                         ui.monospace(format!(
-                            "{}   •   Vol: {}%   •   Loss: {:.1}%   •   BT: {} ms",
+                            "{} • Vol {}% • Loss {:.1}% • BT {} ms",
                             client.addr,
                             client.client_volume,
                             (client.fec_rate_permille as f32) / 10.0,
                             client.bluetooth_delay_ms
                         ));
-                        let mute_label = if client.muted { "Unmute" } else { "Mute" };
-                        if ui.small_button(mute_label).clicked() {
-                            host.set_client_muted(client.addr, !client.muted);
-                        }
-                        if ui.small_button("Kick").clicked() {
-                            host.kick_client(client.addr);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Kick").clicked() {
+                                host.kick_client(client.addr);
+                            }
+                            let mute_label = if client.muted { "Unmute" } else { "Mute" };
+                            if ui.small_button(mute_label).clicked() {
+                                host.set_client_muted(client.addr, !client.muted);
+                            }
+                        });
                     });
                 }
             }
@@ -2246,6 +2421,7 @@ impl AudioShareApp {
                         }
                     });
                     cols[1].vertical(|ui| {
+                        #[cfg(target_os = "linux")]
                         uw::setting_switch_row(
                             ui,
                             dark,
@@ -2352,13 +2528,25 @@ impl AudioShareApp {
                                 self.app_route_status = restore_all_apps_to_default_sink();
                             }
                             if ui.button("Refresh Apps").clicked() {
-                                let prev_pid = self
+                                let prev_selected = self
                                     .selected_app_idx
-                                    .and_then(|idx| self.audio_apps.get(idx).map(|a| a.pid));
+                                    .and_then(|idx| self.audio_apps.get(idx).map(|a| (a.id, a.pid)));
                                 self.audio_apps = list_active_audio_apps();
-                                self.selected_app_idx = prev_pid.and_then(|pid| {
-                                    self.audio_apps.iter().position(|a| a.pid == pid)
+                                self.selected_app_idx = prev_selected.and_then(|(id, pid)| {
+                                    self.audio_apps
+                                        .iter()
+                                        .position(|a| a.id == id)
+                                        .or_else(|| {
+                                            if pid != 0 {
+                                                self.audio_apps.iter().position(|a| a.pid == pid)
+                                            } else {
+                                                None
+                                            }
+                                        })
                                 });
+                                if prev_selected.is_some() && self.selected_app_idx.is_none() {
+                                    self.app_route_status = restore_all_apps_to_default_sink();
+                                }
                             }
                         });
                         if !self.audio_apps.is_empty() {
@@ -2371,9 +2559,11 @@ impl AudioShareApp {
                                         selected,
                                         &format!("{} ({})", app.name, app.pid),
                                     ) {
-                                        self.selected_app_idx = Some(idx);
                                         match route_single_app_to_audioshare(app) {
-                                            Ok(msg) => self.app_route_status = msg,
+                                            Ok(msg) => {
+                                                self.selected_app_idx = Some(idx);
+                                                self.app_route_status = msg;
+                                            }
                                             Err(err) => self.app_route_status = err,
                                         }
                                     }
@@ -2419,13 +2609,16 @@ impl AudioShareApp {
                         });
 
                         if mode_changed && self.phone_mic_receiver.is_some() {
+                            if self.pin_dirty {
+                                self.apply_pin_now();
+                            }
                             if let Some(mut m) = self.phone_mic_receiver.take() {
                                 m.stop();
                             }
                             let phone_pin = if self.enable_pin_encryption
                                 && !self.pairing_pin.trim().is_empty()
                             {
-                                Some(self.pairing_pin.clone())
+                                Some(self.pairing_pin.trim().to_string())
                             } else {
                                 None
                             };
@@ -2465,10 +2658,13 @@ impl AudioShareApp {
                                 if let Some(mut m) = self.phone_mic_receiver.take() {
                                     m.stop();
                                 } else {
+                                    if self.pin_dirty {
+                                        self.apply_pin_now();
+                                    }
                                     let phone_pin = if self.enable_pin_encryption
                                         && !self.pairing_pin.trim().is_empty()
                                     {
-                                        Some(self.pairing_pin.clone())
+                                        Some(self.pairing_pin.trim().to_string())
                                     } else {
                                         None
                                     };
@@ -2501,17 +2697,6 @@ impl AudioShareApp {
                                         host.telemetry
                                             .trigger_sonar_ping
                                             .store(true, Ordering::Relaxed);
-                                    }
-                                    let tx_us = host
-                                        .telemetry
-                                        .sonar_tx_timestamp_us
-                                        .load(Ordering::Relaxed);
-                                    let rx_us =
-                                        mic.last_chirp_rx_timestamp_us.load(Ordering::Relaxed);
-                                    if rx_us > tx_us && (rx_us - tx_us) < 500_000 {
-                                        self.measured_sonar_ms =
-                                            Some(((rx_us - tx_us) as f32) / 2000.0);
-                                        self.measured_sonar_at = Some(Instant::now());
                                     }
                                 }
                             }
@@ -2565,6 +2750,7 @@ impl AudioShareApp {
                             if let Some(mut c) = self.client_engine.take() {
                                 c.stop();
                             }
+                            self.drift_history = VecDeque::from(vec![0.0; 120]);
                             self.client_status_msg = "Disconnected.".into();
                         }
                     }
@@ -2588,6 +2774,37 @@ impl AudioShareApp {
                         p.muted_text
                     }),
             );
+
+            if let Some(ref client) = self.client_engine {
+                let auth_err = client.telemetry.auth_failures.load(Ordering::Relaxed);
+                let idle_secs = client
+                    .telemetry
+                    .seconds_since_last_packet
+                    .load(Ordering::Relaxed);
+                if auth_err > 0 {
+                    ui.add_space(2.0);
+                    uw::status_pill(
+                        ui,
+                        &format!(
+                            "Authentication failed ({} packet(s)) — verify Pairing PIN in Settings",
+                            auth_err
+                        ),
+                        p.warn_bg,
+                        p.warn_fg,
+                    );
+                } else if idle_secs >= 3 {
+                    ui.add_space(2.0);
+                    uw::status_pill(
+                        ui,
+                        &format!(
+                            "No audio packets from Host for {}s — waiting for stream or reconnect…",
+                            idle_secs
+                        ),
+                        p.warn_bg,
+                        p.warn_fg,
+                    );
+                }
+            }
 
             if !discovered.is_empty() {
                 ui.separator();
@@ -2620,25 +2837,32 @@ impl AudioShareApp {
                                     && !self.pairing_pin.trim().is_empty())
                             {
                                 self.show_toast(
-                                    "Encrypted host — enable PIN encryption in Settings and use the same PIN",
+                                    "Encrypted host — enable PIN encryption in Settings and enter the host's PIN",
                                 );
+                                self.client_status_msg =
+                                    "PIN required: enable PIN encryption in Settings to connect to this host.".into();
+                                self.settings_tab = SettingsTab::NetworkAndSecurity;
+                                self.show_settings_modal = true;
+                                return;
                             }
                             self.usb_buffer_mode = host.is_usb;
                             self.connect_client(host.addr);
                         }
                     });
                 }
-            } else if !self.client_manual_ip_open {
+            } else {
                 ui.label(
-                    egui::RichText::new(
-                        "Scanning LAN & USB for beacons... Click 'Manual IP / USB' to enter an address directly.",
-                    )
+                    egui::RichText::new(if self.client_manual_ip_open {
+                        "Scanning LAN & USB for beacons... Or enter a Host IP:Port below."
+                    } else {
+                        "Scanning LAN & USB for beacons... Click 'Manual IP / USB' to enter an address directly."
+                    })
                     .size(11.5)
                     .color(p.muted_text),
                 );
             }
 
-            if self.client_manual_ip_open || discovered.is_empty() {
+            if self.client_manual_ip_open {
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Host IP:Port:").size(12.5).strong());
@@ -3457,7 +3681,7 @@ phone_rx_mode=1
             name: "Game".into(),
         };
 
-        let audio_apps_initial = vec![app1.clone(), app2.clone(), app3.clone()];
+        let audio_apps_initial = [app1.clone(), app2.clone(), app3.clone()];
         // Select app2 (index 1, PID 2002)
         let selected_app_idx = Some(1);
         let prev_pid = selected_app_idx.and_then(|idx| audio_apps_initial.get(idx).map(|a| a.pid));
@@ -3469,7 +3693,7 @@ phone_rx_mode=1
             pid: 4004,
             name: "Chat".into(),
         };
-        let audio_apps_refreshed = vec![app_chat, app2.clone(), app3.clone()];
+        let audio_apps_refreshed = [app_chat, app2.clone(), app3.clone()];
 
         // With PID-based preservation:
         let new_selected_idx = prev_pid.and_then(|pid| {
@@ -3478,7 +3702,7 @@ phone_rx_mode=1
         assert_eq!(new_selected_idx, Some(1)); // Still points to Music Player (PID 2002)
 
         // Now test when Music Player (PID 2002) exits entirely
-        let audio_apps_closed = vec![app3.clone()];
+        let audio_apps_closed = [app3.clone()];
         let closed_selected_idx = prev_pid.and_then(|pid| {
             audio_apps_closed.iter().position(|a| a.pid == pid)
         });
@@ -3487,7 +3711,7 @@ phone_rx_mode=1
 
     #[test]
     fn test_pairing_pin_effective_resolution() {
-        fn effective_pin<'a>(enabled: bool, pin: &'a str) -> Option<&'a str> {
+        fn effective_pin(enabled: bool, pin: &str) -> Option<&str> {
             if enabled && !pin.trim().is_empty() {
                 Some(pin)
             } else {

@@ -511,7 +511,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         read: (AudioShareUiState) -> T,
         write: (AudioShareUiState, T) -> AudioShareUiState
     ): ReadWriteProperty<Any?, T> = object : ReadWriteProperty<Any?, T> {
-        override fun getValue(thisRef: Any?, property: KProperty<*>): T = read(state)
+        override fun getValue(thisRef: Any?, property: KProperty<*>): T {
+            // Subscribe this composition scope to `state`, while reading the
+            // live StateFlow value so synchronous read-after-write callbacks
+            // (applyDspLive / syncAndSaveDsp) always see the newly written value.
+            @Suppress("UNUSED_VARIABLE")
+            val trackedSnapshot = read(state)
+            return read(vm.uiState.value)
+        }
         override fun setValue(thisRef: Any?, property: KProperty<*>, value: T) {
             vm.update { write(it, value) }
         }
@@ -657,8 +664,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     var showCodecDrawer by vmField({ it.showCodecDrawer }, { s, v -> s.copy(showCodecDrawer = v) })
 
     /** Zero-allocation live DSP update: JNI only, no SharedPreferences or intents. */
-    fun applyDspLive() {
-        AudioEngineService.nativeSetGainDb(preampGainDb)
+    fun applyDspLive(updatePreamp: Boolean = false) {
+        if (updatePreamp || !AudioEngineService.isLocallyMutedState) {
+            AudioEngineService.nativeSetGainDb(preampGainDb)
+        }
         AudioEngineService.nativeConfigureDsp(
             bassDb, vocalDb, trebleDb, channelRole,
             crossfeed, nightMode, gamingLock, dolbyEffects
@@ -666,7 +675,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     }
 
     /** Flush the final DSP values to prefs and the service after a gesture ends. */
-    fun syncAndSaveDsp() {
+    fun syncAndSaveDsp(updatePreamp: Boolean = false) {
         prefs.edit()
             .putFloat("gain_db", preampGainDb)
             .putFloat("bass_db", bassDb)
@@ -678,11 +687,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             .putBoolean("dolby_fx", dolbyEffects)
             .putInt("channel_role", channelRole)
             .apply()
-        applyDspLive()
+        applyDspLive(updatePreamp = updatePreamp)
         // Changing the preamp unmutes audio via nativeSetGainDb above. Clear
-        // the service's notification mute flag only when actually muted so
-        // touching EQ/switches/sliders never triggers redundant Service IPC.
-        if (isConnected && AudioEngineService.isLocallyMutedState) {
+        // the service's notification mute flag only when the user actually
+        // adjusted the preamp while muted, so touching EQ/switches never
+        // accidentally unmutes a muted stream.
+        if (updatePreamp && isConnected && AudioEngineService.isLocallyMutedState) {
             context.startService(
                 Intent(context, AudioEngineService::class.java).apply {
                     action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
@@ -724,6 +734,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
                         false
                     )
+                    val err = intent.getStringExtra(AudioEngineService.EXTRA_PHONE_MIC_ERROR)
+                    if (!err.isNullOrBlank()) {
+                        scope.launch { snackbarHostState.showSnackbar(err) }
+                    }
                 } else if (intent?.action == AudioEngineService.ACTION_SLEEP_TIMER_STATE) {
                     sleepTimerMinutes = intent.getIntExtra(
                         AudioEngineService.EXTRA_SLEEP_REMAINING_MINS,
@@ -738,6 +752,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     if (!err.isNullOrBlank()) {
                         scope.launch { snackbarHostState.showSnackbar(err) }
                     }
+                } else if (intent?.action == AudioEngineService.ACTION_DEEP_LINK_HOST) {
+                    val linkedHost = intent.getStringExtra("HOST_ADDR").orEmpty().trim()
+                    val linkedPin = intent.getStringExtra("PIN").orEmpty().trim()
+                    if (linkedHost.isNotEmpty()) {
+                        hostAddress = linkedHost
+                        pinCode = linkedPin
+                    }
                 }
             }
         }
@@ -746,6 +767,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             addAction(AudioEngineService.ACTION_PHONE_MIC_STATE)
             addAction(AudioEngineService.ACTION_SLEEP_TIMER_STATE)
             addAction(AudioEngineService.ACTION_STREAM_STATE)
+            addAction(AudioEngineService.ACTION_DEEP_LINK_HOST)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -816,6 +838,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             startPhoneMicInService()
         } else {
             sharePhoneMic = false
+            scope.launch {
+                snackbarHostState.showSnackbar("Microphone permission is required to share phone mic")
+            }
         }
     }
 
@@ -841,11 +866,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             if (sharePhoneMic) {
                 sharePhoneMic = false
             }
+            val cleanPin = pinCode.trim()
+            HostPinStore.savePin(prefs, hostAddress, cleanPin)
             val svcIntent = Intent(context, AudioEngineService::class.java).apply {
                 action = AudioEngineService.ACTION_START_PARTY_CAST
                 putExtra("PROJECTION_RESULT_CODE", result.resultCode)
                 putExtra("PROJECTION_DATA", resultData)
                 putExtra("TARGET_HOSTS", if (forwardPartyToPc) hostAddress else "")
+                putExtra("PIN", cleanPin)
             }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -876,6 +904,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             projectionLauncher.launch(createAudioCaptureProjectionIntent())
         } else if (!granted) {
             castPhoneInternalAudio = false
+            scope.launch {
+                snackbarHostState.showSnackbar("Audio capture permission is required for Party Mode")
+            }
         }
     }
 
@@ -888,6 +919,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 isConnected = AudioEngineService.isStreaming
+                castPhoneInternalAudio = AudioEngineService.isPartyCasting
+                sharePhoneMic = AudioEngineService.isPhoneMicActive
+                sleepTimerMinutes = AudioEngineService.sleepRemainingMinutes
+                if (!isConnected && !castPhoneInternalAudio && !sharePhoneMic &&
+                    (telemetry.rxPackets != 0L || telemetry.partyListeners != 0L || telemetry.clientVuPeakPct != 0)
+                ) {
+                    telemetry = TelemetrySnapshot.EMPTY
+                }
                 discoveredHosts = withContext(Dispatchers.IO) {
                     runCatching { AudioEngineService.nativeGetDiscoveredHosts() }
                         .getOrDefault("").lines().filter { it.isNotBlank() }
@@ -916,12 +955,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
             return@LaunchedEffect
         }
-        val targetNorm = hostAddress.trim().lowercase()
+        val targetNorm = HostPinStore.normalizeHost(hostAddress)
         val targetEncryptedOnLan = discoveredHosts.any { entry ->
             val parts = entry.split("|")
-            val addr = parts.getOrNull(1)?.trim()?.lowercase()
+            val addr = HostPinStore.normalizeHost(parts.getOrNull(1).orEmpty())
             val enc = parts.getOrNull(3) == "1"
-            addr == targetNorm && enc
+            addr.isNotEmpty() && addr == targetNorm && enc
         }
         if (targetEncryptedOnLan && telemetry.rxPackets == 0L) {
             promptedSilentRejectAttempt = attempt
@@ -1224,12 +1263,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             onClick = {
                                 val usbAddr = "127.0.0.1:65530"
                                 val usbPin = HostPinStore.getPin(prefs, usbAddr)
-                                if (!isConnected) {
-                                    connectToHost(usbAddr, true, usbPin)
-                                } else {
-                                    hostAddress = usbAddr
-                                    pinCode = usbPin
-                                }
+                                connectToHost(usbAddr, true, usbPin)
                             },
                             shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
@@ -1424,7 +1458,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             bassDb = 0f
                             vocalDb = 0f
                             trebleDb = 0f
-                            syncAndSaveDsp()
+                            syncAndSaveDsp(updatePreamp = true)
                         }) {
                             Text("Reset All")
                         }
@@ -1464,9 +1498,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         valueRange = -12.0f..24.0f,
                         onValueChange = {
                             preampGainDb = it
-                            applyDspLive()
+                            applyDspLive(updatePreamp = true)
                         },
-                        onValueChangeFinished = { syncAndSaveDsp() }
+                        onValueChangeFinished = { syncAndSaveDsp(updatePreamp = true) }
                     )
                 }
 
@@ -1599,7 +1633,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 // =====================================================================
                 val modeSummary = when (qualityMode) {
                     1 -> "16-Bit"
-                    2 -> "VBR ${compressedBitrateKbps}k"
+                    2 -> "${if (useOpus) "Opus" else "VBR"} ${compressedBitrateKbps}k"
                     3 -> "10ms 2.4G"
                     4 -> "24-Bit"
                     else -> "Smart Auto"
@@ -1779,6 +1813,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             title = "Also Forward to PC Receiver (Port 65532)",
                             subtitle = "Unicast stream to $hostAddress (OFF = Pure Peer Auto-Discovery)",
                             checked = forwardPartyToPc,
+                            enabled = !castPhoneInternalAudio,
                             onCheckedChange = { enabled ->
                                 forwardPartyToPc = enabled
                                 prefs.edit().putBoolean("party_forward_pc", enabled).apply()
@@ -1857,7 +1892,11 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 telemetry = { telemetry },
                                 partySilenceWarning = partySilenceWarning,
                                 showPartyQrDialog = showPartyQrDialog,
-                                pinCode = pinCode,
+                                pinCode = if (castPhoneInternalAudio) {
+                                    AudioEngineService.activePartyPin
+                                } else {
+                                    pinCode
+                                },
                                 onSilenceWarning = { partySilenceWarning = it },
                                 onShowQr = { showPartyQrDialog = true },
                                 onDismissQr = { showPartyQrDialog = false },
@@ -2002,7 +2041,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             onDismiss = { showQrScanner = false },
             onScanned = { host, pin ->
                 showQrScanner = false
-                connectToHost(host, false, pin)
+                connectToHost(host.trim(), null, pin.trim())
             }
         )
     }

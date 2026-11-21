@@ -220,28 +220,32 @@ pub(crate) mod windows_endpoint_switch {
             let col_vtbl = *(col as *const *const IMMDeviceCollectionVtbl);
             let mut count = 0u32;
             let _ = ((*col_vtbl).get_count)(col, &mut count);
-            let mut found = None;
+            let mut preferred = None;
+            let mut fallback = None;
             for i in 0..count {
                 let mut dev: *mut c_void = core::ptr::null_mut();
                 if ((*col_vtbl).item)(col, i, &mut dev) >= 0 && !dev.is_null() {
                     if let Some(name) = device_friendly_name(dev) {
                         let lower = name.to_ascii_lowercase();
-                        if lower.contains("cable input")
-                            || lower.contains("audioshare")
-                            || lower.contains("virtual")
-                        {
-                            found = device_id(dev);
+                        // Prioritize VB-Cable ("CABLE Input") and AudioShare
+                        // virtual speakers over generic "virtual" devices
+                        // (e.g. Oculus / NVIDIA / Virtual Desktop) so an
+                        // unrelated driver never hijacks VB-Cable.
+                        if lower.contains("cable input") || lower.contains("audioshare") {
+                            preferred = device_id(dev);
+                        } else if fallback.is_none() && lower.contains("virtual") {
+                            fallback = device_id(dev);
                         }
                     }
                     let dev_vtbl = *(dev as *const *const IMMDeviceVtbl);
                     ((*dev_vtbl).unk.release)(dev);
-                    if found.is_some() {
+                    if preferred.is_some() {
                         break;
                     }
                 }
             }
             ((*col_vtbl).unk.release)(col);
-            found
+            preferred.or(fallback)
         }
     }
 
@@ -470,8 +474,20 @@ pub(crate) fn spawn_windows_process_loopback(
                         && running.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         let _ = WaitForSingleObject(sample_evt.0, 20);
-                        while let Ok(pkt_frames) = capture.GetNextPacketSize() {
-                            if pkt_frames == 0 { break; }
+                        loop {
+                            let pkt_frames = match capture.GetNextPacketSize() {
+                                Ok(n) => n,
+                                Err(_) => {
+                                    // Endpoint/service invalidated: signal the
+                                    // host watchdog so it rebinds cleanly
+                                    // instead of spinning silently forever.
+                                    stream_error.store(true, std::sync::atomic::Ordering::Release);
+                                    break 'capture;
+                                }
+                            };
+                            if pkt_frames == 0 {
+                                break;
+                            }
                             let mut data_ptr = core::ptr::null_mut();
                             let mut frames = 0u32;
                             let mut buf_flags = 0u32;
@@ -557,6 +573,26 @@ pub fn list_active_audio_apps() -> Vec<AudioAppEntry> {
 /// Live sink-input IDs currently routed to `sink_name` (PipeWire/Pulse).
 #[cfg(target_os = "linux")]
 fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
+    // Column 2 of `pactl list short sink-inputs` is the numeric sink index
+    // (not the sink name), so resolve `sink_name` -> numeric index first.
+    let target_sink_idx: Option<String> = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let idx = fields.next()?;
+                let name = fields.next()?;
+                if name == sink_name {
+                    Some(idx.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
     let Ok(output) = Command::new("pactl")
         .args(["list", "short", "sink-inputs"])
         .output()
@@ -570,8 +606,10 @@ fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
         let Some(id) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if fields.next() == Some(sink_name) {
-            ids.push(id);
+        if let Some(col2) = fields.next() {
+            if col2 == sink_name || target_sink_idx.as_deref() == Some(col2) {
+                ids.push(id);
+            }
         }
     }
     ids
@@ -785,10 +823,28 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
                 .output();
         }
 
-        // Capture the sink's monitor as the default input.
-        let _ = Command::new("pactl")
-            .args(["set-default-source", "AudioShare_Ultra.monitor"])
-            .output();
+        // Return any previously isolated apps back to @DEFAULT_SINK@ before
+        // isolating the newly selected app so switching App A -> App B never
+        // leaves App A muted on the null sink.
+        let prev_routed: Vec<u32> = {
+            let mut routed = ROUTED_SINK_INPUTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut prev = std::mem::take(&mut *routed);
+            for id in sink_inputs_on_sink("AudioShare_Ultra") {
+                if !prev.contains(&id) {
+                    prev.push(id);
+                }
+            }
+            prev
+        };
+        for id in prev_routed {
+            if id != app.id {
+                let _ = Command::new("pactl")
+                    .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
+                    .output();
+            }
+        }
 
         let status = Command::new("pactl")
             .args(["move-sink-input", &app.id.to_string(), "AudioShare_Ultra"])
@@ -796,6 +852,12 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             .map_err(|e| format!("Failed to move sink-input: {}", e))?;
 
         if status.success() {
+            // Only switch the capture source AFTER move-sink-input succeeded so
+            // a failed route never leaves @DEFAULT_SOURCE@ stranded on an empty
+            // null sink monitor.
+            let _ = Command::new("pactl")
+                .args(["set-default-source", "AudioShare_Ultra.monitor"])
+                .output();
             if let Ok(mut routed) = ROUTED_SINK_INPUTS.lock() {
                 if !routed.contains(&app.id) {
                     routed.push(app.id);
@@ -853,7 +915,16 @@ pub fn restore_all_apps_to_default_sink() -> String {
                 .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
                 .output();
         }
-        if !to_restore.is_empty() {
+        // Always restore `@DEFAULT_SOURCE@` if it is still pointing at
+        // `AudioShare_Ultra.monitor`, even if the isolated app already exited
+        // (`to_restore.is_empty()`).
+        let current_source = Command::new("pactl")
+            .arg("get-default-source")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !to_restore.is_empty() || current_source == "AudioShare_Ultra.monitor" {
             if let Ok(out) = Command::new("pactl").arg("get-default-sink").output() {
                 let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !sink.is_empty() && sink != "AudioShare_Ultra" {

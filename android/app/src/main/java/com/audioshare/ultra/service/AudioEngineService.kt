@@ -68,9 +68,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // foreground notification even when the Compose UI is not running.
         const val ACTION_TOGGLE_PARTY_MUTE = "ACTION_TOGGLE_PARTY_MUTE"
         const val ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE = "ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE"
+        const val ACTION_DEEP_LINK_HOST = "ACTION_DEEP_LINK_HOST"
+        const val EXTRA_PHONE_MIC_ERROR = "PHONE_MIC_ERROR"
 
         @Volatile
         var isPartyCasting: Boolean = false
+            private set
+
+        @Volatile
+        var activePartyPin: String = ""
             private set
 
         @Volatile
@@ -229,6 +235,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // Guards against a late native-start postback from a connection that was
     // stopped or superseded while the blocking JNI call was in flight.
     private val connectGen = java.util.concurrent.atomic.AtomicLong(0)
+    private val micGen = java.util.concurrent.atomic.AtomicLong(0)
     private val sleepTickRunnable = object : Runnable {
         override fun run() {
             if (sleepRemainingMinutes <= 1) {
@@ -304,11 +311,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_STOP_CLIENT_ONLY) {
             val keepAlive = isPartyCasting || micCaptureActive
-            connectGen.incrementAndGet()
+            val gen = connectGen.incrementAndGet()
             runOnEngine {
                 nativeStopClient()
                 mainHandler.post {
-                    if (engineExecutor.isShutdown) return@post
+                    if (engineExecutor.isShutdown || gen != connectGen.get()) return@post
                     isStreaming = false
                     sleepHandler.removeCallbacks(sleepTickRunnable)
                     stopSilenceWatchdog()
@@ -363,7 +370,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
                 android.content.pm.PackageManager.PERMISSION_GRANTED
             ) {
-                broadcastPhoneMicState(false)
+                broadcastPhoneMicState(false, "Microphone permission is required to share phone mic")
                 if (!isStreaming && !isPartyCasting) {
                     ensureForegroundBeforeStop()
                     stopStreamAndService()
@@ -381,19 +388,26 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             // be active BEFORE AAudio opens the input. Own the mic lifecycle in
             // the service (like ACTION_START_PARTY_CAST) instead of racing
             // startForegroundService from the Compose UI thread.
+            micGen.incrementAndGet()
             micCaptureActive = true
             startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
             acquireRealtimeHardwareLocks()
             val started = nativeStartPhoneMic(target, true, pin)
             if (!started) {
                 micCaptureActive = false
-                broadcastPhoneMicState(false)
+                broadcastPhoneMicState(
+                    false,
+                    "Unable to start phone mic for '$target' — select a valid PC host IP first"
+                )
                 if (!isStreaming && !isPartyCasting) {
                     stopStreamAndService()
                     return START_NOT_STICKY
                 }
                 startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = false)
                 return START_STICKY
+            }
+            if (isLocallyMuted) {
+                runCatching { nativeSetPartyCastMuted(true) }
             }
             broadcastPhoneMicState(true)
             refreshAdpfHintSession()
@@ -404,10 +418,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_STOP_PHONE_MIC) {
             val keepAlive = isStreaming || isPartyCasting
+            val gen = micGen.incrementAndGet()
             runOnEngine {
-                nativeStopPhoneMic()
+                if (gen == micGen.get()) {
+                    nativeStopPhoneMic()
+                }
                 mainHandler.post {
-                    if (engineExecutor.isShutdown) return@post
+                    if (engineExecutor.isShutdown || gen != micGen.get()) return@post
                     micCaptureActive = false
                     broadcastPhoneMicState(false)
                     if (!isStreaming && !isPartyCasting) {
@@ -425,6 +442,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         if (intent?.action == ACTION_SET_BT_OFFSET) {
             reportBluetoothRoute()
+            if (!isStreaming && !isPartyCasting && !micCaptureActive) {
+                stopSelf()
+                return START_NOT_STICKY
+            }
             return START_STICKY
         }
         if (intent?.action == ACTION_CLEAR_LOCAL_MUTE) {
@@ -434,7 +455,14 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             // disabled by `if (isLocallyMuted) return`.
             if (isLocallyMuted) {
                 isLocallyMuted = false
+                if (micCaptureActive) {
+                    runCatching { nativeSetPartyCastMuted(false) }
+                }
                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
+            }
+            if (!isStreaming && !isPartyCasting && !micCaptureActive) {
+                stopSelf()
+                return START_NOT_STICKY
             }
             return START_STICKY
         }
@@ -444,6 +472,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             broadcastSleepTimer(mins)
             if (mins > 0) {
                 sleepHandler.postDelayed(sleepTickRunnable, 60_000L)
+            } else if (!isStreaming && !isPartyCasting && !micCaptureActive) {
+                stopSelf()
+                return START_NOT_STICKY
             }
             return START_STICKY
         }
@@ -452,7 +483,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val savedGain = prefs.getFloat("gain_db", 0.0f)
             isLocallyMuted = !isLocallyMuted
             nativeSetGainDb(if (isLocallyMuted) -96.0f else savedGain)
-            if (!isLocallyMuted) {
+            if (micCaptureActive) {
+                runCatching { nativeSetPartyCastMuted(isLocallyMuted) }
+            }
+            if (!isLocallyMuted && isStreaming) {
                 // Re-claim audio focus so the app that stole it pauses instead
                 // of playing over us after the user unmutes.
                 requestAudioFocus(dolbyEffects)
@@ -542,8 +576,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         broadcastStreamState(true, null)
         scheduleSilenceWatchdog()
-        // Restore saved Studio EQ, Spatial Role, Crossfeed, Night Mode, Gaming
-        // Lock and the Dolby/system-effects preference automatically!
+        // Re-apply the active Bluetooth route delay now that the native
+        // ClientEngine exists, and restore saved Studio EQ / DSP settings.
+        reportBluetoothRoute()
         applyDspFromPrefs()
         // Restore both the saved Host Quality Mode (1..=5) and the compressed
         // codec backend (20 = Rust VBR, 21 = Opus RLD) on every stream start.
@@ -668,15 +703,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private fun reportBluetoothRoute() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val fallbackBtDelayMs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val attrs = AudioAttributes.Builder().apply {
-                if (dolbyEffects) {
-                    setUsage(AudioAttributes.USAGE_MEDIA)
-                    setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                } else {
-                    setUsage(AudioAttributes.USAGE_GAME)
-                    setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                }
-            }.build()
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .build()
             val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
             when (routedType) {
                 AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145
@@ -703,14 +733,14 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 else -> 0
             }
         }
-        val reportedDelayMs = if (fallbackBtDelayMs == 145) {
+        val reportedDelayMs = if (fallbackBtDelayMs > 0) {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val manualOverride = prefs.getInt("bt_delay_override_ms", 0)
             if (manualOverride in 40..350) {
                 // Live BT Lip-Sync Calibration slider value wins over the
-                // estimate so the user can dial their exact earbud delay.
+                // estimate for any active Bluetooth route (A2DP, BLE Audio, SCO).
                 manualOverride
-            } else {
+            } else if (fallbackBtDelayMs == 145) {
                 // Android 10-14 blocks reflection on hidden getOutputLatency;
                 // real SBC/AAC/LDAC earbuds typically sit around 185-240 ms.
                 val avdtpMs = runCatching {
@@ -718,9 +748,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
                 }.getOrDefault(0)
                 if (avdtpMs in 35..350) avdtpMs else 185
+            } else {
+                fallbackBtDelayMs
             }
         } else {
-            fallbackBtDelayMs
+            0
         }
         if (reportedDelayMs != lastReportedBtDelayMs) {
             lastReportedBtDelayMs = reportedDelayMs
@@ -836,13 +868,17 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun isUsbHost(hostAddr: String): Boolean {
         if (hostAddr.startsWith("127.0.0.1") ||
-            hostAddr.startsWith("192.168.42.") ||
-            hostAddr.startsWith("192.168.137.")
+            hostAddr.startsWith("[::1]") ||
+            hostAddr.startsWith("192.168.42.")
         ) {
             return true
         }
         // Bracket-aware: "[fd00::1]:65530" must yield "fd00::1", not "".
-        val hostIp = hostAddr.removePrefix("[").substringBefore("]:").substringBefore(':')
+        val hostIp = if (hostAddr.startsWith("[")) {
+            hostAddr.substringAfter("[").substringBefore("]")
+        } else {
+            hostAddr.substringBefore(':')
+        }
         return try {
             val ifaces = java.net.NetworkInterface.getNetworkInterfaces() ?: return false
             for (iface in ifaces) {
@@ -928,6 +964,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // Playback capture is not microphone capture. A previous video-call
         // session may still hold the native hardware-mic transmitter; release
         // it here so the service stays the single owner of phone-mic state.
+        micGen.incrementAndGet()
         nativeStopPhoneMic()
         broadcastPhoneMicState(false)
         micCaptureActive = false
@@ -948,7 +985,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 ?: return failPartyCastStart()
             projection = acquired
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
-            val pin = prefs.getString("pin_code", "") ?: ""
+            val pin = (intent.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: "").trim()
+            activePartyPin = pin
             // Apply the user's locked Party codec & bitrate before starting the
             // transmitter so Party Mode never auto-switches mid-stream.
             val partyCodecProfile = prefs.getInt("party_codec_profile", 0).coerceIn(0, 3)
@@ -999,6 +1037,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } catch (e: Exception) {
             runCatching { projection?.stop() }
             Log.e("AudioEngineService", "Unable to start party cast", e)
+            ensureForegroundBeforeStop()
             return failPartyCastStart()
         }
     }
@@ -1011,6 +1050,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         activeCaster = null
         caster?.stopCasting()
         projectionActive = false
+        activePartyPin = ""
         isPartyCastMuted = false
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
@@ -1039,6 +1079,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val caster = activeCaster
         activeCaster = null
         projectionActive = false
+        activePartyPin = ""
         isPartyCastMuted = false
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
@@ -1065,6 +1106,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             nativeLogEvent(1, "party-cast", "Party cast ended (projection revoked or caster stopped)")
         }
         projectionActive = false
+        activePartyPin = ""
         isPartyCastMuted = false
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
@@ -1116,11 +1158,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         sendBroadcast(intent)
     }
 
-    private fun broadcastPhoneMicState(active: Boolean) {
+    private fun broadcastPhoneMicState(active: Boolean, error: String? = null) {
         isPhoneMicActive = active
         val intent = Intent(ACTION_PHONE_MIC_STATE).apply {
             setPackage(packageName)
             putExtra(EXTRA_PHONE_MIC_ACTIVE, active)
+            if (!error.isNullOrBlank()) putExtra(EXTRA_PHONE_MIC_ERROR, error)
         }
         sendBroadcast(intent)
     }
@@ -1246,11 +1289,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
             val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
             val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
+            val muteLabel = if (micCaptureActive && !isStreaming) {
+                if (isLocallyMuted) "Unmute Mic" else "Mute Mic"
+            } else {
+                if (isLocallyMuted) "Unmute" else "Mute"
+            }
             builder
                 .setContentTitle("AudioShare Ultra • $badge")
                 .setContentText(statusText)
                 .addAction(playPauseIcon, playPauseLabel, playPausePending)
-                .addAction(android.R.drawable.ic_lock_silent_mode, if (isLocallyMuted) "Unmute" else "Mute", mutePending)
+                .addAction(android.R.drawable.ic_lock_silent_mode, muteLabel, mutePending)
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPending)
         }
         val notification = builder.build()
@@ -1351,11 +1399,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private fun stopStreamAndService() {
         // Invalidate any in-flight native-start postback before teardown.
         connectGen.incrementAndGet()
+        micGen.incrementAndGet()
         // Drop the caster before stopping the foreground service so a late
         // projection callback cannot re-enter teardown.
         val caster = activeCaster
         activeCaster = null
         projectionActive = false
+        activePartyPin = ""
         isPartyCastMuted = false
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)

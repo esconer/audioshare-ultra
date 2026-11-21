@@ -132,8 +132,8 @@ impl DiscoveryBeacon {
                 // Link-local scope: never leak discovery beacons past the LAN.
                 let _ = sock.set_multicast_ttl_v4(1);
                 // Interface enumeration is comparatively expensive. Cache the
-                // per-interface broadcast targets and refresh only every 5 s.
-                let mut broadcast_targets: Vec<SocketAddr> = Vec::new();
+                // per-interface (local_ip, broadcast_addr) pairs and refresh only every 5 s.
+                let mut iface_targets: Vec<(Ipv4Addr, SocketAddr)> = Vec::new();
                 let mut last_iface_scan: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
                     let payload = beacon_payload(
@@ -145,17 +145,15 @@ impl DiscoveryBeacon {
                         payload.as_bytes(),
                         SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
                     );
-                    let _ = sock.send_to(
-                        payload.as_bytes(),
-                        SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT)),
-                    );
+                    let mcast_dest = SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT));
+                    let _ = sock.send_to(payload.as_bytes(), mcast_dest);
 
                     if last_iface_scan
                         .map(|t| t.elapsed() >= BEACON_IFACE_REFRESH)
                         .unwrap_or(true)
                     {
                         last_iface_scan = Some(Instant::now());
-                        broadcast_targets.clear();
+                        iface_targets.clear();
                         // Use the OS-reported broadcast address (correct for
                         // /16, /23, point-to-point and USB tethering links)
                         // instead of assuming /24. Fall back to the legacy
@@ -171,16 +169,30 @@ impl DiscoveryBeacon {
                                         let o = v4.ip.octets();
                                         Ipv4Addr::new(o[0], o[1], o[2], 255)
                                     });
-                                    broadcast_targets
-                                        .push(SocketAddr::from((bcast, DISCOVERY_PORT)));
+                                    iface_targets
+                                        .push((v4.ip, SocketAddr::from((bcast, DISCOVERY_PORT))));
                                 }
                             }
                         }
                     }
-                    for target in &broadcast_targets {
-                        let _ = sock.send_to(payload.as_bytes(), *target);
+                    let sock_ref = socket2::SockRef::from(&sock);
+                    for &(local_ip, bcast_target) in &iface_targets {
+                        let _ = sock.send_to(payload.as_bytes(), bcast_target);
+                        // Also emit the link-local multicast beacon explicitly out
+                        // of each physical NIC so multi-homed hosts (Ethernet +
+                        // Wi-Fi / Hotspot / USB RNDIS) discover cleanly even when
+                        // the default route points at Ethernet.
+                        if sock_ref.set_multicast_if_v4(&local_ip).is_ok() {
+                            let _ = sock.send_to(payload.as_bytes(), mcast_dest);
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = sock_ref.set_multicast_if_v4(&Ipv4Addr::UNSPECIFIED);
+                    for _ in 0..10 {
+                        if !run_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
                 }
             })
             .ok();
@@ -369,17 +381,40 @@ impl AdbUsbWatcher {
                 let mut was_connected = false;
                 let mut last_reverse: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
-                    let has_device = silent_command("adb")
-                        .args(["get-state"])
+                    // Enumerate all attached ADB devices in the "device" state so
+                    // `adb reverse` still succeeds when multiple phones or an
+                    // emulator + phone are connected simultaneously (bare
+                    // `adb get-state` / `adb reverse` fails with "more than one
+                    // device/emulator").
+                    let serials: Vec<String> = silent_command("adb")
+                        .args(["devices"])
                         .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .skip(1)
+                                .filter_map(|line| {
+                                    let mut parts = line.split_whitespace();
+                                    let serial = parts.next()?;
+                                    let state = parts.next()?;
+                                    if state == "device" && !serial.is_empty() {
+                                        Some(serial.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let has_device = !serials.is_empty();
 
                     usb_clone.store(has_device, Ordering::Relaxed);
 
                     // `adb reverse` is not durable across a USB cable yank or
                     // an ADB daemon restart: the tunnel silently disappears
-                    // while `adb get-state` still reports a device. Re-arm it
+                    // while `adb devices` still reports a device. Re-arm it
                     // on the initial attach (fast path) and then every 10 s
                     // for as long as the device stays attached.
                     if has_device {
@@ -389,16 +424,26 @@ impl AdbUsbWatcher {
                             .unwrap_or(false);
                         if initial_attach || periodic {
                             let port_spec = format!("tcp:{}", port);
-                            let _ = silent_command("adb")
-                                .args(["reverse", &port_spec, &port_spec])
-                                .output();
+                            for serial in &serials {
+                                let _ = silent_command("adb")
+                                    .args(["-s", serial, "reverse", &port_spec, &port_spec])
+                                    .output();
+                            }
                             last_reverse = Some(Instant::now());
                         }
                     } else {
                         last_reverse = None;
                     }
                     was_connected = has_device;
-                    std::thread::sleep(Duration::from_secs(2));
+                    // Poll `run_clone` every 50 ms instead of blocking in an
+                    // uninterruptible 2 s sleep so `AdbUsbWatcher::drop()`
+                    // returns immediately without freezing the desktop GUI.
+                    for _ in 0..40 {
+                        if !run_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
             })
             .ok();
@@ -463,8 +508,58 @@ impl Drop for AdbSessionSlot {
     }
 }
 
+/// Read a 2-byte big-endian frame length prefix while allowing the connection
+/// to remain idle between frames (`filled == 0`) as long as `alive` and
+/// `running` hold. Once the first byte of a frame arrives (`filled == 1`),
+/// enforces `ADB_TCP_READ_DEADLINE` so a half-open stalled peer still times out.
+fn read_frame_len_interruptible<T: Read>(
+    reader: &mut T,
+    alive: &AtomicBool,
+    running: &AtomicBool,
+) -> std::io::Result<u16> {
+    let mut len_buf = [0u8; 2];
+    let mut filled = 0usize;
+    let mut partial_deadline: Option<Instant> = None;
+    while filled < 2 {
+        if !alive.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "ADB TCP session stopping",
+            ));
+        }
+        if let Some(dl) = partial_deadline {
+            if Instant::now() >= dl {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "ADB TCP length prefix read deadline exceeded",
+                ));
+            }
+        }
+        match reader.read(&mut len_buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB TCP peer closed connection",
+                ));
+            }
+            Ok(n) => {
+                filled += n;
+                if filled == 1 && partial_deadline.is_none() {
+                    partial_deadline = Some(Instant::now() + ADB_TCP_READ_DEADLINE);
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(u16::from_be_bytes(len_buf))
+}
+
 /// Read exactly `buf.len()` bytes, preserving partial progress across
-/// `WouldBlock` / `TimedOut` (e.g. a socket read timeout) instead of restarting
+/// `WouldBlock` / `TimedOut` / `Interrupted` instead of restarting
 /// at offset 0 and corrupting the wire framing. The deadline is rechecked on
 /// every retry so a peer that trickles bytes cannot pin a worker forever.
 fn read_exact_interruptible<T: Read>(
@@ -490,7 +585,8 @@ fn read_exact_interruptible<T: Read>(
             Ok(n) => filled += n,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
@@ -554,19 +650,14 @@ fn spawn_host_adb_tcp_session(
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-in".into())
         .spawn(move || {
-            let mut len_buf = [0u8; 2];
             let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
-                if read_exact_interruptible(
-                    &mut tcp_reader,
-                    &mut len_buf,
-                    Instant::now() + ADB_TCP_READ_DEADLINE,
-                )
-                .is_err()
-                {
+                let Ok(raw_len) =
+                    read_frame_len_interruptible(&mut tcp_reader, &alive_in, &run_in)
+                else {
                     break;
-                }
-                let len = u16::from_be_bytes(len_buf) as usize;
+                };
+                let len = raw_len as usize;
                 if len == 0 || len > pkt.len() {
                     break;
                 }
@@ -677,7 +768,13 @@ impl DirectHotspotController {
                  $cred.Password = '{}'; \
                  $legacy.Passphrase = $cred; \
                  $pub.Start(); \
-                 Write-Output 'ASULTRA_SOFTAP_READY'; \
+                 for ($i = 0; $i -lt 40; $i++) {{ \
+                     $st = $pub.Status.ToString(); \
+                     if ($st -eq 'Started') {{ Write-Output 'ASULTRA_SOFTAP_READY'; break }} \
+                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ Write-Output \"ASULTRA_SOFTAP_FAILED:$st\"; exit 1 }} \
+                     Start-Sleep -Milliseconds 100 \
+                 }}; \
+                 if ($pub.Status.ToString() -ne 'Started') {{ Write-Output 'ASULTRA_SOFTAP_FAILED:Timeout'; exit 1 }}; \
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
@@ -708,24 +805,33 @@ impl DirectHotspotController {
                                         let _ = ready_tx.send(true);
                                         return;
                                     }
+                                    if line.contains("ASULTRA_SOFTAP_FAILED") {
+                                        let _ = ready_tx.send(false);
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
                     let _ = ready_tx.send(false);
                 });
-            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            match ready_rx.recv_timeout(Duration::from_secs(8)) {
                 Ok(true) => {}
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "Wi-Fi Direct SoftAP '{}' did not become ready within 3 s",
+                        "Wi-Fi Direct SoftAP '{}' could not start (check Wi-Fi adapter is enabled)",
                         ssid
                     ));
                 }
             }
-            *windows_hotspot_holder().lock().unwrap() = Some(child);
+            let mut holder = windows_hotspot_holder().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut prev) = holder.take() {
+                let _ = prev.kill();
+                let _ = prev.wait();
+            }
+            *holder = Some(child);
             Ok(format!(
                 "1-Hop Direct Link '{}' Active (IP: 192.168.137.1)",
                 ssid
@@ -887,7 +993,7 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
     #[cfg(target_os = "windows")]
     {
         if enable {
-            let _ = silent_command("reg")
+            match silent_command("reg")
                 .args([
                     "add",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -899,8 +1005,15 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
                     &format!("\"{}\" --autostart", exe_str),
                     "/f",
                 ])
-                .output();
-            "Enabled Windows Boot Auto-Start (HKCU Run)".into()
+                .output()
+            {
+                Ok(o) if o.status.success() => "Enabled Windows Boot Auto-Start (HKCU Run)".into(),
+                Ok(o) => format!(
+                    "Failed to enable Boot Auto-Start: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => format!("Failed to enable Boot Auto-Start: {e}"),
+            }
         } else {
             let _ = silent_command("reg")
                 .args([
@@ -953,7 +1066,12 @@ impl HostVolumeMonitor {
                                 last_os_volume = Some(volume);
                             }
                         }
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !run_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
                 #[cfg(target_os = "windows")]
@@ -972,7 +1090,12 @@ impl HostVolumeMonitor {
                 {
                     let _ = telemetry;
                     while run_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !run_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
             })
@@ -1372,6 +1495,7 @@ impl VirtualSpeakerAndRadioGuard {
             };
             let prev_default_sink_id = if virtual_sink_id.is_some() {
                 crate::app_routing::windows_endpoint_switch::default_playback_id()
+                    .filter(|id| Some(id) != virtual_sink_id.as_ref())
             } else {
                 None
             };

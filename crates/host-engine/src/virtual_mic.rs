@@ -633,6 +633,8 @@ pub struct PhoneMicReceiver {
     #[cfg(target_os = "linux")]
     pactl_mic_source_module_id: Option<String>,
     #[cfg(target_os = "linux")]
+    prev_default_source: Option<String>,
+    #[cfg(target_os = "linux")]
     linux_output: Option<LinuxVirtualMicOutput>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -654,6 +656,28 @@ impl PhoneMicReceiver {
         mode: PhoneRxRoutingMode,
         pin: Option<&str>,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+            use cpal::traits::{DeviceTrait, HostTrait};
+            let has_vbcable = cpal::default_host()
+                .output_devices()
+                .ok()
+                .map(|mut devs| {
+                    devs.any(|d| {
+                        d.name()
+                            .map(|n| n.to_ascii_lowercase().contains("cable input"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if !has_vbcable {
+                return Err(
+                    "VB-Cable ('CABLE Input') not found. Install VB-Cable for Virtual Mic mode, or switch to 'Play on PC Speakers'."
+                        .into(),
+                );
+            }
+        }
+
         let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
@@ -662,8 +686,25 @@ impl PhoneMicReceiver {
         let _ = socket.set_nonblocking(true);
 
         #[cfg(target_os = "linux")]
-        let (pactl_mic_module_id, pactl_mic_source_module_id) =
+        let (pactl_mic_module_id, pactl_mic_source_module_id, prev_default_source) =
             if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                let prev_src = Command::new("pactl")
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            if !s.is_empty() && s != "AudioShare_Phone_Mic" {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    });
+
                 // 1. Create underlying null sink to receive the phone's audio stream silently
                 let sink_id = Command::new("pactl")
                     .args([
@@ -702,12 +743,16 @@ impl PhoneMicReceiver {
                         }
                     });
 
-                let _ = Command::new("pactl")
-                    .args(["set-default-source", "AudioShare_Phone_Mic"])
-                    .output();
-                (sink_id, remap_id)
+                // Do not overwrite `AudioShare_Ultra.monitor` if Linux per-app
+                // capture is currently isolating an application.
+                if prev_src.as_deref() != Some("AudioShare_Ultra.monitor") {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", "AudioShare_Phone_Mic"])
+                        .output();
+                }
+                (sink_id, remap_id, prev_src)
             } else {
-                (None, None)
+                (None, None, None)
             };
 
         let running = Arc::new(AtomicBool::new(true));
@@ -812,7 +857,9 @@ impl PhoneMicReceiver {
                     }
                 };
 
-                #[cfg(not(target_os = "android"))]
+                #[cfg(target_os = "linux")]
+                let pull_sink_active = _mic_out.is_some() || linux_output_active;
+                #[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
                 let pull_sink_active = _mic_out.is_some();
                 #[cfg(target_os = "android")]
                 let pull_sink_active = false;
@@ -855,6 +902,7 @@ impl PhoneMicReceiver {
                 let mut feedback_seq: u32 = wall_clock_ticks.max(1);
                 let mut fb_primary_frames: u32 = 0;
                 let mut fb_recovered_or_lost: u32 = 0;
+                let mut last_target_depth: i16 = 0;
 
                 while run_clone.load(Ordering::Relaxed) {
                     // PIN edits from the UI land between batches; snapshot once
@@ -897,7 +945,11 @@ impl PhoneMicReceiver {
                     };
                     let fifo_watermark = resampler
                         .subframes_to_samples(target_subframes.ceil() as usize)
-                        .min(mic_fifo_thread.capacity_samples());
+                        .min(
+                            mic_fifo_thread
+                                .capacity_samples()
+                                .saturating_sub(SUBFRAME_STEREO_SAMPLES + 16),
+                        );
 
                     while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
                         if let Ok(parsed) = ParsedPacket::parse_and_decrypt(
@@ -954,12 +1006,13 @@ impl PhoneMicReceiver {
                             let resync_ahead = 48i16
                                 .max(fifo_now_sf + 16)
                                 .min((audioshare_protocol::sequencer::RING_SLOTS as i16) - 4);
-                            if dtx_silent || seq_delta > resync_ahead || seq_delta < -32 {
+                            if dtx_silent || seq_delta > resync_ahead || seq_delta < -160 {
                                 dtx_silent = false;
                                 sequencer.reset();
                                 opus_decoder = None;
                                 for slot in &mut opus_ring {
                                     slot.seq = None;
+                                    slot.from_red = false;
                                 }
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
@@ -987,13 +1040,30 @@ impl PhoneMicReceiver {
                             // subframes per datagram; reading only the first
                             // one discarded 50% of the audio.
                             let bundle_is_opus = primary_bundle_is_opus(parsed.primary_payload);
-                            opus_stream_active = bundle_is_opus;
+                            if bundle_is_opus {
+                                opus_stream_active = true;
+                            } else {
+                                for sub_idx in 0..parsed.header.subframe_count {
+                                    let s = base_seq.wrapping_add(sub_idx as u16);
+                                    if (s.wrapping_sub(next_seq) as i16) >= 0 {
+                                        let idx = (s as usize) & (RING_SLOTS - 1);
+                                        opus_ring[idx].seq = None;
+                                        opus_ring[idx].from_red = false;
+                                    }
+                                }
+                            }
                             let mut opus_latest = latest_seq;
+                            // Pass `None` for `opus_decoder` on arrival: Opus
+                            // payloads are always buffered in `opus_ring` and
+                            // decoded at playhead pop time (`push_one_subframe`),
+                            // which drops `opus_decoder` and `opus_stream_active`
+                            // at the exact playhead boundary instead of 15-40 ms
+                            // early while Opus frames remain queued in `opus_ring`.
                             decode_primary_bundle(
                                 parsed.primary_payload,
                                 parsed.header.subframe_count,
                                 base_seq,
-                                Some(&mut opus_decoder),
+                                None,
                                 |missed_seq, plc_pcm| {
                                     // Opus PLC is phase-aligned with the
                                     // lookahead, so it can fill an empty slot
@@ -1020,16 +1090,19 @@ impl PhoneMicReceiver {
                                     // strict in-order decode at the playhead.
                                     // A late packet must never rewind the CELT
                                     // predictor, so drop it here.
-                                    if (s.wrapping_sub(next_seq) as i16) >= 0 {
+                                    if (s.wrapping_sub(next_seq) as i16) >= 0
+                                        && payload.len() <= MAX_OPUS_SUBFRAME_BYTES
+                                    {
                                         let slot = &mut opus_ring[(s as usize) & (RING_SLOTS - 1)];
-                                        if slot.seq != Some(s) {
-                                            let len = payload.len().min(MAX_OPUS_SUBFRAME_BYTES);
+                                        if slot.seq != Some(s) || slot.from_red {
+                                            let len = payload.len();
                                             slot.data[..len].copy_from_slice(&payload[..len]);
                                             slot.len = len as u16;
                                             slot.seq = Some(s);
                                             // A primary always wins over any RED
                                             // heal that previously occupied the slot.
                                             slot.from_red = false;
+                                            sequencer.clear_slot(s);
                                         }
                                         if (s.wrapping_sub(opus_latest) as i16) > 0 {
                                             opus_latest = s;
@@ -1076,13 +1149,26 @@ impl PhoneMicReceiver {
                             // never forced past the fixed 48-subframe guard.
                             let max_depth = base_depth + 8;
                             if buf_depth > max_depth {
-                                next_seq = latest_seq
+                                let new_next_seq = latest_seq
                                     .wrapping_add(1)
                                     .wrapping_sub(base_depth as u16);
+                                let mut s = next_seq;
+                                while s != new_next_seq {
+                                    sequencer.clear_slot(s);
+                                    let idx = (s as usize) & (RING_SLOTS - 1);
+                                    if opus_ring[idx].seq == Some(s) {
+                                        opus_ring[idx].seq = None;
+                                        opus_ring[idx].from_red = false;
+                                    }
+                                    s = s.wrapping_add(1);
+                                }
+                                next_seq = new_next_seq;
                                 sequencer.arm_declick();
                             }
+                            let target_jumped = target_depth >= last_target_depth + 4;
                             if !prebuffer_ready && buf_depth >= base_depth {
                                 prebuffer_ready = true;
+                                last_target_depth = target_depth;
                                 sequencer.arm_fade_in();
                                 let group_extra = (target_depth - base_depth).max(0) as usize;
                                 if group_extra > 0 {
@@ -1104,6 +1190,39 @@ impl PhoneMicReceiver {
                                         }
                                     }
                                 }
+                            } else if prebuffer_ready && target_jumped {
+                                // A Bluetooth peer joined mid-stream: pad the
+                                // FIFO immediately to the new group-sync depth
+                                // instead of forcing the ±400 ppm clock loop to
+                                // take ~5.8 minutes to build 140 ms of delay.
+                                last_target_depth = target_depth;
+                                let fifo_now_sf = resampler
+                                    .samples_to_subframes(mic_fifo_thread.available_samples())
+                                    as i16;
+                                let total_now = buf_depth + fifo_now_sf;
+                                let need_extra = (target_depth - total_now).max(0) as usize;
+                                if need_extra > 0 {
+                                    let mut rem = resampler.subframes_to_samples(need_extra);
+                                    let mut pad = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                                    let mut rng = 0x7F4A_7C15u32;
+                                    while rem > 0 {
+                                        let step = rem.min(pad.len()) & !1;
+                                        if step == 0 {
+                                            break;
+                                        }
+                                        audioshare_protocol::dsp::inject_bluetooth_keepalive_dither(
+                                            &mut pad[..step], &mut rng,
+                                        );
+                                        let pushed = mic_fifo_thread.push_samples(&pad[..step]);
+                                        rem = rem.saturating_sub(pushed);
+                                        if pushed < step {
+                                            break;
+                                        }
+                                    }
+                                    sequencer.arm_fade_in();
+                                }
+                            } else if prebuffer_ready {
+                                last_target_depth = target_depth;
                             }
                         }
                     }
@@ -1266,6 +1385,8 @@ impl PhoneMicReceiver {
             #[cfg(target_os = "linux")]
             pactl_mic_source_module_id,
             #[cfg(target_os = "linux")]
+            prev_default_source,
+            #[cfg(target_os = "linux")]
             linux_output,
             handle: Some(handle),
         })
@@ -1298,8 +1419,22 @@ impl PhoneMicReceiver {
         }
         #[cfg(target_os = "linux")]
         {
-            // Stop pacat first, then remove the remap source and sink.
+            // Stop pacat first, restore previous default source if it still
+            // points at AudioShare_Phone_Mic, then remove remap source and sink.
             drop(self.linux_output.take());
+            if let Some(prev_src) = self.prev_default_source.take() {
+                let current_src = Command::new("pactl")
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if current_src.is_empty() || current_src == "AudioShare_Phone_Mic" {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", &prev_src])
+                        .output();
+                }
+            }
             if let Some(id) = self.pactl_mic_source_module_id.take() {
                 let _ = Command::new("pactl").args(["unload-module", &id]).output();
             }

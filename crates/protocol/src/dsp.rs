@@ -40,12 +40,13 @@ fn sinc_table() -> &'static [[f32; SINC_TAPS]; SINC_PHASES + 1] {
         let inv_i0_beta = 1.0 / bessel_i0(BETA);
         let mut table = [[0.0f32; SINC_TAPS]; SINC_PHASES + 1];
 
-        // Exact unit impulses at phase 0 and phase 1 preserve bit-exact unity
-        // pass-through when `ratio == 1.0` and `phase == 0.0`.
-        table[0][SINC_CENTER] = 1.0;
-        table[SINC_PHASES][SINC_CENTER + 1] = 1.0;
-
-        for p in 1..SINC_PHASES {
+        // Generate all phases 0..=SINC_PHASES continuously from the same
+        // Kaiser-windowed sinc formula (FC = 0.96). Hardcoding unit impulses at
+        // phase 0/1 creates an 11.8x kernel discontinuity that causes severe
+        // mirror imaging on 96/192 kHz DACs and fractional clock-drift sweeps;
+        // exact 1:1 unity pass-through is handled explicitly when
+        // `ratio == 1.0 && phase == 0.0`.
+        for p in 0..=SINC_PHASES {
             let frac = (p as f64) / (SINC_PHASES as f64);
             let mut raw = [0.0f64; SINC_TAPS];
             let mut sum = 0.0f64;
@@ -171,16 +172,18 @@ impl ClockDriftResampler {
 
     #[inline(always)]
     fn filter_input_pair(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let safe_l = if in_l.is_finite() { in_l } else { 0.0 };
+        let safe_r = if in_r.is_finite() { in_r } else { 0.0 };
         if !self.aa_active {
-            return (in_l, in_r);
+            return (safe_l, safe_r);
         }
         const ANTI_DENORMAL: f32 = 1.0e-25;
-        let xl = in_l + ANTI_DENORMAL;
+        let xl = safe_l + ANTI_DENORMAL;
         let yl = self.aa_b0 * xl + self.aa_z1_l;
         self.aa_z1_l = self.aa_b1 * xl - self.aa_a1 * yl + self.aa_z2_l;
         self.aa_z2_l = self.aa_b2 * xl - self.aa_a2 * yl;
 
-        let xr = in_r + ANTI_DENORMAL;
+        let xr = safe_r + ANTI_DENORMAL;
         let yr = self.aa_b0 * xr + self.aa_z1_r;
         self.aa_z1_r = self.aa_b1 * xr - self.aa_a1 * yr + self.aa_z2_r;
         self.aa_z2_r = self.aa_b2 * xr - self.aa_a2 * yr;
@@ -231,6 +234,9 @@ impl ClockDriftResampler {
     /// bursts cancel out while tracking both positive and negative crystal drift.
     #[inline]
     pub fn update_clock_loop(&mut self, current_queued_subframes: f32, target_min_subframes: f32) {
+        if !current_queued_subframes.is_finite() || !target_min_subframes.is_finite() {
+            return;
+        }
         self.err_sum_window += (current_queued_subframes - target_min_subframes) as f64;
         self.window_ticks += 1;
 
@@ -255,21 +261,46 @@ impl ClockDriftResampler {
                 .clamp(-MAX_DRIFT_RATIO, MAX_DRIFT_RATIO);
             let target_ratio = self.base_ratio * (1.0 + corr);
 
-            self.ratio = 0.75 * self.ratio + 0.25 * target_ratio;
+            let prev_ratio = if self.ratio.is_finite() && self.ratio > 1e-9 {
+                self.ratio
+            } else {
+                self.base_ratio
+            };
+            self.ratio = (0.75 * prev_ratio + 0.25 * target_ratio).max(1e-9);
             self.err_sum_window = 0.0;
             self.window_ticks = 0;
         }
     }
 
     #[inline(always)]
+    fn sanitize_phase_and_ratio(&mut self) {
+        if !self.ratio.is_finite() || self.ratio <= 1e-9 {
+            self.ratio = if self.base_ratio.is_finite() && self.base_ratio > 1e-9 {
+                self.base_ratio
+            } else {
+                1.0
+            };
+        }
+        if !self.phase.is_finite() || self.phase < 0.0 {
+            self.phase = 0.0;
+        }
+    }
+
+    #[inline(always)]
     fn interpolate_sinc_stereo(
-        frac: f32,
+        ratio: f64,
+        phase: f64,
         hist_l: &[f32; SINC_TAPS],
         hist_r: &[f32; SINC_TAPS],
     ) -> (f32, f32) {
-        if frac <= 1.0e-6 {
+        // Preserve bit-exact unity pass-through ONLY when truly locked at 1:1
+        // with zero fractional phase; all other ratios (96/192 kHz DACs, 44.1
+        // kHz, active clock-drift slewing) use the continuous Kaiser-sinc table
+        // at every phase including 0.0 so no phase-0/1 discontinuity occurs.
+        if ratio == 1.0 && phase == 0.0 {
             return (hist_l[SINC_CENTER], hist_r[SINC_CENTER]);
         }
+        let frac = (phase as f32).clamp(0.0, 1.0);
         let table = sinc_table();
         let scaled = frac * (SINC_PHASES as f32);
         let idx = (scaled as usize).min(SINC_PHASES - 1);
@@ -289,17 +320,45 @@ impl ClockDriftResampler {
     }
 
     /// Exact number of input stereo frames required by [`Self::process_pull`]
-    /// to produce `out_frames` output stereo frames at the current phase and
-    /// ratio.
+    /// and [`Self::process_from_ring`] to produce `out_frames` output stereo
+    /// frames at the current phase and ratio.
+    ///
+    /// Executes the exact same IEEE-754 `phase += ratio` / `phase -= 1.0`
+    /// recurrence as the inner resampler loop so batched pulls never over-read
+    /// or discard a popped frame on rounding boundaries.
     #[inline]
     pub fn needed_input_frames(&self, out_frames: usize) -> usize {
-        let ratio = self.ratio.max(1e-9);
-        (self.phase + out_frames as f64 * ratio).floor().max(0.0) as usize
+        let ratio = if self.ratio.is_finite() && self.ratio > 1e-9 {
+            self.ratio
+        } else if self.base_ratio.is_finite() && self.base_ratio > 1e-9 {
+            self.base_ratio
+        } else {
+            1.0
+        };
+        let mut p = if self.phase.is_finite() && self.phase >= 0.0 {
+            self.phase
+        } else {
+            0.0
+        };
+        let mut shifts = 0usize;
+        for _ in 0..out_frames {
+            while p >= 1.0 {
+                shifts += 1;
+                p -= 1.0;
+            }
+            p += ratio;
+        }
+        while p >= 1.0 {
+            shifts += 1;
+            p -= 1.0;
+        }
+        shifts
     }
 
     /// Resamples interleaved stereo input into interleaved stereo output.
     /// Returns number of stereo frames (sample pairs) written to `out_stereo`.
     pub fn process(&mut self, in_stereo: &[f32], out_stereo: &mut [f32]) -> usize {
+        self.sanitize_phase_and_ratio();
         let in_frames = in_stereo.len() / 2;
         let max_out_frames = out_stereo.len() / 2;
         let mut in_idx = 0usize;
@@ -308,7 +367,7 @@ impl ClockDriftResampler {
         while in_idx < in_frames && out_idx < max_out_frames {
             while self.phase < 1.0 && out_idx < max_out_frames {
                 let (l, r) =
-                    Self::interpolate_sinc_stereo(self.phase as f32, &self.hist_l, &self.hist_r);
+                    Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
                 out_stereo[out_idx * 2] = l;
                 out_stereo[out_idx * 2 + 1] = r;
                 out_idx += 1;
@@ -333,11 +392,12 @@ impl ClockDriftResampler {
     /// trailing output frames satisfied by the updated history window after the
     /// final input frame is shifted in.
     pub fn process_pull(&mut self, in_stereo: &[f32], out_stereo: &mut [f32]) -> usize {
+        self.sanitize_phase_and_ratio();
         let max_out_frames = out_stereo.len() / 2;
         let mut out_idx = self.process(in_stereo, out_stereo);
         while self.phase < 1.0 && out_idx < max_out_frames {
             let (l, r) =
-                Self::interpolate_sinc_stereo(self.phase as f32, &self.hist_l, &self.hist_r);
+                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             out_idx += 1;
@@ -409,10 +469,11 @@ impl ClockDriftResampler {
         dither_rng: &mut u32,
         out_stereo: &mut [f32],
     ) {
+        self.sanitize_phase_and_ratio();
         // Stack-only batch scratch: at most 64 stereo frames per ring access,
-        // no heap. The phase invariant makes the total input-frame count for
-        // this call exactly `floor(phase + out_frames * ratio)`; popping only
-        // that many (in batches) leaves no surplus in the stack scratch.
+        // no heap. `needed_input_frames` runs the exact phase recurrence below,
+        // so `to_pop` matches the true shift count bit-for-bit and zero popped
+        // frames are ever stranded in `scratch`.
         let mut scratch = [0.0f32; 128];
         let mut scratch_pos = 0usize;
         let mut scratch_len = 0usize;
@@ -432,7 +493,7 @@ impl ClockDriftResampler {
                 self.phase -= 1.0;
             }
             let (l, r) =
-                Self::interpolate_sinc_stereo(self.phase as f32, &self.hist_l, &self.hist_r);
+                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             self.phase += self.ratio;
@@ -450,6 +511,7 @@ impl ClockDriftResampler {
             );
             self.phase -= 1.0;
         }
+        debug_assert_eq!(scratch_pos, scratch_len);
     }
 }
 
@@ -484,9 +546,17 @@ impl BurstDecouplerRing {
 
     #[inline]
     pub fn available_samples(&self) -> usize {
-        let w = self.write_idx.0.load(Ordering::Acquire);
+        // Load `read_idx` before `write_idx` so a concurrent consumer advancing
+        // `read_idx` cannot make `w.wrapping_sub(r)` underflow for a 3rd-thread
+        // observer; still cap to `FIFO_CAPACITY` if both cursors raced.
         let r = self.read_idx.0.load(Ordering::Acquire);
-        w.wrapping_sub(r)
+        let w = self.write_idx.0.load(Ordering::Acquire);
+        let diff = w.wrapping_sub(r);
+        if diff > FIFO_CAPACITY {
+            0
+        } else {
+            diff
+        }
     }
 
     /// Total interleaved samples the ring can hold. Callers that translate a
@@ -650,10 +720,20 @@ impl TruePeakLimiter {
 
         for frame in stereo_samples.chunks_exact_mut(2) {
             self.current_gain_linear += 0.01 * (self.target_gain_linear - self.current_gain_linear);
-            // A non-finite capture sample (driver glitch, decoder damage) must
-            // not propagate NaN/Inf into the ring, DAC, or envelope follower.
-            let in_l = if frame[0].is_finite() { frame[0] } else { 0.0 };
-            let in_r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            // A non-finite or astronomically huge capture sample (driver glitch,
+            // decoder damage) must not propagate NaN/Inf into the ring, DAC, or
+            // envelope follower (finite > 2e37 * 15.85 would overflow to Inf and
+            // turn `over / (over + headroom)` into NaN).
+            let in_l = if frame[0].is_finite() {
+                frame[0].clamp(-1.0e6, 1.0e6)
+            } else {
+                0.0
+            };
+            let in_r = if frame[1].is_finite() {
+                frame[1].clamp(-1.0e6, 1.0e6)
+            } else {
+                0.0
+            };
             let mut l = in_l * self.current_gain_linear;
             let mut r = in_r * self.current_gain_linear;
             let peak = l.abs().max(r.abs());
@@ -745,7 +825,7 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
     const CENTER_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2; // -3.0 dB (0.7071)
     const SURROUND_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2;
     // Equal-power headroom for the stereo bus
-    const HEADROOM: f32 = 0.7071;
+    const HEADROOM: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
     if channels == 0 {
         return;
@@ -1649,5 +1729,98 @@ mod tests {
             );
             assert_eq!(unity_out[m * 2 + 1], input[src_idx * 2 + 1]);
         }
+    }
+
+    #[test]
+    fn test_windowed_sinc_96khz_upsample_has_no_phase_zero_imaging() {
+        // 48 -> 96 kHz hits phase == 0.0 on every other output frame. Hardcoding
+        // a unit impulse at table[0] created an 11.8x kernel jump and dropped
+        // 18 kHz SNR from ~84 dB to ~56 dB.
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(96_000);
+
+        let in_frames = 4096usize;
+        let freq_hz = 18_000.0f64;
+        let omega = std::f64::consts::TAU * freq_hz / 48_000.0;
+        let mut input = vec![0.0f32; in_frames * 2];
+        for n in 0..in_frames {
+            let s = (omega * n as f64).sin() as f32 * 0.5;
+            input[n * 2] = s;
+            input[n * 2 + 1] = s;
+        }
+        let mut output = vec![0.0f32; in_frames * 4];
+        let out_frames = resampler.process(&input, &mut output);
+        assert!(out_frames > 4000);
+
+        let group_delay = (SINC_TAPS - SINC_CENTER) as f64;
+        let mut sig_pow = 0.0f64;
+        let mut cross = 0.0f64;
+        for m in 128..(out_frames - 128) {
+            let t_in = (m as f64) * 0.5 - group_delay;
+            let expected = (omega * t_in).sin() * 0.5;
+            let got = output[m * 2] as f64;
+            sig_pow += expected * expected;
+            cross += got * expected;
+        }
+        let gain = cross / sig_pow;
+        assert!(
+            (gain - 1.0).abs() < 0.01,
+            "96 kHz 18 kHz passband gain drifted: {gain:.5}"
+        );
+        let mut err_pow = 0.0f64;
+        for m in 128..(out_frames - 128) {
+            let t_in = (m as f64) * 0.5 - group_delay;
+            let expected = (omega * t_in).sin() * 0.5 * gain;
+            let got = output[m * 2] as f64;
+            err_pow += (got - expected).powi(2);
+        }
+        let snr_db = 10.0 * ((sig_pow * gain * gain) / err_pow.max(1e-20)).log10();
+        assert!(
+            snr_db > 80.0,
+            "96 kHz 18 kHz upsample SNR too low (phase-0 discontinuity): {snr_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn test_process_from_ring_never_drops_frame_on_44k1_to_48k_boundary() {
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(44_100, 48_000);
+        let ring = BurstDecouplerRing::new();
+        let mut chunk = vec![0.0f32; 2000];
+        for i in 0..1000 {
+            chunk[i * 2] = i as f32;
+            chunk[i * 2 + 1] = -(i as f32);
+        }
+        ring.push_samples(&chunk);
+        let mut rng = 99u32;
+        let mut out = vec![0.0f32; 480 * 2];
+        let before = ring.available_samples();
+        let needed = resampler.needed_input_frames(480);
+        resampler.process_from_ring(&ring, &mut rng, &mut out);
+        let consumed = (before - ring.available_samples()) / 2;
+        assert_eq!(consumed, needed);
+        // The last shifted frame in history must match the exact last popped frame.
+        assert_eq!(resampler.hist_l[SINC_TAPS - 1], (consumed - 1) as f32);
+    }
+
+    #[test]
+    fn test_limiter_huge_finite_input_and_nan_resampler_stay_finite() {
+        let mut limiter = TruePeakLimiter::new(24.0);
+        let mut huge = [1.0e38f32, -1.0e38f32, 0.25, -0.25];
+        limiter.process_in_place(&mut huge);
+        assert!(huge.iter().all(|s| s.is_finite()));
+        let mut follow = [0.2f32, -0.2];
+        limiter.process_in_place(&mut follow);
+        assert!(follow.iter().all(|s| s.is_finite()));
+
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(44_100);
+        resampler.phase = f64::NAN;
+        resampler.ratio = f64::NAN;
+        let bad_in = [f32::NAN, f32::INFINITY, 0.5, -0.5, 0.5, -0.5];
+        let mut out = [0.0f32; 16];
+        let n = resampler.process(&bad_in, &mut out);
+        assert!(n > 0);
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 }

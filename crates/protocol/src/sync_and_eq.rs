@@ -250,17 +250,23 @@ impl GroupSyncEstimator {
 
     #[inline]
     pub fn record_ptp_exchange(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
-        let rtt = ((t4 - t1) - (t3 - t2)).max(0) as u32;
-        let offset = ((t2 - t1) + (t3 - t4)) / 2;
+        let rtt_i64 = t4
+            .saturating_sub(t1)
+            .saturating_sub(t3.saturating_sub(t2));
+        let rtt = rtt_i64.clamp(0, u32::MAX as i64) as u32;
+        let offset = ((t2 as i128 - t1 as i128 + t3 as i128 - t4 as i128) / 2)
+            .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
+        let is_first = self.min_rtt_us == u32::MAX;
         if rtt <= self.min_rtt_us.saturating_add(1500) {
             if rtt < self.min_rtt_us {
                 self.min_rtt_us = rtt;
             }
-            if self.clock_offset_us == 0 {
+            if is_first {
                 self.clock_offset_us = offset;
             } else {
-                self.clock_offset_us = (self.clock_offset_us * 7 + offset) / 8;
+                self.clock_offset_us =
+                    ((self.clock_offset_us as i128 * 7 + offset as i128) / 8) as i64;
             }
         } else {
             self.min_rtt_us = self.min_rtt_us.saturating_add(50);
@@ -275,7 +281,10 @@ impl GroupSyncEstimator {
         my_delay_ms: u16,
     ) -> f32 {
         let extra_ms = max_group_delay_ms.saturating_sub(my_delay_ms) as f32;
-        let extra_subframes = (extra_ms / 2.5).clamp(0.0, 64.0);
+        // Up to 112 extra subframes (280 ms) lets wired devices align to slow
+        // Bluetooth A2DP earbuds + Wi-Fi cushion + manual trim, matching the
+        // client decoupler's 120-subframe (300 ms) watermark ceiling.
+        let extra_subframes = (extra_ms / 2.5).clamp(0.0, 112.0);
         base_target + extra_subframes
     }
 }
@@ -333,10 +342,24 @@ impl StereoBiquad {
     }
 
     pub fn set_peaking_eq(&mut self, freq_hz: f32, q: f32, gain_db: f32) {
-        // UI/prefs may carry an out-of-range or stale gain (e.g. a clamped
-        // slider rounded past its limit). Bound it before the exponent so the
-        // biquad coefficients can never blow up from an unbounded boost/cut.
-        let gain_db = gain_db.clamp(-24.0, 24.0);
+        // UI/prefs may carry an out-of-range, non-finite, or stale gain. Bound
+        // every parameter before computing coefficients so NaN/Inf can never
+        // poison the biquad.
+        let gain_db = if gain_db.is_finite() {
+            gain_db.clamp(-24.0, 24.0)
+        } else {
+            0.0
+        };
+        let freq_hz = if freq_hz.is_finite() {
+            freq_hz.clamp(20.0, 22_000.0)
+        } else {
+            1000.0
+        };
+        let q = if q.is_finite() {
+            q.clamp(0.1, 20.0)
+        } else {
+            1.0
+        };
         if gain_db.abs() < 0.05 {
             self.target_flat = true;
             if self.wet_mix <= 1.0e-5 {
@@ -378,10 +401,10 @@ impl StereoBiquad {
         let na1 = a1 * inv_a0;
         let na2 = a2 * inv_a0;
 
-        if self.target_flat {
-            // Engaging from flat: clear any stale delay history and load the
-            // target coefficients immediately while ramping `wet_mix` 0 -> 1
-            // over ~5 ms for a zero-click entry.
+        if self.wet_mix <= 1.0e-5 {
+            // Engaging from fully settled flat bypass: clear any stale delay
+            // history and load target coefficients immediately while ramping
+            // `wet_mix` 0 -> 1 over ~5 ms for a zero-click entry.
             self.z1_l = 0.0;
             self.z2_l = 0.0;
             self.z1_r = 0.0;
@@ -400,13 +423,16 @@ impl StereoBiquad {
             self.target_flat = false;
             self.slewing = false;
         } else {
-            // Updating an already-active band (slider drag or preset change):
-            // slew coefficients smoothly over ~2.5 ms instead of stepping them.
+            // Updating an already-active or mid-fade-out band (e.g. dragging
+            // an EQ slider across 0 dB): keep filter state and `wet_mix`
+            // continuous and slew coefficients smoothly instead of snapping
+            // `wet_mix` to 0.0 with a click.
             self.tgt_b0 = nb0;
             self.tgt_b1 = nb1;
             self.tgt_b2 = nb2;
             self.tgt_a1 = na1;
             self.tgt_a2 = na2;
+            self.target_flat = false;
             self.slewing = true;
         }
     }
@@ -932,14 +958,14 @@ mod tests {
     }
 
     #[test]
-    fn test_group_sync_alignment_allows_64_extra_subframes() {
+    fn test_group_sync_alignment_allows_112_extra_subframes() {
         let sync = GroupSyncEstimator::new();
         // 168 ms max group delay - 8 ms local delay = 160 ms = 64 subframes.
         assert!((sync.aligned_target_subframes(2.0, 168, 8) - 66.0).abs() < 0.01);
-        // 64 extra subframes alone are allowed from a zero base target.
-        assert!((sync.aligned_target_subframes(0.0, 168, 8) - 64.0).abs() < 0.01);
-        // Larger mismatches still clamp at 64 extra subframes (160 ms).
-        assert!((sync.aligned_target_subframes(2.0, 400, 8) - 66.0).abs() < 0.01);
+        // 288 ms max group delay - 8 ms local delay = 280 ms = 112 subframes.
+        assert!((sync.aligned_target_subframes(0.0, 288, 8) - 112.0).abs() < 0.01);
+        // Larger mismatches clamp at 112 extra subframes (280 ms).
+        assert!((sync.aligned_target_subframes(2.0, 400, 8) - 114.0).abs() < 0.01);
         // A local delay longer than the group max adds nothing.
         assert!((sync.aligned_target_subframes(2.0, 8, 28) - 2.0).abs() < 0.01);
     }
@@ -1056,14 +1082,16 @@ mod tests {
     #[test]
     fn test_eq_reset_to_flat_clears_filter_history() {
         // While all three bands are at 0 dB `StudioEqualizer::process`
-        // bypasses the biquads, so their delay state freezes. Re-engaging a
-        // band then discharged that stale state as a click on the first frame.
+        // ramps wet_mix to 0 and bypasses the biquads; re-engaging a band
+        // after flat bypass must not discharge stale delay state as a click.
         let mut eq = StudioEqualizer::new();
         eq.update_if_changed(60, 0, 0); // +6 dB bass
         let mut warmup = [0.25f32; 480];
         eq.process(&mut warmup);
 
         eq.update_if_changed(0, 0, 0); // user clicks Flat
+        let mut settle = [0.25f32; 600]; // >= 5 ms flat fade-out to settled bypass
+        eq.process(&mut settle);
         eq.update_if_changed(60, 0, 0); // re-engage the same bass boost
 
         let mut first = [0.0f32; 2];
@@ -1073,6 +1101,44 @@ mod tests {
             first[0].abs() < 1.0e-6 && first[1].abs() < 1.0e-6,
             "stale biquad state produced a click: {:?}",
             first
+        );
+    }
+
+    #[test]
+    fn test_eq_crossing_zero_db_during_fade_is_click_free() {
+        // Dragging an EQ slider rapidly across 0 dB (+12 dB -> 0 dB for 2 ms
+        // -> -6 dB) must keep `wet_mix` and filter state continuous rather than
+        // hard-snapping `wet_mix = 0.0` mid-fade.
+        let mut eq = StudioEqualizer::new();
+        eq.update_if_changed(120, 0, 0);
+        let mut prev = 0.0f32;
+        let mut max_step = 0.0f32;
+        for block in 0..8 {
+            match block {
+                3 => eq.update_if_changed(0, 0, 0),    // enter 5 ms fade-out
+                4 => eq.update_if_changed(-60, 0, 0),  // cross 0 dB at 2.5 ms (wet_mix ~ 0.5)
+                _ => {}
+            }
+            let mut buf = [0.0f32; 240];
+            for i in 0..120 {
+                let t = (block * 120 + i) as f32;
+                let s = (t * 2.0 * std::f32::consts::PI * 100.0 / 48_000.0).sin() * 0.25;
+                buf[i * 2] = s;
+                buf[i * 2 + 1] = s;
+            }
+            eq.process(&mut buf);
+            for i in 0..120 {
+                let s = buf[i * 2];
+                if block > 0 || i > 0 {
+                    max_step = max_step.max((s - prev).abs());
+                }
+                prev = s;
+            }
+        }
+        assert!(
+            max_step < 0.08,
+            "crossing 0 dB mid-fade produced a click step of {:.4}",
+            max_step
         );
     }
 

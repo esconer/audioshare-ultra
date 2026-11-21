@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd;
 
-use audioshare_host_engine::{configure_realtime_udp_socket, promote_thread_realtime};
+use audioshare_host_engine::{configure_realtime_udp_socket, RealtimeThreadGuard};
 use audioshare_protocol::crypto::SessionKey;
 use audioshare_protocol::dsp::{
     soft_limit_post_resample, BurstDecouplerRing, ClockDriftResampler, TruePeakLimiter,
@@ -511,6 +511,24 @@ fn resync_ahead_subframes(fifo_now_subframes: i16) -> i16 {
         .min((RING_SLOTS as i16) - 4)
 }
 
+/// Dynamic backward resync threshold, bounded by the sequencer ring.
+///
+/// During an active Wi-Fi background scan or scan-shield window, emergency PLC
+/// can advance `next_play_seq` by 40..120+ subframes before the AP flushes its
+/// queued pre-scan packets. Scaling the backward threshold with the active
+/// Wi-Fi cushion and PLC burst length prevents those delayed retransmits from
+/// triggering a hard backwards stream resync storm while keeping the tight -32
+/// (-80 ms) host-restart detector during normal steady-state streaming.
+#[inline]
+fn resync_behind_subframes(adaptive_wifi_subframes: f32, consecutive_empty_ticks: u16) -> i16 {
+    let cushion_allowance = (adaptive_wifi_subframes.ceil() as i16).saturating_add(16);
+    let plc_allowance = (consecutive_empty_ticks as i16).saturating_add(16);
+    STREAM_RESYNC_BEHIND_SUBFRAMES
+        .min(-cushion_allowance)
+        .min(-plc_allowance)
+        .max(-((RING_SLOTS as i16) - 4))
+}
+
 /// Decode a `CodecMode::RawPcm16` payload.
 ///
 /// The lossless encoder's raw fallback is a tagged 481-byte frame
@@ -696,6 +714,9 @@ fn pending_hardware_delay_ms(
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn aaudio_buffer_frames_for_profile(burst: i32, capacity: i32, normal_mixer: bool) -> Option<i32> {
+    if burst <= 0 {
+        return None;
+    }
     if normal_mixer {
         // AAudio grants PERFORMANCE_MODE_NONE on the Dolby/shared-mixer path,
         // where the normal mixer's HAL burst is already 20-40 ms. One burst is
@@ -950,6 +971,59 @@ const ADB_TCP_RECONNECT_INTERVAL: Duration = Duration::from_millis(400);
 /// must span several timeout cycles to tolerate a slow/stalled peer.
 const ADB_FRAME_READ_DEADLINE: Duration = Duration::from_millis(1_000);
 
+/// Read a 2-byte big-endian frame length prefix while allowing the ADB TCP
+/// tunnel to remain idle between frames (`filled == 0`, e.g. when the host
+/// mutes the client or pauses audio) without disconnecting every 1.0 s.
+/// Once the first byte of a frame arrives (`filled == 1`), enforces
+/// `ADB_FRAME_READ_DEADLINE` so a half-open stalled peer still times out.
+fn read_frame_len_interruptible<T: Read>(
+    reader: &mut T,
+    alive: &AtomicBool,
+    running: &AtomicBool,
+) -> std::io::Result<u16> {
+    let mut len_buf = [0u8; 2];
+    let mut filled = 0usize;
+    let mut partial_deadline: Option<Instant> = None;
+    while filled < 2 {
+        if !alive.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "ADB TCP client bridge stopping",
+            ));
+        }
+        match reader.read(&mut len_buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB TCP peer closed connection",
+                ));
+            }
+            Ok(n) => {
+                filled += n;
+                if filled == 1 && partial_deadline.is_none() {
+                    partial_deadline = Some(Instant::now() + ADB_FRAME_READ_DEADLINE);
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if let Some(dl) = partial_deadline {
+                    if Instant::now() >= dl {
+                        return Err(std::io::Error::new(
+                            e.kind(),
+                            "timed out waiting for the remainder of an ADB TCP length prefix",
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(u16::from_be_bytes(len_buf))
+}
+
 /// Fill `buf` completely from `reader`, tolerating `WouldBlock`/`TimedOut`
 /// without discarding bytes already read.
 ///
@@ -1011,9 +1085,17 @@ impl AdbTcpClientBridge {
         if !server_addr.ip().is_loopback() {
             return None;
         }
-        // Fast probe: fail immediately when no ADB reverse listener exists so
-        // normal localhost UDP clients do not pay a reconnect-loop penalty.
-        let probe = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?;
+        // On desktop, fail immediately when no ADB reverse TCP listener exists
+        // so normal localhost UDP clients/tests do not pay a reconnect-loop
+        // penalty. On Android, 127.0.0.1 is exclusively the `adb reverse`
+        // USB tunnel (never a local UDP host), so always start the supervisor
+        // even if `adb reverse` has not finished setting up yet.
+        #[cfg(not(target_os = "android"))]
+        let probe = Some(
+            TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?,
+        );
+        #[cfg(target_os = "android")]
+        let probe = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok();
 
         // Stable UDP endpoint handed to ClientEngine. It survives TCP
         // reconnects, so the caller's effective server address never changes.
@@ -1030,9 +1112,8 @@ impl AdbTcpClientBridge {
             .name("as-ultra-adb-cli-supervisor".into())
             .spawn(move || {
                 let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, client_udp_port));
-                // Reuse the probe as the first session so our exchange starts
-                // on the very socket the listener already accepted.
-                let mut pending_stream = Some(probe);
+                // Reuse the probe as the first session when already connected.
+                let mut pending_stream = probe;
                 let mut next_connect = Instant::now();
 
                 while run_supervisor.load(Ordering::Relaxed) {
@@ -1088,17 +1169,16 @@ impl AdbTcpClientBridge {
                     let in_handle = std::thread::Builder::new()
                         .name("as-ultra-adb-cli-in".into())
                         .spawn(move || {
-                            let mut len_buf = [0u8; 2];
                             let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
                             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed)
                             {
-                                match read_exact_interruptible(
+                                match read_frame_len_interruptible(
                                     &mut tcp_reader,
-                                    &mut len_buf,
-                                    Instant::now() + ADB_FRAME_READ_DEADLINE,
+                                    &alive_in,
+                                    &run_in,
                                 ) {
-                                    Ok(()) => {
-                                        let len = u16::from_be_bytes(len_buf) as usize;
+                                    Ok(raw_len) => {
+                                        let len = raw_len as usize;
                                         if len == 0 || len > pkt.len() {
                                             break;
                                         }
@@ -1250,14 +1330,21 @@ impl ClientEngine {
             aaudio_xrun_count: AtomicU32::new(0),
         });
 
-        let session_key = Arc::new(Mutex::new(pin.map(SessionKey::from_pin)));
+        let clean_pin = pin.map(str::trim).filter(|s| !s.is_empty());
+        let session_key = Arc::new(Mutex::new(clean_pin.map(SessionKey::from_pin)));
         let key_version = Arc::new(AtomicU64::new(0));
 
         // Ephemeral source port avoids hijacking HostEngine on Windows
         // (SO_REUSEADDR let the client bind 65530 while the host was already
         // bound there) and EADDRINUSE on Linux. Both PC and Party hosts unicast
         // replies to our real source port, so the fixed bind is unnecessary.
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        // Match the address family of `config.server_addr` so IPv6 hosts work.
+        let bind_addr: SocketAddr = if config.server_addr.is_ipv6() {
+            SocketAddr::from(([0u16; 8], 0))
+        } else {
+            SocketAddr::from(([0u8; 4], 0))
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .map_err(|e| format!("Failed to bind client UDP socket: {}", e))?;
         configure_realtime_udp_socket(&socket)
             .map_err(|e| format!("Failed to configure real-time client socket: {}", e))?;
@@ -1295,7 +1382,7 @@ impl ClientEngine {
         let rx_handle = std::thread::Builder::new()
             .name("as-ultra-client-rx".into())
             .spawn(move || {
-                promote_thread_realtime();
+                let _rt_guard = RealtimeThreadGuard::enter();
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 unsafe {
                     telemetry_clone
@@ -1356,7 +1443,8 @@ impl ClientEngine {
     }
 
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
-        self.set_session_key(pin.map(SessionKey::from_pin));
+        let clean = pin.map(str::trim).filter(|s| !s.is_empty());
+        self.set_session_key(clean.map(SessionKey::from_pin));
     }
 
     /// Swap the AEAD key used for feedback and audio without a lock on the
@@ -1368,6 +1456,7 @@ impl ClientEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = key;
         self.key_version.fetch_add(1, Ordering::Release);
+        self.telemetry.auth_failures.store(0, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
@@ -1684,6 +1773,7 @@ impl ClientEngine {
         let mut scan_shield_subframes: f32 = 0.0;
         let mut smoothed_host_vol: f32 = 1.0;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
+        let mut last_large_burst_extra_sf: f32 = 0.0;
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
         let mut prev_tx_us: u32 = 0;
@@ -1971,11 +2061,11 @@ impl ClientEngine {
                 let bt_delay_ms = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed);
                 let raw_hw_delay_ms =
                     fallback_output_delay_ms(telemetry.downstream_hw_delay_ms.load(Ordering::Relaxed));
-                let base_target_for_fb = if gaming_lock_now {
+                let base_target_for_fb = (if gaming_lock_now {
                     gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
                 } else {
                     adaptive_wifi_subframes
-                };
+                }) + last_large_burst_extra_sf;
                 let base_fifo_for_fb = fifo_target_subframes(base_target_for_fb);
                 let effective_hw_delay_ms = effective_unaligned_delay_ms(
                     base_fifo_for_fb,
@@ -2096,7 +2186,7 @@ impl ClientEngine {
                         telemetry.packets_received.fetch_add(1, Ordering::Relaxed);
                         telemetry
                             .host_volume
-                            .store(parsed.header.host_volume, Ordering::Relaxed);
+                            .store(parsed.header.host_volume.min(100), Ordering::Relaxed);
                         telemetry
                             .max_group_delay_ms
                             .store((parsed.header.stream_id as u16) * 2, Ordering::Relaxed);
@@ -2123,6 +2213,8 @@ impl ClientEngine {
                         // behind the 16-bit wrap point.
                         if parsed.header.mode == CodecMode::SilenceHeartbeat {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
+                            telemetry.buffered_audio_us.store(0, Ordering::Relaxed);
+                            telemetry.client_vu_peak_pct.store(0, Ordering::Relaxed);
                             // DTX means the burst is over: drop any expanded
                             // scan shield and return the cushion to baseline.
                             scan_shield_until = None;
@@ -2144,6 +2236,7 @@ impl ClientEngine {
                             slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
                                 slot.seq = None;
+                                slot.from_red = false;
                             }
                             continue;
                         }
@@ -2166,6 +2259,57 @@ impl ClientEngine {
                         }
                         last_audio_codec_mode = Some(parsed.header.mode);
 
+                        if !stream_initialized {
+                            next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
+                            stream_initialized = true;
+                        }
+
+                        // Evaluate stream resync BEFORE feeding the RFC 3550
+                        // jitter/spike estimator so a host restart or DTX wake
+                        // never feeds a bogus 150 ms timestamp jump into
+                        // `spike_cushion_subframes` (which previously slammed
+                        // `adaptive_wifi_subframes` to its 100-120 ms ceiling
+                        // for 15 s right before line 2283 cleared `prev_rx_us`).
+                        let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
+                        let fifo_now_subframes =
+                            resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
+                        let resync_ahead = resync_ahead_subframes(fifo_now_subframes);
+                        let resync_behind = resync_behind_subframes(
+                            adaptive_wifi_subframes,
+                            consecutive_empty_ticks,
+                        );
+                        let was_dtx = telemetry.server_dtx_silent.swap(false, Ordering::Relaxed);
+                        if was_dtx || seq_delta > resync_ahead || seq_delta < resync_behind {
+                            if !was_dtx {
+                                // A DTX wake-up legitimately re-anchors the
+                                // playhead; only count/log genuine stream
+                                // restarts and sequence-tracker losses.
+                                telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
+                                audioshare_protocol::diagnostics::warn(
+                                    "client-rx",
+                                    format!(
+                                        "stream resync: seq_delta={} base_seq={} next_play_seq={} fifo_subframes={}",
+                                        seq_delta, base_seq, next_play_seq, fifo_now_subframes
+                                    ),
+                                );
+                            }
+                            sequencer.reset();
+                            next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
+                            prebuffer_ready = false;
+                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            last_plc_emit = None;
+                            prev_rx_us = None;
+                            opus_decoder = None;
+                            last_played_codec_mode = None;
+                            slot_codec_mode.fill(None);
+                            for slot in &mut opus_ring {
+                                slot.seq = None;
+                                slot.from_red = false;
+                            }
+                        }
+
                         // RFC 3550 Inter-Arrival Jitter calculation using sender `tx_timestamp_us`.
                         // Sample only the first audio packet per drain: packets
                         // already queued in the socket would otherwise report a
@@ -2176,9 +2320,9 @@ impl ClientEngine {
                         let mut raw_spike_us = 0.0f32;
                         if audio_packets_drained == 1 {
                             if let Some(last_r) = prev_rx_us {
-                                let d_rx = rx_now_us.wrapping_sub(last_r) as i32;
-                                let d_tx = tx_now_us.wrapping_sub(prev_tx_us) as i32;
-                                let raw_delta = (d_rx - d_tx).unsigned_abs();
+                                let d_rx = (rx_now_us.wrapping_sub(last_r) as i32) as i64;
+                                let d_tx = (tx_now_us.wrapping_sub(prev_tx_us) as i32) as i64;
+                                let raw_delta = (d_rx - d_tx).unsigned_abs().min(u32::MAX as u64) as u32;
                                 raw_spike_us = raw_delta.min(150_000) as f32;
                                 let transit_delta = raw_delta.min(50_000) as f32;
                                 jitter_estimate_us +=
@@ -2195,14 +2339,6 @@ impl ClientEngine {
                         telemetry
                             .network_jitter_us
                             .store(jitter_estimate_us.max(0.0) as u32, Ordering::Relaxed);
-                        // Track the sender's current bundling mode instead of
-                        // ratcheting the floor upward. A single 10 ms packet
-                        // (4 subframes) used to raise the floor to 11
-                        // subframes (27.5 ms) for the rest of the session,
-                        // even after the host returned to 5 ms or 2.5 ms
-                        // framing. Use the smoothed count so a transient
-                        // `SplitPerSubframe` datagram cannot drop the floor
-                        // from 15 ms to 10 ms for one packet.
                         let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                         let bt_coex_floor = if bt_now {
                             configured_floor.max(8.0)
@@ -2237,57 +2373,6 @@ impl ClientEngine {
                         adaptive_wifi_subframes = adaptive_wifi_subframes
                             .max(proactive_floor)
                             .max(spike_floor);
-
-                        if !stream_initialized {
-                            next_play_seq = base_seq;
-                            latest_rx_seq = base_seq;
-                            stream_initialized = true;
-                        }
-
-                        // Signed 16-bit sequence delta (RFC 1982): >0 means future, <0 means past/late duplicate
-                        let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
-                        // Allow the sequencer backlog to absorb a draining
-                        // group-sync FIFO without misclassifying it as a host
-                        // restart (which used to drop 120 ms of audio).
-                        let fifo_now_subframes =
-                            resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
-                        let resync_ahead = resync_ahead_subframes(fifo_now_subframes);
-                        let was_dtx = telemetry.server_dtx_silent.swap(false, Ordering::Relaxed);
-                        if was_dtx
-                            || seq_delta > resync_ahead
-                            || seq_delta < STREAM_RESYNC_BEHIND_SUBFRAMES
-                        {
-                            if !was_dtx {
-                                // A DTX wake-up legitimately re-anchors the
-                                // playhead; only count/log genuine stream
-                                // restarts and sequence-tracker losses.
-                                telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
-                                audioshare_protocol::diagnostics::warn(
-                                    "client-rx",
-                                    format!(
-                                        "stream resync: seq_delta={} base_seq={} next_play_seq={} fifo_subframes={}",
-                                        seq_delta, base_seq, next_play_seq, fifo_now_subframes
-                                    ),
-                                );
-                            }
-                            // The playhead is jumping to a new base sequence.
-                            // Clear old slots so a wrapped/reused sequence
-                            // number cannot surface a stale payload, and
-                            // clear PLC history from the previous stream.
-                            sequencer.reset();
-                            next_play_seq = base_seq;
-                            latest_rx_seq = base_seq;
-                            prebuffer_ready = false;
-                            telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
-                            last_plc_emit = None;
-                            prev_rx_us = None;
-                            opus_decoder = None;
-                            last_played_codec_mode = None;
-                            slot_codec_mode.fill(None);
-                            for slot in &mut opus_ring {
-                                slot.seq = None;
-                            }
-                        }
 
                         // Lazy FEC Decoding: only decode the backup frames that
                         // cover slots that are ACTUALLY missing and still
@@ -2375,14 +2460,16 @@ impl ClientEngine {
                                 if (s.wrapping_sub(next_play_seq) as i16) >= 0 {
                                     let ring_idx = (s as usize) & (RING_SLOTS - 1);
                                     let slot = &mut opus_ring[ring_idx];
-                                    if slot.seq != Some(s) {
+                                    if slot.seq != Some(s) || slot.from_red {
                                         slot.data[..sub_len].copy_from_slice(payload);
                                         slot.len = sub_len as u16;
                                         slot.seq = Some(s);
                                         // A real primary always supersedes any
-                                        // earlier RED concealment in this slot.
+                                        // earlier RED concealment in this slot
+                                        // and clears any stale sequencer slot.
                                         slot.from_red = false;
                                         slot_codec_mode[ring_idx] = Some((s, CodecMode::OpusRld));
+                                        sequencer.clear_slot(s);
                                     }
                                     if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                         latest_rx_seq = s;
@@ -2398,10 +2485,18 @@ impl ClientEngine {
                                 CodecMode::CompressedLowDelay | CodecMode::OpusRld
                             ) {
                                 let payload = &prim[cursor..cursor + sub_len];
+                                // Opus payloads already returned in the block
+                                // above. Pass a temporary `None` here so
+                                // arriving VBR packets do not destroy the
+                                // playhead's `opus_decoder` 15-40 ms early
+                                // while unplayed Opus frames remain queued in
+                                // `opus_ring` (line 2794 drops `opus_decoder`
+                                // at the exact playhead pop boundary).
+                                let mut non_opus_dec: Option<OpusStreamDecoder> = None;
                                 decode_compressed_payload(
                                     payload,
                                     s,
-                                    &mut opus_decoder,
+                                    &mut non_opus_dec,
                                     &sequencer,
                                     next_play_seq,
                                     &mut pcm_f32,
@@ -2432,9 +2527,11 @@ impl ClientEngine {
                             };
 
                             if decoded_ok {
+                                let ring_idx = (s as usize) & (RING_SLOTS - 1);
+                                opus_ring[ring_idx].seq = None;
+                                opus_ring[ring_idx].from_red = false;
                                 sequencer.push_primary(s, &pcm_f32);
-                                slot_codec_mode[(s as usize) & (RING_SLOTS - 1)] =
-                                    Some((s, parsed.header.mode));
+                                slot_codec_mode[ring_idx] = Some((s, parsed.header.mode));
                                 if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                     latest_rx_seq = s;
                                 }
@@ -2559,6 +2656,7 @@ impl ClientEngine {
             }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
             let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
+            last_large_burst_extra_sf = large_burst_extra_sf;
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
@@ -2660,8 +2758,14 @@ impl ClientEngine {
                 (target_fifo_subframes.saturating_sub(base_fifo_subframes) as u32) * 2500,
                 Ordering::Relaxed,
             );
-            let fifo_capacity = burst_fifo.capacity_samples().saturating_sub(2);
             let one_subframe_samples = resampler.subframes_to_samples(1);
+            // Reserve at least one full resampled subframe + margin below the
+            // physical ring capacity so high-rate USB DACs (192 / 384 kHz) under
+            // Group Sync never enter the refill loop when `push_samples` would
+            // truncate the tail of `resampled_out`.
+            let fifo_capacity = burst_fifo
+                .capacity_samples()
+                .saturating_sub(one_subframe_samples.saturating_add(16).max(2));
             // Keep at least 3 subframes (7.5 ms = 720 samples @ 48 kHz) above
             // one HAL burst so draining a 256-frame (512-sample) Android fast
             // burst still leaves >= 1 full burst in the decoupler instead of
@@ -2903,6 +3007,8 @@ impl ClientEngine {
                             prebuffer_ready = false;
                             stream_initialized = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            telemetry.buffered_audio_us.store(0, Ordering::Relaxed);
+                            telemetry.client_vu_peak_pct.store(0, Ordering::Relaxed);
                             last_plc_emit = None;
                             sequencer.reset();
                             // A restarted host re-anchors at a low base_seq, so
@@ -2915,6 +3021,7 @@ impl ClientEngine {
                             slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
                                 slot.seq = None;
+                                slot.from_red = false;
                             }
                             consecutive_empty_ticks = 0;
                         }
@@ -2990,6 +3097,7 @@ impl ClientEngine {
                 // 2.4GHz streams never accumulate permanent latency after a
                 // Wi-Fi stall. Only the sequencer share can be shortened; the
                 // decoupler is already feeding the DAC.
+                let old_play_seq = next_play_seq;
                 if trim_post_stall_backlog(
                     latest_rx_seq,
                     &mut next_play_seq,
@@ -3003,6 +3111,22 @@ impl ClientEngine {
                     target_buf.max(resampler.samples_to_subframes(fifo_watermark)),
                     last_pkt_subframe_count,
                 ) {
+                    // Invalidate every skipped slot in both `sequencer` and
+                    // `opus_ring` so a 16-bit sequence wraparound (~2.73 min
+                    // later) can never replay or collide with a skipped frame.
+                    let mut s = old_play_seq;
+                    while s != next_play_seq {
+                        sequencer.clear_slot(s);
+                        let idx = (s as usize) & (RING_SLOTS - 1);
+                        if opus_ring[idx].seq == Some(s) {
+                            opus_ring[idx].seq = None;
+                            opus_ring[idx].from_red = false;
+                        }
+                        if matches!(slot_codec_mode[idx], Some((seq_tag, _)) if seq_tag == s) {
+                            slot_codec_mode[idx] = None;
+                        }
+                        s = s.wrapping_add(1);
+                    }
                     // Fast-forward skipped real audio; splice the next frame
                     // from the last played sample instead of clicking.
                     sequencer.arm_declick();
