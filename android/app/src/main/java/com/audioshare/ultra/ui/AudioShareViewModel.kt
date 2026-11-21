@@ -143,6 +143,8 @@ data class AudioShareUiState(
     val btDelayOverrideMs: Int = 0,
     val forwardPartyToPc: Boolean = false,
     val muteHostSpeakerInParty: Boolean = true,
+    val partyCodecProfile: Int = 0,
+    val partyBitrateKbps: Int = 256,
     val showManualConnect: Boolean = false,
     val showTelemetryDrawer: Boolean = false,
     val showEqDrawer: Boolean = false,
@@ -167,6 +169,10 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun loadInitial(): AudioShareUiState {
         val savedBitrate = prefs.getInt("target_bitrate_kbps", 256).let {
+            if (it == 96 || it == 160 || it == 256 || it == 320 || it == 510) it else 256
+        }
+        val savedPartyCodec = prefs.getInt("party_codec_profile", 0).coerceIn(0, 3)
+        val savedPartyBitrate = prefs.getInt("party_bitrate_kbps", 256).let {
             if (it == 96 || it == 160 || it == 256 || it == 320) it else 256
         }
         val hud = prefs.getBoolean("latency_debug", false)
@@ -195,7 +201,9 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
             useOpus = prefs.getBoolean("use_opus", true),
             btDelayOverrideMs = prefs.getInt("bt_delay_override_ms", 0),
             forwardPartyToPc = prefs.getBoolean("party_forward_pc", false),
-            muteHostSpeakerInParty = prefs.getBoolean("party_mute_local", true)
+            muteHostSpeakerInParty = prefs.getBoolean("party_mute_local", true),
+            partyCodecProfile = savedPartyCodec,
+            partyBitrateKbps = savedPartyBitrate
         )
     }
 

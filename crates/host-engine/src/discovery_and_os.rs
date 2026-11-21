@@ -958,9 +958,15 @@ impl HostVolumeMonitor {
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    // A single COM apartment + IMMDeviceEnumerator for the
-                    // whole thread (not one per 500 ms poll).
-                    run_windows_volume_monitor(&telemetry, &run_clone);
+                    // On Windows, keep `host_volume` at full 100% digital unity
+                    // (0 dBFS) unless the user adjusts the AudioShare Ultra
+                    // Master Volume slider. Mirroring Windows physical speaker
+                    // endpoint volume halved/muted phone audio whenever the user
+                    // turned down laptop speakers to avoid echo, and doubled
+                    // attenuation on APO endpoints where WASAPI loopback already
+                    // reflects software volume.
+                    let _ = telemetry;
+                    let _ = run_clone;
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
@@ -1025,6 +1031,7 @@ fn read_linux_master_volume() -> Option<u8> {
 /// for the whole monitor thread lifetime. Rebuilding them on every 500 ms poll
 /// repeatedly tore down COM apartment state and cost far more than the read.
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn run_windows_volume_monitor(telemetry: &HostTelemetry, running: &AtomicBool) {
     use core::ffi::c_void;
 

@@ -68,6 +68,77 @@ impl ChannelRole {
     }
 }
 
+/// Zero-click matrix blender for live [`ChannelRole`] switching.
+///
+/// Switching directly between `(L, R)` and `(L, L)` or `((L+R)/2, (L+R)/2)` in
+/// one sample produces an audible step click. This blender slews the 2x2
+/// routing matrix over ~3 ms and bypasses at zero cost once settled on Stereo.
+pub struct ChannelRoleBlender {
+    ll: f32,
+    lr: f32,
+    rl: f32,
+    rr: f32,
+}
+
+impl Default for ChannelRoleBlender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChannelRoleBlender {
+    pub const fn new() -> Self {
+        Self {
+            ll: 1.0,
+            lr: 0.0,
+            rl: 0.0,
+            rr: 1.0,
+        }
+    }
+
+    #[inline]
+    fn target_matrix(role: ChannelRole) -> (f32, f32, f32, f32) {
+        match role {
+            ChannelRole::Stereo => (1.0, 0.0, 0.0, 1.0),
+            ChannelRole::LeftMono => (1.0, 0.0, 1.0, 0.0),
+            ChannelRole::RightMono => (0.0, 1.0, 0.0, 1.0),
+            ChannelRole::CenterDialogue => (0.5, 0.5, 0.5, 0.5),
+            ChannelRole::SurroundAmbient => (0.5, -0.5, -0.5, 0.5),
+        }
+    }
+
+    #[inline]
+    pub fn process_in_place(&mut self, role: ChannelRole, stereo_samples: &mut [f32]) {
+        let (t_ll, t_lr, t_rl, t_rr) = Self::target_matrix(role);
+        let settled = (self.ll - t_ll).abs() <= 1.0e-5
+            && (self.lr - t_lr).abs() <= 1.0e-5
+            && (self.rl - t_rl).abs() <= 1.0e-5
+            && (self.rr - t_rr).abs() <= 1.0e-5;
+        if settled {
+            self.ll = t_ll;
+            self.lr = t_lr;
+            self.rl = t_rl;
+            self.rr = t_rr;
+            if role == ChannelRole::Stereo {
+                return;
+            }
+            role.apply_in_place(stereo_samples);
+            return;
+        }
+        const ALPHA: f32 = 0.008; // ~2.6 ms time constant @ 48 kHz
+        for frame in stereo_samples.chunks_exact_mut(2) {
+            self.ll += ALPHA * (t_ll - self.ll);
+            self.lr += ALPHA * (t_lr - self.lr);
+            self.rl += ALPHA * (t_rl - self.rl);
+            self.rr += ALPHA * (t_rr - self.rr);
+            let l = frame[0];
+            let r = frame[1];
+            frame[0] = l * self.ll + r * self.lr;
+            frame[1] = l * self.rl + r * self.rr;
+        }
+    }
+}
+
 /// 2. Audiophile Bauer Stereophonic-to-Binaural Headphone Crossfeed (0.00ms Lookahead!)
 /// Simulates studio monitor speakers at +/- 30 degrees by feeding a 270us (13-sample @ 48kHz)
 /// delayed, 700Hz low-pass filtered cross-signal into the opposite ear.
@@ -77,6 +148,7 @@ pub struct BauerCrossfeedFilter {
     idx: usize,
     lp_l: f32,
     lp_r: f32,
+    wet_mix: f32,
 }
 
 impl BauerCrossfeedFilter {
@@ -87,17 +159,36 @@ impl BauerCrossfeedFilter {
             idx: 0,
             lp_l: 0.0,
             lp_r: 0.0,
+            wet_mix: 0.0,
         }
     }
 
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
+        self.wet_mix = 1.0;
+        self.process_with_enable(stereo, true);
+    }
+
+    /// Click-free crossfeed toggle: ramps wet/dry smoothly over ~8 ms when
+    /// enabled or disabled, and clears delay state cleanly once fully bypassed.
+    #[inline]
+    pub fn process_with_enable(&mut self, stereo: &mut [f32], enabled: bool) {
+        if !enabled && self.wet_mix <= 1.0e-5 {
+            self.wet_mix = 0.0;
+            self.delay_l = [0.0; 16];
+            self.delay_r = [0.0; 16];
+            self.lp_l = 0.0;
+            self.lp_r = 0.0;
+            return;
+        }
+
         const ANTI_DENORMAL: f32 = 1.0e-25;
         // 700 Hz 1-pole low-pass coefficient at 48kHz: 1 - exp(-2*pi*700/48000)
         const ALPHA_700HZ: f32 = 0.0875;
         const DIRECT_GAIN: f32 = 0.78;
         const CROSS_GAIN: f32 = 0.22; // DIRECT_GAIN + CROSS_GAIN == 1.00 (0.0 dB unity center)
         const ITD_SAMPLES: usize = 7; // 146 us ITD (+/-30 deg studio monitor angle, no 1.8kHz notch)
+        const RAMP_STEP: f32 = 1.0 / 384.0; // ~8 ms smooth ramp @ 48 kHz
 
         for frame in stereo.chunks_exact_mut(2) {
             let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
@@ -120,8 +211,23 @@ impl BauerCrossfeedFilter {
             // -0.21 dB instead of the old -1.41 dB treble loss.
             let hf_l = in_l - self.lp_l;
             let hf_r = in_r - self.lp_r;
-            frame[0] = in_l * DIRECT_GAIN + (hf_l + cross_from_r) * CROSS_GAIN;
-            frame[1] = in_r * DIRECT_GAIN + (hf_r + cross_from_l) * CROSS_GAIN;
+            let wet_l = in_l * DIRECT_GAIN + (hf_l + cross_from_r) * CROSS_GAIN;
+            let wet_r = in_r * DIRECT_GAIN + (hf_r + cross_from_l) * CROSS_GAIN;
+
+            if enabled {
+                self.wet_mix = (self.wet_mix + RAMP_STEP).min(1.0);
+            } else {
+                self.wet_mix = (self.wet_mix - RAMP_STEP).max(0.0);
+            }
+            let w = self.wet_mix;
+            if w >= 1.0 {
+                frame[0] = wet_l;
+                frame[1] = wet_r;
+            } else {
+                let d = 1.0 - w;
+                frame[0] = in_l * d + wet_l * w;
+                frame[1] = in_r * d + wet_r * w;
+            }
 
             self.idx = (self.idx + 1) & 15;
         }
@@ -175,6 +281,8 @@ impl GroupSyncEstimator {
 }
 
 /// 4. Zero-Allocation Direct-Form II Transposed Stereo Biquad Filter
+/// Supports smooth per-sample coefficient slewing and wet/dry fade so tapping
+/// EQ presets, moving sliders, or resetting to flat never clicks.
 #[derive(Clone, Copy)]
 pub struct StereoBiquad {
     b0: f32,
@@ -182,10 +290,18 @@ pub struct StereoBiquad {
     b2: f32,
     a1: f32,
     a2: f32,
+    tgt_b0: f32,
+    tgt_b1: f32,
+    tgt_b2: f32,
+    tgt_a1: f32,
+    tgt_a2: f32,
     z1_l: f32,
     z2_l: f32,
     z1_r: f32,
     z2_r: f32,
+    wet_mix: f32,
+    target_flat: bool,
+    slewing: bool,
 }
 
 impl StereoBiquad {
@@ -196,11 +312,24 @@ impl StereoBiquad {
             b2: 0.0,
             a1: 0.0,
             a2: 0.0,
+            tgt_b0: 1.0,
+            tgt_b1: 0.0,
+            tgt_b2: 0.0,
+            tgt_a1: 0.0,
+            tgt_a2: 0.0,
             z1_l: 0.0,
             z2_l: 0.0,
             z1_r: 0.0,
             z2_r: 0.0,
+            wet_mix: 0.0,
+            target_flat: true,
+            slewing: false,
         }
+    }
+
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        !self.target_flat || self.wet_mix > 1.0e-5
     }
 
     pub fn set_peaking_eq(&mut self, freq_hz: f32, q: f32, gain_db: f32) {
@@ -209,19 +338,25 @@ impl StereoBiquad {
         // biquad coefficients can never blow up from an unbounded boost/cut.
         let gain_db = gain_db.clamp(-24.0, 24.0);
         if gain_db.abs() < 0.05 {
-            self.b0 = 1.0;
-            self.b1 = 0.0;
-            self.b2 = 0.0;
-            self.a1 = 0.0;
-            self.a2 = 0.0;
-            // `StudioEqualizer::process` bypasses all biquads while every band
-            // is flat, so these delay states freeze instead of decaying. Clear
-            // them here or re-engaging the band discharges the old history as
-            // a click on the first frame.
-            self.z1_l = 0.0;
-            self.z2_l = 0.0;
-            self.z1_r = 0.0;
-            self.z2_r = 0.0;
+            self.target_flat = true;
+            if self.wet_mix <= 1.0e-5 {
+                self.b0 = 1.0;
+                self.b1 = 0.0;
+                self.b2 = 0.0;
+                self.a1 = 0.0;
+                self.a2 = 0.0;
+                self.tgt_b0 = 1.0;
+                self.tgt_b1 = 0.0;
+                self.tgt_b2 = 0.0;
+                self.tgt_a1 = 0.0;
+                self.tgt_a2 = 0.0;
+                self.z1_l = 0.0;
+                self.z2_l = 0.0;
+                self.z1_r = 0.0;
+                self.z2_r = 0.0;
+                self.wet_mix = 0.0;
+                self.slewing = false;
+            }
             return;
         }
         let a = 10.0f32.powf(gain_db / 40.0);
@@ -237,28 +372,119 @@ impl StereoBiquad {
         let a2 = 1.0 - alpha / a;
 
         let inv_a0 = 1.0 / a0;
-        self.b0 = b0 * inv_a0;
-        self.b1 = b1 * inv_a0;
-        self.b2 = b2 * inv_a0;
-        self.a1 = a1 * inv_a0;
-        self.a2 = a2 * inv_a0;
+        let nb0 = b0 * inv_a0;
+        let nb1 = b1 * inv_a0;
+        let nb2 = b2 * inv_a0;
+        let na1 = a1 * inv_a0;
+        let na2 = a2 * inv_a0;
+
+        if self.target_flat {
+            // Engaging from flat: clear any stale delay history and load the
+            // target coefficients immediately while ramping `wet_mix` 0 -> 1
+            // over ~5 ms for a zero-click entry.
+            self.z1_l = 0.0;
+            self.z2_l = 0.0;
+            self.z1_r = 0.0;
+            self.z2_r = 0.0;
+            self.b0 = nb0;
+            self.b1 = nb1;
+            self.b2 = nb2;
+            self.a1 = na1;
+            self.a2 = na2;
+            self.tgt_b0 = nb0;
+            self.tgt_b1 = nb1;
+            self.tgt_b2 = nb2;
+            self.tgt_a1 = na1;
+            self.tgt_a2 = na2;
+            self.wet_mix = 0.0;
+            self.target_flat = false;
+            self.slewing = false;
+        } else {
+            // Updating an already-active band (slider drag or preset change):
+            // slew coefficients smoothly over ~2.5 ms instead of stepping them.
+            self.tgt_b0 = nb0;
+            self.tgt_b1 = nb1;
+            self.tgt_b2 = nb2;
+            self.tgt_a1 = na1;
+            self.tgt_a2 = na2;
+            self.slewing = true;
+        }
     }
 
     #[inline]
     pub fn process_stereo_in_place(&mut self, stereo: &mut [f32]) {
+        if self.target_flat && self.wet_mix <= 1.0e-5 {
+            self.wet_mix = 0.0;
+            self.z1_l = 0.0;
+            self.z2_l = 0.0;
+            self.z1_r = 0.0;
+            self.z2_r = 0.0;
+            return;
+        }
         const ANTI_DENORMAL: f32 = 1.0e-25;
+        const COEFF_SLEW: f32 = 0.02; // ~1 ms time constant @ 48 kHz
+        const WET_STEP: f32 = 1.0 / 240.0; // ~5 ms smooth ramp @ 48 kHz
+
         for frame in stereo.chunks_exact_mut(2) {
+            if self.slewing {
+                self.b0 += COEFF_SLEW * (self.tgt_b0 - self.b0);
+                self.b1 += COEFF_SLEW * (self.tgt_b1 - self.b1);
+                self.b2 += COEFF_SLEW * (self.tgt_b2 - self.b2);
+                self.a1 += COEFF_SLEW * (self.tgt_a1 - self.a1);
+                self.a2 += COEFF_SLEW * (self.tgt_a2 - self.a2);
+            }
+
             let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
             let out_l = self.b0 * in_l + self.z1_l;
             self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
             self.z2_l = self.b2 * in_l - self.a2 * out_l;
-            frame[0] = out_l;
 
             let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
             let out_r = self.b0 * in_r + self.z1_r;
             self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
             self.z2_r = self.b2 * in_r - self.a2 * out_r;
-            frame[1] = out_r;
+
+            if self.target_flat {
+                self.wet_mix = (self.wet_mix - WET_STEP).max(0.0);
+            } else if self.wet_mix < 1.0 {
+                self.wet_mix = (self.wet_mix + WET_STEP).min(1.0);
+            }
+
+            let w = self.wet_mix;
+            if w >= 1.0 {
+                frame[0] = out_l;
+                frame[1] = out_r;
+            } else if w <= 0.0 {
+                frame[0] = in_l;
+                frame[1] = in_r;
+            } else {
+                let d = 1.0 - w;
+                frame[0] = in_l * d + out_l * w;
+                frame[1] = in_r * d + out_r * w;
+            }
+        }
+
+        if self.slewing {
+            let err = (self.b0 - self.tgt_b0).abs()
+                + (self.b1 - self.tgt_b1).abs()
+                + (self.b2 - self.tgt_b2).abs()
+                + (self.a1 - self.tgt_a1).abs()
+                + (self.a2 - self.tgt_a2).abs();
+            if err < 1.0e-5 {
+                self.b0 = self.tgt_b0;
+                self.b1 = self.tgt_b1;
+                self.b2 = self.tgt_b2;
+                self.a1 = self.tgt_a1;
+                self.a2 = self.tgt_a2;
+                self.slewing = false;
+            }
+        }
+        if self.target_flat && self.wet_mix <= 1.0e-5 {
+            self.wet_mix = 0.0;
+            self.z1_l = 0.0;
+            self.z2_l = 0.0;
+            self.z1_r = 0.0;
+            self.z2_r = 0.0;
         }
     }
 }
@@ -287,9 +513,8 @@ impl StudioEqualizer {
 
     #[inline]
     pub fn update_if_changed(&mut self, bass_tenths: i32, pres_tenths: i32, treb_tenths: i32) {
-        // Recompute each band independently. `set_peaking_eq` resets that
-        // band's delay state when it goes flat, so touching a band the user
-        // did not change would discharge stale history as an audible click.
+        // Recompute each band independently so touching one band never
+        // disturbs another band's state.
         if bass_tenths != self.last_bass_tenths {
             self.last_bass_tenths = bass_tenths;
             self.bass
@@ -309,13 +534,13 @@ impl StudioEqualizer {
 
     #[inline]
     pub fn process(&mut self, stereo: &mut [f32]) {
-        if self.last_bass_tenths != 0 {
+        if self.bass.is_active() {
             self.bass.process_stereo_in_place(stereo);
         }
-        if self.last_pres_tenths != 0 {
+        if self.presence.is_active() {
             self.presence.process_stereo_in_place(stereo);
         }
-        if self.last_treb_tenths != 0 {
+        if self.treble.is_active() {
             self.treble.process_stereo_in_place(stereo);
         }
     }
@@ -379,6 +604,32 @@ impl NightModeCompressor {
         Self {
             env: 0.0,
             gain_env: 1.0,
+        }
+    }
+
+    /// Click-free Night Mode toggle: when disabled, smoothly slews `gain_env`
+    /// back to 1.0 over ~3 ms before bypassing instead of stepping gain.
+    #[inline]
+    pub fn process_with_enable(&mut self, stereo: &mut [f32], enabled: bool) {
+        if enabled {
+            self.process_in_place(stereo);
+            return;
+        }
+        if (self.gain_env - 1.0).abs() <= 1.0e-4 {
+            self.gain_env = 1.0;
+            self.env = 0.0;
+            return;
+        }
+        for frame in stereo.chunks_exact_mut(2) {
+            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
+            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            self.gain_env += 0.008 * (1.0 - self.gain_env);
+            frame[0] = (l * self.gain_env).clamp(-0.98, 0.98);
+            frame[1] = (r * self.gain_env).clamp(-0.98, 0.98);
+        }
+        if (self.gain_env - 1.0).abs() <= 1.0e-4 {
+            self.gain_env = 1.0;
+            self.env = 0.0;
         }
     }
 
@@ -1198,6 +1449,13 @@ mod tests {
 
     #[test]
     fn test_per_band_biquad_bypass_is_bit_transparent() {
+        // Fresh flat EQ is immediately bit-exact untouched.
+        let mut fresh_eq = StudioEqualizer::new();
+        let mut flat_fresh = [0.12345f32; 240];
+        let original_fresh = flat_fresh;
+        fresh_eq.process(&mut flat_fresh);
+        assert_eq!(flat_fresh, original_fresh, "fresh 0dB EQ must be bit-identical");
+
         let mut eq = StudioEqualizer::new();
         // Boost only bass (+3 dB), presence and treble flat (0 dB)
         eq.update_if_changed(30, 0, 0);
@@ -1205,12 +1463,143 @@ mod tests {
         let mut signal = [0.5f32; 240];
         eq.process(&mut signal);
 
-        // When all bands are 0 dB, signal must be bit-exact untouched
+        // Resetting to 0 dB smoothly ramps wet_mix to 0 over ~5 ms (no click),
+        // then settles into bit-exact bypass.
+        eq.update_if_changed(0, 0, 0);
+        let mut settle = [0.12345f32; 600];
+        eq.process(&mut settle);
+
         let mut flat_signal = [0.12345f32; 240];
         let original = flat_signal;
-        eq.update_if_changed(0, 0, 0);
         eq.process(&mut flat_signal);
-        assert_eq!(flat_signal, original, "0dB EQ must be bit-identical");
+        assert_eq!(flat_signal, original, "settled 0dB EQ must be bit-identical");
+    }
+
+    #[test]
+    fn test_dsp_toggles_are_click_free() {
+        // Constant stereo tone where hard-switching any DSP block would create
+        // a large instant step discontinuity.
+        let mut prev_l = 0.0f32;
+        let mut max_step = 0.0f32;
+
+        // 1. ChannelRoleBlender: Stereo -> MonoLeft -> CenterDialogue -> Stereo
+        let mut blender = ChannelRoleBlender::new();
+        for block in 0..8 {
+            let role = match block {
+                0 => ChannelRole::Stereo,
+                1..=2 => ChannelRole::LeftMono,
+                3..=4 => ChannelRole::CenterDialogue,
+                _ => ChannelRole::Stereo,
+            };
+            let mut buf = [0.0f32; 240];
+            for i in 0..120 {
+                let t = (block * 120 + i) as f32;
+                buf[i * 2] = (t * 2.0 * std::f32::consts::PI * 220.0 / 48_000.0).sin() * 0.5;
+                buf[i * 2 + 1] = -(t * 2.0 * std::f32::consts::PI * 220.0 / 48_000.0).sin() * 0.5;
+            }
+            blender.process_in_place(role, &mut buf);
+            for i in 0..120 {
+                let s = buf[i * 2];
+                if block > 0 || i > 0 {
+                    max_step = max_step.max((s - prev_l).abs());
+                }
+                prev_l = s;
+            }
+        }
+        assert!(
+            max_step < 0.05,
+            "ChannelRoleBlender produced a click step of {:.4}",
+            max_step
+        );
+
+        // 2. BauerCrossfeedFilter::process_with_enable toggle ON -> OFF
+        let mut xfeed = BauerCrossfeedFilter::new();
+        let mut prev_r = 0.0f32;
+        let mut xfeed_max_step = 0.0f32;
+        for block in 0..8 {
+            let enabled = (1..=3).contains(&block);
+            let mut buf = [0.0f32; 240];
+            for i in 0..120 {
+                let t = (block * 120 + i) as f32;
+                buf[i * 2] = (t * 2.0 * std::f32::consts::PI * 300.0 / 48_000.0).sin() * 0.6;
+                buf[i * 2 + 1] = 0.0;
+            }
+            xfeed.process_with_enable(&mut buf, enabled);
+            for i in 0..120 {
+                let r = buf[i * 2 + 1];
+                if block > 0 || i > 0 {
+                    xfeed_max_step = xfeed_max_step.max((r - prev_r).abs());
+                }
+                prev_r = r;
+            }
+        }
+        assert!(
+            xfeed_max_step < 0.05,
+            "BauerCrossfeedFilter toggle produced a click step of {:.4}",
+            xfeed_max_step
+        );
+
+        // 3. NightModeCompressor::process_with_enable toggle ON -> OFF
+        let mut night = NightModeCompressor::new();
+        let mut prev_n = 0.0f32;
+        let mut night_max_step = 0.0f32;
+        for block in 0..10 {
+            let enabled = (1..=4).contains(&block);
+            let mut buf = [0.0f32; 240];
+            for i in 0..120 {
+                let t = (block * 120 + i) as f32;
+                let s = (t * 2.0 * std::f32::consts::PI * 250.0 / 48_000.0).sin() * 0.06;
+                buf[i * 2] = s;
+                buf[i * 2 + 1] = s;
+            }
+            night.process_with_enable(&mut buf, enabled);
+            for i in 0..120 {
+                let s = buf[i * 2];
+                if block > 0 || i > 0 {
+                    night_max_step = night_max_step.max((s - prev_n).abs());
+                }
+                prev_n = s;
+            }
+        }
+        assert!(
+            night_max_step < 0.05,
+            "NightModeCompressor toggle produced a click step of {:.4}",
+            night_max_step
+        );
+
+        // 4. StudioEqualizer aggressive preset jump: Flat -> +12 dB -> -12 dB -> Flat
+        let mut eq = StudioEqualizer::new();
+        let mut prev_eq = 0.0f32;
+        let mut eq_max_step = 0.0f32;
+        for block in 0..12 {
+            match block {
+                0 => eq.update_if_changed(0, 0, 0),
+                2 => eq.update_if_changed(120, 60, 80),
+                5 => eq.update_if_changed(-120, -60, -80),
+                8 => eq.update_if_changed(0, 0, 0),
+                _ => {}
+            }
+            let mut buf = [0.0f32; 240];
+            for i in 0..120 {
+                let t = (block * 120 + i) as f32;
+                let s = (t * 2.0 * std::f32::consts::PI * 200.0 / 48_000.0).sin() * 0.25;
+                buf[i * 2] = s;
+                buf[i * 2 + 1] = s;
+            }
+            eq.process(&mut buf);
+            for i in 0..120 {
+                let s = buf[i * 2];
+                if block > 0 || i > 0 {
+                    eq_max_step = eq_max_step.max((s - prev_eq).abs());
+                }
+                prev_eq = s;
+            }
+        }
+        assert!(
+            eq_max_step < 0.08,
+            "StudioEqualizer preset jump produced a click step of {:.4}",
+            eq_max_step
+        );
     }
 
     #[test]

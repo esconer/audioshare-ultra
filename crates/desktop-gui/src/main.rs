@@ -699,7 +699,7 @@ impl AudioShareApp {
                     "prefer_opus" => self.prefer_opus = v.trim() != "false",
                     "target_bitrate_kbps" => {
                         if let Ok(n) = v.trim().parse::<u16>() {
-                            self.target_bitrate_kbps = n.clamp(96, 320);
+                            self.target_bitrate_kbps = n.clamp(96, 510);
                         }
                     }
                     "usb_low_latency_pacing" => self.usb_low_latency_pacing = v.trim() == "true",
@@ -1100,7 +1100,7 @@ impl eframe::App for AudioShareApp {
                 .telemetry
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
-                .clamp(96, 320);
+                .clamp(96, 510);
 
             let pkts = host.telemetry.packets_sent.load(Ordering::Relaxed);
             let bytes_now = host.telemetry.bytes_sent.load(Ordering::Relaxed);
@@ -2170,7 +2170,7 @@ impl AudioShareApp {
                     let choices: &[u16] = if stability {
                         &[96, 160]
                     } else {
-                        &[96, 160, 256, 320]
+                        &[96, 160, 256, 320, 510]
                     };
                     let effective = if stability {
                         self.target_bitrate_kbps.clamp(96, 160)
@@ -3432,7 +3432,7 @@ phone_rx_mode=1
 
         // Upper bound clamp (max 320)
         app.parse_config_string("target_bitrate_kbps=1000\n");
-        assert_eq!(app.target_bitrate_kbps, 320);
+        assert_eq!(app.target_bitrate_kbps, 510);
 
         // Within range
         app.parse_config_string("target_bitrate_kbps=160\n");

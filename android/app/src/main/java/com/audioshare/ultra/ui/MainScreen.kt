@@ -624,6 +624,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         { it.muteHostSpeakerInParty },
         { s, v -> s.copy(muteHostSpeakerInParty = v) }
     )
+    // User-locked Party Host codec & bitrate (never auto-switches mid-stream).
+    var partyCodecProfile by vmField(
+        { it.partyCodecProfile },
+        { s, v -> s.copy(partyCodecProfile = v) }
+    )
+    var partyBitrateKbps by vmField(
+        { it.partyBitrateKbps },
+        { s, v -> s.copy(partyBitrateKbps = v) }
+    )
     var sleepTimerMinutes by vmField(
         { it.sleepRemainingMins },
         { s, v -> s.copy(sleepRemainingMins = v) }
@@ -671,9 +680,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             .apply()
         applyDspLive()
         // Changing the preamp unmutes audio via nativeSetGainDb above. Clear
-        // the service's notification mute flag in the same gesture so the
-        // notification cannot stay stuck on "MUTED".
-        if (isConnected) {
+        // the service's notification mute flag only when actually muted so
+        // touching EQ/switches/sliders never triggers redundant Service IPC.
+        if (isConnected && AudioEngineService.isLocallyMutedState) {
             context.startService(
                 Intent(context, AudioEngineService::class.java).apply {
                     action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
@@ -1668,7 +1677,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val stabilityMode = qualityMode == 3
                             val bitrateChoices =
                                 if (stabilityMode) listOf(96, 160)
-                                else listOf(96, 160, 256, 320)
+                                else listOf(96, 160, 256, 320, 510)
                             val effectiveBitrate =
                                 if (stabilityMode) compressedBitrateKbps.coerceIn(96, 160)
                                 else compressedBitrateKbps
@@ -1697,7 +1706,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             }
                             if (stabilityMode) {
                                 Text(
-                                    "2.4G stability caps the target at 160 kbps and uses 96 kbps above 200‰ loss.",
+                                    "2.4G stability caps the target at 160 kbps, steps to 96 kbps above 200‰ loss, and 64 kbps above 280‰.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1775,6 +1784,73 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 prefs.edit().putBoolean("party_forward_pc", enabled).apply()
                             }
                         )
+
+                        HorizontalDivider(color = Color(0xFF243047))
+                        Text(
+                            "Party Broadcast Codec (Locked — Never Auto-Switches)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            listOf(
+                                0 to "Opus RLD",
+                                1 to "16-Bit Lossless",
+                                2 to "10ms Stability",
+                                3 to "Rust VBR"
+                            ).forEach { (profileIdx, label) ->
+                                FilterChip(
+                                    selected = partyCodecProfile == profileIdx,
+                                    onClick = {
+                                        partyCodecProfile = profileIdx
+                                        prefs.edit().putInt("party_codec_profile", profileIdx).apply()
+                                        AudioEngineService.nativeSetPartyCodecConfig(
+                                            profileIdx,
+                                            partyBitrateKbps
+                                        )
+                                    },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+
+                        if (partyCodecProfile != 1) {
+                            val partyStability = partyCodecProfile == 2
+                            val partyBitrateChoices =
+                                if (partyStability) listOf(96, 160)
+                                else listOf(96, 160, 256, 320)
+                            val effectivePartyBitrate =
+                                if (partyStability) partyBitrateKbps.coerceIn(96, 160)
+                                else partyBitrateKbps
+                            Text(
+                                "Party Bitrate",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                partyBitrateChoices.forEach { kbps ->
+                                    FilterChip(
+                                        selected = effectivePartyBitrate == kbps,
+                                        onClick = {
+                                            partyBitrateKbps = kbps
+                                            prefs.edit().putInt("party_bitrate_kbps", kbps).apply()
+                                            AudioEngineService.nativeSetPartyCodecConfig(
+                                                partyCodecProfile,
+                                                kbps
+                                            )
+                                        },
+                                        label = { Text("$kbps kbps") }
+                                    )
+                                }
+                            }
+                        }
 
                         AnimatedVisibility(visible = castPhoneInternalAudio) {
                             PartyTelemetrySection(

@@ -81,6 +81,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         var sleepRemainingMinutes: Int = 0
             private set
 
+        @Volatile
+        var isLocallyMutedState: Boolean = false
+            private set
+
         @JvmStatic
         external fun nativeStartClient(
             hostAddr: String,
@@ -130,6 +134,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         external fun nativeSetPartyCastMuted(muted: Boolean)
 
         @JvmStatic
+        external fun nativeSetPartyCodecConfig(codecProfile: Int, bitrateKbps: Int)
+
+        @JvmStatic
         external fun nativeTakePartyMediaCommand(): Int
 
         @JvmStatic
@@ -160,6 +167,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var audioDeviceCallback: AudioDeviceCallback? = null
     private var currentGainDb = 0.0f
     private var isLocallyMuted: Boolean = false
+        set(value) {
+            field = value
+            isLocallyMutedState = value
+        }
     // Last value handed to native A/V sync. Device callbacks can re-report the
     // same route repeatedly; log only real transitions to keep the report useful.
     private var lastReportedBtDelayMs: Int = -1
@@ -541,12 +552,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
         val savedQuality = prefs.getInt("quality_mode", 0).coerceIn(0, 4)
         nativeSendMediaCommand(savedQuality + 1)
-        // Restore the compressed bitrate target (30..33 = 96/160/256/320 kbps)
+        // Restore the compressed bitrate target (30..34 = 96/160/256/320/510 kbps)
         // in its own slot as well.
         val savedBitrateCmd = when (prefs.getInt("target_bitrate_kbps", 256)) {
             96 -> 30
             160 -> 31
             320 -> 33
+            510 -> 34
             else -> 32
         }
         nativeSendMediaCommand(savedBitrateCmd)
@@ -719,24 +731,21 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         nativeReportBluetoothDelayMs(reportedDelayMs)
     }
 
-    private fun requestAudioFocus(useDolby: Boolean) {
+    private fun requestAudioFocus(@Suppress("UNUSED_PARAMETER") useDolby: Boolean) {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         // Reconnects call onStartCommand again; abandon the previous request
         // instead of overwriting it and leaking focus ownership.
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         audioManager = am
-        // Raw mode uses game/sonification attributes so the platform and OEM
-        // Dolby services do not treat the stream as media playback. Dolby mode
-        // deliberately matches the shared-mixer AAudio profile.
-        val attributes = AudioAttributes.Builder().apply {
-            if (useDolby) {
-                setUsage(AudioAttributes.USAGE_MEDIA)
-                setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-            } else {
-                setUsage(AudioAttributes.USAGE_GAME)
-                setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            }
-        }.build()
+        // Always request MEDIA/MUSIC focus to match the AAudio USAGE_MEDIA /
+        // CONTENT_TYPE_MUSIC stream attributes. Using GAME/SONIFICATION caused
+        // OEM audio HALs (ColorOS/MIUI/OneUI) to apply quieter UI/game volume
+        // curves (~6 dB lower than music apps at 100% media volume). Raw mode
+        // still bypasses OEM effects via AAudio EXCLUSIVE + SPATIALIZATION_NEVER.
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
             .setAudioAttributes(attributes)
             .setOnAudioFocusChangeListener(this)
@@ -940,6 +949,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             projection = acquired
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val pin = prefs.getString("pin_code", "") ?: ""
+            // Apply the user's locked Party codec & bitrate before starting the
+            // transmitter so Party Mode never auto-switches mid-stream.
+            val partyCodecProfile = prefs.getInt("party_codec_profile", 0).coerceIn(0, 3)
+            val partyBitrateKbps = prefs.getInt("party_bitrate_kbps", 256).coerceIn(96, 320)
+            runCatching { nativeSetPartyCodecConfig(partyCodecProfile, partyBitrateKbps) }
 
             var casterRef: PhoneAudioCaster? = null
             val caster = PhoneAudioCaster(acquired, targets, pin) {

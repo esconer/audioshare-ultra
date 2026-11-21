@@ -54,6 +54,19 @@ const SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
 /// Above this loss even the 2.4 GHz stability framing steps down to the
 /// 96 kbps rung. 200 permille = 20% packet loss.
 const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
+/// Above 28% packet loss on severe/slow networks, step smoothly down to the
+/// 64 kbps survival rung (with 4-subframe framing + exact [P-1]/[P-2] Opus RED)
+/// so audio stays continuous instead of stalling.
+const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
+/// Sustained spotless lossless operation required before SmartAuto promotes
+/// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
+/// (~2.8-4.5+ Mbps) on Wi-Fi links.
+const SMART_AUTO_MASTER_PROMOTE_SECS: u64 = 15;
+/// Spotless loss threshold (0.2%) required to arm/hold 24-bit Master promotion.
+const SMART_AUTO_MASTER_PROMOTE_MAX_LOSS_PERMILLE: u16 = 2;
+/// Any loss above 0.5% immediately steps back from 24-bit Master to 16-bit
+/// Lossless (zero-click, identical CodecMode::StudioLosslessLpc & 0 ms lookahead).
+const SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE: u16 = 5;
 /// Keep compressed mode for this long after the last high-loss report. Without
 /// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
 /// encoder every 500 ms.
@@ -189,18 +202,84 @@ fn warm_opus_lookahead(
     }
 }
 
+/// Promotes SmartAuto from 16-bit Lossless (~1.5 Mbps) to full-capacity
+/// 24-bit Studio Master (~2.8-4.5+ Mbps) once the link proves spotless capacity
+/// (or immediately on pure USB), and steps down cleanly to 16-bit before loss
+/// ever reaches the Opus compression threshold. Because 16-bit and 24-bit share
+/// `CodecMode::StudioLosslessLpc` and 0 ms lookahead, transitions are
+/// sample-accurate with zero glitches.
+struct CleanLinkPromoter {
+    clean_since: Option<Instant>,
+    master_24bit: bool,
+}
+
+impl CleanLinkPromoter {
+    fn new() -> Self {
+        Self {
+            clean_since: None,
+            master_24bit: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        raw_loss_permille: u16,
+        governed_loss_permille: u16,
+        bt_active: bool,
+        all_usb: bool,
+        has_clients: bool,
+        now: Instant,
+    ) -> bool {
+        if !has_clients || bt_active || governed_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE
+        {
+            self.clean_since = None;
+            self.master_24bit = false;
+            return false;
+        }
+        if all_usb && raw_loss_permille <= SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
+            self.master_24bit = true;
+            return true;
+        }
+        if self.master_24bit {
+            if raw_loss_permille > SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
+                self.master_24bit = false;
+                self.clean_since = None;
+            }
+            return self.master_24bit;
+        }
+        if raw_loss_permille <= SMART_AUTO_MASTER_PROMOTE_MAX_LOSS_PERMILLE {
+            let since = *self.clean_since.get_or_insert(now);
+            if now.saturating_duration_since(since)
+                >= Duration::from_secs(SMART_AUTO_MASTER_PROMOTE_SECS)
+            {
+                self.master_24bit = true;
+            }
+        } else {
+            self.clean_since = None;
+        }
+        self.master_24bit
+    }
+
+    #[inline]
+    fn is_master_24bit(&self) -> bool {
+        self.master_24bit
+    }
+}
+
 /// Primary bitrate for the 2.4 GHz stability framing, used by both the
 /// explicit `MaxStability24Ghz` profile and Smart Auto's high-loss tier.
 ///
 /// The profile exists for long-range links through walls, so the primary
-/// stream is capped at 160 kbps even when the user selected 256/320. A
+/// stream is capped at 160 kbps even when the user selected 256/320/510. A
 /// user-selected 96 kbps is honored rather than silently raised to 160.
-/// Above 20% loss the 96 kbps rung is the better tradeoff: its primary
-/// payload is 36 B/subframe instead of 53 B, leaving more airtime for the
-/// FEC backups that actually repair the loss.
+/// Above 20% loss the 96 kbps rung is the better tradeoff, and above 28%
+/// loss the 64 kbps survival rung keeps slow/weak networks flowing smoothly
+/// with exact `[P-1]/[P-2]` Opus RED.
 #[inline]
 fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
-    if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
+    if worst_loss_permille > SEVERE_LOSS_THRESHOLD_PERMILLE {
+        64
+    } else if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
         96
     } else {
         selected_kbps.clamp(96, 160)
@@ -306,10 +385,19 @@ fn select_tx_profile(
                     selected_kbps.clamp(96, 192),
                 )
             } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+                // Smooth intra-Opus bitrate scaling (zero codec switch, zero
+                // framing jump): keep 320k cap on 2-sf Wi-Fi so exact [P-1]/[P-2]
+                // RED always fits inside 255 bytes, and gently step down to 224k
+                // above 8% loss before ever needing 10 ms framing at >12% loss.
+                let smooth_kbps = if worst_loss_permille > 80 {
+                    selected_kbps.clamp(96, 224)
+                } else {
+                    selected_kbps.clamp(96, 320)
+                };
                 (
                     CodecMode::CompressedLowDelay,
                     if gaming_lock { 1 } else { 2 },
-                    selected_kbps,
+                    smooth_kbps,
                 )
             } else {
                 (CodecMode::StudioLosslessLpc, base_subframes, selected_kbps)
@@ -824,16 +912,11 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
     let sock_ref = socket2::SockRef::from(socket);
     // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
     let _ = sock_ref.set_tos(0xA0);
-    // Asymmetric buffers: the send buffer must absorb a burst of split 24-bit
-    // datagrams while the Wi-Fi driver waits for a TXOP. The old tight 16 KB
-    // also overflowed after only a few large fast-scene allocations, and
-    // `send_to` runs on a non-blocking socket, so those drops were silent.
-    // 256 KB send buffer absorbs 250+ ms Wi-Fi driver TX stalls without
-    // silent non-blocking `send_to` drops (send_err).
-    // 128 KB SO_RCVBUF ensures the receiver never drops Wi-Fi aggregation
-    // bursts.
-    let _ = sock_ref.set_send_buffer_size(262_144);
-    let _ = sock_ref.set_recv_buffer_size(131_072);
+    // 1 MB send & receive buffers absorb 5+ Mbps 24-bit Master bursts and
+    // 250-350 ms Wi-Fi driver TXOP/A-MPDU aggregation stalls without silent
+    // non-blocking `send_to` drops or kernel RX queue overflows.
+    let _ = sock_ref.set_send_buffer_size(1_048_576);
+    let _ = sock_ref.set_recv_buffer_size(1_048_576);
 
     // Disable Winsock's legacy SIO_UDP_CONNRESET behavior: without this, one
     // ICMP Port Unreachable from a restarting/disconnected phone makes
@@ -2692,6 +2775,7 @@ impl HostEngine {
         let mut dynamic_codec_mode;
         let mut tx_bitrate_kbps;
         let mut loss_governor = LossGovernor::new(Instant::now());
+        let mut clean_link_promoter = CleanLinkPromoter::new();
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         // Lazily created on the first compressed packet after the user enables
         // the Opus backend. Smart Auto also keeps it warm through Tier 0 so
@@ -3022,7 +3106,7 @@ impl HostEngine {
                     // Remote quality-mode selection from the phone UI:
                     // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
                     // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                    // Bitrate selections are 30=96, 31=160, 32=256, 33=320 kbps.
+                    // Bitrate selections are 30=96, 31=160, 32=256, 33=320, 34=510 kbps.
                     // Other values are media transport or codec-backend
                     // commands handled above.
                     if (1..=5).contains(&fb.requested_mode) {
@@ -3035,6 +3119,7 @@ impl HostEngine {
                             31 => Some(160),
                             32 => Some(256),
                             33 => Some(320),
+                            34 => Some(510),
                             _ => None,
                         };
                         if let Some(kbps) = kbps {
@@ -3085,7 +3170,8 @@ impl HostEngine {
                         .map(|c| c.fec_rate_permille)
                         .max()
                         .unwrap_or(0);
-                    loss_governor.update(raw_worst, Instant::now());
+                    let now_fb = Instant::now();
+                    loss_governor.update(raw_worst, now_fb);
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
 
@@ -3096,6 +3182,14 @@ impl HostEngine {
                         }
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    clean_link_promoter.update(
+                        raw_worst,
+                        loss_governor.value,
+                        telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
+                        cached_all_usb,
+                        !cached_targets.is_empty(),
+                        now_fb,
+                    );
                     drop(map);
                     if newly_joined {
                         audioshare_protocol::diagnostics::info(
@@ -3141,7 +3235,8 @@ impl HostEngine {
                         .map(|c| c.fec_rate_permille)
                         .max()
                         .unwrap_or(0);
-                    loss_governor.update(raw_worst, Instant::now());
+                    let now_sweep = Instant::now();
+                    loss_governor.update(raw_worst, now_sweep);
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
@@ -3151,6 +3246,14 @@ impl HostEngine {
                         }
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    clean_link_promoter.update(
+                        raw_worst,
+                        loss_governor.value,
+                        telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
+                        cached_all_usb,
+                        !cached_targets.is_empty(),
+                        now_sweep,
+                    );
                 }
             }
 
@@ -3162,7 +3265,7 @@ impl HostEngine {
             let selected_kbps = telemetry
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
-                .clamp(96, 320);
+                .clamp(64, 510);
             // Framing/profile/bitrate decisions are factored into
             // `select_tx_profile` so the BT/gaming-lock guardrails are shared
             // with unit tests. Tier selection uses the governor's paced
@@ -3183,6 +3286,10 @@ impl HostEngine {
                 any_wifi,
                 cached_all_usb,
             );
+            let use_pcm24 = profile == QualityProfile::StudioLossless24Bit
+                || (profile == QualityProfile::SmartAuto
+                    && dynamic_codec_mode == CodecMode::StudioLosslessLpc
+                    && clean_link_promoter.is_master_24bit());
             // Compressed-codec backend selection. Opus is opt-in and only
             // replaces the payload of compressed profiles; lossless and
             // 24-bit modes are untouched. If encoder creation fails we stay
@@ -3354,7 +3461,7 @@ impl HostEngine {
 
                 // Studio Master 24-bit must preserve -85..-100 dBFS reverb
                 // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
-                let active_audio = if profile == QualityProfile::StudioLossless24Bit {
+                let active_audio = if use_pcm24 {
                     f32_subframe.iter().any(|s| s.abs() > 1.0e-5)
                 } else {
                     max_abs > 3
@@ -3518,7 +3625,20 @@ impl HostEngine {
                             primary_bundle[primary_cursor..primary_cursor + enc_len]
                                 .copy_from_slice(&enc_primary[..enc_len]);
                             primary_cursor += enc_len;
-                        } else if profile == QualityProfile::StudioLossless24Bit {
+                        } else if use_pcm24 {
+                            // Keep SmartAuto's warm Opus lookahead primed even
+                            // while promoted to 24-bit Master so a sudden Wi-Fi
+                            // fade never drops to silence on entry into Opus.
+                            if profile == QualityProfile::SmartAuto
+                                && prefer_opus
+                                && !cached_all_usb
+                            {
+                                warm_opus_lookahead(
+                                    &mut opus_encoder,
+                                    &f32_subframes[sub_idx],
+                                    tx_bitrate_kbps,
+                                );
+                            }
                             // Encode from the original f32 samples (not the i16
                             // noise-shaper output) so the lower 8 bits carry
                             // genuine 24-bit resolution when available.
@@ -4645,10 +4765,13 @@ mod tests {
         assert_eq!(stability_bitrate_kbps(128, 0), 128);
         assert_eq!(stability_bitrate_kbps(160, 0), 160);
         assert_eq!(stability_bitrate_kbps(320, 0), 160);
-        // Exactly 20% loss keeps the normal stability rung; above it, 96.
+        // Exactly 20% loss keeps the normal stability rung; above it, 96;
+        // above 28% severe loss, the 64 kbps survival rung keeps weak links alive.
         assert_eq!(stability_bitrate_kbps(320, 200), 160);
         assert_eq!(stability_bitrate_kbps(320, 201), 96);
-        assert_eq!(stability_bitrate_kbps(96, 900), 96);
+        assert_eq!(stability_bitrate_kbps(320, 280), 96);
+        assert_eq!(stability_bitrate_kbps(320, 281), 64);
+        assert_eq!(stability_bitrate_kbps(96, 900), 64);
     }
 
     #[test]
@@ -5821,6 +5944,71 @@ mod tests {
         assert!(
             saw_both_red >= 3,
             "expected steady-state packets with both [P-1] and [P-2] RED blobs, got {saw_both_red}"
+        );
+    }
+
+    #[test]
+    fn test_clean_link_promoter_upgrades_to_24bit_and_demotes_cleanly() {
+        let mut promoter = CleanLinkPromoter::new();
+        let t0 = Instant::now();
+
+        // Wi-Fi link stays 16-bit before 15 s of spotless reception.
+        assert!(!promoter.update(0, 0, false, false, true, t0));
+        assert!(!promoter.update(2, 2, false, false, true, t0 + Duration::from_secs(14)));
+        // At 15 s spotless, promotes to 24-bit Studio Master (~2.8-4.5+ Mbps).
+        assert!(promoter.update(1, 1, false, false, true, t0 + Duration::from_secs(15)));
+        assert!(promoter.is_master_24bit());
+
+        // Minor 4‰ blip holds 24-bit (hysteresis <= 5‰), >5‰ steps cleanly back to 16-bit.
+        assert!(promoter.update(4, 4, false, false, true, t0 + Duration::from_secs(16)));
+        assert!(!promoter.update(6, 6, false, false, true, t0 + Duration::from_secs(17)));
+
+        // Pure USB promotes immediately with zero wait.
+        assert!(promoter.update(0, 0, false, true, true, t0 + Duration::from_secs(18)));
+        // Active Bluetooth never promotes to 24-bit Master.
+        assert!(!promoter.update(0, 0, true, true, true, t0 + Duration::from_secs(19)));
+    }
+
+    #[test]
+    fn test_select_tx_profile_smooth_bandwidth_ladder() {
+        // Explicit LowLatencyCompressed supports up to 510 kbps when user requests it.
+        assert_eq!(
+            select_tx_profile(
+                QualityProfile::LowLatencyCompressed,
+                2,
+                510,
+                0,
+                false,
+                false,
+                true,
+                false
+            ),
+            (CodecMode::CompressedLowDelay, 2, 510)
+        );
+        // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf -> 96k 4sf -> 64k 4sf.
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 0, false, false, true, false),
+            (CodecMode::StudioLosslessLpc, 2, 510)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 50, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 2, 320)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 90, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 2, 224)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 150, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 160)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 220, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 96)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 320, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 64)
         );
     }
 }

@@ -456,9 +456,9 @@ fn effective_wifi_ceiling(
     shield_subframes: &mut f32,
 ) -> f32 {
     let base_cap: f32 = if bt_active || pkt_subframes >= 4 {
-        28.0
+        48.0
     } else {
-        24.0
+        40.0
     };
     if let Some(until) = *shield_until {
         if now < until && (bt_active || pkt_subframes >= 4) {
@@ -1585,9 +1585,14 @@ impl ClientEngine {
         let mut resampler = ClockDriftResampler::new();
         let mut limiter = TruePeakLimiter::new(config.preamp_gain_db);
         let mut studio_eq = audioshare_protocol::sync_and_eq::StudioEqualizer::new();
+        let mut role_blender = audioshare_protocol::sync_and_eq::ChannelRoleBlender::new();
         let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
         let mut night_compressor = audioshare_protocol::sync_and_eq::NightModeCompressor::new();
         let group_sync = audioshare_protocol::sync_and_eq::GroupSyncEstimator::new();
+        // Hold the grown Wi-Fi jitter cushion for 10 s after any PLC, FEC
+        // burst, or ring underrun so fluctuating Wi-Fi never oscillates back
+        // into crackles 2 seconds after recovering.
+        let mut cushion_hold_until = Instant::now();
         // Created lazily on the first Opus packet. Dropped on DTX/resync and
         // whenever the host switches back to VBR.
         let mut opus_decoder: Option<OpusStreamDecoder> = None;
@@ -1869,7 +1874,15 @@ impl ClientEngine {
                 last_gaming_feedback = Instant::now();
             }
 
-            let periodic_due = last_feedback.elapsed() >= Duration::from_millis(500);
+            // While connecting (0 packets received), retry handshake/feedback
+            // every 150 ms so even slow or lossy networks lock on promptly;
+            // once streaming, keep the steady 500 ms feedback cadence.
+            let feedback_interval = if telemetry.packets_received.load(Ordering::Relaxed) == 0 {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_millis(500)
+            };
+            let periodic_due = last_feedback.elapsed() >= feedback_interval;
             if periodic_due
                 || telemetry.pending_media_command.load(Ordering::Relaxed) != 0
                 || telemetry
@@ -1895,12 +1908,21 @@ impl ClientEngine {
                 let fec_permille = if periodic_due {
                     let closed = window.close();
 
-                    // Decay the 2.4 GHz cushion when the link is healthy
-                    // enough that FEC is keeping up. Minor background recovery
-                    // must not pin the cushion at its 35 ms ceiling forever.
-                    adaptive_wifi_subframes =
-                        decay_adaptive_cushion(adaptive_wifi_subframes, initial_wifi_floor, closed);
-                    last_feedback = Instant::now();
+                    // Decay the Wi-Fi cushion only after the stability hold
+                    // expires and the link is healthy enough that FEC is
+                    // keeping up. Holding for 10 s after any burst eliminates
+                    // periodic sawtooth underrun crackles on fluctuating Wi-Fi.
+                    let now_fb = Instant::now();
+                    if closed > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
+                        cushion_hold_until = now_fb + Duration::from_secs(10);
+                    } else if now_fb >= cushion_hold_until {
+                        adaptive_wifi_subframes = decay_adaptive_cushion(
+                            adaptive_wifi_subframes,
+                            initial_wifi_floor,
+                            closed,
+                        );
+                    }
+                    last_feedback = now_fb;
                     closed
                 } else {
                     window.last_permille()
@@ -2168,7 +2190,7 @@ impl ClientEngine {
                         };
                         initial_wifi_floor =
                             wifi_floor_for_packet(bt_coex_floor, last_pkt_subframe_count);
-                        // Proactively cushion buffer to >= 2.2x measured network jitter (in 2500us subframes)
+                        // Proactively cushion buffer to >= 2.6x measured network jitter (in 2500us subframes)
                         let wifi_ceiling = effective_wifi_ceiling(
                             bt_now,
                             last_pkt_subframe_count,
@@ -2177,7 +2199,7 @@ impl ClientEngine {
                             &mut scan_shield_subframes,
                         )
                         .max(initial_wifi_floor);
-                        let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.2)
+                        let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.6)
                             .clamp(initial_wifi_floor, wifi_ceiling);
                         adaptive_wifi_subframes = adaptive_wifi_subframes.max(proactive_floor);
 
@@ -2497,7 +2519,8 @@ impl ClientEngine {
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
             {
                 sequencer.arm_fade_in();
-                adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.0).min(adaptive_ceiling);
+                adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.5).min(adaptive_ceiling);
+                cushion_hold_until = Instant::now() + Duration::from_secs(10);
             }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
             let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
@@ -2761,9 +2784,11 @@ impl ClientEngine {
                         last_plc_emit = None;
                         window.record_fec();
                         // 2.4GHz Wi-Fi jitter/drop detected: expand cushion by
-                        // +0.35 subframes, clamped to the route-aware ceiling.
+                        // +0.35 subframes, clamped to the route-aware ceiling,
+                        // and hold the grown cushion against premature decay.
                         adaptive_wifi_subframes =
                             (adaptive_wifi_subframes + 0.35).min(adaptive_ceiling);
+                        cushion_hold_until = Instant::now() + Duration::from_secs(10);
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
@@ -2790,6 +2815,7 @@ impl ClientEngine {
                         // +0.75 subframes, clamped to the route-aware ceiling.
                         let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                         let now_empty = Instant::now();
+                        cushion_hold_until = now_empty + Duration::from_secs(10);
                         let shield_armed = update_scan_shield(
                             bt_now,
                             last_pkt_subframe_count,
@@ -2817,11 +2843,11 @@ impl ClientEngine {
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
 
-                        // If Host disconnected or Wi-Fi dropped for >600ms (240 PLC
-                        // subframes), suspend into clean standby. 200ms was too
-                        // aggressive for 225-394 ms stock-OS Wi-Fi scans and
-                        // caused false standby.
-                        if consecutive_empty_ticks >= 240 {
+                        // If Host disconnected or Wi-Fi dropped for >1000ms (400 PLC
+                        // subframes), suspend into clean standby. Allowing a full
+                        // second absorbs stock-OS Wi-Fi scans and brief slow-network
+                        // stalls without wiping the buffer into a resync glitch.
+                        if consecutive_empty_ticks >= 400 {
                             telemetry.stream_resyncs.fetch_add(1, Ordering::Relaxed);
                             audioshare_protocol::diagnostics::warn(
                                 "client-rx",
@@ -2857,7 +2883,7 @@ impl ClientEngine {
                     }
                 }
 
-                // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay)
+                // 1. Apply 3-Band Studio Parametric EQ (0.00ms delay, click-free)
                 studio_eq.update_if_changed(
                     telemetry.eq_bass_db_tenths.load(Ordering::Relaxed),
                     telemetry.eq_presence_db_tenths.load(Ordering::Relaxed),
@@ -2865,21 +2891,23 @@ impl ClientEngine {
                 );
                 studio_eq.process(&mut raw_subframe);
 
-                // 2. Apply Spatial Channel Role (Stereo / Left / Right / Center / Surround)
+                // 2. Apply Spatial Channel Role with smooth matrix blending (zero click)
                 let role = audioshare_protocol::sync_and_eq::ChannelRole::from_u8(
                     telemetry.channel_role.load(Ordering::Relaxed),
                 );
-                role.apply_in_place(&mut raw_subframe);
+                role_blender.process_in_place(role, &mut raw_subframe);
 
-                // 3. Apply Audiophile Bauer Headphone Crossfeed if enabled (0.00ms delay)
-                if telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed) {
-                    crossfeed.process_in_place(&mut raw_subframe);
-                }
+                // 3. Apply Audiophile Bauer Headphone Crossfeed with smooth wet/dry ramp
+                crossfeed.process_with_enable(
+                    &mut raw_subframe,
+                    telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed),
+                );
 
-                // 3b. Apply Night-Mode Upward Whisper Compressor & Explosion Tamer (0.00ms delay)
-                if telemetry.enable_night_mode.load(Ordering::Relaxed) {
-                    night_compressor.process_in_place(&mut raw_subframe);
-                }
+                // 3b. Apply Night-Mode Upward Whisper Compressor with smooth bypass release
+                night_compressor.process_with_enable(
+                    &mut raw_subframe,
+                    telemetry.enable_night_mode.load(Ordering::Relaxed),
+                );
 
                 let gain_db =
                     (telemetry.preamp_gain_db_tenths.load(Ordering::Relaxed) as f32) / 10.0;
@@ -4339,18 +4367,18 @@ mod tests {
         let mut until = None;
         let mut shield = 0.0f32;
 
-        // Low-latency speaker/wired 5 ms stream must stay at 24 sf (60 ms).
+        // Low-latency speaker/wired 5 ms stream caps at 40 sf (100 ms).
         assert!(!update_scan_shield(false, 2, 40, now, &mut until, &mut shield));
-        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 24.0);
+        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 40.0);
 
         // Bluetooth stream with a 225 ms (90 sf) scan freeze arms the shield.
         assert!(update_scan_shield(true, 2, 90, now, &mut until, &mut shield));
         let cap = effective_wifi_ceiling(true, 2, now, &mut until, &mut shield);
         assert_eq!(cap, 102.0);
 
-        // Expires cleanly after 25 s back to the 28 sf BT baseline ceiling.
+        // Expires cleanly after 25 s back to the 48 sf BT baseline ceiling.
         let later = now + SCAN_SHIELD_HOLD + Duration::from_secs(1);
-        assert_eq!(effective_wifi_ceiling(true, 2, later, &mut until, &mut shield), 28.0);
+        assert_eq!(effective_wifi_ceiling(true, 2, later, &mut until, &mut shield), 48.0);
         assert_eq!(shield, 0.0);
     }
 
@@ -5103,9 +5131,7 @@ pub mod android_aaudio {
     const AAUDIO_PERFORMANCE_MODE_NONE: i32 = 10;
     const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
     const AAUDIO_USAGE_MEDIA: i32 = 1;
-    const AAUDIO_USAGE_GAME: i32 = 14;
     const AAUDIO_CONTENT_TYPE_MUSIC: i32 = 2;
-    const AAUDIO_CONTENT_TYPE_SONIFICATION: i32 = 4;
     const AAUDIO_SPATIALIZATION_BEHAVIOR_AUTO: i32 = 1;
     const AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER: i32 = 2;
     const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
@@ -5119,23 +5145,23 @@ pub mod android_aaudio {
         spatialization_behavior: i32,
     }
 
-    /// Raw path: exclusive MMAP first, game/sonification attributes, and
-    /// spatialization explicitly disabled. Exclusive mode bypasses
-    /// AudioFlinger effects entirely; the shared fallback still carries the
-    /// anti-spatialization flags so OEM post-processing does not attach.
+    /// Raw path: exclusive MMAP first with MEDIA/MUSIC attributes for full
+    /// hardware media-volume loudness, and spatialization explicitly disabled.
+    /// Using GAME/SONIFICATION routed onto OEM low-gain UI/notification curves
+    /// (~6 dB quieter than music apps at 100% volume).
     const RAW_PROFILE: AAudioProfile = AAudioProfile {
         sharing_mode: AAUDIO_SHARING_MODE_EXCLUSIVE,
         performance_mode: AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
-        usage: AAUDIO_USAGE_GAME,
-        content_type: AAUDIO_CONTENT_TYPE_SONIFICATION,
+        usage: AAUDIO_USAGE_MEDIA,
+        content_type: AAUDIO_CONTENT_TYPE_MUSIC,
         spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER,
     };
 
     const RAW_SHARED_PROFILE: AAudioProfile = AAudioProfile {
         sharing_mode: AAUDIO_SHARING_MODE_SHARED,
         performance_mode: AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
-        usage: AAUDIO_USAGE_GAME,
-        content_type: AAUDIO_CONTENT_TYPE_SONIFICATION,
+        usage: AAUDIO_USAGE_MEDIA,
+        content_type: AAUDIO_CONTENT_TYPE_MUSIC,
         spatialization_behavior: AAUDIO_SPATIALIZATION_BEHAVIOR_NEVER,
     };
 

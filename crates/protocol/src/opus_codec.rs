@@ -173,9 +173,10 @@ pub const OPUS_LOOKAHEAD_MS: f32 = 2.5;
 /// 37.50 dB at complexity 5 vs 37.67 dB at 8 (no regression); <2% CPU.
 const OPUS_COMPLEXITY: i32 = 8;
 
-/// Minimum/maximum target bitrates accepted by the compressed-mode UI.
+/// Minimum/maximum target bitrates accepted by the compressed-mode UI and
+/// adaptive link negotiator (64 kbps low-network survival -> 510 kbps max Opus).
 const MIN_BITRATE_KBPS: u16 = 64;
-const MAX_BITRATE_KBPS: u16 = 320;
+const MAX_BITRATE_KBPS: u16 = 510;
 
 /// The bundled Opus implementation is always available because it is compiled
 /// into every host and client binary.
