@@ -375,6 +375,7 @@ struct AudioShareApp {
     app_route_status: String,
     phone_mic_receiver: Option<PhoneMicReceiver>,
     phone_rx_mode: PhoneRxRoutingMode,
+    phone_rx_status: String,
 
     // Client & Studio DSP State
     /// `None` in the side-effect-free test instance (no UDP bind). Started in
@@ -520,6 +521,7 @@ impl AudioShareApp {
             app_route_status: "Capturing Full System Audio".into(),
             phone_mic_receiver: None,
             phone_rx_mode: PhoneRxRoutingMode::VirtualMicForCalls,
+            phone_rx_status: "Stopped — click Start Phone Receiver, then enable Share Phone Microphone on your phone.".into(),
             scanner: None,
             client_engine: None,
             manual_server_ip: format!("127.0.0.1:{}", DEFAULT_PORT),
@@ -2627,11 +2629,39 @@ impl AudioShareApp {
                                 self.phone_rx_mode,
                                 phone_pin.as_deref(),
                             ) {
-                                Ok(rx) => self.phone_mic_receiver = Some(rx),
-                                Err(e) => self.show_toast(format!(
-                                    "Phone receiver could not restart: {}",
-                                    e
-                                )),
+                                Ok(rx) => {
+                                    self.phone_rx_status = if self.phone_rx_mode
+                                        == PhoneRxRoutingMode::VirtualMicForCalls
+                                    {
+                                        #[cfg(target_os = "windows")]
+                                        {
+                                            format!(
+                                                "Listening (UDP/USB 65532) -> {} • In Zoom/Discord/Windows select 'CABLE Output (VB-Audio Virtual Cable)' as Microphone",
+                                                rx.output_device_name
+                                            )
+                                        }
+                                        #[cfg(not(target_os = "windows"))]
+                                        {
+                                            format!(
+                                                "Listening (UDP/USB 65532) -> {}",
+                                                rx.output_device_name
+                                            )
+                                        }
+                                    } else {
+                                        format!(
+                                            "Listening (UDP/USB 65532) -> {}",
+                                            rx.output_device_name
+                                        )
+                                    };
+                                    self.phone_mic_receiver = Some(rx);
+                                }
+                                Err(e) => {
+                                    self.phone_rx_status = format!("Error: {}", e);
+                                    self.show_toast(format!(
+                                        "Phone receiver could not restart: {}",
+                                        e
+                                    ));
+                                }
                             }
                         }
 
@@ -2657,6 +2687,7 @@ impl AudioShareApp {
                             if ui.add(btn).clicked() {
                                 if let Some(mut m) = self.phone_mic_receiver.take() {
                                     m.stop();
+                                    self.phone_rx_status = "Phone receiver stopped.".into();
                                 } else {
                                     if self.pin_dirty {
                                         self.apply_pin_now();
@@ -2673,11 +2704,39 @@ impl AudioShareApp {
                                         self.phone_rx_mode,
                                         phone_pin.as_deref(),
                                     ) {
-                                        Ok(rx) => self.phone_mic_receiver = Some(rx),
-                                        Err(e) => self.show_toast(format!(
-                                            "Phone receiver could not start: {}",
-                                            e
-                                        )),
+                                        Ok(rx) => {
+                                            self.phone_rx_status = if self.phone_rx_mode
+                                                == PhoneRxRoutingMode::VirtualMicForCalls
+                                            {
+                                                #[cfg(target_os = "windows")]
+                                                {
+                                                    format!(
+                                                        "Listening (UDP/USB 65532) -> {} • In Zoom/Discord/Windows select 'CABLE Output (VB-Audio Virtual Cable)' as Microphone",
+                                                        rx.output_device_name
+                                                    )
+                                                }
+                                                #[cfg(not(target_os = "windows"))]
+                                                {
+                                                    format!(
+                                                        "Listening (UDP/USB 65532) -> {}",
+                                                        rx.output_device_name
+                                                    )
+                                                }
+                                            } else {
+                                                format!(
+                                                    "Listening (UDP/USB 65532) -> {}",
+                                                    rx.output_device_name
+                                                )
+                                            };
+                                            self.phone_mic_receiver = Some(rx);
+                                        }
+                                        Err(e) => {
+                                            self.phone_rx_status = format!("Error: {}", e);
+                                            self.show_toast(format!(
+                                                "Phone receiver could not start: {}",
+                                                e
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -2713,6 +2772,36 @@ impl AudioShareApp {
                                 );
                             }
                         });
+                        ui.label(
+                            egui::RichText::new(&self.phone_rx_status)
+                                .size(11.0)
+                                .color(if self.phone_rx_status.starts_with("Error:") {
+                                    p.warn_fg
+                                } else {
+                                    p.muted_text
+                                }),
+                        );
+                        #[cfg(target_os = "windows")]
+                        if self.phone_mic_receiver.is_some() && !self.windows_firewall_ok {
+                            ui.horizontal_wrapped(|ui| {
+                                uw::status_pill(
+                                    ui,
+                                    "Firewall not open for Wi-Fi mic (UDP 65532) — allow firewall or use USB",
+                                    p.warn_bg,
+                                    p.warn_fg,
+                                );
+                                if ui
+                                    .add_enabled(
+                                        !self.firewall_task_in_flight,
+                                        egui::Button::new("Allow Firewall (UAC)"),
+                                    )
+                                    .clicked()
+                                {
+                                    let ctx = ui.ctx().clone();
+                                    self.dispatch_open_firewall(&ctx);
+                                }
+                            });
+                        }
                     });
                 });
             });

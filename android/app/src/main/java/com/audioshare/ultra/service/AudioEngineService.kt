@@ -378,11 +378,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 }
                 return START_STICKY
             }
-            val target = intent.getStringExtra("HOST_ADDR").orEmpty()
-            val pin = intent.getStringExtra("PIN").orEmpty()
+            val target = intent.getStringExtra("HOST_ADDR").orEmpty().trim()
+            val pin = intent.getStringExtra("PIN").orEmpty().trim()
             if (!isStreaming) {
-                currentHostAddr = "PC Video-Call Mic Active"
-                currentIsUsb = false
+                currentHostAddr = target.ifEmpty { "PC Video-Call Mic" }
+                currentIsUsb = isUsbHost(target)
+                isLocallyMuted = false
             }
             // targetSdk 34 requires the MICROPHONE foreground-service type to
             // be active BEFORE AAudio opens the input. Own the mic lifecycle in
@@ -397,7 +398,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 micCaptureActive = false
                 broadcastPhoneMicState(
                     false,
-                    "Unable to start phone mic for '$target' — select a valid PC host IP first"
+                    "Unable to start phone mic for '$target' — select a valid PC host IP or USB first"
                 )
                 if (!isStreaming && !isPartyCasting) {
                     stopStreamAndService()
@@ -410,6 +411,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 runCatching { nativeSetPartyCastMuted(true) }
             }
             broadcastPhoneMicState(true)
+            startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
             refreshAdpfHintSession()
             scheduleAdpfRefresh()
             // A mic-only session has no peer to reconnect to after process
@@ -1285,20 +1287,43 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     "Stop Party",
                     stopPartyPending
                 )
+        } else if (micCaptureActive && !isStreaming) {
+            val stopMicIntent = Intent(this, AudioEngineService::class.java).apply {
+                action = ACTION_STOP_PHONE_MIC
+            }
+            val stopMicPending = PendingIntent.getService(
+                this, 6, stopMicIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder
+                .setContentTitle("AudioShare Ultra • Wireless Mic")
+                .setContentText(
+                    if (isLocallyMuted) "MIC MUTED • $hostAddr (Port 65532)"
+                    else "MIC LIVE -> $hostAddr (Port 65532)"
+                )
+                .addAction(
+                    android.R.drawable.ic_lock_silent_mode,
+                    if (isLocallyMuted) "Unmute Mic" else "Mute Mic",
+                    mutePending
+                )
+                .addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Stop Mic",
+                    stopMicPending
+                )
         } else {
             val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
             val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
             val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
-            val muteLabel = if (micCaptureActive && !isStreaming) {
-                if (isLocallyMuted) "Unmute Mic" else "Mute Mic"
-            } else {
-                if (isLocallyMuted) "Unmute" else "Mute"
-            }
             builder
                 .setContentTitle("AudioShare Ultra • $badge")
                 .setContentText(statusText)
                 .addAction(playPauseIcon, playPauseLabel, playPausePending)
-                .addAction(android.R.drawable.ic_lock_silent_mode, muteLabel, mutePending)
+                .addAction(
+                    android.R.drawable.ic_lock_silent_mode,
+                    if (isLocallyMuted) "Unmute" else "Mute",
+                    mutePending
+                )
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPending)
         }
         val notification = builder.build()

@@ -636,6 +636,48 @@ impl PreviewPull {
     }
 }
 
+/// Rank Windows/desktop virtual-cable playback endpoint names so VB-Audio
+/// Virtual Cable works regardless of whether Windows names the endpoint
+/// `"CABLE Input (VB-Audio Virtual Cable)"`, `"Speakers (VB-Audio Virtual Cable)"`,
+/// or `"CABLE In 16 Ch (VB-Audio Virtual Cable)"`. Lower values are preferred
+/// (standard 2-ch VB-Cable input before 16-ch or generic virtual cables).
+#[inline]
+pub fn vbcable_output_match_priority(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    let is_16ch = lower.contains("16 ch") || lower.contains("16ch");
+    if lower.contains("cable input") && !is_16ch {
+        Some(0)
+    } else if lower.contains("vb-audio virtual cable") && !is_16ch {
+        Some(1)
+    } else if lower.contains("cable in") {
+        Some(2)
+    } else if lower.contains("vb-audio") || lower.contains("voicemeeter") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Find the best available VB-Cable / virtual-cable playback endpoint name on
+/// this machine using [`vbcable_output_match_priority`].
+#[cfg(not(target_os = "android"))]
+pub fn find_vbcable_output_device_name() -> Option<String> {
+    let host = cpal::default_host();
+    let devices = host.output_devices().ok()?;
+    let mut best: Option<(u8, String)> = None;
+    for dev in devices {
+        let Ok(name) = dev.name() else {
+            continue;
+        };
+        if let Some(prio) = vbcable_output_match_priority(&name) {
+            if best.as_ref().map(|(p, _)| prio < *p).unwrap_or(true) {
+                best = Some((prio, name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 #[cfg(not(target_os = "android"))]
 impl ClientPreviewSink {
     #[allow(dead_code)]
@@ -690,14 +732,24 @@ impl ClientPreviewSink {
         let host = cpal::default_host();
         let preferred = preferred_name.and_then(|needle| {
             let needle_lower = needle.to_ascii_lowercase();
-            host.output_devices().ok().and_then(|mut devices| {
-                devices.find(|device| {
+            let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
+            devices
+                .iter()
+                .find(|device| {
                     device
                         .name()
-                        .map(|name| name.to_ascii_lowercase().contains(&needle_lower))
+                        .map(|name| name.eq_ignore_ascii_case(needle))
                         .unwrap_or(false)
                 })
-            })
+                .or_else(|| {
+                    devices.iter().find(|device| {
+                        device
+                            .name()
+                            .map(|name| name.to_ascii_lowercase().contains(&needle_lower))
+                            .unwrap_or(false)
+                    })
+                })
+                .cloned()
         });
         let dev = preferred
             .or_else(|| host.default_output_device())

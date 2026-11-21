@@ -1911,7 +1911,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
                     SettingSwitchRow(
                         title = "Share Phone Microphone",
-                        subtitle = "Streams low-latency AAudio hardware mic to PC Virtual Mic on Port 65532",
+                        subtitle = "Streams low-latency AAudio mic to $hostAddress (Port 65532)",
                         checked = sharePhoneMic,
                         enabled = !castPhoneInternalAudio,
                         badgeText = if (sharePhoneMic) "MIC LIVE" else null,
@@ -1922,6 +1922,20 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 }
                                 context.startService(stopIntent)
                             } else {
+                                // If the user hasn't picked a PC yet and is still
+                                // on the legacy RNDIS default, auto-pick the first
+                                // discovered PC host on LAN instead of failing.
+                                if (hostAddress == "192.168.42.129:65530") {
+                                    val firstDiscovered = discoveredHosts
+                                        .firstOrNull()
+                                        ?.split("|")
+                                        ?.getOrNull(1)
+                                        ?.trim()
+                                    if (!firstDiscovered.isNullOrEmpty()) {
+                                        hostAddress = firstDiscovered
+                                        pinCode = HostPinStore.getPin(prefs, firstDiscovered)
+                                    }
+                                }
                                 val hasPerm = ContextCompat.checkSelfPermission(
                                     context,
                                     Manifest.permission.RECORD_AUDIO
@@ -1934,6 +1948,22 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             }
                         }
                     )
+                    AnimatedVisibility(visible = sharePhoneMic && !castPhoneInternalAudio) {
+                        val micVu = ((telemetry.partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            HorizontalDivider(color = Color(0xFF243047))
+                            Text(
+                                "Mic Target: $hostAddress -> Port 65532  •  Input Level: $micVu%",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                            Text(
+                                "On Windows: open 'App Audio Picker & Phone Microphone', click 'Start Phone Receiver', and pick 'CABLE Output (VB-Audio Virtual Cable)' as your mic.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             } // End Tab 2
         }

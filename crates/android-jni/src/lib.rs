@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -264,8 +265,9 @@ struct PartyPeerState {
     feedback_replay: FeedbackReplayWindow,
 }
 
-fn parse_target_endpoints_with_locals(
+fn parse_target_endpoints_for_mode(
     target_hosts: &str,
+    use_hardware_mic: bool,
     local_ips: &[IpAddr],
     has_usb_iface: bool,
 ) -> Vec<SocketAddr> {
@@ -289,15 +291,24 @@ fn parse_target_endpoints_with_locals(
         } else {
             continue;
         };
-        let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
 
-        // A unicast phone-to-phone transmitter must never send to a broadcast,
-        // multicast, loopback or unspecified address: 802.11 transmits
-        // broadcast/multicast at the mandatory basic rate, and loopback
-        // (127.0.0.1:65532) is the phone's own localhost, not a PC receiver.
-        if addr.ip().is_unspecified() || addr.ip().is_multicast() || addr.ip().is_loopback() {
+        // A unicast transmitter must never send to a broadcast, multicast, or
+        // unspecified address. Loopback (`127.0.0.1` / `::1`) is only allowed
+        // in hardware-mic mode, where it tunnels over `adb reverse tcp:65532`
+        // to the PC's `PhoneMicReceiver` over USB.
+        if ip.is_unspecified() || ip.is_multicast() {
             continue;
         }
+        if ip.is_loopback() {
+            if use_hardware_mic {
+                let adb_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PHONE_MIC_PORT);
+                if !targets.contains(&adb_addr) {
+                    targets.push(adb_addr);
+                }
+            }
+            continue;
+        }
+        let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
         if let IpAddr::V4(ipv4) = addr.ip() {
             if ipv4.is_broadcast() {
                 continue;
@@ -318,11 +329,20 @@ fn parse_target_endpoints_with_locals(
     targets
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_target_endpoints_with_locals(
+    target_hosts: &str,
+    local_ips: &[IpAddr],
+    has_usb_iface: bool,
+) -> Vec<SocketAddr> {
+    parse_target_endpoints_for_mode(target_hosts, false, local_ips, has_usb_iface)
+}
+
 pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
     let ifaces = list_valid_host_interfaces();
     let local_ips: Vec<IpAddr> = ifaces.iter().map(|iface| iface.ip).collect();
     let has_usb_iface = ifaces.iter().any(|iface| iface.is_usb_tethering);
-    parse_target_endpoints_with_locals(target_hosts, &local_ips, has_usb_iface)
+    parse_target_endpoints_for_mode(target_hosts, false, &local_ips, has_usb_iface)
 }
 
 fn initial_party_peers(
@@ -502,7 +522,11 @@ impl PhoneMicTransmitter {
         use_hardware_mic: bool,
         pin: Option<&str>,
     ) -> Result<Self, String> {
-        let static_targets = parse_target_endpoints(target_hosts);
+        let ifaces = list_valid_host_interfaces();
+        let local_ips: Vec<IpAddr> = ifaces.iter().map(|iface| iface.ip).collect();
+        let has_usb_iface = ifaces.iter().any(|iface| iface.is_usb_tethering);
+        let static_targets =
+            parse_target_endpoints_for_mode(target_hosts, use_hardware_mic, &local_ips, has_usb_iface);
         // Hardware-mic mode streams to explicitly configured PC receivers. A
         // Party host is allowed to start with only its beacon: peer phones
         // register themselves by HELLO/feedback and never rely on broadcast.
@@ -656,6 +680,12 @@ impl PhoneMicTransmitter {
                 };
                 let mut last_tx: Option<Instant> = None;
                 let mut last_party_dtx_heartbeat = Instant::now();
+                // Persistent TCP_NODELAY stream for USB ADB reverse (`127.0.0.1:65532`)
+                // hardware-mic mode, using the exact 2-byte big-endian length-prefixed
+                // framing expected by `AdbUsbWatcher::spawn_host_adb_tcp_session`.
+                let mut adb_mic_tcp: Option<TcpStream> = None;
+                let mut last_adb_tcp_attempt: Option<Instant> = None;
+                let mut tcp_frame = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
 
                 while run_clone.load(Ordering::Relaxed) {
                     #[cfg(target_os = "android")]
@@ -1133,7 +1163,37 @@ impl PhoneMicTransmitter {
                         });
                         if let Ok(pkt_len) = packed {
                             for target in peers.keys() {
-                                let _ = socket.send_to(&dgram[..pkt_len], *target);
+                                if use_hardware_mic && target.ip().is_loopback() {
+                                    if adb_mic_tcp.is_none()
+                                        && last_adb_tcp_attempt
+                                            .map(|t| t.elapsed() >= Duration::from_secs(1))
+                                            .unwrap_or(true)
+                                    {
+                                        last_adb_tcp_attempt = Some(Instant::now());
+                                        if let Ok(stream) = TcpStream::connect_timeout(
+                                            target,
+                                            Duration::from_millis(250),
+                                        ) {
+                                            let _ = stream.set_nodelay(true);
+                                            let _ = stream.set_write_timeout(Some(
+                                                Duration::from_millis(250),
+                                            ));
+                                            adb_mic_tcp = Some(stream);
+                                        }
+                                    }
+                                    if let Some(ref mut stream) = adb_mic_tcp {
+                                        let len_be = (pkt_len as u16).to_be_bytes();
+                                        tcp_frame[0] = len_be[0];
+                                        tcp_frame[1] = len_be[1];
+                                        tcp_frame[2..2 + pkt_len]
+                                            .copy_from_slice(&dgram[..pkt_len]);
+                                        if stream.write_all(&tcp_frame[..2 + pkt_len]).is_err() {
+                                            adb_mic_tcp = None;
+                                        }
+                                    }
+                                } else {
+                                    let _ = socket.send_to(&dgram[..pkt_len], *target);
+                                }
                             }
                             last_tx = Some(Instant::now());
 
@@ -1851,6 +1911,20 @@ mod tests {
         let local_v6: IpAddr = "fe80::1".parse().unwrap();
         assert!(
             parse_target_endpoints_with_locals("[fe80::1]:65530", &[local_v6], false).is_empty()
+        );
+
+        // Hardware-mic mode allows ADB USB loopback (`127.0.0.1:65530` ->
+        // `127.0.0.1:65532`), while Party mode keeps rejecting loopback.
+        let usb_mic_targets =
+            parse_target_endpoints_for_mode("127.0.0.1:65530", true, &[local], false);
+        assert_eq!(
+            usb_mic_targets,
+            vec!["127.0.0.1:65532".parse().unwrap()],
+            "hardware mic mode must tunnel loopback targets over ADB port 65532"
+        );
+        assert!(
+            parse_target_endpoints_for_mode("127.0.0.1:65530", false, &[local], false).is_empty(),
+            "Party mode must continue rejecting loopback targets"
         );
     }
 

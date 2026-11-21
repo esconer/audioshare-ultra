@@ -628,6 +628,10 @@ pub struct PhoneMicReceiver {
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
     pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
+    /// Human-readable output endpoint the receiver routed to (e.g.
+    /// `"Speakers (VB-Audio Virtual Cable)"`, `"AudioShare_Phone_Mic"`, or
+    /// `"Default PC Speakers"`).
+    pub output_device_name: String,
     #[cfg(target_os = "linux")]
     pactl_mic_module_id: Option<String>,
     #[cfg(target_os = "linux")]
@@ -636,6 +640,10 @@ pub struct PhoneMicReceiver {
     prev_default_source: Option<String>,
     #[cfg(target_os = "linux")]
     linux_output: Option<LinuxVirtualMicOutput>,
+    /// Bridges `adb reverse tcp:65532 tcp:65532` into the local UDP receiver
+    /// socket so USB-connected phones can share their microphone without Wi-Fi
+    /// or Windows Firewall rules, even when PC->Phone Broadcast is stopped.
+    adb_usb_watcher: Option<crate::discovery_and_os::AdbUsbWatcher>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -657,26 +665,33 @@ impl PhoneMicReceiver {
         pin: Option<&str>,
     ) -> Result<Self, String> {
         #[cfg(target_os = "windows")]
-        if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-            use cpal::traits::{DeviceTrait, HostTrait};
-            let has_vbcable = cpal::default_host()
-                .output_devices()
-                .ok()
-                .map(|mut devs| {
-                    devs.any(|d| {
-                        d.name()
-                            .map(|n| n.to_ascii_lowercase().contains("cable input"))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if !has_vbcable {
-                return Err(
-                    "VB-Cable ('CABLE Input') not found. Install VB-Cable for Virtual Mic mode, or switch to 'Play on PC Speakers'."
-                        .into(),
-                );
+        let windows_vbcable_name: Option<String> = if mode == PhoneRxRoutingMode::VirtualMicForCalls
+        {
+            match crate::find_vbcable_output_device_name() {
+                Some(name) => Some(name),
+                None => {
+                    return Err(
+                        "VB-Cable output device not found. Install VB-Audio Virtual Cable for Virtual Mic mode, or switch to 'Play on PC Speakers'."
+                            .into(),
+                    );
+                }
             }
-        }
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "windows")]
+        let output_device_name = windows_vbcable_name
+            .clone()
+            .unwrap_or_else(|| "Default PC Speakers".to_string());
+        #[cfg(target_os = "linux")]
+        let output_device_name = if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+            "AudioShare_Phone_Microphone".to_string()
+        } else {
+            "Default PC Speakers".to_string()
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let output_device_name = "Default Output".to_string();
 
         let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
         let socket = UdpSocket::bind(("0.0.0.0", port))
@@ -833,7 +848,7 @@ impl PhoneMicReceiver {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
                             crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
                                 Arc::clone(&mic_fifo_thread),
-                                Some("CABLE Input"),
+                                windows_vbcable_name.as_deref(),
                                 Some(Arc::clone(&observed_cb_frames)),
                             )
                             .ok()
@@ -1374,12 +1389,22 @@ impl PhoneMicReceiver {
             })
             .map_err(|e| format!("Failed to spawn PhoneMicReceiver thread: {}", e))?;
 
+        #[cfg(not(target_os = "android"))]
+        let adb_usb_watcher = if port == PHONE_MIC_PORT {
+            Some(crate::discovery_and_os::AdbUsbWatcher::start(port))
+        } else {
+            None
+        };
+        #[cfg(target_os = "android")]
+        let adb_usb_watcher = None;
+
         Ok(Self {
             running,
             session_key,
             mic_packets_received,
             mic_peak_level_pct,
             last_chirp_rx_timestamp_us,
+            output_device_name,
             #[cfg(target_os = "linux")]
             pactl_mic_module_id,
             #[cfg(target_os = "linux")]
@@ -1388,6 +1413,7 @@ impl PhoneMicReceiver {
             prev_default_source,
             #[cfg(target_os = "linux")]
             linux_output,
+            adb_usb_watcher,
             handle: Some(handle),
         })
     }
@@ -1414,6 +1440,7 @@ impl PhoneMicReceiver {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        drop(self.adb_usb_watcher.take());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -2316,5 +2343,31 @@ mod tests {
         let old_len = pack_opus_red_blob(99, &[sf2], &mut old_blob).unwrap();
         heal_opus_red_slots(&old_blob[..old_len], next_seq, &sequencer, &mut opus_ring);
         assert_ne!(opus_ring[99 & (RING_SLOTS - 1)].seq, Some(99));
+    }
+
+    #[test]
+    fn test_vbcable_output_device_priority_matches_renamed_windows_endpoints() {
+        use crate::vbcable_output_match_priority;
+
+        assert_eq!(
+            vbcable_output_match_priority("CABLE Input (VB-Audio Virtual Cable)"),
+            Some(0)
+        );
+        // Windows 11 / VB-Cable commonly exposes the 2-ch playback side as
+        // "Speakers (VB-Audio Virtual Cable)" alongside "CABLE In 16 Ch".
+        // The 2-ch endpoint must match and beat the 16-ch endpoint.
+        let renamed_2ch =
+            vbcable_output_match_priority("Speakers (VB-Audio Virtual Cable)").unwrap();
+        let cable_16ch =
+            vbcable_output_match_priority("CABLE In 16 Ch (VB-Audio Virtual Cable)").unwrap();
+        assert!(
+            renamed_2ch < cable_16ch,
+            "2-ch VB-Cable ({renamed_2ch}) must be preferred over 16-ch ({cable_16ch})"
+        );
+        // Physical speakers must never match as VB-Cable.
+        assert_eq!(
+            vbcable_output_match_priority("Speakers (2- High Definition Audio Device)"),
+            None
+        );
     }
 }

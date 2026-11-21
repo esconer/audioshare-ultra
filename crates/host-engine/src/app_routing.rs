@@ -220,32 +220,38 @@ pub(crate) mod windows_endpoint_switch {
             let col_vtbl = *(col as *const *const IMMDeviceCollectionVtbl);
             let mut count = 0u32;
             let _ = ((*col_vtbl).get_count)(col, &mut count);
-            let mut preferred = None;
+            let mut best_preferred: Option<(u8, Vec<u16>)> = None;
             let mut fallback = None;
             for i in 0..count {
                 let mut dev: *mut c_void = core::ptr::null_mut();
                 if ((*col_vtbl).item)(col, i, &mut dev) >= 0 && !dev.is_null() {
                     if let Some(name) = device_friendly_name(dev) {
                         let lower = name.to_ascii_lowercase();
-                        // Prioritize VB-Cable ("CABLE Input") and AudioShare
-                        // virtual speakers over generic "virtual" devices
-                        // (e.g. Oculus / NVIDIA / Virtual Desktop) so an
-                        // unrelated driver never hijacks VB-Cable.
-                        if lower.contains("cable input") || lower.contains("audioshare") {
-                            preferred = device_id(dev);
+                        // Prioritize VB-Cable (including renamed "Speakers
+                        // (VB-Audio Virtual Cable)" and "CABLE Input") and
+                        // AudioShare virtual speakers over generic "virtual"
+                        // devices so unrelated drivers never hijack VB-Cable.
+                        let prio = if lower.contains("audioshare") {
+                            Some(0u8)
+                        } else {
+                            crate::vbcable_output_match_priority(&name)
+                        };
+                        if let Some(p) = prio {
+                            if best_preferred.as_ref().map(|(bp, _)| p < *bp).unwrap_or(true) {
+                                if let Some(id) = device_id(dev) {
+                                    best_preferred = Some((p, id));
+                                }
+                            }
                         } else if fallback.is_none() && lower.contains("virtual") {
                             fallback = device_id(dev);
                         }
                     }
                     let dev_vtbl = *(dev as *const *const IMMDeviceVtbl);
                     ((*dev_vtbl).unk.release)(dev);
-                    if preferred.is_some() {
-                        break;
-                    }
                 }
             }
             ((*col_vtbl).unk.release)(col);
-            preferred.or(fallback)
+            best_preferred.map(|(_, id)| id).or(fallback)
         }
     }
 

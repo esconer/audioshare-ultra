@@ -96,13 +96,19 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
 /// recovery burst right afterwards (which tripped `trim_post_stall_backlog`
 /// and skipped live audio). Expanding immediately on any >=12 ms stall lets
 /// the recovery burst land cleanly inside the buffer with zero crack.
+/// A stall of `D` ms drains `D` ms of audio from the buffer while the sender
+/// keeps transmitting, so the recovery burst is covered by a TOTAL cushion of
+/// about `D` plus one subframe of margin. The old formula added 1.15x `D` on
+/// top of the floor, which overshot to the 100-120 ms ceiling on a single
+/// Wi-Fi hiccup and then took ~90 s to decay back (170 ms -> 70 ms of audible
+/// lag after every connect or signal dip).
 #[inline]
 fn spike_cushion_subframes(initial_floor: f32, raw_transit_delta_us: f32, ceiling: f32) -> f32 {
     if raw_transit_delta_us < 12_000.0 {
         return initial_floor;
     }
-    let spike_sf = (raw_transit_delta_us.min(150_000.0) / 2500.0) * 1.15;
-    (initial_floor + spike_sf).clamp(initial_floor, ceiling)
+    let needed_sf = raw_transit_delta_us.min(100_000.0) / 2500.0 + 1.0;
+    needed_sf.clamp(initial_floor, ceiling.max(initial_floor))
 }
 
 /// Floor that covers one sender packet plus one subframe of margin.
@@ -180,7 +186,7 @@ fn decay_adaptive_cushion(adaptive: f32, floor: f32, fec_permille: u16) -> f32 {
     if adaptive <= floor || fec_permille > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
         return adaptive;
     }
-    let step = ((adaptive - floor) * 0.12).max(0.15);
+    let step = ((adaptive - floor) * 0.22).max(0.30);
     (adaptive - step).max(floor)
 }
 
@@ -2368,7 +2374,7 @@ impl ClientEngine {
                             wifi_ceiling,
                         );
                         if spike_floor > adaptive_wifi_subframes + 0.1 {
-                            cushion_hold_until = now_rx + Duration::from_secs(15);
+                            cushion_hold_until = now_rx + Duration::from_secs(6);
                         }
                         adaptive_wifi_subframes = adaptive_wifi_subframes
                             .max(proactive_floor)
@@ -5108,12 +5114,14 @@ mod tests {
     fn test_spike_cushion_expands_immediately_on_wifi_signal_drop() {
         // Normal jitter < 12 ms leaves floor untouched.
         assert_eq!(spike_cushion_subframes(8.0, 5_000.0, 40.0), 8.0);
-        // A 40 ms signal-bar stall immediately expands cushion to absorb the
-        // arriving recovery burst (8 + 16*1.15 = 26.4 sf = 66 ms).
+        // A 40 ms signal-bar stall immediately expands the TOTAL cushion to
+        // cover the arriving recovery burst (40/2.5 + 1 = 17 sf = 42.5 ms).
         let grown = spike_cushion_subframes(8.0, 40_000.0, 40.0);
-        assert!(grown >= 26.0 && grown <= 27.0, "got {grown}");
+        assert!((16.5..=17.5).contains(&grown), "got {grown}");
         // Respects ceiling on huge stalls.
         assert_eq!(spike_cushion_subframes(8.0, 150_000.0, 40.0), 40.0);
+        // A moderate stall never overshoots past the stall length.
+        assert!(spike_cushion_subframes(8.0, 20_000.0, 48.0) < 10.0);
     }
 
     #[test]
@@ -5311,6 +5319,7 @@ pub mod android_aaudio {
 
     const AAUDIO_DIRECTION_OUTPUT: i32 = 0;
     const AAUDIO_DIRECTION_INPUT: i32 = 1;
+    const AAUDIO_FORMAT_PCM_I16: i32 = 1;
     const AAUDIO_FORMAT_PCM_FLOAT: i32 = 2;
     const AAUDIO_UNSPECIFIED: i32 = 0;
     const AAUDIO_SHARING_MODE_EXCLUSIVE: i32 = 0;
@@ -5877,11 +5886,19 @@ pub mod android_aaudio {
     struct InputContext {
         fifo: Arc<BurstDecouplerRing>,
         disconnected: AtomicBool,
+        /// Granted AAudio sample format (`AAUDIO_FORMAT_PCM_FLOAT` or
+        /// `AAUDIO_FORMAT_PCM_I16`). Many Android capture HALs only grant I16.
+        actual_format: i32,
+        /// Granted channel count (`1` or `2`). Stereo captures are downmixed
+        /// to mono in the callback before stereo expansion/resampling.
+        actual_channels: usize,
         /// True when the granted mic rate differs from the 48 kHz network rate
         /// (e.g. a BT HFP headset mic opens at 16 kHz or 44.1 kHz).
         needs_resample: bool,
         /// Accessed exclusively on the single AAudio input callback thread.
         resampler: core::cell::UnsafeCell<ClockDriftResampler>,
+        /// Mono conversion scratch for PCM_I16 / stereo-to-mono capture.
+        mono_scratch: core::cell::UnsafeCell<[f32; 2048]>,
         /// Mono->stereo/resample scratch, moved off the callback stack. An
         /// RT audio callback must not reserve 16 KB of stack per invocation;
         /// keeping it in the heap-allocated context also makes the buffer
@@ -5900,19 +5917,60 @@ pub mod android_aaudio {
         }
         unsafe {
             let ctx = &*(user_data as *const InputContext);
-            let frames = num_frames as usize;
-            let mono = core::slice::from_raw_parts(audio_data as *const f32, frames);
-            // Expand mono to interleaved stereo and resample when the granted
-            // rate is not 48 kHz (BT HFP 16 kHz / A2DP 44.1 kHz mic paths).
-            // The scratch lives in the heap-allocated context, not on this
-            // real-time callback's stack.
-            audioshare_protocol::dsp::push_mono_mic_chunk(
-                &ctx.fifo,
-                mono,
-                &mut *ctx.resampler.get(),
-                ctx.needs_resample,
-                &mut *ctx.scratch.get(),
-            );
+            let total_frames = num_frames as usize;
+            let channels = ctx.actual_channels.clamp(1, 2);
+            if ctx.actual_format == AAUDIO_FORMAT_PCM_FLOAT && channels == 1 {
+                let mono = core::slice::from_raw_parts(audio_data as *const f32, total_frames);
+                audioshare_protocol::dsp::push_mono_mic_chunk(
+                    &ctx.fifo,
+                    mono,
+                    &mut *ctx.resampler.get(),
+                    ctx.needs_resample,
+                    &mut *ctx.scratch.get(),
+                );
+            } else {
+                let mono_buf = &mut *ctx.mono_scratch.get();
+                let mut offset = 0usize;
+                while offset < total_frames {
+                    let chunk = (total_frames - offset).min(mono_buf.len());
+                    if ctx.actual_format == AAUDIO_FORMAT_PCM_FLOAT {
+                        let src = core::slice::from_raw_parts(
+                            audio_data as *const f32,
+                            total_frames * channels,
+                        );
+                        for i in 0..chunk {
+                            let base = (offset + i) * channels;
+                            mono_buf[i] = if channels == 2 {
+                                0.5 * (src[base] + src[base + 1])
+                            } else {
+                                src[base]
+                            };
+                        }
+                    } else {
+                        let src = core::slice::from_raw_parts(
+                            audio_data as *const i16,
+                            total_frames * channels,
+                        );
+                        const INV_I16: f32 = 1.0 / 32768.0;
+                        for i in 0..chunk {
+                            let base = (offset + i) * channels;
+                            mono_buf[i] = if channels == 2 {
+                                0.5 * (f32::from(src[base]) + f32::from(src[base + 1])) * INV_I16
+                            } else {
+                                f32::from(src[base]) * INV_I16
+                            };
+                        }
+                    }
+                    audioshare_protocol::dsp::push_mono_mic_chunk(
+                        &ctx.fifo,
+                        &mono_buf[..chunk],
+                        &mut *ctx.resampler.get(),
+                        ctx.needs_resample,
+                        &mut *ctx.scratch.get(),
+                    );
+                    offset += chunk;
+                }
+            }
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
     }
@@ -5946,14 +6004,51 @@ pub mod android_aaudio {
             unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
         }
 
-        /// Open a low-latency mono microphone stream and expand it to the
-        /// stereo ring consumed by `PhoneMicTransmitter`.
+        /// Open a low-latency microphone stream and expand it to the stereo
+        /// ring consumed by `PhoneMicTransmitter`. Falls back cleanly across
+        /// exclusive/shared, float/i16, and low-latency/normal capture paths
+        /// so Android HALs that only grant PCM_I16 or normal mode still stream.
         pub fn open_low_latency_mic(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
-            Self::open_internal(Arc::clone(&fifo), AAUDIO_SHARING_MODE_EXCLUSIVE)
-                .or_else(|| Self::open_internal(fifo, AAUDIO_SHARING_MODE_SHARED))
+            let attempts = [
+                (
+                    AAUDIO_SHARING_MODE_EXCLUSIVE,
+                    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+                    AAUDIO_FORMAT_PCM_FLOAT,
+                ),
+                (
+                    AAUDIO_SHARING_MODE_SHARED,
+                    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+                    AAUDIO_FORMAT_PCM_FLOAT,
+                ),
+                (
+                    AAUDIO_SHARING_MODE_SHARED,
+                    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+                    AAUDIO_FORMAT_PCM_I16,
+                ),
+                (
+                    AAUDIO_SHARING_MODE_SHARED,
+                    AAUDIO_PERFORMANCE_MODE_NONE,
+                    AAUDIO_FORMAT_PCM_I16,
+                ),
+            ];
+            for (sharing, perf, fmt) in attempts {
+                if let Some(guard) = Self::open_internal(Arc::clone(&fifo), sharing, perf, fmt) {
+                    return Some(guard);
+                }
+            }
+            audioshare_protocol::diagnostics::error(
+                "aaudio-in",
+                "Failed to open AAudio microphone input across all fallback profiles",
+            );
+            None
         }
 
-        fn open_internal(fifo: Arc<BurstDecouplerRing>, sharing_mode: i32) -> Option<Self> {
+        fn open_internal(
+            fifo: Arc<BurstDecouplerRing>,
+            sharing_mode: i32,
+            perf_mode: i32,
+            format: i32,
+        ) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
                 if AAudio_createStreamBuilder(&mut builder) != 0 || builder.is_null() {
@@ -5963,21 +6058,21 @@ pub mod android_aaudio {
                 let ctx = Box::new(InputContext {
                     fifo,
                     disconnected: AtomicBool::new(false),
+                    actual_format: format,
+                    actual_channels: 1,
                     needs_resample: false,
                     resampler: core::cell::UnsafeCell::new(ClockDriftResampler::new()),
+                    mono_scratch: core::cell::UnsafeCell::new([0.0f32; 2048]),
                     scratch: core::cell::UnsafeCell::new([0.0f32; 4096]),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
 
                 AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
-                AAudioStreamBuilder_setPerformanceMode(
-                    builder,
-                    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
-                );
+                AAudioStreamBuilder_setPerformanceMode(builder, perf_mode);
                 AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
                 AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
                 AAudioStreamBuilder_setChannelCount(builder, 1);
-                AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
+                AAudioStreamBuilder_setFormat(builder, format);
                 AAudioStreamBuilder_setDataCallback(
                     builder,
                     aaudio_input_callback,
@@ -5998,21 +6093,24 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                // The input callback casts `audio_data` to a mono f32 slice
-                // sized by frame count. If the HAL granted PCM16 or more than
-                // one channel, that cast would decode garbage / overrun. Reject
-                // the stream rather than feeding invalid samples to the mic ring.
                 let actual_format = AAudioStream_getFormat(stream);
                 let actual_channels = AAudioStream_getChannelCount(stream);
-                if actual_format != AAUDIO_FORMAT_PCM_FLOAT || actual_channels != 1 {
-                    eprintln!(
-                        "AAudio input: unexpected format={} channels={} (expected {} / 1); closing stream",
-                        actual_format, actual_channels, AAUDIO_FORMAT_PCM_FLOAT
+                if (actual_format != AAUDIO_FORMAT_PCM_FLOAT
+                    && actual_format != AAUDIO_FORMAT_PCM_I16)
+                    || (actual_channels != 1 && actual_channels != 2)
+                {
+                    audioshare_protocol::diagnostics::warn(
+                        "aaudio-in",
+                        format!(
+                            "Unsupported input format={actual_format} channels={actual_channels}; closing"
+                        ),
                     );
                     AAudioStream_close(stream);
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
                 }
+                (*ctx_ptr).actual_format = actual_format;
+                (*ctx_ptr).actual_channels = actual_channels as usize;
 
                 // A BT HFP headset mic may be granted 16 kHz (or 44.1 kHz)
                 // even though the network stream is fixed at 48 kHz. Verify
@@ -6024,10 +6122,6 @@ pub mod android_aaudio {
                         .set_sample_rates(granted_rate as u32, SAMPLE_RATE);
                 }
 
-                // Speaker/USB mics keep the verified 3x burst cushion, but a
-                // BT HFP mic can be granted a 480+ frame burst already; tripling
-                // that added 20-40 ms of capture latency. Size from the granted
-                // capacity when available and fall back to the old formula.
                 let burst = AAudioStream_getFramesPerBurst(stream);
                 if burst > 0 {
                     let granted_cap = AAudioStream_getBufferCapacityInFrames(stream);
@@ -6048,6 +6142,12 @@ pub mod android_aaudio {
                     let _ = Box::from_raw(ctx_ptr);
                     return None;
                 }
+                audioshare_protocol::diagnostics::info(
+                    "aaudio-in",
+                    format!(
+                        "opened mic rate={granted_rate}Hz fmt={actual_format} ch={actual_channels} burst={burst} sharing={sharing_mode} perf={perf_mode}"
+                    ),
+                );
                 Some(Self { stream, ctx_ptr })
             }
         }
