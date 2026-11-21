@@ -173,18 +173,19 @@ impl LossGovernor {
 }
 
 /// Advance a warm Opus encoder with one live subframe while Smart Auto is in
-/// its lossless tier. The encoded output is intentionally discarded: this
-/// only keeps the encoder's 2.5 ms lookahead primed so the first compressed
-/// packet carries the previous live subframe instead of codec warm-up silence.
+/// its lossless tier or immediately after allocating a fresh Opus encoder
+/// mid-stream. The encoded output is intentionally discarded: this primes the
+/// encoder's 2.5 ms lookahead so the first transmitted compressed packet
+/// carries the previous live subframe instead of codec warm-up silence.
 #[inline]
 fn warm_opus_lookahead(
     encoder: &mut Option<OpusStreamEncoder>,
-    pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
+    pcm_stereo_f32: &[f32; SUBFRAME_STEREO_SAMPLES],
     kbps: u16,
 ) {
     if let Some(encoder) = encoder.as_mut() {
         let mut discard = [0u8; MAX_OPUS_SUBFRAME_BYTES];
-        let _ = encoder.encode_subframe(pcm_stereo, kbps, &mut discard);
+        let _ = encoder.encode_subframe_f32(pcm_stereo_f32, kbps, &mut discard);
     }
 }
 
@@ -2698,6 +2699,11 @@ impl HostEngine {
         // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
         let mut opus_encoder_failed = false;
+        // Retain the most recently transmitted live f32 subframe so switching
+        // from Lossless/24-bit/VBR into Opus mid-stream can immediately prime
+        // the new encoder's 2.5 ms lookahead instead of emitting a silence hole.
+        let mut prev_f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut has_prev_subframe = false;
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
         let mut cached_all_usb = false;
         if let Ok(map) = clients.lock() {
@@ -3384,6 +3390,8 @@ impl HostEngine {
             if !has_targets || is_dtx_active {
                 opus_encoder = None;
                 fec_hist_len = 0;
+                has_prev_subframe = false;
+                prev_f32_subframe.fill(0.0);
                 // DTX silence entry (and zero-client standby) invalidates the
                 // Opus RED ring: receivers reset their sequencer on the silence
                 // heartbeat, so old blobs must never be replayed afterwards.
@@ -3396,7 +3404,9 @@ impl HostEngine {
             // Lazily allocate the Opus encoder only for a real, audible packet
             // with at least one receiver. Both zero-client standby and DTX
             // silence leave it None, so neither can trigger the old 200 Hz
-            // alloc/drop cycle.
+            // alloc/drop cycle. When switching into Opus mid-stream, prime the
+            // new encoder's 2.5 ms lookahead with the previous live subframe so
+            // the first transmitted Opus frame does not drop to digital silence.
             if has_targets
                 && !is_dtx_active
                 && dynamic_codec_mode == CodecMode::OpusRld
@@ -3410,6 +3420,8 @@ impl HostEngine {
                 opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                 if opus_encoder.is_none() {
                     opus_encoder_failed = true;
+                } else if has_prev_subframe {
+                    warm_opus_lookahead(&mut opus_encoder, &prev_f32_subframe, tx_bitrate_kbps);
                 }
             }
             if dynamic_codec_mode == CodecMode::OpusRld && opus_encoder_failed {
@@ -3534,7 +3546,7 @@ impl HostEngine {
                             {
                                 warm_opus_lookahead(
                                     &mut opus_encoder,
-                                    &i16_subframes[sub_idx],
+                                    &f32_subframes[sub_idx],
                                     tx_bitrate_kbps,
                                 );
                             }
@@ -3551,7 +3563,21 @@ impl HostEngine {
                         }
                         subframe_ranges[sub_idx] = (entry_start, primary_cursor);
                     }
+                    // Leaving Opus for any non-SmartAuto-Tier0 profile (e.g.
+                    // manual StudioLossless / 24-bit / VBR): drop the stale
+                    // Opus encoder immediately so a later switch back to Opus
+                    // allocates a fresh encoder primed with live audio rather
+                    // than replaying stale lookahead samples from seconds ago.
+                    let keep_warm_for_smart_auto = profile == QualityProfile::SmartAuto
+                        && dynamic_codec_mode == CodecMode::StudioLosslessLpc
+                        && prefer_opus
+                        && !cached_all_usb;
+                    if !keep_warm_for_smart_auto {
+                        opus_encoder = None;
+                    }
                 }
+                prev_f32_subframe = f32_subframes[subframes_per_pkt - 1];
+                has_prev_subframe = true;
             } else if profile != QualityProfile::SmartAuto {
                 // Leaving compressed/SmartAuto: drop the codec state so a
                 // later compressed period starts clean. SmartAuto Tier 0
@@ -5064,13 +5090,13 @@ mod tests {
     fn test_warm_opus_lookahead_primes_first_packet() {
         use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
 
-        fn tone(freq: f32, start_sample: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
-            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        fn tone(freq: f32, start_sample: usize) -> [f32; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0.0f32; SUBFRAME_STEREO_SAMPLES];
             for i in 0..SUBFRAME_FRAMES {
                 let t = ((start_sample + i) as f32) / (SAMPLE_RATE as f32);
-                let sample = (t * freq * std::f32::consts::TAU).sin() * 0.25 * 32767.0;
-                pcm[i * 2] = sample as i16;
-                pcm[i * 2 + 1] = sample as i16;
+                let sample = (t * freq * std::f32::consts::TAU).sin() * 0.25;
+                pcm[i * 2] = sample;
+                pcm[i * 2 + 1] = sample;
             }
             pcm
         }
@@ -5079,13 +5105,13 @@ mod tests {
         let current = tone(1200.0, SUBFRAME_FRAMES);
         let mut encoder = Some(OpusStreamEncoder::new(128).expect("create Opus encoder"));
 
-        // Tier 0 keeps the encoder primed with live lossless audio.
+        // Tier 0 / mid-stream switch into Opus primes the encoder with live f32 audio.
         warm_opus_lookahead(&mut encoder, &previous, 128);
         let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
         let len = encoder
             .as_mut()
             .expect("warm encoder")
-            .encode_subframe(&current, 128, &mut payload)
+            .encode_subframe_f32(&current, 128, &mut payload)
             .expect("encode first transmitted frame");
         assert_eq!(payload[0], TAG_OPUS_RLD);
 
@@ -5093,11 +5119,8 @@ mod tests {
         let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decoder.decode_subframe(&payload[..len], &mut decoded));
 
-        let dot = |lhs: &[f32; SUBFRAME_STEREO_SAMPLES], rhs: &[i16; SUBFRAME_STEREO_SAMPLES]| {
-            lhs.iter()
-                .zip(rhs.iter())
-                .map(|(a, b)| *a * (*b as f32 / 32768.0))
-                .sum::<f32>()
+        let dot = |lhs: &[f32; SUBFRAME_STEREO_SAMPLES], rhs: &[f32; SUBFRAME_STEREO_SAMPLES]| {
+            lhs.iter().zip(rhs.iter()).map(|(a, b)| *a * *b).sum::<f32>()
         };
         let dot_previous = dot(&decoded, &previous);
         let dot_current = dot(&decoded, &current);

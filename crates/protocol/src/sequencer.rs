@@ -93,7 +93,8 @@ impl ZeroJitterSequencer {
         self.pending_fade_in = true;
     }
 
-    /// Arm a 0.33 ms linear splice from the last played sample on the next subframe.
+    /// Arm a 1.0 ms raised-cosine splice from the last played sample on the
+    /// next subframe (post-stall fast-forward / codec switch).
     #[inline]
     pub fn arm_declick(&mut self) {
         self.pending_declick = true;
@@ -115,9 +116,13 @@ impl ZeroJitterSequencer {
             let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
             let dl = last_l - out[0];
             let dr = last_r - out[1];
-            const SPLICE_FRAMES: usize = 16;
+            // 48 frames = 1.0 ms C1-continuous raised-cosine splice: hides
+            // both DC steps and lookahead/phase jumps across codec transitions
+            // (e.g. Lossless 0 ms <-> Opus 2.5 ms) without a slope kink.
+            const SPLICE_FRAMES: usize = 48;
             for i in 0..SPLICE_FRAMES {
-                let w = 1.0 - (i as f32) / (SPLICE_FRAMES as f32);
+                let alpha = (i as f32) / (SPLICE_FRAMES as f32);
+                let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
                 out[i * 2] += dl * w;
                 out[i * 2 + 1] += dr * w;
             }
@@ -682,5 +687,42 @@ mod tests {
         }
         let tail_peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(tail_peak < 1e-6, "PLC must fade to silence after 60 ms, got {tail_peak}");
+    }
+
+    #[test]
+    fn test_arm_declick_applies_raised_cosine_splice() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Establish steady +0.5 output history (pop two frames so the initial
+        // fade-in on frame 0 is complete).
+        let hi = [0.5f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &hi));
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(seq.push_primary(1, &hi));
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Arm declick before a full-scale polarity flip (-0.5) such as a
+        // Lossless <-> Opus lookahead jump.
+        seq.arm_declick();
+        let lo = [-0.5f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(2, &lo));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Frame 0 starts exactly at the previous sample (+0.5) with zero jump.
+        assert!((out[0] - 0.5).abs() < 1e-6, "frame 0 stepped to {}", out[0]);
+        // Midpoint (frame 24) sits at 0.0 (halfway through raised cosine).
+        assert!(out[24 * 2].abs() < 1e-5, "midpoint was {}", out[24 * 2]);
+        // Monotonically decreasing across the 48-frame splice window.
+        for i in 1..48 {
+            assert!(
+                out[i * 2] <= out[(i - 1) * 2] + 1e-6,
+                "non-monotonic splice at frame {i}"
+            );
+        }
+        // Unmodified from frame 48 onward.
+        for i in 48..SUBFRAME_FRAMES {
+            assert_eq!(out[i * 2], -0.5, "splice leaked past frame {i}");
+        }
     }
 }

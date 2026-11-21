@@ -186,6 +186,25 @@ fn clock_loop_observation(net_subframes: f32, fifo_subframes: f32) -> f32 {
     net_subframes.max(0.0) + fifo_subframes.max(0.0)
 }
 
+/// Update `last_played` at the playhead and return `true` if and only if
+/// `cur_slot_mode` is a real decoded frame whose codec differs from the
+/// previously played codec (e.g. `Lossless16Bit` <-> `OpusRld`).
+///
+/// Missing/PLC slots pass `None` and leave `last_played` unchanged so CELT PLC
+/// keeps tracking the active playhead codec across short drops.
+#[inline]
+fn detect_playhead_codec_switch(
+    last_played: &mut Option<CodecMode>,
+    cur_slot_mode: Option<CodecMode>,
+) -> bool {
+    let Some(cur) = cur_slot_mode else {
+        return false;
+    };
+    let switched = matches!(*last_played, Some(prev) if prev != cur);
+    *last_played = Some(cur);
+    switched
+}
+
 /// Post-volume output peak level in percent (0..=100), with a sqrt curve to
 /// match the host's VU meter. Pure so the live loop cannot allocate.
 #[inline]
@@ -1273,6 +1292,7 @@ impl ClientEngine {
                     u32,
                     Arc<AtomicBool>,
                     Arc<AtomicUsize>,
+                    Arc<AtomicU32>,
                 )> = None;
 
                 #[cfg(target_os = "android")]
@@ -1349,13 +1369,16 @@ impl ClientEngine {
         stereo_scratch: &mut [f32; 2048],
         dither_rng: &mut u32,
         mut write_sample: impl FnMut(usize, f32),
-    ) {
+    ) -> bool {
         let ch = channels.max(1);
         let max_chunk_frames = stereo_scratch.len() / 2;
         let mut frame_offset = 0usize;
+        let mut all_ok = true;
         while frame_offset < frames {
             let chunk_frames = (frames - frame_offset).min(max_chunk_frames);
-            fifo.pop_exact_or_dither(&mut stereo_scratch[..chunk_frames * 2], dither_rng);
+            if !fifo.pop_exact_or_dither(&mut stereo_scratch[..chunk_frames * 2], dither_rng) {
+                all_ok = false;
+            }
             for f in 0..chunk_frames {
                 let l = stereo_scratch[f * 2];
                 let r = stereo_scratch[f * 2 + 1];
@@ -1372,13 +1395,14 @@ impl ClientEngine {
             }
             frame_offset += chunk_frames;
         }
+        all_ok
     }
 
     #[cfg(not(target_os = "android"))]
     pub fn fill_i16_output(fifo: &BurstDecouplerRing, out: &mut [i16], dither_rng: &mut u32) {
         let mut scratch = [0.0f32; 2048];
         let frames = out.len() / 2;
-        Self::pull_stereo_to_channels(fifo, 2, frames, &mut scratch, dither_rng, |idx, s| {
+        let _ = Self::pull_stereo_to_channels(fifo, 2, frames, &mut scratch, dither_rng, |idx, s| {
             out[idx] = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
         });
     }
@@ -1386,7 +1410,16 @@ impl ClientEngine {
     #[cfg(not(target_os = "android"))]
     fn spawn_desktop_output_sink(
         burst_fifo: Arc<BurstDecouplerRing>,
-    ) -> Result<(cpal::Stream, u32, Arc<AtomicBool>, Arc<AtomicUsize>), String> {
+    ) -> Result<
+        (
+            cpal::Stream,
+            u32,
+            Arc<AtomicBool>,
+            Arc<AtomicUsize>,
+            Arc<AtomicU32>,
+        ),
+        String,
+    > {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -1402,6 +1435,7 @@ impl ClientEngine {
         // fallback used to size the decoupler watermark. Some devices deliver
         // 1024+ frames per callback; assuming 480 starved the refill loop.
         let observed_frames = Arc::new(AtomicUsize::new(0));
+        let ring_underruns = Arc::new(AtomicU32::new(0));
 
         // Prefer a 5 ms fixed callback buffer to cut desktop output latency.
         // Many ALSA/PulseAudio backends reject an unsupported period size, so
@@ -1426,6 +1460,7 @@ impl ClientEngine {
             let fifo = Arc::clone(&burst_fifo);
             let err_flag = Arc::clone(&stream_error);
             let frames_seen = Arc::clone(&observed_frames);
+            let underruns = Arc::clone(&ring_underruns);
             let ch = cfg.channels.max(1) as usize;
             let rate = cfg.sample_rate.0;
             let mut dither_rng = 0x9E37_79B9u32;
@@ -1439,9 +1474,11 @@ impl ClientEngine {
                     move |out: &mut [i16], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
                         frames_seen.store(frames, Ordering::Relaxed);
-                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                        if !Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
-                        });
+                        }) {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                        }
                     },
                     err_cb,
                     None,
@@ -1451,9 +1488,11 @@ impl ClientEngine {
                     move |out: &mut [u16], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
                         frames_seen.store(frames, Ordering::Relaxed);
-                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                        if !Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = ((s.clamp(-1.0, 1.0) * 32768.0 + 32768.0).round()).clamp(0.0, 65535.0) as u16;
-                        });
+                        }) {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                        }
                     },
                     err_cb,
                     None,
@@ -1463,9 +1502,11 @@ impl ClientEngine {
                     move |out: &mut [i32], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
                         frames_seen.store(frames, Ordering::Relaxed);
-                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                        if !Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = (f64::from(s.clamp(-1.0, 1.0)) * 2_147_483_647.0).round() as i32;
-                        });
+                        }) {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                        }
                     },
                     err_cb,
                     None,
@@ -1475,9 +1516,11 @@ impl ClientEngine {
                     move |out: &mut [f64], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
                         frames_seen.store(frames, Ordering::Relaxed);
-                        Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
+                        if !Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                             out[idx] = f64::from(s.clamp(-1.0, 1.0));
-                        });
+                        }) {
+                            underruns.fetch_add(1, Ordering::Relaxed);
+                        }
                     },
                     err_cb,
                     None,
@@ -1487,12 +1530,15 @@ impl ClientEngine {
                     move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                         let frames = out.len() / ch;
                         frames_seen.store(frames, Ordering::Relaxed);
-                        if ch == 2 {
-                            fifo.pop_exact_or_dither(out, &mut dither_rng);
+                        let ok = if ch == 2 {
+                            fifo.pop_exact_or_dither(out, &mut dither_rng)
                         } else {
                             Self::pull_stereo_to_channels(&fifo, ch, frames, &mut scratch, &mut dither_rng, |idx, s| {
                                 out[idx] = s;
-                            });
+                            })
+                        };
+                        if !ok {
+                            underruns.fetch_add(1, Ordering::Relaxed);
                         }
                     },
                     err_cb,
@@ -1513,7 +1559,7 @@ impl ClientEngine {
         stream
             .play()
             .map_err(|e| format!("Failed to start audio output: {}", e))?;
-        Ok((stream, actual_rate, stream_error, observed_frames))
+        Ok((stream, actual_rate, stream_error, observed_frames, ring_underruns))
     }
 
     fn realtime_rx_and_dsp_loop(
@@ -1527,6 +1573,7 @@ impl ClientEngine {
             u32,
             Arc<AtomicBool>,
             Arc<AtomicUsize>,
+            Arc<AtomicU32>,
         )>,
         #[cfg(target_os = "android")] aaudio_guard: &mut Option<android_aaudio::AAudioOutputGuard>,
         running: Arc<AtomicBool>,
@@ -1568,7 +1615,13 @@ impl ClientEngine {
             };
             RING_SLOTS
         ];
+        // Per-slot codec mode recorded at RX time and consumed at playhead pop
+        // time so codec-switch declick fires on the EXACT transition frame
+        // (not 15-40 ms early at UDP arrival time).
+        let mut slot_codec_mode: Vec<Option<(u16, CodecMode)>> = vec![None; RING_SLOTS];
         let mut last_audio_codec_mode: Option<CodecMode> = None;
+        let mut last_played_codec_mode: Option<CodecMode> = None;
+        let mut last_observed_ring_underruns: u32 = 0;
 
         let mut recv_buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
         let mut stream_initialized = false;
@@ -1661,7 +1714,7 @@ impl ClientEngine {
             {
                 let failed = desktop_stream
                     .as_ref()
-                    .map(|(_, _, err, _)| err.load(Ordering::Acquire))
+                    .map(|(_, _, err, _, _)| err.load(Ordering::Acquire))
                     .unwrap_or(false);
                 let retry_due = desktop_stream.is_none()
                     && last_desktop_open_attempt
@@ -1670,11 +1723,13 @@ impl ClientEngine {
                 if failed || retry_due {
                     last_desktop_open_attempt = Some(Instant::now());
                     *desktop_stream = None;
-                    if let Ok((stream, rate, err, observed_frames)) =
+                    last_observed_ring_underruns = 0;
+                    if let Ok((stream, rate, err, observed_frames, ring_underruns)) =
                         Self::spawn_desktop_output_sink(Arc::clone(&burst_fifo))
                     {
                         resampler.set_output_sample_rate(rate);
-                        *desktop_stream = Some((stream, rate, err, observed_frames));
+                        *desktop_stream =
+                            Some((stream, rate, err, observed_frames, ring_underruns));
                     }
                 }
             }
@@ -1749,6 +1804,7 @@ impl ClientEngine {
                     // the old stream keeps the device busy during an
                     // exclusive-mode reopen.
                     *aaudio_guard = None;
+                    last_observed_ring_underruns = 0;
                     *aaudio_guard = android_aaudio::AAudioOutputGuard::open_with_mode(
                         Arc::clone(&burst_fifo),
                         want_dolby,
@@ -2044,21 +2100,21 @@ impl ClientEngine {
                             sequencer.reset();
                             opus_decoder = None;
                             last_plc_emit = None;
+                            last_played_codec_mode = None;
+                            slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
                                 slot.seq = None;
                             }
                             continue;
                         }
 
-                        // A codec switch (Lossless <-> Opus in SmartAuto) joins
-                        // two different waveform predictors; splice the new
-                        // mode in from the last played sample to avoid a click.
+                        // Log codec mode transitions when the first packet of a
+                        // new mode arrives. The actual declick splice is armed
+                        // at playhead pop time (using `slot_codec_mode`) so it
+                        // lands on the exact transition frame rather than 15-40
+                        // ms early while old-codec frames are still playing.
                         if let Some(prev_mode) = last_audio_codec_mode {
                             if prev_mode != parsed.header.mode {
-                                sequencer.arm_declick();
-                                // Edge-triggered (SmartAuto backend switches are
-                                // rare); the allocation lives off the steady
-                                // 2.5 ms subframe path.
                                 audioshare_protocol::diagnostics::info(
                                     "client-rx",
                                     format!(
@@ -2169,6 +2225,8 @@ impl ClientEngine {
                             last_plc_emit = None;
                             prev_rx_us = None;
                             opus_decoder = None;
+                            last_played_codec_mode = None;
+                            slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
                                 slot.seq = None;
                             }
@@ -2258,7 +2316,8 @@ impl ClientEngine {
                                 && sub_len <= MAX_OPUS_SUBFRAME_BYTES
                             {
                                 if (s.wrapping_sub(next_play_seq) as i16) >= 0 {
-                                    let slot = &mut opus_ring[(s as usize) & (RING_SLOTS - 1)];
+                                    let ring_idx = (s as usize) & (RING_SLOTS - 1);
+                                    let slot = &mut opus_ring[ring_idx];
                                     if slot.seq != Some(s) {
                                         slot.data[..sub_len].copy_from_slice(payload);
                                         slot.len = sub_len as u16;
@@ -2266,6 +2325,7 @@ impl ClientEngine {
                                         // A real primary always supersedes any
                                         // earlier RED concealment in this slot.
                                         slot.from_red = false;
+                                        slot_codec_mode[ring_idx] = Some((s, CodecMode::OpusRld));
                                     }
                                     if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                         latest_rx_seq = s;
@@ -2316,6 +2376,8 @@ impl ClientEngine {
 
                             if decoded_ok {
                                 sequencer.push_primary(s, &pcm_f32);
+                                slot_codec_mode[(s as usize) & (RING_SLOTS - 1)] =
+                                    Some((s, parsed.header.mode));
                                 if (s.wrapping_sub(latest_rx_seq) as i16) > 0 {
                                     latest_rx_seq = s;
                                 }
@@ -2348,8 +2410,9 @@ impl ClientEngine {
                                                 && !sequencer.has_primary(red_seq)
                                                 && red_payload.len() <= MAX_OPUS_SUBFRAME_BYTES
                                             {
-                                                let slot = &mut opus_ring
-                                                    [(red_seq as usize) & (RING_SLOTS - 1)];
+                                                let ring_idx =
+                                                    (red_seq as usize) & (RING_SLOTS - 1);
+                                                let slot = &mut opus_ring[ring_idx];
                                                 // Keep a genuine primary or an
                                                 // earlier RED copy in place.
                                                 if slot.seq != Some(red_seq) {
@@ -2358,6 +2421,8 @@ impl ClientEngine {
                                                     slot.len = red_payload.len() as u16;
                                                     slot.seq = Some(red_seq);
                                                     slot.from_red = true;
+                                                    slot_codec_mode[ring_idx] =
+                                                        Some((red_seq, CodecMode::OpusRld));
                                                 }
                                             }
                                         },
@@ -2399,7 +2464,7 @@ impl ClientEngine {
             #[cfg(not(target_os = "android"))]
             let hal_burst_samples = desktop_stream
                 .as_ref()
-                .and_then(|(_, _, _, observed)| {
+                .and_then(|(_, _, _, observed, _)| {
                     let frames = observed.load(Ordering::Relaxed);
                     if frames > 0 {
                         Some(frames * 2)
@@ -2408,6 +2473,32 @@ impl ClientEngine {
                     }
                 })
                 .unwrap_or(480usize);
+            // Detect silent `BurstDecouplerRing` partial/empty underruns from
+            // the audio callback (invisible to HAL XRun counts because the
+            // callback returns CONTINUE with faded/zero-filled samples). When
+            // one happens during active playback, arm a fade-in so recovery
+            // does not click from 0 -> full-scale, and expand the adaptive
+            // cushion so the decoupler rises out of the underrun zone.
+            #[cfg(target_os = "android")]
+            let cur_ring_underruns = aaudio_guard
+                .as_ref()
+                .map(|g| g.ring_underrun_count())
+                .unwrap_or(0);
+            #[cfg(not(target_os = "android"))]
+            let cur_ring_underruns = desktop_stream
+                .as_ref()
+                .map(|(_, _, _, _, u)| u.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let ring_underrun_delta = cur_ring_underruns.wrapping_sub(last_observed_ring_underruns);
+            last_observed_ring_underruns = cur_ring_underruns;
+            if ring_underrun_delta > 0
+                && stream_initialized
+                && prebuffer_ready
+                && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
+            {
+                sequencer.arm_fade_in();
+                adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.0).min(adaptive_ceiling);
+            }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
             let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
 
@@ -2513,9 +2604,13 @@ impl ClientEngine {
             );
             let fifo_capacity = burst_fifo.capacity_samples().saturating_sub(2);
             let one_subframe_samples = resampler.subframes_to_samples(1);
+            // Keep at least 3 subframes (7.5 ms = 720 samples @ 48 kHz) above
+            // one HAL burst so draining a 256-frame (512-sample) Android fast
+            // burst still leaves >= 1 full burst in the decoupler instead of
+            // causing partial-burst tail fades on minor Wi-Fi jitter.
             let fifo_watermark = resampler
                 .subframes_to_samples(target_fifo_subframes)
-                .max(hal_burst_samples + one_subframe_samples * 2)
+                .max(hal_burst_samples + one_subframe_samples * 3)
                 .min(fifo_capacity);
             // Deliberately NOT scaled by `hal_burst_samples`: tying the
             // emergency watermark to a whole HAL burst made every callback
@@ -2566,6 +2661,24 @@ impl ClientEngine {
                     // triggering WSOLA PLC!
                     break;
                 }
+                // Playhead-aligned codec-switch detection: arm the 1.0 ms
+                // raised-cosine declick splice on the exact transition frame
+                // when `next_play_seq` crosses between codecs (e.g. Lossless
+                // 0 ms lookahead <-> Opus 2.5 ms lookahead).
+                let play_slot_mode = if has_opus_slot {
+                    Some(CodecMode::OpusRld)
+                } else if !slot_missing {
+                    match slot_codec_mode[opus_slot_idx] {
+                        Some((seq_tag, mode)) if seq_tag == next_play_seq => Some(mode),
+                        _ => last_played_codec_mode,
+                    }
+                } else {
+                    None
+                };
+                if detect_playhead_codec_switch(&mut last_played_codec_mode, play_slot_mode) {
+                    sequencer.arm_declick();
+                }
+
                 let mut raw_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                 // Set only when this slot's bytes were recovered from Opus RED
                 // so the STATUS_PRIMARY_LOSSLESS arm below can reclassify the
@@ -2597,7 +2710,7 @@ impl ClientEngine {
                         sequencer.pop_next(next_play_seq, &mut raw_subframe)
                     }
                 } else if sequencer.is_slot_missing(next_play_seq)
-                    && last_audio_codec_mode == Some(CodecMode::OpusRld)
+                    && last_played_codec_mode == Some(CodecMode::OpusRld)
                     && opus_decoder.is_some()
                 {
                     // Phase-locked CELT PLC right at the playhead instead of
@@ -2730,6 +2843,8 @@ impl ClientEngine {
                             // until the 16-bit sequence wraps (~82 s silence).
                             opus_decoder = None;
                             prev_rx_us = None;
+                            last_played_codec_mode = None;
+                            slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
                                 slot.seq = None;
                             }
@@ -4890,6 +5005,82 @@ mod tests {
         assert!(summary.contains("estimated_one_way_ms="), "{summary}");
         client.stop();
     }
+
+    #[test]
+    fn test_playhead_codec_switch_fires_on_exact_transition_frame() {
+        let mut last_played: Option<CodecMode> = None;
+
+        // First real frame establishes the baseline without a spurious declick.
+        assert!(!detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::StudioLosslessLpc)
+        ));
+        assert_eq!(last_played, Some(CodecMode::StudioLosslessLpc));
+
+        // Same-codec continuation never triggers a declick.
+        assert!(!detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::StudioLosslessLpc)
+        ));
+
+        // Missing PLC slot leaves `last_played` intact and does not trigger.
+        assert!(!detect_playhead_codec_switch(&mut last_played, None));
+        assert_eq!(last_played, Some(CodecMode::StudioLosslessLpc));
+
+        // Exact transition frame into Opus triggers declick once.
+        assert!(detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::OpusRld)
+        ));
+        assert_eq!(last_played, Some(CodecMode::OpusRld));
+
+        // Subsequent Opus frames (and Opus PLC gaps) do not re-trigger.
+        assert!(!detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::OpusRld)
+        ));
+        assert!(!detect_playhead_codec_switch(&mut last_played, None));
+        assert_eq!(last_played, Some(CodecMode::OpusRld));
+
+        // Switching back to Lossless triggers declick once at the exact boundary.
+        assert!(detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::StudioLosslessLpc)
+        ));
+        assert_eq!(last_played, Some(CodecMode::StudioLosslessLpc));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_pull_stereo_to_channels_reports_ring_underrun() {
+        let ring = BurstDecouplerRing::new();
+        let mut scratch = [0.0f32; 2048];
+        let mut rng = 42u32;
+        let mut out = [0.0f32; 8];
+
+        // Empty ring reports false (underrun) so the RX loop can arm fade-in
+        // and expand the jitter cushion.
+        assert!(!ClientEngine::pull_stereo_to_channels(
+            &ring,
+            2,
+            4,
+            &mut scratch,
+            &mut rng,
+            |i, s| out[i] = s,
+        ));
+
+        // Full ring reports true.
+        ring.push_samples(&[0.25f32; 8]);
+        assert!(ClientEngine::pull_stereo_to_channels(
+            &ring,
+            2,
+            4,
+            &mut scratch,
+            &mut rng,
+            |i, s| out[i] = s,
+        ));
+        assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -5090,6 +5281,10 @@ pub mod android_aaudio {
         // the RNG state is atomic and every access uses a shared reference.
         dither_rng: AtomicU32,
         disconnected: AtomicBool,
+        /// Incremented whenever `pop_exact_or_dither` returns `false` (partial
+        /// or empty ring read) so the RX loop can arm a fade-in and widen the
+        /// jitter cushion instead of letting silent underruns click.
+        ring_underruns: AtomicU32,
     }
 
     extern "C" fn aaudio_output_callback(
@@ -5106,7 +5301,9 @@ pub mod android_aaudio {
             let total_samples = (num_frames as usize) * 2;
             let out_slice = core::slice::from_raw_parts_mut(audio_data as *mut f32, total_samples);
             let mut rng = ctx.dither_rng.load(Ordering::Relaxed);
-            ctx.fifo.pop_exact_or_dither(out_slice, &mut rng);
+            if !ctx.fifo.pop_exact_or_dither(out_slice, &mut rng) {
+                ctx.ring_underruns.fetch_add(1, Ordering::Relaxed);
+            }
             ctx.dither_rng.store(rng, Ordering::Relaxed);
         }
         AAUDIO_CALLBACK_RESULT_CONTINUE
@@ -5153,6 +5350,16 @@ pub mod android_aaudio {
                 return true;
             }
             unsafe { (*self.ctx_ptr).disconnected.load(Ordering::Acquire) }
+        }
+
+        /// Number of `BurstDecouplerRing` partial/empty reads observed by the
+        /// AAudio data callback since this stream opened.
+        #[inline]
+        pub fn ring_underrun_count(&self) -> u32 {
+            if self.ctx_ptr.is_null() {
+                return 0;
+            }
+            unsafe { (*self.ctx_ptr).ring_underruns.load(Ordering::Relaxed) }
         }
 
         /// The rate AAudio actually opened, which may be 44.1 kHz on an A2DP
@@ -5287,6 +5494,7 @@ pub mod android_aaudio {
                     fifo,
                     dither_rng: AtomicU32::new(0x1357_9BDF),
                     disconnected: AtomicBool::new(false),
+                    ring_underruns: AtomicU32::new(0),
                 });
                 let ctx_ptr = Box::into_raw(ctx);
 
