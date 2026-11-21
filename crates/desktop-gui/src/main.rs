@@ -91,7 +91,8 @@ fn main() -> eframe::Result<()> {
     // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
     let crash_path = AudioShareApp::config_file_path().with_file_name("audioshare-ultra-crash.log");
     audioshare_protocol::diagnostics::install_crash_hook(crash_path);
-    let options = eframe::NativeOptions {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([920.0, 740.0])
             .with_min_inner_size([760.0, 560.0])
@@ -99,6 +100,16 @@ fn main() -> eframe::Result<()> {
             .with_title("AudioShare Ultra — Studio Audio Routing Mesh"),
         ..Default::default()
     };
+
+    // On Windows, wgpu's default Backends::PRIMARY includes Vulkan, which loads
+    // third-party Vulkan ICDs (e.g. Intel igvk64.dll) that can segfault (0xc0000005)
+    // during adapter enumeration before wgpu can fall back to DX12. Prefer native
+    // DX12 (+ GL fallback) unless the user explicitly sets WGPU_BACKEND.
+    #[cfg(target_os = "windows")]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = options.wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::from_env()
+            .unwrap_or(eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::GL);
+    }
 
     eframe::run_native(
         "AudioShare Ultra",
