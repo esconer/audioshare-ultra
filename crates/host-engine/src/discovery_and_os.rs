@@ -57,10 +57,10 @@ fn parse_beacon_fields(rest: &str) -> Option<(&str, u16, bool)> {
     Some((hostname, port, encrypted))
 }
 
-/// Docker/WSL/VMware/VirtualBox and Linux bridge interfaces are virtual links,
-/// not real LAN segments. Broadcasting discovery beacons on them leaks traffic
-/// into virtual subnets and makes phones advertise phantom hosts.
-fn is_virtual_interface_name(name: &str) -> bool {
+/// Docker/WSL/VMware/VirtualBox, VPN/tunnel, and bridge interfaces are not real
+/// LAN segments. Broadcasting discovery beacons on them leaks traffic into
+/// virtual/VPN subnets and makes phones advertise phantom or unreachable hosts.
+pub(crate) fn is_virtual_interface_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("docker")
         || lower.contains("wsl")
@@ -72,6 +72,22 @@ fn is_virtual_interface_name(name: &str) -> bool {
         || lower.contains("virtualbox")
         || lower.contains("virbr")
         || lower.contains("br-")
+        || lower.contains("tailscale")
+        || lower.contains("wireguard")
+        || lower.starts_with("wg")
+        || lower.contains("wintun")
+        || lower.contains("openvpn")
+        || lower.contains("zerotier")
+        || lower.starts_with("zt")
+        || lower.contains("nordlynx")
+        || lower.contains("cloudflare")
+        || lower.contains("warp")
+        || lower.contains("hamachi")
+        || lower.contains("radmin")
+        || lower.contains("bluetooth")
+        || lower.contains("npcap")
+        || lower.starts_with("tun")
+        || lower.starts_with("tap")
 }
 
 #[cfg(target_os = "windows")]
@@ -165,6 +181,9 @@ impl DiscoveryBeacon {
                                     continue;
                                 }
                                 if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                                    if v4.ip.is_link_local() || v4.ip.is_unspecified() {
+                                        continue;
+                                    }
                                     let bcast = v4.broadcast.unwrap_or_else(|| {
                                         let o = v4.ip.octets();
                                         Ipv4Addr::new(o[0], o[1], o[2], 255)
@@ -342,7 +361,14 @@ impl DiscoveryScanner {
     }
 
     pub fn discovered_hosts(&self) -> Vec<DiscoveredHost> {
-        let mut list: Vec<DiscoveredHost> = self.hosts.lock().unwrap().values().cloned().collect();
+        let mut list: Vec<DiscoveredHost> = self
+            .hosts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v.last_seen.elapsed() < Duration::from_secs(4))
+            .cloned()
+            .collect();
         list.sort_by_key(|h| !h.is_usb);
         list
     }
@@ -620,6 +646,13 @@ fn spawn_host_adb_tcp_session(
     }
     let slot = Arc::new(AdbSessionSlot(Arc::clone(&active_sessions)));
 
+    // CRITICAL (Windows Winsock2): `accept()` inherits `FIONBIO` non-blocking
+    // mode from `TcpListener::set_nonblocking(true)`. Leaving the accepted
+    // stream non-blocking makes `SO_RCVTIMEO`/`SO_SNDTIMEO` ignored, causing
+    // `read_frame_len_interruptible` to spin at 100% CPU on `WouldBlock` and
+    // `tcp_writer.write_all` to disconnect immediately on transient send
+    // backpressure (`WSAEWOULDBLOCK`). Explicitly restore blocking mode!
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
@@ -634,6 +667,7 @@ fn spawn_host_adb_tcp_session(
     let Ok(udp_rx) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
         return;
     };
+    crate::disable_windows_udp_connreset(&udp_rx);
     if udp_rx.connect((Ipv4Addr::LOCALHOST, host_udp_port)).is_err() {
         return;
     }
@@ -695,7 +729,9 @@ fn spawn_host_adb_tcp_session(
                     Ok(_) => {}
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::ConnectionReset => {}
                     Err(_) => break,
                 }
             }
@@ -708,9 +744,12 @@ fn spawn_host_adb_tcp_session(
 impl Drop for AdbUsbWatcher {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        // Do NOT block the caller/GUI thread joining `as-ultra-adb-watcher`:
+        // it may be waiting on a slow/cold-starting `adb` child process and
+        // holds no network sockets. It checks `running` every 50 ms and exits
+        // promptly on its own. Always join `tcp_bridge_handle` (<=50 ms) so
+        // the loopback TCP port is released cleanly before any restart.
+        let _ = self.handle.take();
         if let Some(h) = self.tcp_bridge_handle.take() {
             let _ = h.join();
         }
@@ -785,10 +824,22 @@ impl DirectHotspotController {
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| format!("Failed to launch WinRT SoftAP host: {}", e))?;
-            // `$pub.Start()` is asynchronous. Returning before the SoftAP is
-            // actually up makes the phone's first connection fail, so wait
-            // for the sentinel emitted by the script (or kill + fail).
+            // `$pub.Start()` is asynchronous. Take stdout BEFORE storing the
+            // child in `windows_hotspot_holder()` so if the user quits during
+            // the 8 s startup wait, `stop_direct_hotspot()` kills the hidden
+            // PowerShell process instead of leaking it permanently.
             let stdout = child.stdout.take();
+            let child_pid = child.id();
+            {
+                let mut holder = windows_hotspot_holder()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(mut prev) = holder.take() {
+                    let _ = prev.kill();
+                    let _ = prev.wait();
+                }
+                *holder = Some(child);
+            }
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
             let _ = std::thread::Builder::new()
                 .name("as-ultra-softap-ready".into())
@@ -818,20 +869,21 @@ impl DirectHotspotController {
             match ready_rx.recv_timeout(Duration::from_secs(8)) {
                 Ok(true) => {}
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let mut holder = windows_hotspot_holder()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if holder.as_ref().map(|c| c.id()) == Some(child_pid) {
+                        if let Some(mut c) = holder.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                    }
                     return Err(format!(
                         "Wi-Fi Direct SoftAP '{}' could not start (check Wi-Fi adapter is enabled)",
                         ssid
                     ));
                 }
             }
-            let mut holder = windows_hotspot_holder().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(mut prev) = holder.take() {
-                let _ = prev.kill();
-                let _ = prev.wait();
-            }
-            *holder = Some(child);
             Ok(format!(
                 "1-Hop Direct Link '{}' Active (IP: 192.168.137.1)",
                 ssid
@@ -892,9 +944,31 @@ pub fn is_windows_firewall_configured() -> bool {
     #[cfg(target_os = "windows")]
     {
         silent_command("netsh")
-            .args(["advfirewall", "firewall", "show", "rule", "name=AudioShare_Ultra_UDP"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=AudioShare_Ultra_UDP",
+            ])
             .output()
-            .map(|o| o.status.success())
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let out = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+                // Reject disabled or block rules; accept locale-agnostic
+                // non-"no" enabled rules that cover port 65530-65532.
+                let explicitly_disabled = out.lines().any(|l| {
+                    let trimmed = l.trim();
+                    trimmed.starts_with("enabled:") && trimmed.ends_with("no")
+                });
+                let explicitly_block = out.lines().any(|l| {
+                    let trimmed = l.trim();
+                    trimmed.starts_with("action:") && trimmed.contains("block")
+                });
+                !explicitly_disabled && !explicitly_block && out.contains("65530")
+            })
             .unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
@@ -1359,6 +1433,11 @@ pub struct VirtualSpeakerAndRadioGuard {
     prev_default_sink_id: Option<Vec<u16>>,
     #[cfg(target_os = "windows")]
     virtual_sink_id: Option<Vec<u16>>,
+    /// Keeps the `WlanOpenHandle` session open so Windows `Wlansvc` actually
+    /// holds `wlan_intf_opcode_media_streaming_mode = 1` for the duration of
+    /// the stream (closing the handle immediately reverts the setting!).
+    #[cfg(target_os = "windows")]
+    wlan_streaming_guard: Option<WindowsWlanMediaStreamingGuard>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1486,8 +1565,9 @@ impl VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "windows")]
         {
-            // Suppress Windows 60-second background Wi-Fi roaming/location channel scans
-            set_windows_wlan_media_streaming_mode(true);
+            // Keep the WlanOpenHandle alive until Drop so Windows actually
+            // suppresses 60-second background Wi-Fi channel scans.
+            let wlan_streaming_guard = WindowsWlanMediaStreamingGuard::acquire();
             let virtual_sink_id = if enable_virtual_speaker {
                 crate::app_routing::windows_endpoint_switch::find_virtual_playback_id()
             } else {
@@ -1504,6 +1584,7 @@ impl VirtualSpeakerAndRadioGuard {
                 active: false,
                 prev_default_sink_id,
                 virtual_sink_id,
+                wlan_streaming_guard,
             }
         }
 
@@ -1538,6 +1619,15 @@ impl VirtualSpeakerAndRadioGuard {
         #[cfg(target_os = "windows")]
         {
             if let Some(ref id) = self.virtual_sink_id {
+                // Re-snapshot the user's current default playback device right
+                // before switching (if it's not already the virtual cable), so
+                // plugging in headphones between Start and client connect
+                // restores the headphones on disconnect rather than stale speakers.
+                if let Some(cur) = crate::app_routing::windows_endpoint_switch::default_playback_id()
+                    .filter(|cur| cur != id)
+                {
+                    self.prev_default_sink_id = Some(cur);
+                }
                 crate::app_routing::windows_endpoint_switch::set_default_endpoint(id);
             }
             self.active = true;
@@ -1583,89 +1673,99 @@ impl Drop for VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "windows")]
         {
-            set_windows_wlan_media_streaming_mode(false);
+            let _ = self.wlan_streaming_guard.take();
         }
     }
 }
 
-/// Dynamically invokes Win32 `wlanapi.dll` `WlanSetInterface(..., wlan_intf_opcode_media_streaming_mode)`
-/// to prevent Windows from scanning other Wi-Fi channels every 60 seconds during real-time audio streaming.
+/// RAII guard that holds an open Win32 `wlanapi.dll` `WlanOpenHandle` with
+/// `wlan_intf_opcode_media_streaming_mode = 1` for the lifetime of the stream.
+/// Windows `Wlansvc` reference-counts media streaming mode per open client
+/// handle and reverts it immediately when `WlanCloseHandle` is called.
 #[cfg(target_os = "windows")]
-fn set_windows_wlan_media_streaming_mode(enable: bool) {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Guid {
-        data1: u32,
-        data2: u16,
-        data3: u16,
-        data4: [u8; 8],
-    }
+struct WindowsWlanMediaStreamingGuard {
+    hmod: usize,
+    client_handle: usize,
+}
 
-    #[repr(C)]
-    struct WlanInterfaceInfo {
-        interface_guid: Guid,
-        interface_description: [u16; 256],
-        is_state: u32,
-    }
-
-    #[repr(C)]
-    struct WlanInterfaceInfoList {
-        number_of_items: u32,
-        index: u32,
-        interface_info: [WlanInterfaceInfo; 1],
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
-        fn GetProcAddress(
-            module: *mut core::ffi::c_void,
-            name: *const u8,
-        ) -> *mut core::ffi::c_void;
-        fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
-    }
-
-    type FnWlanOpenHandle = unsafe extern "system" fn(
-        u32,
-        *mut core::ffi::c_void,
-        *mut u32,
-        *mut *mut core::ffi::c_void,
-    ) -> u32;
-    type FnWlanEnumInterfaces = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        *mut core::ffi::c_void,
-        *mut *mut WlanInterfaceInfoList,
-    ) -> u32;
-    type FnWlanSetInterface = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        *const Guid,
-        u32,
-        u32,
-        *const core::ffi::c_void,
-        *mut core::ffi::c_void,
-    ) -> u32;
-    type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
-    type FnWlanCloseHandle =
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
-
-    unsafe {
-        let hmod = LoadLibraryA(b"wlanapi.dll\0".as_ptr());
-        if hmod.is_null() {
-            return;
+#[cfg(target_os = "windows")]
+impl WindowsWlanMediaStreamingGuard {
+    fn acquire() -> Option<Self> {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
         }
 
-        let p_open = GetProcAddress(hmod, b"WlanOpenHandle\0".as_ptr());
-        let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
-        let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
-        let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
-        let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+        #[repr(C)]
+        struct WlanInterfaceInfo {
+            interface_guid: Guid,
+            interface_description: [u16; 256],
+            is_state: u32,
+        }
 
-        if !p_open.is_null()
-            && !p_enum.is_null()
-            && !p_set.is_null()
-            && !p_free.is_null()
-            && !p_close.is_null()
-        {
+        #[repr(C)]
+        struct WlanInterfaceInfoList {
+            number_of_items: u32,
+            index: u32,
+            interface_info: [WlanInterfaceInfo; 1],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+        }
+
+        type FnWlanOpenHandle = unsafe extern "system" fn(
+            u32,
+            *mut core::ffi::c_void,
+            *mut u32,
+            *mut *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanEnumInterfaces = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut *mut WlanInterfaceInfoList,
+        ) -> u32;
+        type FnWlanSetInterface = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *const Guid,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
+        type FnWlanCloseHandle =
+            unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
+
+        unsafe {
+            let hmod = LoadLibraryA(b"wlanapi.dll\0".as_ptr());
+            if hmod.is_null() {
+                return None;
+            }
+            let p_open = GetProcAddress(hmod, b"WlanOpenHandle\0".as_ptr());
+            let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
+            let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
+            let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
+            let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+            if p_open.is_null()
+                || p_enum.is_null()
+                || p_set.is_null()
+                || p_free.is_null()
+                || p_close.is_null()
+            {
+                FreeLibrary(hmod);
+                return None;
+            }
             let wlan_open: FnWlanOpenHandle = core::mem::transmute(p_open);
             let wlan_enum: FnWlanEnumInterfaces = core::mem::transmute(p_enum);
             let wlan_set: FnWlanSetInterface = core::mem::transmute(p_set);
@@ -1674,41 +1774,152 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
 
             let mut negotiated_version = 0u32;
             let mut client_handle: *mut core::ffi::c_void = core::ptr::null_mut();
-
             if wlan_open(
                 2,
                 core::ptr::null_mut(),
                 &mut negotiated_version,
                 &mut client_handle,
-            ) == 0
+            ) != 0
+                || client_handle.is_null()
             {
-                let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
-                if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
-                    && !list_ptr.is_null()
-                {
-                    let count = (*list_ptr).number_of_items as usize;
-                    let first_ptr = (*list_ptr).interface_info.as_ptr();
-                    let val_bool: i32 = if enable { 1 } else { 0 };
-                    // wlan_intf_opcode_media_streaming_mode = 3
-                    const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
-
-                    for i in 0..count {
-                        let info = &*first_ptr.add(i);
-                        let _ = wlan_set(
-                            client_handle,
-                            &info.interface_guid,
-                            OPCODE_MEDIA_STREAMING_MODE,
-                            core::mem::size_of::<i32>() as u32,
-                            &val_bool as *const _ as *const core::ffi::c_void,
-                            core::ptr::null_mut(),
-                        );
-                    }
-                    wlan_free(list_ptr as *mut core::ffi::c_void);
-                }
-                let _ = wlan_close(client_handle, core::ptr::null_mut());
+                FreeLibrary(hmod);
+                return None;
             }
+
+            let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
+            let mut enabled_any = false;
+            if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
+                && !list_ptr.is_null()
+            {
+                let count = (*list_ptr).number_of_items as usize;
+                let first_ptr = (*list_ptr).interface_info.as_ptr();
+                let val_bool: i32 = 1;
+                const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
+                for i in 0..count {
+                    let info = &*first_ptr.add(i);
+                    if wlan_set(
+                        client_handle,
+                        &info.interface_guid,
+                        OPCODE_MEDIA_STREAMING_MODE,
+                        core::mem::size_of::<i32>() as u32,
+                        &val_bool as *const _ as *const core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    ) == 0
+                    {
+                        enabled_any = true;
+                    }
+                }
+                wlan_free(list_ptr as *mut core::ffi::c_void);
+            }
+            if !enabled_any {
+                let _ = wlan_close(client_handle, core::ptr::null_mut());
+                FreeLibrary(hmod);
+                return None;
+            }
+            Some(Self {
+                hmod: hmod as usize,
+                client_handle: client_handle as usize,
+            })
         }
-        FreeLibrary(hmod);
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsWlanMediaStreamingGuard {
+    fn drop(&mut self) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
+        }
+
+        #[repr(C)]
+        struct WlanInterfaceInfo {
+            interface_guid: Guid,
+            interface_description: [u16; 256],
+            is_state: u32,
+        }
+
+        #[repr(C)]
+        struct WlanInterfaceInfoList {
+            number_of_items: u32,
+            index: u32,
+            interface_info: [WlanInterfaceInfo; 1],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+        }
+
+        type FnWlanEnumInterfaces = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut *mut WlanInterfaceInfoList,
+        ) -> u32;
+        type FnWlanSetInterface = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *const Guid,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
+        type FnWlanCloseHandle =
+            unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
+
+        unsafe {
+            let hmod = self.hmod as *mut core::ffi::c_void;
+            let client_handle = self.client_handle as *mut core::ffi::c_void;
+            if hmod.is_null() {
+                return;
+            }
+            if !client_handle.is_null() {
+                let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
+                let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
+                let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
+                let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+                if !p_enum.is_null() && !p_set.is_null() && !p_free.is_null() {
+                    let wlan_enum: FnWlanEnumInterfaces = core::mem::transmute(p_enum);
+                    let wlan_set: FnWlanSetInterface = core::mem::transmute(p_set);
+                    let wlan_free: FnWlanFreeMemory = core::mem::transmute(p_free);
+                    let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
+                    if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
+                        && !list_ptr.is_null()
+                    {
+                        let count = (*list_ptr).number_of_items as usize;
+                        let first_ptr = (*list_ptr).interface_info.as_ptr();
+                        let val_bool: i32 = 0;
+                        const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
+                        for i in 0..count {
+                            let info = &*first_ptr.add(i);
+                            let _ = wlan_set(
+                                client_handle,
+                                &info.interface_guid,
+                                OPCODE_MEDIA_STREAMING_MODE,
+                                core::mem::size_of::<i32>() as u32,
+                                &val_bool as *const _ as *const core::ffi::c_void,
+                                core::ptr::null_mut(),
+                            );
+                        }
+                        wlan_free(list_ptr as *mut core::ffi::c_void);
+                    }
+                }
+                if !p_close.is_null() {
+                    let wlan_close: FnWlanCloseHandle = core::mem::transmute(p_close);
+                    let _ = wlan_close(client_handle, core::ptr::null_mut());
+                }
+            }
+            FreeLibrary(hmod);
+        }
     }
 }
 

@@ -443,8 +443,27 @@ fn default_qr_iface_index(interfaces: &[NetworkInterfaceInfo]) -> usize {
         .unwrap_or(0)
 }
 
+/// Refresh `interfaces` while preserving the operator's previously chosen QR
+/// adapter by IP address (so plugging in a USB-tethered phone after launch,
+/// which inserts at index 0, never silently switches a Wi-Fi QR code to an
+/// unreachable USB RNDIS IP).
+fn refreshed_qr_iface_index_by_ip(
+    interfaces: &[NetworkInterfaceInfo],
+    prev_ip: Option<std::net::IpAddr>,
+    prev_idx: usize,
+) -> usize {
+    if let Some(ip) = prev_ip {
+        if let Some(pos) = interfaces.iter().position(|i| i.ip == ip) {
+            return pos;
+        }
+    }
+    let _ = prev_idx;
+    default_qr_iface_index(interfaces)
+}
+
 /// Keep the operator's chosen adapter across a refresh, falling back to the
 /// Wi-Fi/LAN default only when the old index no longer exists.
+#[allow(dead_code)]
 fn refreshed_qr_iface_index(interfaces: &[NetworkInterfaceInfo], selected: usize) -> usize {
     if selected < interfaces.len() {
         selected
@@ -785,6 +804,19 @@ impl AudioShareApp {
         }
     }
 
+    fn refresh_interfaces_preserving_qr(&mut self) {
+        let prev_ip = self
+            .interfaces
+            .get(self.selected_qr_iface_idx)
+            .map(|i| i.ip);
+        self.interfaces = list_valid_host_interfaces();
+        self.selected_qr_iface_idx = refreshed_qr_iface_index_by_ip(
+            &self.interfaces,
+            prev_ip,
+            self.selected_qr_iface_idx,
+        );
+    }
+
     fn toggle_host(&mut self) {
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
@@ -797,6 +829,8 @@ impl AudioShareApp {
                 self.selected_app_idx = None;
                 self.app_route_status = "Capturing Full System Audio".into();
             }
+            self.measured_sonar_ms = None;
+            self.measured_sonar_at = None;
             self.prev_bytes_sent = 0;
             self.prev_pkts_sent = 0;
             self.live_kbps = 0;
@@ -810,7 +844,7 @@ impl AudioShareApp {
             if self.pin_dirty {
                 self.apply_pin_now();
             }
-            self.interfaces = list_valid_host_interfaces();
+            self.refresh_interfaces_preserving_qr();
             let cfg = HostConfig {
                 bind_port: DEFAULT_PORT,
                 subframes_per_packet: if self.usb_low_latency_pacing { 1 } else { 2 },
@@ -914,16 +948,16 @@ impl AudioShareApp {
     fn sync_client_dsp_atomics(&self, c: &ClientEngine) {
         c.telemetry
             .preamp_gain_db_tenths
-            .store((self.preamp_gain_db * 10.0) as i32, Ordering::Relaxed);
+            .store((self.preamp_gain_db * 10.0).round() as i32, Ordering::Relaxed);
         c.telemetry
             .eq_bass_db_tenths
-            .store((self.eq_bass_db * 10.0) as i32, Ordering::Relaxed);
+            .store((self.eq_bass_db * 10.0).round() as i32, Ordering::Relaxed);
         c.telemetry
             .eq_presence_db_tenths
-            .store((self.eq_presence_db * 10.0) as i32, Ordering::Relaxed);
+            .store((self.eq_presence_db * 10.0).round() as i32, Ordering::Relaxed);
         c.telemetry
             .eq_treble_db_tenths
-            .store((self.eq_treble_db * 10.0) as i32, Ordering::Relaxed);
+            .store((self.eq_treble_db * 10.0).round() as i32, Ordering::Relaxed);
         c.telemetry
             .channel_role
             .store(self.channel_role as u8, Ordering::Relaxed);
@@ -969,7 +1003,7 @@ impl AudioShareApp {
             let _ = tx.send(BgTaskResult::Firewall { msg, firewall_ok });
             ctx_clone.request_repaint();
         });
-        self.hotspot_status = "Opening firewall ports (65530-65532/UDP)…".into();
+        self.show_toast("Opening firewall ports (65530-65532/UDP)…");
     }
 
     fn dispatch_hotspot_start(&mut self, ctx: &egui::Context) {
@@ -1018,7 +1052,6 @@ impl AudioShareApp {
                     }
                     #[cfg(not(target_os = "windows"))]
                     let _ = firewall_ok;
-                    self.hotspot_status = msg.clone();
                     self.show_toast(msg);
                 }
                 BgTaskResult::HotspotStart { result } => {
@@ -1026,11 +1059,7 @@ impl AudioShareApp {
                     match result {
                         Ok(msg) => {
                             self.direct_hotspot_active = true;
-                            self.interfaces = list_valid_host_interfaces();
-                            self.selected_qr_iface_idx = refreshed_qr_iface_index(
-                                &self.interfaces,
-                                self.selected_qr_iface_idx,
-                            );
+                            self.refresh_interfaces_preserving_qr();
                             self.hotspot_status = msg.clone();
                             self.show_toast(msg);
                         }
@@ -1043,11 +1072,7 @@ impl AudioShareApp {
                 BgTaskResult::HotspotStop => {
                     self.hotspot_task_in_flight = false;
                     self.direct_hotspot_active = false;
-                    self.interfaces = list_valid_host_interfaces();
-                    self.selected_qr_iface_idx = refreshed_qr_iface_index(
-                        &self.interfaces,
-                        self.selected_qr_iface_idx,
-                    );
+                    self.refresh_interfaces_preserving_qr();
                     self.hotspot_status = "Router LAN Mode".into();
                     self.show_toast("1-Hop Direct Hotspot stopped");
                 }
@@ -1061,6 +1086,10 @@ impl AudioShareApp {
     /// Push the current PIN setting into every live engine at once.
     fn apply_pin_now(&mut self) {
         self.pairing_pin = self.pairing_pin.trim().to_string();
+        if self.pairing_pin.is_empty() {
+            // Keep the UI switch truthful: an empty PIN disables encryption.
+            self.enable_pin_encryption = false;
+        }
         let pin = if self.enable_pin_encryption && !self.pairing_pin.is_empty() {
             Some(self.pairing_pin.as_str())
         } else {
@@ -1124,8 +1153,13 @@ impl eframe::App for AudioShareApp {
             }
         }
 
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        // Only intercept close-to-minimize while the window is visible; if the
+        // user explicitly right-clicks the minimized taskbar button -> "Close
+        // window", let the app exit cleanly instead of swallowing the close.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.force_quit
+            && !is_minimized
             && self.minimize_on_close
             && (self.host_engine.is_some()
                 || self.client_engine.is_some()
@@ -1135,11 +1169,18 @@ impl eframe::App for AudioShareApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
 
+        // Surface asynchronous Windows per-app process-loopback failures or
+        // isolated-process exits immediately instead of claiming isolation.
+        if let Some(err) = audioshare_host_engine::app_routing::take_windows_app_isolation_error() {
+            self.selected_app_idx = None;
+            self.app_route_status = err.clone();
+            self.show_toast(err);
+        }
+
         // Event-driven repaint: 0 Hz on the idle Host tab (no GPU/CPU burn),
         // ~16 Hz while streaming for smooth VU/oscilloscope, 1 Hz while the
         // Receive tab scans LAN beacons, 2 Hz while hidden/minimized, and
         // 4 Hz while a toast is visible so it expires promptly.
-        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         // Only scan LAN/USB beacons while the Receive tab is visible.
         if let Some(ref scanner) = self.scanner {
             scanner.set_paused(self.tab != AppTab::ClientReceiver || is_minimized);
@@ -1225,7 +1266,22 @@ impl eframe::App for AudioShareApp {
             }
 
             if let Some(ref mut guard) = self.os_guard {
-                if client_count > 0 {
+                // On Linux, Virtual Speaker and Per-App Capture share
+                // `AudioShare_Ultra`: do not overwrite `@DEFAULT_SINK@` /
+                // `@DEFAULT_SOURCE@` while a single app is isolated.
+                // On Windows, Virtual Speaker and Phone Virtual Mic share the
+                // single VB-Cable endpoint: pause Virtual Speaker while Phone
+                // Virtual Mic is active so call audio cannot feed back into
+                // VB-Cable in a howling loop.
+                #[cfg(target_os = "windows")]
+                let virtual_speaker_blocked = self.phone_mic_receiver.is_some()
+                    && self.phone_rx_mode == PhoneRxRoutingMode::VirtualMicForCalls;
+                #[cfg(target_os = "linux")]
+                let virtual_speaker_blocked = self.selected_app_idx.is_some();
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                let virtual_speaker_blocked = false;
+
+                if client_count > 0 && !virtual_speaker_blocked {
                     guard.activate();
                 } else {
                     guard.deactivate();
@@ -1253,7 +1309,7 @@ impl eframe::App for AudioShareApp {
             }
         }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Comma)) {
-            self.interfaces = list_valid_host_interfaces();
+            self.refresh_interfaces_preserving_qr();
             if self.show_settings_modal {
                 if self.pin_dirty {
                     self.apply_pin_now();
@@ -1262,6 +1318,9 @@ impl eframe::App for AudioShareApp {
                 }
             }
             self.show_settings_modal = !self.show_settings_modal;
+            if self.show_settings_modal {
+                self.show_qr_modal = false;
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
             self.latency_debug = !self.latency_debug;
@@ -1328,7 +1387,7 @@ impl eframe::App for AudioShareApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                         if uw::pill_choice(ui, dark, self.show_settings_modal, "Settings") {
-                            self.interfaces = list_valid_host_interfaces();
+                            self.refresh_interfaces_preserving_qr();
                             if self.show_settings_modal {
                                 if self.pin_dirty {
                                     self.apply_pin_now();
@@ -1337,17 +1396,19 @@ impl eframe::App for AudioShareApp {
                                 }
                             }
                             self.show_settings_modal = !self.show_settings_modal;
+                            if self.show_settings_modal {
+                                self.show_qr_modal = false;
+                            }
                         }
                         if uw::pill_choice(ui, dark, self.show_qr_modal, "Pair Phone QR") {
                             if self.pin_dirty {
                                 self.apply_pin_now();
                             }
-                            self.interfaces = list_valid_host_interfaces();
-                            self.selected_qr_iface_idx = refreshed_qr_iface_index(
-                                &self.interfaces,
-                                self.selected_qr_iface_idx,
-                            );
+                            self.refresh_interfaces_preserving_qr();
                             self.show_qr_modal = !self.show_qr_modal;
+                            if self.show_qr_modal {
+                                self.show_settings_modal = false;
+                            }
                         }
                         // Clickable PIN ON indicator — jumps straight to Security.
                         if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
@@ -1378,6 +1439,7 @@ impl eframe::App for AudioShareApp {
                             {
                                 self.settings_tab = SettingsTab::NetworkAndSecurity;
                                 self.show_settings_modal = true;
+                                self.show_qr_modal = false;
                             }
                         }
                     });
@@ -1412,12 +1474,17 @@ impl eframe::App for AudioShareApp {
                         let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
                         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
                         let kb = host.telemetry.bytes_sent.load(Ordering::Relaxed) / 1024;
+                        let display_kbps = if self.quality_profile == QualityProfile::MaxStability24Ghz {
+                            self.target_bitrate_kbps.clamp(96, 160)
+                        } else {
+                            self.target_bitrate_kbps
+                        };
                         let codec_label = if dtx {
                             "Smart DTX Sleep (0.6 kbps)".to_string()
                         } else if mode_id == 4 {
-                            format!("Opus RLD ({} kbps)", self.target_bitrate_kbps)
+                            format!("Opus RLD ({} kbps)", display_kbps)
                         } else if mode_id == 2 {
-                            format!("Rust VBR ({} kbps)", self.target_bitrate_kbps)
+                            format!("Rust VBR ({} kbps)", display_kbps)
                         } else if self.quality_profile == QualityProfile::StudioLossless24Bit {
                             "24-Bit Studio Master".to_string()
                         } else {
@@ -2178,10 +2245,9 @@ impl AudioShareApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Pair New Phone (QR)").clicked() {
-                        self.interfaces = list_valid_host_interfaces();
-                        self.selected_qr_iface_idx =
-                            refreshed_qr_iface_index(&self.interfaces, self.selected_qr_iface_idx);
+                        self.refresh_interfaces_preserving_qr();
                         self.show_qr_modal = true;
+                        self.show_settings_modal = false;
                     }
                 });
             });
@@ -2197,40 +2263,42 @@ impl AudioShareApp {
             } else if let Some(ref host) = self.host_engine {
                 ui.separator();
                 for client in clients {
-                    ui.horizontal(|ui| {
-                        // Link-health dot: green (<1% loss), amber (1-5%), red (>5%).
-                        let (dot_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        let health_col = if client.fec_rate_permille < 10 {
-                            egui::Color32::from_rgb(16, 185, 129)
-                        } else if client.fec_rate_permille < 50 {
-                            egui::Color32::from_rgb(245, 158, 11)
-                        } else {
-                            egui::Color32::from_rgb(239, 68, 68)
-                        };
-                        ui.painter().circle_filled(dot_rect.center(), 4.0, health_col);
-                        let badge = if client.is_usb { "USB" } else { "Wi-Fi" };
-                        uw::status_pill(
-                            ui,
-                            badge,
-                            egui::Color32::from_rgb(30, 58, 138),
-                            egui::Color32::WHITE,
-                        );
-                        ui.monospace(format!(
-                            "{} • Vol {}% • Loss {:.1}% • BT {} ms",
-                            client.addr,
-                            client.client_volume,
-                            (client.fec_rate_permille as f32) / 10.0,
-                            client.bluetooth_delay_ms
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Kick").clicked() {
-                                host.kick_client(client.addr);
-                            }
-                            let mute_label = if client.muted { "Unmute" } else { "Mute" };
-                            if ui.small_button(mute_label).clicked() {
-                                host.set_client_muted(client.addr, !client.muted);
-                            }
+                    ui.push_id(client.addr, |ui| {
+                        ui.horizontal(|ui| {
+                            // Link-health dot: green (<1% loss), amber (1-5%), red (>5%).
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            let health_col = if client.fec_rate_permille < 10 {
+                                egui::Color32::from_rgb(16, 185, 129)
+                            } else if client.fec_rate_permille < 50 {
+                                egui::Color32::from_rgb(245, 158, 11)
+                            } else {
+                                egui::Color32::from_rgb(239, 68, 68)
+                            };
+                            ui.painter().circle_filled(dot_rect.center(), 4.0, health_col);
+                            let badge = if client.is_usb { "USB" } else { "Wi-Fi" };
+                            uw::status_pill(
+                                ui,
+                                badge,
+                                egui::Color32::from_rgb(30, 58, 138),
+                                egui::Color32::WHITE,
+                            );
+                            ui.monospace(format!(
+                                "{} • Vol {}% • Loss {:.1}% • BT {} ms",
+                                client.addr,
+                                client.client_volume,
+                                (client.fec_rate_permille as f32) / 10.0,
+                                client.bluetooth_delay_ms
+                            ));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Kick").clicked() {
+                                    host.kick_client(client.addr);
+                                }
+                                let mute_label = if client.muted { "Unmute" } else { "Mute" };
+                                if ui.small_button(mute_label).clicked() {
+                                    host.set_client_muted(client.addr, !client.muted);
+                                }
+                            });
                         });
                     });
                 }
@@ -2586,6 +2654,7 @@ impl AudioShareApp {
                                 .size(13.0)
                                 .strong(),
                         );
+                        let prev_mode = self.phone_rx_mode;
                         let mut mode_changed = false;
                         ui.horizontal_wrapped(|ui| {
                             if uw::pill_choice(
@@ -2611,56 +2680,75 @@ impl AudioShareApp {
                         });
 
                         if mode_changed && self.phone_mic_receiver.is_some() {
-                            if self.pin_dirty {
-                                self.apply_pin_now();
-                            }
-                            if let Some(mut m) = self.phone_mic_receiver.take() {
-                                m.stop();
-                            }
-                            let phone_pin = if self.enable_pin_encryption
-                                && !self.pairing_pin.trim().is_empty()
-                            {
-                                Some(self.pairing_pin.trim().to_string())
+                            // Pre-flight check on Windows so switching to
+                            // Virtual Mic without VB-Cable never destroys a
+                            // working `PlayOnPcSpeakers` stream.
+                            #[cfg(target_os = "windows")]
+                            let vbcable_missing = self.phone_rx_mode
+                                == PhoneRxRoutingMode::VirtualMicForCalls
+                                && audioshare_host_engine::find_vbcable_output_device_name()
+                                    .is_none();
+                            #[cfg(not(target_os = "windows"))]
+                            let vbcable_missing = false;
+
+                            if vbcable_missing {
+                                self.phone_rx_mode = prev_mode;
+                                let msg = "VB-Cable not found — kept 'Play on PC Speakers' active.";
+                                self.phone_rx_status = format!("Error: {}", msg);
+                                self.show_toast(msg);
                             } else {
-                                None
-                            };
-                            match PhoneMicReceiver::start_with_mode_and_pin(
-                                PHONE_MIC_PORT,
-                                self.phone_rx_mode,
-                                phone_pin.as_deref(),
-                            ) {
-                                Ok(rx) => {
-                                    self.phone_rx_status = if self.phone_rx_mode
-                                        == PhoneRxRoutingMode::VirtualMicForCalls
-                                    {
-                                        #[cfg(target_os = "windows")]
+                                if self.pin_dirty {
+                                    self.apply_pin_now();
+                                }
+                                if let Some(mut m) = self.phone_mic_receiver.take() {
+                                    m.stop();
+                                }
+                                let phone_pin = if self.enable_pin_encryption
+                                    && !self.pairing_pin.trim().is_empty()
+                                {
+                                    Some(self.pairing_pin.trim().to_string())
+                                } else {
+                                    None
+                                };
+                                match PhoneMicReceiver::start_with_mode_and_pin(
+                                    PHONE_MIC_PORT,
+                                    self.phone_rx_mode,
+                                    phone_pin.as_deref(),
+                                ) {
+                                    Ok(rx) => {
+                                        self.phone_rx_status = if self.phone_rx_mode
+                                            == PhoneRxRoutingMode::VirtualMicForCalls
                                         {
-                                            format!(
-                                                "Listening (UDP/USB 65532) -> {} • In Zoom/Discord/Windows select 'CABLE Output (VB-Audio Virtual Cable)' as Microphone",
-                                                rx.output_device_name
-                                            )
-                                        }
-                                        #[cfg(not(target_os = "windows"))]
-                                        {
+                                            #[cfg(target_os = "windows")]
+                                            {
+                                                format!(
+                                                    "Listening (UDP/USB 65532) -> {} • In Zoom/Discord/Windows select 'CABLE Output (VB-Audio Virtual Cable)' as Microphone",
+                                                    rx.output_device_name
+                                                )
+                                            }
+                                            #[cfg(not(target_os = "windows"))]
+                                            {
+                                                format!(
+                                                    "Listening (UDP/USB 65532) -> {}",
+                                                    rx.output_device_name
+                                                )
+                                            }
+                                        } else {
                                             format!(
                                                 "Listening (UDP/USB 65532) -> {}",
                                                 rx.output_device_name
                                             )
-                                        }
-                                    } else {
-                                        format!(
-                                            "Listening (UDP/USB 65532) -> {}",
-                                            rx.output_device_name
-                                        )
-                                    };
-                                    self.phone_mic_receiver = Some(rx);
-                                }
-                                Err(e) => {
-                                    self.phone_rx_status = format!("Error: {}", e);
-                                    self.show_toast(format!(
-                                        "Phone receiver could not restart: {}",
-                                        e
-                                    ));
+                                        };
+                                        self.phone_mic_receiver = Some(rx);
+                                    }
+                                    Err(e) => {
+                                        self.phone_rx_mode = prev_mode;
+                                        self.phone_rx_status = format!("Error: {}", e);
+                                        self.show_toast(format!(
+                                            "Phone receiver could not restart: {}",
+                                            e
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -2687,6 +2775,8 @@ impl AudioShareApp {
                             if ui.add(btn).clicked() {
                                 if let Some(mut m) = self.phone_mic_receiver.take() {
                                     m.stop();
+                                    self.measured_sonar_ms = None;
+                                    self.measured_sonar_at = None;
                                     self.phone_rx_status = "Phone receiver stopped.".into();
                                 } else {
                                     if self.pin_dirty {
@@ -2744,12 +2834,21 @@ impl AudioShareApp {
                             if let Some(ref mic) = self.phone_mic_receiver {
                                 let pkts = mic.mic_packets_received.load(Ordering::Relaxed);
                                 let peak = mic.mic_peak_level_pct.load(Ordering::Relaxed);
+                                let auth_fails = mic.auth_failures.load(Ordering::Relaxed);
                                 uw::status_pill(
                                     ui,
                                     &format!("RX: {} pkts • Peak: {}%", pkts, peak),
                                     p.ok_bg,
                                     p.ok_fg,
                                 );
+                                if auth_fails > 0 {
+                                    uw::status_pill(
+                                        ui,
+                                        &format!("PIN Mismatch ({} dropped)", auth_fails),
+                                        p.warn_bg,
+                                        p.warn_fg,
+                                    );
+                                }
 
                                 if let Some(ref host) = self.host_engine {
                                     if ui.button("Ping Acoustic Latency (Sonar)").clicked() {

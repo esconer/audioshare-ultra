@@ -729,6 +729,20 @@ impl ClientPreviewSink {
         preferred_name: Option<&str>,
         observed_cb_frames: Option<Arc<AtomicUsize>>,
     ) -> Result<cpal::Stream, String> {
+        Self::spawn_preferred_strict_with_cb_frames(fifo, preferred_name, false, observed_cb_frames)
+            .map(|(stream, _)| stream)
+    }
+
+    /// Spawn a CPAL output sink with error reporting (`stream_error` atomic)
+    /// and optional strict matching (`require_preferred = true` fails cleanly
+    /// instead of silently falling back to Default PC Speakers — critical for
+    /// `VirtualMicForCalls` so call audio never feeds back into PC speakers).
+    pub(crate) fn spawn_preferred_strict_with_cb_frames(
+        fifo: Arc<BurstDecouplerRing>,
+        preferred_name: Option<&str>,
+        require_preferred: bool,
+        observed_cb_frames: Option<Arc<AtomicUsize>>,
+    ) -> Result<(cpal::Stream, Arc<AtomicBool>), String> {
         let host = cpal::default_host();
         let preferred = preferred_name.and_then(|needle| {
             let needle_lower = needle.to_ascii_lowercase();
@@ -751,9 +765,18 @@ impl ClientPreviewSink {
                 })
                 .cloned()
         });
-        let dev = preferred
-            .or_else(|| host.default_output_device())
-            .ok_or("No output device")?;
+        let dev = if require_preferred {
+            preferred.ok_or_else(|| {
+                format!(
+                    "Required output device '{}' not found",
+                    preferred_name.unwrap_or("<none>")
+                )
+            })?
+        } else {
+            preferred
+                .or_else(|| host.default_output_device())
+                .ok_or("No output device")?
+        };
         let default_cfg = dev.default_output_config().map_err(|e| e.to_string())?;
         let sample_format = default_cfg.sample_format();
         match sample_format {
@@ -772,10 +795,6 @@ impl ClientPreviewSink {
         let dev_rate = default_cfg.sample_rate().0.max(1);
         let dev_channels = default_cfg.channels().max(1);
 
-        // A 240-frame (5 ms) callback matches the 2.5 ms network subframe and
-        // stops the OS from draining 10-21 ms in one pull. Some backends
-        // reject a fixed period, so fall back to the stereo default and then
-        // to whatever rate/channel layout the endpoint natively opens.
         let low_lat_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
@@ -792,6 +811,7 @@ impl ClientPreviewSink {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let stream_error = Arc::new(AtomicBool::new(false));
         let build_for_cfg = |cfg: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
             let out_channels = cfg.channels.max(1) as usize;
             let out_rate = cfg.sample_rate.0;
@@ -803,13 +823,17 @@ impl ClientPreviewSink {
                     observed_cb_frames.clone(),
                 )
             };
+            let err_flag = Arc::clone(&stream_error);
+            let on_err = move |_err| {
+                err_flag.store(true, Ordering::Release);
+            };
             match sample_format {
                 cpal::SampleFormat::I16 => {
                     let mut pull = make_pull();
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [i16], _: &cpal::OutputCallbackInfo| pull.fill_i16(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -819,7 +843,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [u16], _: &cpal::OutputCallbackInfo| pull.fill_u16(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -829,7 +853,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [i32], _: &cpal::OutputCallbackInfo| pull.fill_i32(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -839,7 +863,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [f64], _: &cpal::OutputCallbackInfo| pull.fill_f64(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -849,7 +873,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [f32], _: &cpal::OutputCallbackInfo| pull.fill_f32(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -866,7 +890,7 @@ impl ClientPreviewSink {
             .or_else(|_| build_for_cfg(&native_fallback_cfg))
             .map_err(|e| format!("Failed to build preview output stream: {e}"))?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(stream)
+        Ok((stream, stream_error))
     }
 }
 
@@ -897,21 +921,13 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
                 continue;
             }
             let ip = iface.ip();
-            if !ip.is_ipv4() {
+            let IpAddr::V4(v4) = ip else {
+                continue;
+            };
+            if v4.is_link_local() || v4.is_unspecified() {
                 continue;
             }
-            let lower = iface.name.to_lowercase();
-            let is_virtual = lower.contains("docker")
-                || lower.starts_with("veth")
-                || lower.contains("wsl")
-                || lower.contains("vethernet")
-                || lower.contains("vmware")
-                || lower.contains("vmnet")
-                || lower.contains("vbox")
-                || lower.contains("virtualbox")
-                || lower.contains("virbr")
-                || lower.contains("br-");
-            if is_virtual {
+            if discovery_and_os::is_virtual_interface_name(&iface.name) {
                 continue;
             }
 
@@ -969,20 +985,10 @@ pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
     })
 }
 
-pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
-    let sock_ref = socket2::SockRef::from(socket);
-    // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
-    let _ = sock_ref.set_tos(0xA0);
-    // 1 MB send & receive buffers absorb 5+ Mbps 24-bit Master bursts and
-    // 250-350 ms Wi-Fi driver TXOP/A-MPDU aggregation stalls without silent
-    // non-blocking `send_to` drops or kernel RX queue overflows.
-    let _ = sock_ref.set_send_buffer_size(1_048_576);
-    let _ = sock_ref.set_recv_buffer_size(1_048_576);
-
-    // Disable Winsock's legacy SIO_UDP_CONNRESET behavior: without this, one
-    // ICMP Port Unreachable from a restarting/disconnected phone makes
-    // recv_from() fail with WSAECONNRESET (10054) and aborts the control drain
-    // (the host then goes deaf to all subsequent HELLO/feedback packets).
+/// Disable Winsock's legacy `SIO_UDP_CONNRESET` behavior on Windows so an
+/// ICMP Port Unreachable from a momentarily restarting peer cannot make
+/// `recv()`/`recv_from()` return `WSAECONNRESET` (10054).
+pub(crate) fn disable_windows_udp_connreset(socket: &UdpSocket) {
     #[cfg(target_os = "windows")]
     unsafe {
         use std::os::windows::io::AsRawSocket;
@@ -1015,6 +1021,21 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
             core::ptr::null_mut(),
         );
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = socket;
+}
+
+pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(socket);
+    // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
+    let _ = sock_ref.set_tos(0xA0);
+    // 1 MB send & receive buffers absorb 5+ Mbps 24-bit Master bursts and
+    // 250-350 ms Wi-Fi driver TXOP/A-MPDU aggregation stalls without silent
+    // non-blocking `send_to` drops or kernel RX queue overflows.
+    let _ = sock_ref.set_send_buffer_size(1_048_576);
+    let _ = sock_ref.set_recv_buffer_size(1_048_576);
+
+    disable_windows_udp_connreset(socket);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -1742,6 +1763,9 @@ pub struct HostEngine {
     running: Arc<AtomicBool>,
     pub telemetry: Arc<HostTelemetry>,
     clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+    /// Temporary per-IP kick cooldown so a kicked client's periodic 500 ms
+    /// feedback packet does not immediately re-admit it unmuted.
+    kicked_clients: Arc<Mutex<HashMap<IpAddr, Instant>>>,
     /// Bumped whenever `clients` is mutated from outside the TX loop (mute,
     /// kick, or PIN change) so `cached_targets` refreshes on the very next
     /// 2.5 ms tick instead of waiting up to 1 second for the periodic sweep.
@@ -1838,6 +1862,7 @@ impl HostEngine {
             Ordering::Relaxed,
         );
         let clients = Arc::new(Mutex::new(client_map));
+        let kicked_clients = Arc::new(Mutex::new(HashMap::<IpAddr, Instant>::new()));
         let clients_version = Arc::new(AtomicU64::new(0));
         let session_key = Arc::new(Mutex::new(initial_key));
         let key_version = Arc::new(AtomicU64::new(0));
@@ -1860,6 +1885,7 @@ impl HostEngine {
         let running_clone = Arc::clone(&running);
         let telemetry_clone = Arc::clone(&telemetry);
         let clients_clone = Arc::clone(&clients);
+        let kicked_clients_clone = Arc::clone(&kicked_clients);
         let clients_version_clone = Arc::clone(&clients_version);
         let key_clone = Arc::clone(&session_key);
         let key_version_clone = Arc::clone(&key_version);
@@ -1877,6 +1903,7 @@ impl HostEngine {
                     running_clone,
                     telemetry_clone,
                     clients_clone,
+                    kicked_clients_clone,
                     clients_version_clone,
                     key_clone,
                     key_version_clone,
@@ -1900,6 +1927,7 @@ impl HostEngine {
             running,
             telemetry,
             clients,
+            kicked_clients,
             clients_version,
             session_key,
             key_version,
@@ -1951,7 +1979,17 @@ impl HostEngine {
     }
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {
-        self.clients.lock().unwrap().values().cloned().collect()
+        let mut list: Vec<ConnectedClient> = self
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        // Deterministic ordering so GUI client rows never jump under the cursor
+        // when HashMap rehashes on join/leave.
+        list.sort_by_key(|c| c.addr);
+        list
     }
 
     /// Count a rejected handshake and log only the first one and every 50th
@@ -2096,12 +2134,21 @@ impl HostEngine {
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
         drop(map);
+        // Hold a 15-second kick cooldown for this peer IP so its periodic
+        // 500 ms feedback heartbeat does not immediately re-admit it unmuted.
+        const KICK_COOLDOWN: Duration = Duration::from_secs(15);
+        {
+            let mut kicked = self.kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            kicked.retain(|_, until| *until > now);
+            kicked.insert(addr.ip(), now + KICK_COOLDOWN);
+        }
         if removed {
             self.clients_version.fetch_add(1, Ordering::AcqRel);
             audioshare_protocol::diagnostics::info(
                 "host-clients",
                 format!(
-                    "kick {} (remaining {})",
+                    "kick {} (15s cooldown; remaining {})",
                     addr,
                     self.telemetry.active_clients_count.load(Ordering::Relaxed)
                 ),
@@ -2116,6 +2163,9 @@ impl HostEngine {
         }
         // Dropping the monitor stops and joins its polling thread.
         self.volume_monitor = None;
+        // Clear any leftover per-app isolation PID so a fresh HostEngine
+        // session does not silently inherit an old PID.
+        app_routing::clear_windows_target_capture_pid();
         // Final snapshot after the TX thread has stopped: useful when a
         // session ends unexpectedly and the report is pulled offline.
         audioshare_protocol::diagnostics::info(
@@ -2799,6 +2849,7 @@ impl HostEngine {
         running: Arc<AtomicBool>,
         telemetry: Arc<HostTelemetry>,
         clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+        kicked_clients: Arc<Mutex<HashMap<IpAddr, Instant>>>,
         clients_version: Arc<AtomicU64>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
         key_version: Arc<AtomicU64>,
@@ -3066,19 +3117,26 @@ impl HostEngine {
                 };
                 let target_pid = app_routing::windows_target_capture_pid();
                 let pid_changed = target_pid != bound_target_pid;
+                // `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` is endpoint-independent,
+                // so a default speaker change must NOT tear down an active
+                // isolated-app capture stream.
+                let endpoint_rebind_needed = device_changed && target_pid == 0;
                 // Only rebind when the stream is missing, reported a device error,
-                // the default output endpoint changed, or the isolated app changed.
+                // the default output endpoint changed (in full-system mode), or
+                // the isolated app changed.
                 if active_stream.is_none()
                     || capture_stream_error.load(Ordering::Acquire)
-                    || device_changed
+                    || endpoint_rebind_needed
                     || pid_changed
                 {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
                     // Drop the previous stream BEFORE creating a new SPSC
                     // producer so two backends never share the audio device.
                     drop(active_stream.take());
+                    capture_stream_error.store(false, Ordering::Release);
+                    let mut effective_pid = target_pid;
                     active_stream = if target_pid != 0 {
-                        app_routing::spawn_windows_process_loopback(
+                        match app_routing::spawn_windows_process_loopback(
                             target_pid,
                             Arc::clone(&ring),
                             Arc::clone(&capture_wakeup),
@@ -3086,19 +3144,29 @@ impl HostEngine {
                             Arc::clone(&capture_stream_error),
                             Arc::clone(&running),
                             start_instant,
-                        )
-                        .map(HostCaptureStream::WindowsProcess)
-                        .or_else(|_| {
-                            Self::spawn_loopback_capture(
-                                Arc::clone(&ring),
-                                Arc::clone(&capture_wakeup),
-                                Arc::clone(&capture_heartbeat_ms),
-                                Arc::clone(&capture_stream_error),
-                                Arc::clone(&running),
-                                start_instant,
-                            )
-                        })
-                        .ok()
+                        ) {
+                            Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
+                            Err(err) => {
+                                // Never silently fall back to full system audio
+                                // while leaving `WINDOWS_TARGET_CAPTURE_PID` set
+                                // (privacy leak): clear target PID and publish
+                                // the error so the GUI immediately shows it.
+                                app_routing::clear_windows_target_capture_pid();
+                                app_routing::set_windows_app_isolation_error(Some(format!(
+                                    "App isolation (PID {target_pid}) failed: {err} — fell back to Full System Audio"
+                                )));
+                                effective_pid = 0;
+                                Self::spawn_loopback_capture(
+                                    Arc::clone(&ring),
+                                    Arc::clone(&capture_wakeup),
+                                    Arc::clone(&capture_heartbeat_ms),
+                                    Arc::clone(&capture_stream_error),
+                                    Arc::clone(&running),
+                                    start_instant,
+                                )
+                                .ok()
+                            }
+                        }
                     } else {
                         Self::spawn_loopback_capture(
                             Arc::clone(&ring),
@@ -3113,7 +3181,7 @@ impl HostEngine {
                     if active_stream.is_some() {
                         bound_output_name = latest_name;
                         bound_output_generation = generation;
-                        bound_target_pid = target_pid;
+                        bound_target_pid = effective_pid;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         let rebinds =
                             telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3121,7 +3189,7 @@ impl HostEngine {
                             "host-capture",
                             format!(
                                 "hotplug rebind #{}: endpoint={:?} generation={} pid={}",
-                                rebinds, bound_output_name, generation, target_pid
+                                rebinds, bound_output_name, generation, effective_pid
                             ),
                         );
                     }
@@ -3155,8 +3223,6 @@ impl HostEngine {
 
             // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
             while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
-                let is_usb = is_usb_subnet_ip(src_addr.ip());
-
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
                     // A bare HELLO carries no PIN/MAC. When the host has a
                     // session key, only authenticated feedback may register a
@@ -3171,6 +3237,18 @@ impl HostEngine {
                         );
                         continue;
                     }
+                    // Reject recently kicked IPs during their cooldown window
+                    // so clicking Kick doesn't immediately re-admit the peer.
+                    {
+                        let kicked = kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+                        if kicked
+                            .get(&src_addr.ip())
+                            .map(|until| *until > Instant::now())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                    }
                     let mut map = clients.lock().unwrap();
                     Self::evict_same_ip_stale_ports(&mut map, src_addr);
                     if !Self::can_admit_client(&map, src_addr) {
@@ -3179,6 +3257,13 @@ impl HostEngine {
                         continue;
                     }
                     let newly_joined = !map.contains_key(&src_addr);
+                    // Only query OS interfaces when inserting a genuinely new
+                    // client (never on every 500 ms heartbeat in the RT loop!).
+                    let is_usb = if newly_joined {
+                        is_usb_subnet_ip(src_addr.ip())
+                    } else {
+                        false
+                    };
                     map.entry(src_addr)
                         .or_insert(ConnectedClient {
                             addr: src_addr,
@@ -3243,15 +3328,10 @@ impl HostEngine {
                         _ => None,
                     };
                     let mut newly_joined = false;
+                    let mut newly_joined_usb = false;
                     let allow_remote_commands: bool;
                     {
                         let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
-                        Self::evict_same_ip_stale_ports(&mut map, src_addr);
-                        if !Self::can_admit_client(&map, src_addr) {
-                            // At capacity: feedback from an unknown peer must not
-                            // grow the map or execute any remote commands.
-                            continue;
-                        }
                         if let Some(entry) = map.get_mut(&src_addr) {
                             if !entry.feedback_window.check_and_accept(
                                 active_key.is_some(),
@@ -3269,6 +3349,29 @@ impl HostEngine {
                             }
                             allow_remote_commands = !entry.muted;
                         } else {
+                            // Reject continuing heartbeats (`feedback_seq > 1`)
+                            // from recently kicked IPs during their 15 s
+                            // cooldown so clicking Kick actually keeps an
+                            // active client out instead of auto-rejoining in
+                            // 500 ms. A deliberate fresh reconnect starts a new
+                            // `ClientEngine` at `feedback_seq == 1`, which is
+                            // admitted immediately and clears the cooldown.
+                            {
+                                let mut kicked =
+                                    kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+                                if fb.feedback_seq == 1 {
+                                    kicked.remove(&src_addr.ip());
+                                } else if kicked
+                                    .get(&src_addr.ip())
+                                    .map(|until| *until > Instant::now())
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                            }
+                            // Validate feedback_seq BEFORE evicting any stale
+                            // port from the same IP so a malformed/zero-seq
+                            // packet cannot evict a live client.
                             let mut accepted_window = FeedbackReplayWindow::default();
                             if !accepted_window.check_and_accept(
                                 active_key.is_some(),
@@ -3276,7 +3379,15 @@ impl HostEngine {
                             ) {
                                 continue;
                             }
+                            Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                            if !Self::can_admit_client(&map, src_addr) {
+                                // At capacity: feedback from an unknown peer must not
+                                // grow the map or execute any remote commands.
+                                continue;
+                            }
+                            let is_usb = is_usb_subnet_ip(src_addr.ip());
                             newly_joined = true;
+                            newly_joined_usb = is_usb;
                             allow_remote_commands = true;
                             map.insert(
                                 src_addr,
@@ -3378,7 +3489,7 @@ impl HostEngine {
                             format!(
                                 "join {} usb={} (total {})",
                                 src_addr,
-                                is_usb,
+                                newly_joined_usb,
                                 telemetry.active_clients_count.load(Ordering::Relaxed)
                             ),
                         );

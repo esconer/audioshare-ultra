@@ -153,14 +153,33 @@ impl ZeroJitterSequencer {
         self.append_to_history(out);
     }
 
-    /// Invalidate a single ring slot if it currently belongs to `target_seq`
-    /// (or unconditionally for that ring index) so skipped or Opus-superseded
-    /// subframes can never resurface 65,536 subframes (~2.73 min) later after a
-    /// 16-bit sequence wraparound.
+    /// Invalidate a single ring slot if it currently belongs to `seq` so
+    /// skipped or Opus-superseded subframes can never resurface 65,536
+    /// subframes (~2.73 min) later after a 16-bit sequence wraparound.
+    /// Uses an atomic CAS so it never races a concurrent `STATUS_BUSY` writer
+    /// or wipes an unrelated epoch sharing the same ring index.
     #[inline]
     pub fn clear_slot(&self, seq: u16) {
         let slot = &self.slots[(seq as usize) & RING_MASK];
-        slot.state.store(STATUS_EMPTY, Ordering::Release);
+        loop {
+            let cur = slot.state.load(Ordering::Acquire);
+            let cur_seq = (cur >> 16) as u16;
+            let cur_status = cur & 0xFFFF;
+            if cur_status == STATUS_EMPTY || cur_seq != seq {
+                return;
+            }
+            if cur_status == STATUS_BUSY {
+                std::hint::spin_loop();
+                continue;
+            }
+            if slot
+                .state
+                .compare_exchange_weak(cur, STATUS_EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing

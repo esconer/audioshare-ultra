@@ -476,10 +476,22 @@ pub(crate) fn spawn_windows_process_loopback(
                     let _ = ready_tx.send(Ok(()));
 
                     let silence = [0.0f32; 2048];
+                    let mut last_liveness_check = std::time::Instant::now();
                     'capture: while active_t.load(std::sync::atomic::Ordering::Relaxed)
                         && running.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         let _ = WaitForSingleObject(sample_evt.0, 20);
+                        if last_liveness_check.elapsed() >= std::time::Duration::from_millis(500) {
+                            last_liveness_check = std::time::Instant::now();
+                            if !is_windows_pid_alive(target_pid) {
+                                set_windows_app_isolation_error(Some(format!(
+                                    "Isolated app (PID {target_pid}) exited — returned to Full System Audio"
+                                )));
+                                clear_windows_target_capture_pid();
+                                stream_error.store(true, std::sync::atomic::Ordering::Release);
+                                break 'capture;
+                            }
+                        }
                         loop {
                             let pkt_frames = match capture.GetNextPacketSize() {
                                 Ok(n) => n,
@@ -531,7 +543,12 @@ pub(crate) fn spawn_windows_process_loopback(
                     if !started_ok {
                         let _ = ready_tx.send(Err(err));
                     }
-                    stream_error.store(true, std::sync::atomic::Ordering::Release);
+                    // Only flag `stream_error` if this stream was not already
+                    // cancelled/timed-out by the host watchdog; otherwise a
+                    // late timeout failure would poison the replacement stream.
+                    if active_t.load(std::sync::atomic::Ordering::Relaxed) {
+                        stream_error.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 if com_ok { CoUninitialize(); }
             }
@@ -687,37 +704,97 @@ fn list_windows_audio_processes() -> Vec<AudioAppEntry> {
     list_windows_audio_processes_tasklist()
 }
 
-/// Enumerate the PIDs behind every active CoreAudio render session via
+/// Check whether a Windows process ID is still alive (`STILL_ACTIVE`).
+#[cfg(target_os = "windows")]
+fn is_windows_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code).is_ok();
+        let _ = CloseHandle(handle);
+        ok && code == STILL_ACTIVE.0 as u32
+    }
+}
+
+static WINDOWS_APP_ISOLATION_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_windows_app_isolation_error(err: Option<String>) {
+    if let Ok(mut guard) = WINDOWS_APP_ISOLATION_ERROR.lock() {
+        *guard = err;
+    }
+}
+
+pub fn take_windows_app_isolation_error() -> Option<String> {
+    WINDOWS_APP_ISOLATION_ERROR
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
+
+pub fn clear_windows_target_capture_pid() {
+    #[cfg(target_os = "windows")]
+    WINDOWS_TARGET_CAPTURE_PID.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Enumerate the PIDs behind every active/inactive CoreAudio render session on
+/// both the Multimedia and Communications default endpoints via
 /// `IAudioSessionManager2::GetSessionEnumerator` ->
-/// `IAudioSessionControl2::GetProcessId`.
+/// `IAudioSessionControl2::GetProcessId`. Filters out expired sessions,
+/// System Sounds, and AudioShare's own process.
 #[cfg(target_os = "windows")]
 fn windows_audio_session_pids() -> Vec<u32> {
     use windows::core::Interface;
     use windows::Win32::Media::Audio::{
-        IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
-        MMDeviceEnumerator,
+        eCommunications, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl2,
+        IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
+    let self_pid = std::process::id();
     let mut pids = Vec::new();
     unsafe {
         let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
         let enumerated = (|| -> windows::core::Result<()> {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let endpoint = enumerator.GetDefaultAudioEndpoint(
-                windows::Win32::Media::Audio::eRender,
-                windows::Win32::Media::Audio::eMultimedia,
-            )?;
-            let manager: IAudioSessionManager2 = endpoint.Activate(CLSCTX_ALL, None)?;
-            let sessions: IAudioSessionEnumerator = manager.GetSessionEnumerator()?;
-            for index in 0..sessions.GetCount()? {
-                if let Ok(control) = sessions.GetSession(index) {
-                    if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                        if let Ok(pid) = control2.GetProcessId() {
-                            pids.push(pid);
+            for role in [eMultimedia, eCommunications] {
+                let Ok(endpoint) = enumerator.GetDefaultAudioEndpoint(eRender, role) else {
+                    continue;
+                };
+                let Ok(manager) = endpoint.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
+                else {
+                    continue;
+                };
+                let Ok(sessions) = manager.GetSessionEnumerator() else {
+                    continue;
+                };
+                let Ok(count) = sessions.GetCount() else {
+                    continue;
+                };
+                for index in 0..count {
+                    if let Ok(control) = sessions.GetSession(index) {
+                        if let Ok(state) = control.GetState() {
+                            if state == AudioSessionStateExpired {
+                                continue;
+                            }
+                        }
+                        if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                            if control2.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
+                                continue;
+                            }
+                            if let Ok(pid) = control2.GetProcessId() {
+                                if pid != 0 && pid != self_pid && is_windows_pid_alive(pid) {
+                                    pids.push(pid);
+                                }
+                            }
                         }
                     }
                 }
@@ -743,7 +820,7 @@ fn windows_process_image_name(pid: u32) -> Option<String> {
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buffer = [0u16; 260];
+        let mut buffer = [0u16; 1024];
         let mut len = buffer.len() as u32;
         let ok = QueryFullProcessImageNameW(
             handle,

@@ -169,13 +169,34 @@ impl OpusRedHistory {
             self.prev1_len = packed_len;
         } else if subframes.len() >= 2 {
             let mid = subframes.len() / 2;
-            let len1 = pack_opus_red_blob(base_seq, &subframes[..mid], &mut self.prev1).unwrap_or(0);
-            let len2 = pack_opus_red_blob(
+            let mut len1 =
+                pack_opus_red_blob(base_seq, &subframes[..mid], &mut self.prev1).unwrap_or(0);
+            let mut len2 = pack_opus_red_blob(
                 base_seq.wrapping_add(mid as u16),
                 &subframes[mid..],
                 &mut self.prev2,
             )
             .unwrap_or(0);
+            // If each half still exceeds 255 bytes (e.g. 510 kbps with 4
+            // subframes where 2 subframes = ~326 B), fall back to packing the
+            // trailing two individual subframes across both RED slots so
+            // redundancy never silently drops to zero.
+            if len1 == 0 && len2 == 0 {
+                let last_idx = subframes.len() - 1;
+                let prev_idx = last_idx - 1;
+                len1 = pack_opus_red_blob(
+                    base_seq.wrapping_add(prev_idx as u16),
+                    &subframes[prev_idx..prev_idx + 1],
+                    &mut self.prev1,
+                )
+                .unwrap_or(0);
+                len2 = pack_opus_red_blob(
+                    base_seq.wrapping_add(last_idx as u16),
+                    &subframes[last_idx..last_idx + 1],
+                    &mut self.prev2,
+                )
+                .unwrap_or(0);
+            }
             self.prev1_len = len1;
             self.prev2_len = len2;
         } else {

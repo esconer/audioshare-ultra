@@ -729,6 +729,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     // The service restores the saved music volume on every
                     // stop path, so the UI must not touch it here.
                     castPhoneInternalAudio = active
+                    val err = intent.getStringExtra(AudioEngineService.EXTRA_PARTY_CAST_ERROR)
+                    if (!err.isNullOrBlank()) {
+                        scope.launch { snackbarHostState.showSnackbar(err) }
+                    }
                 } else if (intent?.action == AudioEngineService.ACTION_PHONE_MIC_STATE) {
                     sharePhoneMic = intent.getBooleanExtra(
                         AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
@@ -758,6 +762,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     if (linkedHost.isNotEmpty()) {
                         hostAddress = linkedHost
                         pinCode = linkedPin
+                        connectAttemptId += 1
+                        lastHandledAuthFailures = 0L
+                        showPinMismatchDialog = false
                     }
                 }
             }
@@ -814,6 +821,20 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             context.startForegroundService(intent)
         } else {
             context.startService(intent)
+        }
+        // If Phone Mic is active when switching PCs or toggling USB <-> Wi-Fi,
+        // retarget the native mic transmitter so it matches the new host & PIN.
+        if (sharePhoneMic && !castPhoneInternalAudio) {
+            val micIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = AudioEngineService.ACTION_START_PHONE_MIC
+                putExtra("HOST_ADDR", addr)
+                putExtra("PIN", cleanPin)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(micIntent)
+            } else {
+                context.startService(micIntent)
+            }
         }
     }
 
@@ -945,9 +966,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     }
 
     // Encrypted hosts drop feedback packets whose PIN/MAC does not verify,
-    // sending zero datagrams back. If the target host is visibly advertising
-    // `enc=1` on the LAN and 2.5 s pass with zero packets received, prompt for
-    // its PIN once for this connect attempt.
+    // sending zero datagrams back. Prompt once after 2.5 s of 0 packets when
+    // the target advertises `enc=1` OR when connecting via USB (`127.0.0.1`)
+    // / manual IP (neither emits LAN discovery beacons for that exact address).
     LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
         if (!isConnected) return@LaunchedEffect
         val attempt = connectAttemptId
@@ -956,13 +977,17 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             return@LaunchedEffect
         }
         val targetNorm = HostPinStore.normalizeHost(hostAddress)
-        val targetEncryptedOnLan = discoveredHosts.any { entry ->
+        val matchedLanEntry = discoveredHosts.firstOrNull { entry ->
             val parts = entry.split("|")
             val addr = HostPinStore.normalizeHost(parts.getOrNull(1).orEmpty())
-            val enc = parts.getOrNull(3) == "1"
-            addr.isNotEmpty() && addr == targetNorm && enc
+            addr.isNotEmpty() && addr == targetNorm
         }
-        if (targetEncryptedOnLan && telemetry.rxPackets == 0L) {
+        val targetEncryptedOnLan = matchedLanEntry?.split("|")?.getOrNull(3) == "1"
+        val isUsbOrManual = matchedLanEntry == null
+        val anyLanHostEncrypted = discoveredHosts.any { it.split("|").getOrNull(3) == "1" }
+        val shouldPromptForPin =
+            targetEncryptedOnLan || (isUsbOrManual && (anyLanHostEncrypted || pinCode.isNotEmpty()))
+        if (shouldPromptForPin && telemetry.rxPackets == 0L) {
             promptedSilentRejectAttempt = attempt
             pinMismatchDraft = ""
             showPinMismatchDialog = true
@@ -1092,6 +1117,34 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 gamingLock = gamingLock,
                 latencyDebug = latencyDebug
             )
+
+            // Surface local speaker mute in-app (e.g. after headphone unplug or
+            // AUDIOFOCUS_LOSS) so users with notifications disabled on Android
+            // 13+ are never stranded in silent playback with no Unmute button.
+            if (isConnected && AudioEngineService.isLocallyMutedState) {
+                StudioCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Audio Muted (Headphones unplugged or focus lost)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudioColors.WarnFg,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(onClick = {
+                            val i = Intent(context, AudioEngineService::class.java).apply {
+                                action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
+                            }
+                            context.startService(i)
+                        }) {
+                            Text("Unmute")
+                        }
+                    }
+                }
+            }
 
             // Tab navigation moved to the ergonomic bottom NavigationBar above.
 
@@ -1304,9 +1357,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     value = hostAddress,
                                     onValueChange = { nextAddr ->
                                         hostAddress = nextAddr
-                                        HostPinStore.getSavedPinForHost(prefs, nextAddr)?.let { saved ->
-                                            pinCode = saved
-                                        }
+                                        pinCode = HostPinStore.getSavedPinForHost(prefs, nextAddr).orEmpty()
                                     },
                                     label = { Text("Host IP:Port (USB RNDIS or Wi-Fi)") },
                                     singleLine = true,
@@ -1924,10 +1975,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             } else {
                                 // If the user hasn't picked a PC yet and is still
                                 // on the legacy RNDIS default, auto-pick the first
-                                // discovered PC host on LAN instead of failing.
+                                // discovered PC host on LAN (excluding Party phones).
                                 if (hostAddress == "192.168.42.129:65530") {
                                     val firstDiscovered = discoveredHosts
-                                        .firstOrNull()
+                                        .firstOrNull { entry ->
+                                            val name = entry.split("|").getOrNull(0).orEmpty()
+                                            !name.contains("Party", ignoreCase = true)
+                                        }
                                         ?.split("|")
                                         ?.getOrNull(1)
                                         ?.trim()
@@ -2039,9 +2093,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     value = hostAddress,
                     onValueChange = { nextAddr ->
                         hostAddress = nextAddr
-                        HostPinStore.getSavedPinForHost(prefs, nextAddr)?.let { saved ->
-                            pinCode = saved
-                        }
+                        pinCode = HostPinStore.getSavedPinForHost(prefs, nextAddr).orEmpty()
                     },
                     label = { Text("Host IP:Port") },
                     singleLine = true,

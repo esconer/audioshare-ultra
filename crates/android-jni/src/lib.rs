@@ -679,7 +679,18 @@ impl PhoneMicTransmitter {
                     2
                 };
                 let mut last_tx: Option<Instant> = None;
+                let mut last_vu_update = Instant::now();
                 let mut last_party_dtx_heartbeat = Instant::now();
+                // Separate IPv6 socket when any target is IPv6 (the primary
+                // socket binds `0.0.0.0`, which cannot send to IPv6 peers).
+                let mut socket_v6: Option<UdpSocket> = if static_targets.iter().any(|t| t.is_ipv6())
+                {
+                    UdpSocket::bind("[::]:0").ok().inspect(|s| {
+                        let _ = s.set_nonblocking(true);
+                    })
+                } else {
+                    None
+                };
                 // Persistent TCP_NODELAY stream for USB ADB reverse (`127.0.0.1:65532`)
                 // hardware-mic mode, using the exact 2-byte big-endian length-prefixed
                 // framing expected by `AdbUsbWatcher::spawn_host_adb_tcp_session`.
@@ -775,11 +786,15 @@ impl PhoneMicTransmitter {
                                 .map(|iface| iface.ip)
                                 .collect();
                         }
-                        if last_salt_rotation.elapsed() >= PARTY_SALT_ROTATION_INTERVAL {
-                            last_salt_rotation = Instant::now();
-                            if let Some(ref mut key) = session_key {
-                                key.rotate_session_salt();
-                            }
+                    }
+                    // Rotate the AEAD session salt every 30 minutes in BOTH
+                    // Party Mode and hardware Phone Mic mode so `tx_timestamp_us`
+                    // (which wraps at 71.58 minutes) never causes ChaCha20-Poly1305
+                    // nonce reuse on long encrypted calls.
+                    if last_salt_rotation.elapsed() >= PARTY_SALT_ROTATION_INTERVAL {
+                        last_salt_rotation = Instant::now();
+                        if let Some(ref mut key) = session_key {
+                            key.rotate_session_salt();
                         }
                     }
 
@@ -847,6 +862,7 @@ impl PhoneMicTransmitter {
                                 (peak.clamp(0.0, 1.0).sqrt() * 100.0).min(100.0) as u8,
                                 Ordering::Relaxed,
                             );
+                            last_vu_update = Instant::now();
                             opus_encoder = None;
                             fec_hist_len = 0;
                             // No listener means no Opus chain to continue.
@@ -913,6 +929,7 @@ impl PhoneMicTransmitter {
                             (pkt_peak.clamp(0.0, 1.0).sqrt() * 100.0).min(100.0) as u8,
                             Ordering::Relaxed,
                         );
+                        last_vu_update = Instant::now();
 
                         seq = seq.wrapping_add(subframes_per_pkt as u16);
 
@@ -1191,6 +1208,15 @@ impl PhoneMicTransmitter {
                                             adb_mic_tcp = None;
                                         }
                                     }
+                                } else if target.is_ipv6() {
+                                    if socket_v6.is_none() {
+                                        socket_v6 = UdpSocket::bind("[::]:0").ok().inspect(|s| {
+                                            let _ = s.set_nonblocking(true);
+                                        });
+                                    }
+                                    if let Some(ref s6) = socket_v6 {
+                                        let _ = s6.send_to(&dgram[..pkt_len], *target);
+                                    }
                                 } else {
                                     let _ = socket.send_to(&dgram[..pkt_len], *target);
                                 }
@@ -1206,6 +1232,15 @@ impl PhoneMicTransmitter {
                             }
                         }
                     } else {
+                        // If capture stalls (AAudio disconnect or MediaProjection
+                        // silence/revoke), zero the VU meter after 250 ms so the UI
+                        // never stays frozen on the last peak and Party Mode's
+                        // silence warning can trigger.
+                        if last_vu_update.elapsed() >= Duration::from_millis(250) {
+                            party_telem_clone
+                                .capture_vu_peak_pct
+                                .store(0, Ordering::Relaxed);
+                        }
                         std::thread::sleep(Duration::from_micros(800));
                     }
                 }

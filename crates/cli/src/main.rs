@@ -83,7 +83,12 @@ fn main() {
         "client" => run_client(&args[2..]),
         "benchmark" => run_wifi_torture_benchmark(),
         "soak" => run_soak_cli(&args[2..]),
-        _ => print_usage(),
+        "help" | "--help" | "-h" => print_usage(),
+        other => {
+            eprintln!("Unknown command: {}", other);
+            print_usage();
+            std::process::exit(2);
+        }
     }
 }
 
@@ -147,7 +152,21 @@ fn has_missing_pin_value(args: &[String]) -> bool {
 }
 
 fn has_help_flag(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--help" || a == "-h" || a == "help")
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--pin" {
+            skip_next = true;
+            continue;
+        }
+        if a == "--help" || a == "-h" || a == "help" {
+            return true;
+        }
+    }
+    false
 }
 
 fn client_target(args: &[String]) -> &str {
@@ -349,8 +368,12 @@ fn run_host(args: &[String]) {
     if last_applied_lipsync != 0 {
         audioshare_host_engine::bt_optimization::reset_video_lipsync_offset_blocking();
     }
-    // Run the guard deterministically before returning (restores the default
-    // speaker and clears the WlanSetInterface media-streaming override).
+    // Stop and drop the HostEngine, beacon, and ADB watcher BEFORE dropping
+    // `os_guard` so capture never races the OS virtual sink teardown / default
+    // speaker restoration.
+    drop(host);
+    drop(_beacon);
+    drop(_adb);
     drop(os_guard);
 }
 

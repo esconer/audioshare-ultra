@@ -48,8 +48,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val ACTION_PARTY_CAST_STATE = "ACTION_PARTY_CAST_STATE"
         const val ACTION_STOP_CLIENT_ONLY = "ACTION_STOP_CLIENT_ONLY"
         const val EXTRA_PARTY_CAST_ACTIVE = "PARTY_CAST_ACTIVE"
+        const val EXTRA_PARTY_CAST_ERROR = "PARTY_CAST_ERROR"
         const val ACTION_START_PHONE_MIC = "ACTION_START_PHONE_MIC"
         const val ACTION_STOP_PHONE_MIC = "ACTION_STOP_PHONE_MIC"
+        const val ACTION_TOGGLE_MIC_MUTE = "ACTION_TOGGLE_MIC_MUTE"
         const val ACTION_PHONE_MIC_STATE = "ACTION_PHONE_MIC_STATE"
         const val EXTRA_PHONE_MIC_ACTIVE = "PHONE_MIC_ACTIVE"
         const val ACTION_SET_BT_OFFSET = "ACTION_SET_BT_OFFSET"
@@ -90,6 +92,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         @Volatile
         var isLocallyMutedState: Boolean = false
             private set
+
+        // Process-wide single-thread executor and generation counters matching
+        // the process-wide Rust statics (`GLOBAL_ANDROID_CLIENT` /
+        // `GLOBAL_PHONE_MIC_TX`). Keeping these in the companion object ensures
+        // a rapid Service destroy/recreate (e.g. Disconnect -> Reconnect) can
+        // NEVER race Instance #1's async teardown against Instance #2's start.
+        private val engineExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        private val connectGen = java.util.concurrent.atomic.AtomicLong(0)
+        private val micGen = java.util.concurrent.atomic.AtomicLong(0)
 
         @JvmStatic
         external fun nativeStartClient(
@@ -199,6 +210,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // host never leaves the phone speaker stuck at volume 0 and peer media keys
     // keep working. Default local-speaker mute is ON (party_mute_local = true).
     private var isPartyCastMuted: Boolean = false
+    private var isMicMuted: Boolean = false
+    private var serviceDestroyed: Boolean = false
+    private var serviceStopped: Boolean = false
     private var savedPartyMusicVolume: Int = -1
     private val partyMediaHandler = Handler(Looper.getMainLooper())
     // Polls peer remote media commands (10..12) in the Service so friends can
@@ -226,16 +240,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private val adpfHandler = Handler(Looper.getMainLooper())
     private val adpfRefreshRunnable = Runnable { refreshAdpfHintSession() }
     private val sleepHandler = Handler(Looper.getMainLooper())
-    // JNI start/stop calls and network-interface enumeration can block the
-    // caller. Run them on a private single-thread executor and marshal every
-    // state mutation, broadcast and notification update back to the main
-    // looper (startForegroundNotification itself always stays on main).
-    private val engineExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
-    // Guards against a late native-start postback from a connection that was
-    // stopped or superseded while the blocking JNI call was in flight.
-    private val connectGen = java.util.concurrent.atomic.AtomicLong(0)
-    private val micGen = java.util.concurrent.atomic.AtomicLong(0)
     private val sleepTickRunnable = object : Runnable {
         override fun run() {
             if (sleepRemainingMinutes <= 1) {
@@ -309,18 +314,27 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             stopStreamAndService()
             return START_NOT_STICKY
         }
+        serviceStopped = false
         if (intent?.action == ACTION_STOP_CLIENT_ONLY) {
             val keepAlive = isPartyCasting || micCaptureActive
             val gen = connectGen.incrementAndGet()
+            // Release PC-playback-only OS hooks immediately (MediaSession,
+            // AudioFocus, becomingNoisyReceiver, audioDeviceCallback) so an
+            // active Party Mode session does not route peer media keys right
+            // back into our own dead MediaSession.
+            releaseClientPlaybackResources()
+            isStreaming = false
+            isLocallyMuted = false
+            sleepHandler.removeCallbacks(sleepTickRunnable)
+            stopSilenceWatchdog()
+            broadcastSleepTimer(0)
+            broadcastStreamState(false, null)
             runOnEngine {
-                nativeStopClient()
+                if (gen == connectGen.get()) {
+                    nativeStopClient()
+                }
                 mainHandler.post {
-                    if (engineExecutor.isShutdown || gen != connectGen.get()) return@post
-                    isStreaming = false
-                    sleepHandler.removeCallbacks(sleepTickRunnable)
-                    stopSilenceWatchdog()
-                    broadcastSleepTimer(0)
-                    broadcastStreamState(false, null)
+                    if (serviceDestroyed || gen != connectGen.get()) return@post
                     if (!isPartyCasting && !micCaptureActive) {
                         stopStreamAndService()
                     } else {
@@ -363,6 +377,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             applyLocalPartySpeakerMute(intent.getBooleanExtra("MUTE_LOCAL", false))
             return START_STICKY
         }
+        if (intent?.action == ACTION_TOGGLE_MIC_MUTE) {
+            if (micCaptureActive) {
+                isMicMuted = !isMicMuted
+                runCatching { nativeSetPartyCastMuted(isMicMuted) }
+                if (foregroundStarted) {
+                    startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
+                }
+            }
+            return START_STICKY
+        }
         if (intent?.action == ACTION_START_PHONE_MIC) {
             // targetSdk 34 forbids declaring the MICROPHONE foreground-service
             // type without RECORD_AUDIO. Refuse before touching the native mic
@@ -383,37 +407,48 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             if (!isStreaming) {
                 currentHostAddr = target.ifEmpty { "PC Video-Call Mic" }
                 currentIsUsb = isUsbHost(target)
-                isLocallyMuted = false
             }
+            // Phone mic always starts unmuted (decoupled from PC speaker mute).
+            isMicMuted = false
             // targetSdk 34 requires the MICROPHONE foreground-service type to
-            // be active BEFORE AAudio opens the input. Own the mic lifecycle in
-            // the service (like ACTION_START_PARTY_CAST) instead of racing
-            // startForegroundService from the Compose UI thread.
-            micGen.incrementAndGet()
+            // be active BEFORE AAudio opens the input. Publish FGS synchronously
+            // on main, then serialize native start on `engineExecutor` so it
+            // never races `ACTION_STOP_PHONE_MIC` or blocks the UI thread.
+            val gen = micGen.incrementAndGet()
             micCaptureActive = true
             startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
             acquireRealtimeHardwareLocks()
-            val started = nativeStartPhoneMic(target, true, pin)
-            if (!started) {
-                micCaptureActive = false
-                broadcastPhoneMicState(
-                    false,
-                    "Unable to start phone mic for '$target' — select a valid PC host IP or USB first"
-                )
-                if (!isStreaming && !isPartyCasting) {
-                    stopStreamAndService()
-                    return START_NOT_STICKY
+            runOnEngine {
+                if (gen != micGen.get()) return@runOnEngine
+                val started = runCatching { nativeStartPhoneMic(target, true, pin) }.getOrDefault(false)
+                if (started) {
+                    runCatching { nativeSetPartyCastMuted(false) }
                 }
-                startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = false)
-                return START_STICKY
+                mainHandler.post {
+                    if (serviceDestroyed || gen != micGen.get()) return@post
+                    if (!started) {
+                        micCaptureActive = false
+                        broadcastPhoneMicState(
+                            false,
+                            "Unable to start phone mic for '$target' — select a valid PC host IP or USB first"
+                        )
+                        if (!isStreaming && !isPartyCasting) {
+                            stopStreamAndService()
+                        } else {
+                            startForegroundNotification(
+                                currentHostAddr,
+                                currentIsUsb,
+                                includeMicType = false
+                            )
+                        }
+                        return@post
+                    }
+                    broadcastPhoneMicState(true)
+                    startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
+                    refreshAdpfHintSession()
+                    scheduleAdpfRefresh()
+                }
             }
-            if (isLocallyMuted) {
-                runCatching { nativeSetPartyCastMuted(true) }
-            }
-            broadcastPhoneMicState(true)
-            startForegroundNotification(currentHostAddr, currentIsUsb, includeMicType = true)
-            refreshAdpfHintSession()
-            scheduleAdpfRefresh()
             // A mic-only session has no peer to reconnect to after process
             // death, so do not request a sticky restart for it.
             return if (isStreaming) START_STICKY else START_NOT_STICKY
@@ -421,12 +456,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         if (intent?.action == ACTION_STOP_PHONE_MIC) {
             val keepAlive = isStreaming || isPartyCasting
             val gen = micGen.incrementAndGet()
+            isMicMuted = false
             runOnEngine {
                 if (gen == micGen.get()) {
                     nativeStopPhoneMic()
                 }
                 mainHandler.post {
-                    if (engineExecutor.isShutdown || gen != micGen.get()) return@post
+                    if (serviceDestroyed || gen != micGen.get()) return@post
                     micCaptureActive = false
                     broadcastPhoneMicState(false)
                     if (!isStreaming && !isPartyCasting) {
@@ -451,14 +487,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             return START_STICKY
         }
         if (intent?.action == ACTION_CLEAR_LOCAL_MUTE) {
-            // The UI's preamp slider calls nativeSetGainDb(preampGainDb), which
-            // unmutes audio. Drop the stale notification flag too, otherwise
-            // the notification stays on "MUTED" and phone-call auto-mute stays
-            // disabled by `if (isLocallyMuted) return`.
+            // The UI's preamp slider or Unmute button restores PC speaker audio.
+            // Re-claim audio focus too so future phone calls trigger focus loss.
             if (isLocallyMuted) {
                 isLocallyMuted = false
-                if (micCaptureActive) {
-                    runCatching { nativeSetPartyCastMuted(false) }
+                val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
+                val savedGain = prefs.getFloat("gain_db", currentGainDb)
+                nativeSetGainDb(savedGain)
+                if (isStreaming) {
+                    requestAudioFocus(dolbyEffects)
                 }
                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
             }
@@ -485,9 +522,6 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val savedGain = prefs.getFloat("gain_db", 0.0f)
             isLocallyMuted = !isLocallyMuted
             nativeSetGainDb(if (isLocallyMuted) -96.0f else savedGain)
-            if (micCaptureActive) {
-                runCatching { nativeSetPartyCastMuted(isLocallyMuted) }
-            }
             if (!isLocallyMuted && isStreaming) {
                 // Re-claim audio focus so the app that stole it pauses instead
                 // of playing over us after the user unmutes.
@@ -557,9 +591,18 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     /** Called on the main looper after the blocking native client start finishes. */
     private fun handleClientStartResult(started: Boolean, hostAddr: String, gen: Long) {
         // A teardown or a newer connect may have happened while JNI was blocking.
-        if (engineExecutor.isShutdown || gen != connectGen.get()) return
+        if (serviceDestroyed || gen != connectGen.get()) return
         isStreaming = started
         if (!started) {
+            // Stop any previously-running ClientEngine (e.g. if the user tried
+            // switching to an invalid host address while Party/Mic was active,
+            // `android_start_stream` returned Err before stopping the old client).
+            releaseClientPlaybackResources()
+            runOnEngine {
+                if (gen == connectGen.get()) {
+                    nativeStopClient()
+                }
+            }
             if (!isPartyCasting && !micCaptureActive) {
                 // stopStreamAndService() emits a clean false state; send the
                 // error AFTER teardown so the Snackbar text is not overwritten.
@@ -570,6 +613,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 )
                 return
             }
+            startForegroundNotification(currentHostAddr, currentIsUsb)
             broadcastStreamState(
                 false,
                 "Unable to connect to $hostAddr (check IP, firewall, or USB)"
@@ -577,6 +621,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             return
         }
         broadcastStreamState(true, null)
+        // Refresh notification now that `isStreaming == true` so PC Stream
+        // controls (Pause PC / Mute / Disconnect) appear even if Party/Mic was
+        // already running before the stream connected.
+        startForegroundNotification(currentHostAddr, currentIsUsb)
         scheduleSilenceWatchdog()
         // Re-apply the active Bluetooth route delay now that the native
         // ClientEngine exists, and restore saved Studio EQ / DSP settings.
@@ -984,7 +1032,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
             val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             val acquired = mgr.getMediaProjection(resultCode, resultData)
-                ?: return failPartyCastStart()
+                ?: return failPartyCastStart("MediaProjection permission was revoked or unavailable")
             projection = acquired
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val pin = (intent.getStringExtra("PIN") ?: prefs.getString("pin_code", "") ?: "").trim()
@@ -1007,7 +1055,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
             casterRef = caster
             if (!caster.startCasting()) {
-                return failPartyCastStart()
+                return failPartyCastStart("Could not start internal audio capture (check Android AudioRecord/mic availability)")
             }
             activeCaster = caster
             isPartyCastMuted = false
@@ -1040,13 +1088,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             runCatching { projection?.stop() }
             Log.e("AudioEngineService", "Unable to start party cast", e)
             ensureForegroundBeforeStop()
-            return failPartyCastStart()
+            return failPartyCastStart("Party Mode failed: ${e.message ?: "unexpected error"}")
         }
     }
 
-    private fun failPartyCastStart(): Int {
+    private fun failPartyCastStart(reason: String = "Unable to start Party Mode"): Int {
         runCatching {
-            nativeLogEvent(2, "party-cast", "Party cast start failed")
+            nativeLogEvent(2, "party-cast", "Party cast start failed: $reason")
         }
         val caster = activeCaster
         activeCaster = null
@@ -1058,9 +1106,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
         applyLocalPartySpeakerMute(false)
         micCaptureActive = false
-        AudioEngineService.nativeStopPhoneMic()
-        broadcastPartyCastState(false)
+        val gen = micGen.incrementAndGet()
+        runOnEngine {
+            if (gen == micGen.get()) nativeStopPhoneMic()
+        }
         if (isStreaming) {
+            broadcastPartyCastState(false, reason)
             runCatching {
                 startForegroundNotification(
                     currentHostAddr,
@@ -1071,6 +1122,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             return START_STICKY
         }
         stopStreamAndService()
+        broadcastPartyCastState(false, reason)
         return START_NOT_STICKY
     }
 
@@ -1087,7 +1139,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
         applyLocalPartySpeakerMute(false)
         caster?.stopCasting()
-        AudioEngineService.nativeStopPhoneMic()
+        val gen = micGen.incrementAndGet()
+        runOnEngine {
+            if (gen == micGen.get()) nativeStopPhoneMic()
+        }
         broadcastPartyCastState(false)
         if (isStreaming) {
             runCatching {
@@ -1113,7 +1168,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
         applyLocalPartySpeakerMute(false)
-        AudioEngineService.nativeStopPhoneMic()
+        val gen = micGen.incrementAndGet()
+        runOnEngine {
+            if (gen == micGen.get()) nativeStopPhoneMic()
+        }
         broadcastPartyCastState(false)
         if (isStreaming && foregroundStarted) {
             runCatching {
@@ -1151,11 +1209,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    private fun broadcastPartyCastState(active: Boolean) {
+    private fun broadcastPartyCastState(active: Boolean, error: String? = null) {
         isPartyCasting = active
         val intent = Intent(ACTION_PARTY_CAST_STATE).apply {
             setPackage(packageName)
             putExtra(EXTRA_PARTY_CAST_ACTIVE, active)
+            if (!error.isNullOrBlank()) putExtra(EXTRA_PARTY_CAST_ERROR, error)
         }
         sendBroadcast(intent)
     }
@@ -1288,6 +1347,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     stopPartyPending
                 )
         } else if (micCaptureActive && !isStreaming) {
+            val muteMicIntent = Intent(this, AudioEngineService::class.java).apply {
+                action = ACTION_TOGGLE_MIC_MUTE
+            }
+            val muteMicPending = PendingIntent.getService(
+                this, 7, muteMicIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
             val stopMicIntent = Intent(this, AudioEngineService::class.java).apply {
                 action = ACTION_STOP_PHONE_MIC
             }
@@ -1298,13 +1364,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             builder
                 .setContentTitle("AudioShare Ultra • Wireless Mic")
                 .setContentText(
-                    if (isLocallyMuted) "MIC MUTED • $hostAddr (Port 65532)"
+                    if (isMicMuted) "MIC MUTED • $hostAddr (Port 65532)"
                     else "MIC LIVE -> $hostAddr (Port 65532)"
                 )
                 .addAction(
                     android.R.drawable.ic_lock_silent_mode,
-                    if (isLocallyMuted) "Unmute Mic" else "Mute Mic",
-                    mutePending
+                    if (isMicMuted) "Unmute Mic" else "Mute Mic",
+                    muteMicPending
                 )
                 .addAction(
                     android.R.drawable.ic_menu_close_clear_cancel,
@@ -1421,27 +1487,18 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
     }
 
-    private fun stopStreamAndService() {
-        // Invalidate any in-flight native-start postback before teardown.
-        connectGen.incrementAndGet()
-        micGen.incrementAndGet()
-        // Drop the caster before stopping the foreground service so a late
-        // projection callback cannot re-enter teardown.
-        val caster = activeCaster
-        activeCaster = null
-        projectionActive = false
-        activePartyPin = ""
-        isPartyCastMuted = false
-        runCatching { nativeSetPartyCastMuted(false) }
-        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
-        applyLocalPartySpeakerMute(false)
-        caster?.stopCasting()
+    /**
+     * Release OS resources that belong exclusively to PC->Phone audio playback
+     * (AudioFocus, BT route callback, becoming-noisy receiver, and MediaSession).
+     * Called on both full teardown and `ACTION_STOP_CLIENT_ONLY` so an active
+     * Party Mode / Phone Mic session never holds a dead MediaSession that
+     * hijacks peer media keys.
+     */
+    private fun releaseClientPlaybackResources() {
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
         audioDeviceCallback?.let { callback ->
             try {
-                // audioManager may be null on a never-started service; ask the
-                // system for the live manager instead of skipping unregister.
                 val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                 am.unregisterAudioDeviceCallback(callback)
             } catch (_: Exception) {
@@ -1449,10 +1506,43 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         }
         audioDeviceCallback = null
         audioManager = null
-        // Single-thread executor preserves mic-before-client teardown order.
+        if (noisyReceiverRegistered) {
+            try {
+                unregisterReceiver(becomingNoisyReceiver)
+            } catch (_: Exception) {}
+            noisyReceiverRegistered = false
+        }
+        mediaSession?.isActive = false
+        mediaSession?.release()
+        mediaSession = null
+    }
+
+    private fun stopStreamAndService() {
+        if (serviceStopped) return
+        serviceStopped = true
+        // Invalidate any in-flight native-start postback before teardown.
+        val cGen = connectGen.incrementAndGet()
+        val mGen = micGen.incrementAndGet()
+        // Drop the caster before stopping the foreground service so a late
+        // projection callback cannot re-enter teardown.
+        val caster = activeCaster
+        activeCaster = null
+        projectionActive = false
+        activePartyPin = ""
+        isPartyCastMuted = false
+        isMicMuted = false
+        isLocallyMuted = false
+        runCatching { nativeSetPartyCastMuted(false) }
+        partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
+        applyLocalPartySpeakerMute(false)
+        caster?.stopCasting()
+        releaseClientPlaybackResources()
+        // Process-wide single-thread executor + generation guard ensures a
+        // rapid Service destroy/recreate can NEVER let Instance #1's async
+        // teardown kill Instance #2's freshly started Rust engine.
         runOnEngine {
-            nativeStopPhoneMic()
-            nativeStopClient()
+            if (mGen == micGen.get()) nativeStopPhoneMic()
+            if (cGen == connectGen.get()) nativeStopClient()
         }
         isStreaming = false
         sleepHandler.removeCallbacks(sleepTickRunnable)
@@ -1463,15 +1553,6 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         broadcastPartyCastState(false)
         broadcastPhoneMicState(false)
         foregroundStarted = false
-        if (noisyReceiverRegistered) {
-            try {
-                unregisterReceiver(becomingNoisyReceiver)
-            } catch (_: Exception) {}
-            noisyReceiverRegistered = false
-        }
-        mediaSession?.isActive = false
-        mediaSession?.release()
-        mediaSession = null
         adpfHandler.removeCallbacks(adpfRefreshRunnable)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try { perfHintSession?.close() } catch (_: Exception) {}
@@ -1484,10 +1565,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     }
 
     override fun onDestroy() {
+        serviceDestroyed = true
         stopStreamAndService()
-        // shutdown() still drains the teardown calls queued above, but blocks
-        // any later start/stop work from resurrecting the service.
-        engineExecutor.shutdown()
         super.onDestroy()
     }
 

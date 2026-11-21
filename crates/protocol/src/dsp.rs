@@ -568,6 +568,16 @@ impl BurstDecouplerRing {
         FIFO_CAPACITY
     }
 
+    /// Discard all buffered samples when the output consumer stream is stopped
+    /// (quiescent). Callers MUST only invoke this after dropping/closing the
+    /// audio output stream and before starting the replacement stream so no
+    /// concurrent consumer touches `read_idx`.
+    #[inline]
+    pub fn clear_when_quiescent(&self) {
+        let w = self.write_idx.0.load(Ordering::Acquire);
+        self.read_idx.0.store(w, Ordering::Release);
+    }
+
     #[inline]
     pub fn push_samples(&self, samples: &[f32]) -> usize {
         let w = self.write_idx.0.load(Ordering::Relaxed);
