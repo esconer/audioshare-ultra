@@ -191,9 +191,10 @@ jobs:
             echo "$AUDIOSHARE_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
             export AUDIOSHARE_KEYSTORE_PATH="$RUNNER_TEMP/release.keystore"
           fi
-          # Force fresh metadata resolution: setup-gradle's restored cache can
-          # otherwise replay a stale negative lookup as "Could not find <artifact>".
-          gradle assembleRelease --refresh-dependencies
+          # Use the restored Gradle cache first; only force --refresh-dependencies
+          # (with capped concurrency to avoid Maven Central HTTP 429) if a stale
+          # negative lookup causes resolution to fail.
+          gradle assembleRelease || gradle assembleRelease --refresh-dependencies --max-workers=2
           cp app/build/outputs/apk/release/app-release.apk ../audioshare-ultra-android.apk
 
       - uses: actions/upload-artifact@v6
