@@ -1146,7 +1146,7 @@ impl AdbTcpClientBridge {
         // even if `adb reverse` has not finished setting up yet.
         #[cfg(not(target_os = "android"))]
         let probe = Some(
-            TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok()?,
+            TcpStream::connect_timeout(&server_addr, Duration::from_millis(300)).ok()?,
         );
         #[cfg(target_os = "android")]
         let probe = TcpStream::connect_timeout(&server_addr, Duration::from_millis(150)).ok();
@@ -3433,11 +3433,28 @@ mod tests {
     fn test_adb_tcp_bridge_loopback_end_to_end() {
         use audioshare_host_engine::discovery_and_os::AdbUsbWatcher;
 
-        // Reserve then release an ephemeral port so host UDP + bridge TCP can
-        // both own it (different protocol spaces). No physical device needed:
-        // the TCP leg stands in for `adb reverse tcp:P tcp:P`.
-        let (mut host, port) = start_test_host();
-        let _adb = AdbUsbWatcher::start(port);
+        // Reserve a port free in BOTH UDP and TCP spaces (on busy Windows CI
+        // runners an ephemeral UDP port can already be occupied in TCP space).
+        let (mut host, port, _adb) = (0..16)
+            .find_map(|_| {
+                let (h, p) = start_test_host();
+                let watcher = AdbUsbWatcher::start(p);
+                // Confirm the loopback TCP bridge actually bound `p`.
+                if std::net::TcpStream::connect_timeout(
+                    &SocketAddr::from(([127, 0, 0, 1], p)),
+                    Duration::from_millis(250),
+                )
+                .is_ok()
+                {
+                    Some((h, p, watcher))
+                } else {
+                    drop(watcher);
+                    let mut h = h;
+                    h.stop();
+                    None
+                }
+            })
+            .expect("could not allocate a dual UDP+TCP port for ADB bridge test");
 
         let mut client = ClientEngine::connect(ClientConfig {
             server_addr: SocketAddr::from(([127, 0, 0, 1], port)),

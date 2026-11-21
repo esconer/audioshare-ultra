@@ -715,6 +715,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         }
     }
 
+    var showPinMismatchDialog by remember { mutableStateOf(false) }
+    var pinMismatchDraft by remember { mutableStateOf("") }
+    var lastHandledAuthFailures by remember { mutableLongStateOf(0L) }
+    var connectAttemptId by remember { mutableIntStateOf(0) }
+    var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
+    var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
+
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
     // switch back even when this screen was not the caller.
@@ -789,13 +796,6 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             }
         }
     }
-
-    var showPinMismatchDialog by remember { mutableStateOf(false) }
-    var pinMismatchDraft by remember { mutableStateOf("") }
-    var lastHandledAuthFailures by remember { mutableLongStateOf(0L) }
-    var connectAttemptId by remember { mutableIntStateOf(0) }
-    var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
-    var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
 
     // Route every "connect" gesture through one place. True connection state
     // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
