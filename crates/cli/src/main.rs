@@ -83,7 +83,12 @@ fn main() {
         "client" => run_client(&args[2..]),
         "benchmark" => run_wifi_torture_benchmark(),
         "soak" => run_soak_cli(&args[2..]),
-        _ => print_usage(),
+        "help" | "--help" | "-h" => print_usage(),
+        other => {
+            eprintln!("Unknown command: {}", other);
+            print_usage();
+            std::process::exit(2);
+        }
     }
 }
 
@@ -117,14 +122,51 @@ fn latency_debug_enabled(args: &[String]) -> bool {
             .unwrap_or(false)
 }
 
-/// Returns the value immediately following `flag` (e.g. `--pin 4829` -> "4829").
+/// Returns the value immediately following `flag` (e.g. `--pin 4829` -> "4829")
+/// or attached via `=` (e.g. `--pin=4829` -> "4829").
 /// Trims whitespace and rejects empty or flag-like (`--...`) values so a
 /// missing PIN such as `--pin --test-tone` cannot become a bogus secret.
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let eq_prefix = format!("{flag}=");
+    for a in args {
+        if let Some(rest) = a.strip_prefix(&eq_prefix) {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("--") {
+                return Some(trimmed);
+            }
+        }
+    }
     args.windows(2)
         .find(|w| w[0] == flag)
         .map(|w| w[1].trim())
         .filter(|v| !v.is_empty() && !v.starts_with("--"))
+}
+
+/// True if `--pin` or `--pin=` was passed on the command line without a valid
+/// non-empty value (prevents a silent security downgrade to unencrypted).
+fn has_missing_pin_value(args: &[String]) -> bool {
+    let mentions_pin = args
+        .iter()
+        .any(|a| a == "--pin" || a.starts_with("--pin="));
+    mentions_pin && flag_value(args, "--pin").is_none()
+}
+
+fn has_help_flag(args: &[String]) -> bool {
+    let mut skip_next = false;
+    for a in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--pin" {
+            skip_next = true;
+            continue;
+        }
+        if a == "--help" || a == "-h" || a == "help" {
+            return true;
+        }
+    }
+    false
 }
 
 fn client_target(args: &[String]) -> &str {
@@ -159,6 +201,14 @@ fn parse_client_target(raw: &str) -> Result<SocketAddr, String> {
 }
 
 fn run_host(args: &[String]) {
+    if has_help_flag(args) {
+        print_usage();
+        return;
+    }
+    if has_missing_pin_value(args) {
+        eprintln!("Error: `--pin` requires a non-empty PIN value (refusing to start unencrypted).");
+        std::process::exit(1);
+    }
     let use_test_tone = args.iter().any(|a| a == "--test-tone");
     let usb_mode = args.iter().any(|a| a == "--usb");
     // Opus RLD is the default; `--vbr` opts out to the pure-Rust VBR fallback.
@@ -200,7 +250,10 @@ fn run_host(args: &[String]) {
     };
 
     let mut os_guard = VirtualSpeakerAndRadioGuard::acquire(virtual_speaker);
-    let host = match HostEngine::start(cfg, vec![]) {
+    if virtual_speaker && !os_guard.is_virtual_speaker_available() {
+        eprintln!("[!] Warning: --virtual-speaker requested, but no virtual speaker endpoint (e.g. VB-Cable / Pulse null-sink) was available.");
+    }
+    let host = match HostEngine::start_with_pin(cfg, vec![], pin) {
         Ok(engine) => engine,
         Err(e) => {
             // Startup failures are operator errors (missing capture device,
@@ -213,13 +266,7 @@ fn run_host(args: &[String]) {
         }
     };
     host.telemetry.prefer_opus.store(use_opus, Ordering::Relaxed);
-    let beacon_encrypted = Arc::new(AtomicBool::new(false));
-    if let Some(pin) = pin {
-        host.set_encryption_pin(Some(pin));
-        // Flip the shared flag when the PIN is applied so the beacon advertises
-        // `enc=1` on its very next interval.
-        beacon_encrypted.store(true, Ordering::Relaxed);
-    }
+    let beacon_encrypted = Arc::new(AtomicBool::new(pin.is_some()));
     let _beacon = DiscoveryBeacon::start_with_encryption_flag(
         DEFAULT_PORT,
         "CLI-AudioShare-Ultra".into(),
@@ -304,12 +351,14 @@ fn run_host(args: &[String]) {
                 if dtx { "SMART-DTX" } else { codec }
             );
         } else {
+            let rejected = host.telemetry.rejected_handshakes.load(Ordering::Relaxed);
             print!(
-                "\r[HOST HUD] Clients: {} | TX Packets: {:<8} | Total KB: {:<8} | Mode: {:<18}",
+                "\r[HOST HUD] Clients: {} | TX Packets: {:<8} | Total KB: {:<8} | Mode: {:<18} | Auth Rejects: {}",
                 clients,
                 pkts,
                 bytes / 1024,
-                if dtx { "SMART-DTX (0.6kbps)" } else { codec }
+                if dtx { "SMART-DTX (0.6kbps)" } else { codec },
+                rejected
             );
         }
         use std::io::Write;
@@ -319,12 +368,24 @@ fn run_host(args: &[String]) {
     if last_applied_lipsync != 0 {
         audioshare_host_engine::bt_optimization::reset_video_lipsync_offset_blocking();
     }
-    // Run the guard deterministically before returning (restores the default
-    // speaker and clears the WlanSetInterface media-streaming override).
+    // Stop and drop the HostEngine, beacon, and ADB watcher BEFORE dropping
+    // `os_guard` so capture never races the OS virtual sink teardown / default
+    // speaker restoration.
+    drop(host);
+    drop(_beacon);
+    drop(_adb);
     drop(os_guard);
 }
 
 fn run_client(args: &[String]) {
+    if has_help_flag(args) {
+        print_usage();
+        return;
+    }
+    if has_missing_pin_value(args) {
+        eprintln!("Error: `--pin` requires a non-empty PIN value (refusing to connect unencrypted).");
+        std::process::exit(1);
+    }
     let latency_debug = latency_debug_enabled(args);
     let pin = flag_value(args, "--pin");
     // Allow `client --latency-debug 192.168.1.5` as well as the address first.
@@ -399,14 +460,16 @@ fn run_client(args: &[String]) {
                 drift
             );
         } else {
+            let auth_err = client.telemetry.auth_failures.load(Ordering::Relaxed);
             print!(
-                "\r[CLIENT HUD] RX Pkts: {:<7} | Lossless Frames: {:<7} | FEC Healed: {:<4} | PLC: {:<4} | Clock Drift: {:+4} ppm | DTX: {}",
-                pkts, prim, fec, plc, drift, if dtx { "SLEEP" } else { "LIVE " }
+                "\r[CLIENT HUD] RX Pkts: {:<7} | Primary Frames: {:<7} | FEC Healed: {:<4} | PLC: {:<4} | Drift: {:+4} ppm | Auth Err: {} | DTX: {}",
+                pkts, prim, fec, plc, drift, auth_err, if dtx { "SLEEP" } else { "LIVE " }
             );
         }
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
+    println!("\n[*] Shutting down client cleanly...");
 }
 
 /// Automated Torture Benchmark: Simulates 1,000 subframes (2.5 seconds of 48kHz stereo audio)
@@ -434,6 +497,9 @@ fn run_wifi_torture_benchmark() {
     let mut next_play_seq: u16 = 0;
 
     for seq in 0..total_subframes {
+        if CLI_STOP.load(Ordering::Acquire) {
+            return;
+        }
         // Generate stereo harmonic audio signal
         let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
         for i in 0..SUBFRAME_FRAMES {
@@ -493,7 +559,7 @@ fn run_wifi_torture_benchmark() {
     }
 
     // Drain the final two subframes after the FEC window has closed.
-    while next_play_seq < (total_subframes - 2) {
+    while next_play_seq < total_subframes {
         match sequencer.pop_next(next_play_seq, &mut out_f32) {
             STATUS_PRIMARY_LOSSLESS => lossless_played += 1,
             STATUS_HEALED_BY_FEC => fec_healed += 1,
@@ -575,7 +641,8 @@ fn execute_network_soak(
         (resampler.samples_to_subframes(fifo_wm) - 0.5 * resampler.samples_to_subframes(hal_burst_samples))
             .max(1.0);
 
-    let host_pkt_period_ms = (pkt_subframes as f64 * 2.5) / (1.0 + (drift_ppm as f64) * 1e-6);
+    let clamped_drift = drift_ppm.clamp(-500_000, 500_000);
+    let host_pkt_period_ms = (pkt_subframes as f64 * 2.5) / (1.0 + (clamped_drift as f64) * 1e-6);
     let hal_period_ms = 4.0f64;
 
     let mut t = 0.0f64;
@@ -611,7 +678,7 @@ fn execute_network_soak(
     };
 
     let end_ms = (duration_secs as f64) * 1000.0;
-    while t < end_ms {
+    while t < end_ms && !CLI_STOP.load(Ordering::Acquire) {
         let next_arr = in_flight.iter().map(|(at, _)| *at).fold(f64::MAX, f64::min);
         t = next_tx.min(next_hal).min(next_clock_tick).min(next_arr);
 
@@ -691,6 +758,9 @@ fn execute_network_soak(
                 if delta > 48 || delta < -32 {
                     report.resync_stops += 1;
                     sequencer.reset();
+                    if use_opus {
+                        opus_dec = OpusStreamDecoder::new();
+                    }
                     next_play_seq = base;
                     latest_rx_seq = base;
                     prebuffer_ready = false;
@@ -798,11 +868,19 @@ fn execute_network_soak(
 }
 
 fn run_soak_cli(args: &[String]) {
+    if has_help_flag(args) {
+        print_usage();
+        return;
+    }
     let secs = flag_value(args, "--seconds").and_then(|v| v.parse().ok()).unwrap_or(60);
     let drift = flag_value(args, "--drift-ppm").and_then(|v| v.parse().ok()).unwrap_or(-200);
     let loss = flag_value(args, "--loss-pct").and_then(|v| v.parse().ok()).unwrap_or(3);
     let use_opus = args.iter().any(|a| a == "--opus");
     let r = execute_network_soak(secs, drift, loss, use_opus);
+    if CLI_STOP.load(Ordering::Acquire) {
+        println!("\n[*] Soak test interrupted.");
+        return;
+    }
     println!(
         "[SOAK {}s | drift {:+}ppm | loss {}% | {}] played={} | PLC={} | resync_stops={} | dac_underruns={} | locked={:+}ppm",
         secs, drift, loss, if use_opus { "Opus" } else { "LPC+FEC" },
@@ -872,16 +950,18 @@ mod tests {
 
     #[test]
     fn test_host_flag_parsing() {
-        let test_args = args(&["--test-tone", "--usb", "--libopus", "--latency-debug"]);
+        let test_args = args(&["--test-tone", "--usb", "--vbr", "--virtual-speaker", "--latency-debug"]);
         assert!(test_args.iter().any(|a| a == "--test-tone"));
         assert!(test_args.iter().any(|a| a == "--usb"));
-        assert!(test_args.iter().any(|a| a == "--libopus"));
+        assert!(test_args.iter().any(|a| a == "--vbr"));
+        assert!(test_args.iter().any(|a| a == "--virtual-speaker"));
         assert!(latency_debug_enabled(&test_args));
 
         let plain_args = args(&[]);
         assert!(!plain_args.iter().any(|a| a == "--test-tone"));
         assert!(!plain_args.iter().any(|a| a == "--usb"));
-        assert!(!plain_args.iter().any(|a| a == "--libopus"));
+        assert!(!plain_args.iter().any(|a| a == "--vbr"));
+        assert!(!plain_args.iter().any(|a| a == "--virtual-speaker"));
         assert!(!has_latency_debug_flag(&plain_args));
     }
 
@@ -889,13 +969,25 @@ mod tests {
     fn test_pin_flag_parsing_and_client_target_skips_pin_value() {
         let pin_first = args(&["--pin", "4829", "192.168.1.5"]);
         assert_eq!(flag_value(&pin_first, "--pin"), Some("4829"));
+        assert!(!has_missing_pin_value(&pin_first));
         assert_eq!(client_target(&pin_first), "192.168.1.5");
+
+        let eq_pin = args(&["--pin=4829", "192.168.1.5"]);
+        assert_eq!(flag_value(&eq_pin, "--pin"), Some("4829"));
+        assert!(!has_missing_pin_value(&eq_pin));
+        assert_eq!(client_target(&eq_pin), "192.168.1.5");
+
+        let missing_pin = args(&["--pin", "--test-tone"]);
+        assert!(has_missing_pin_value(&missing_pin));
+        assert!(has_missing_pin_value(&args(&["--pin"])));
+        assert!(has_missing_pin_value(&args(&["--pin="])));
 
         let addr_first = args(&["192.168.1.5", "--pin", "1234"]);
         assert_eq!(flag_value(&addr_first, "--pin"), Some("1234"));
         assert_eq!(client_target(&addr_first), "192.168.1.5");
 
         assert_eq!(flag_value(&args(&["--vbr"]), "--pin"), None);
+        assert!(!has_missing_pin_value(&args(&["--vbr"])));
     }
 
     #[test]

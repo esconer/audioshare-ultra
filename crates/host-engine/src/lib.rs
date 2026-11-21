@@ -20,7 +20,7 @@ use audioshare_protocol::lpc_lossless::{
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::opus_codec::{
-    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES, MAX_OPUS_SUBFRAME_BYTES,
+    OpusRedHistory, OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES,
 };
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
@@ -54,10 +54,24 @@ const SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
 /// Above this loss even the 2.4 GHz stability framing steps down to the
 /// 96 kbps rung. 200 permille = 20% packet loss.
 const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
-/// Keep compressed mode for this long after the last high-loss report. Without
-/// a hold-down, a link alternating between 5% and 0% loss recreated the Opus
-/// encoder every 500 ms.
-const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
+/// Above 28% packet loss on severe/slow networks, step smoothly down to the
+/// 64 kbps survival rung (with 4-subframe framing + exact [P-1]/[P-2] Opus RED)
+/// so audio stays continuous instead of stalling.
+const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
+/// Sustained spotless lossless operation required before SmartAuto promotes
+/// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
+/// (~2.8-4.5+ Mbps) on Wi-Fi links.
+const SMART_AUTO_MASTER_PROMOTE_SECS: u64 = 30;
+/// Spotless loss threshold (0.2%) required to arm/hold 24-bit Master promotion.
+const SMART_AUTO_MASTER_PROMOTE_MAX_LOSS_PERMILLE: u16 = 2;
+/// Any loss above 0.5% immediately steps back from 24-bit Master to 16-bit
+/// Lossless (zero-click, identical CodecMode::StudioLosslessLpc & 0 ms lookahead).
+const SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE: u16 = 5;
+/// Keep compressed mode for this long after the last high-loss report. A 12 s
+/// base hold (backing off 12 -> 36 -> 90 s on repeat dips) prevents SmartAuto
+/// from flapping back into Lossless every time Wi-Fi regains a bar for a few
+/// seconds.
+const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(12);
 /// Release pace after the hold expires. The estimate steps down by this much
 /// at most once per interval, so a 130 permille report walks
 /// Tier 2 -> Tier 1 -> Tier 0 instead of jumping back to lossless in one
@@ -65,13 +79,13 @@ const SMART_AUTO_LOSS_HOLD: Duration = Duration::from_secs(5);
 const SMART_AUTO_RELEASE_STEP_PERMILLE: u16 = 25;
 const SMART_AUTO_RELEASE_INTERVAL: Duration = Duration::from_millis(500);
 /// A loss report within this window of a release below threshold is the
-/// fast-flapping pattern seen on congested 2.4 GHz links; it escalates the
-/// hold window instead of re-using the base 5 s every time.
-const SMART_AUTO_RELEASE_REARM_WINDOW: Duration = Duration::from_secs(15);
+/// fast-flapping pattern seen on fluctuating Wi-Fi links; it escalates the
+/// hold window instead of re-using the base 12 s every time.
+const SMART_AUTO_RELEASE_REARM_WINDOW: Duration = Duration::from_secs(20);
 /// Continuous sub-threshold operation this long clears an escalated hold.
-const SMART_AUTO_HOLD_RESET_AFTER: Duration = Duration::from_secs(60);
-/// Ceiling for the escalated hold window (5 -> 15 -> 45 s).
-const SMART_AUTO_MAX_HOLD_SECS: u64 = 45;
+const SMART_AUTO_HOLD_RESET_AFTER: Duration = Duration::from_secs(90);
+/// Ceiling for the escalated hold window (12 -> 36 -> 90 s).
+const SMART_AUTO_MAX_HOLD_SECS: u64 = 90;
 
 /// Fast-attack / paced-release governor for Smart Auto.
 ///
@@ -173,18 +187,83 @@ impl LossGovernor {
 }
 
 /// Advance a warm Opus encoder with one live subframe while Smart Auto is in
-/// its lossless tier. The encoded output is intentionally discarded: this
-/// only keeps the encoder's 2.5 ms lookahead primed so the first compressed
-/// packet carries the previous live subframe instead of codec warm-up silence.
+/// its lossless tier or immediately after allocating a fresh Opus encoder
+/// mid-stream. The encoded output is intentionally discarded: this primes the
+/// encoder's 2.5 ms lookahead so the first transmitted compressed packet
+/// carries the previous live subframe instead of codec warm-up silence.
 #[inline]
 fn warm_opus_lookahead(
     encoder: &mut Option<OpusStreamEncoder>,
-    pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
+    pcm_stereo_f32: &[f32; SUBFRAME_STEREO_SAMPLES],
     kbps: u16,
 ) {
     if let Some(encoder) = encoder.as_mut() {
         let mut discard = [0u8; MAX_OPUS_SUBFRAME_BYTES];
-        let _ = encoder.encode_subframe(pcm_stereo, kbps, &mut discard);
+        let _ = encoder.encode_subframe_f32(pcm_stereo_f32, kbps, &mut discard);
+    }
+}
+
+/// Promotes SmartAuto from 16-bit Lossless (~1.5 Mbps) to full-capacity
+/// 24-bit Studio Master (~2.8-4.5+ Mbps) once the link proves spotless capacity
+/// (or immediately on pure USB), and steps down cleanly to 16-bit before loss
+/// ever reaches the Opus compression threshold. Because 16-bit and 24-bit share
+/// `CodecMode::StudioLosslessLpc` and 0 ms lookahead, transitions are
+/// sample-accurate with zero glitches.
+struct CleanLinkPromoter {
+    clean_since: Option<Instant>,
+    master_24bit: bool,
+}
+
+impl CleanLinkPromoter {
+    fn new() -> Self {
+        Self {
+            clean_since: None,
+            master_24bit: false,
+        }
+    }
+
+    fn update(
+        &mut self,
+        raw_loss_permille: u16,
+        governed_loss_permille: u16,
+        bt_active: bool,
+        all_usb: bool,
+        has_clients: bool,
+        now: Instant,
+    ) -> bool {
+        if !has_clients || bt_active || governed_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE
+        {
+            self.clean_since = None;
+            self.master_24bit = false;
+            return false;
+        }
+        if all_usb && raw_loss_permille <= SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
+            self.master_24bit = true;
+            return true;
+        }
+        if self.master_24bit {
+            if raw_loss_permille > SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
+                self.master_24bit = false;
+                self.clean_since = None;
+            }
+            return self.master_24bit;
+        }
+        if raw_loss_permille <= SMART_AUTO_MASTER_PROMOTE_MAX_LOSS_PERMILLE {
+            let since = *self.clean_since.get_or_insert(now);
+            if now.saturating_duration_since(since)
+                >= Duration::from_secs(SMART_AUTO_MASTER_PROMOTE_SECS)
+            {
+                self.master_24bit = true;
+            }
+        } else {
+            self.clean_since = None;
+        }
+        self.master_24bit
+    }
+
+    #[inline]
+    fn is_master_24bit(&self) -> bool {
+        self.master_24bit
     }
 }
 
@@ -192,14 +271,16 @@ fn warm_opus_lookahead(
 /// explicit `MaxStability24Ghz` profile and Smart Auto's high-loss tier.
 ///
 /// The profile exists for long-range links through walls, so the primary
-/// stream is capped at 160 kbps even when the user selected 256/320. A
+/// stream is capped at 160 kbps even when the user selected 256/320/510. A
 /// user-selected 96 kbps is honored rather than silently raised to 160.
-/// Above 20% loss the 96 kbps rung is the better tradeoff: its primary
-/// payload is 36 B/subframe instead of 53 B, leaving more airtime for the
-/// FEC backups that actually repair the loss.
+/// Above 20% loss the 96 kbps rung is the better tradeoff, and above 28%
+/// loss the 64 kbps survival rung keeps slow/weak networks flowing smoothly
+/// with exact `[P-1]/[P-2]` Opus RED.
 #[inline]
 fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
-    if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
+    if worst_loss_permille > SEVERE_LOSS_THRESHOLD_PERMILLE {
+        64
+    } else if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
         96
     } else {
         selected_kbps.clamp(96, 160)
@@ -305,10 +386,19 @@ fn select_tx_profile(
                     selected_kbps.clamp(96, 192),
                 )
             } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
+                // Smooth intra-Opus bitrate scaling (zero codec switch, zero
+                // framing jump): keep 320k cap on 2-sf Wi-Fi so exact [P-1]/[P-2]
+                // RED always fits inside 255 bytes, and gently step down to 224k
+                // above 8% loss before ever needing 10 ms framing at >12% loss.
+                let smooth_kbps = if worst_loss_permille > 80 {
+                    selected_kbps.clamp(96, 224)
+                } else {
+                    selected_kbps.clamp(96, 320)
+                };
                 (
                     CodecMode::CompressedLowDelay,
                     if gaming_lock { 1 } else { 2 },
-                    selected_kbps,
+                    smooth_kbps,
                 )
             } else {
                 (CodecMode::StudioLosslessLpc, base_subframes, selected_kbps)
@@ -546,6 +636,48 @@ impl PreviewPull {
     }
 }
 
+/// Rank Windows/desktop virtual-cable playback endpoint names so VB-Audio
+/// Virtual Cable works regardless of whether Windows names the endpoint
+/// `"CABLE Input (VB-Audio Virtual Cable)"`, `"Speakers (VB-Audio Virtual Cable)"`,
+/// or `"CABLE In 16 Ch (VB-Audio Virtual Cable)"`. Lower values are preferred
+/// (standard 2-ch VB-Cable input before 16-ch or generic virtual cables).
+#[inline]
+pub fn vbcable_output_match_priority(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    let is_16ch = lower.contains("16 ch") || lower.contains("16ch");
+    if lower.contains("cable input") && !is_16ch {
+        Some(0)
+    } else if lower.contains("vb-audio virtual cable") && !is_16ch {
+        Some(1)
+    } else if lower.contains("cable in") {
+        Some(2)
+    } else if lower.contains("vb-audio") || lower.contains("voicemeeter") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Find the best available VB-Cable / virtual-cable playback endpoint name on
+/// this machine using [`vbcable_output_match_priority`].
+#[cfg(not(target_os = "android"))]
+pub fn find_vbcable_output_device_name() -> Option<String> {
+    let host = cpal::default_host();
+    let devices = host.output_devices().ok()?;
+    let mut best: Option<(u8, String)> = None;
+    for dev in devices {
+        let Ok(name) = dev.name() else {
+            continue;
+        };
+        if let Some(prio) = vbcable_output_match_priority(&name) {
+            if best.as_ref().map(|(p, _)| prio < *p).unwrap_or(true) {
+                best = Some((prio, name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 #[cfg(not(target_os = "android"))]
 impl ClientPreviewSink {
     #[allow(dead_code)]
@@ -597,20 +729,54 @@ impl ClientPreviewSink {
         preferred_name: Option<&str>,
         observed_cb_frames: Option<Arc<AtomicUsize>>,
     ) -> Result<cpal::Stream, String> {
+        Self::spawn_preferred_strict_with_cb_frames(fifo, preferred_name, false, observed_cb_frames)
+            .map(|(stream, _)| stream)
+    }
+
+    /// Spawn a CPAL output sink with error reporting (`stream_error` atomic)
+    /// and optional strict matching (`require_preferred = true` fails cleanly
+    /// instead of silently falling back to Default PC Speakers — critical for
+    /// `VirtualMicForCalls` so call audio never feeds back into PC speakers).
+    pub(crate) fn spawn_preferred_strict_with_cb_frames(
+        fifo: Arc<BurstDecouplerRing>,
+        preferred_name: Option<&str>,
+        require_preferred: bool,
+        observed_cb_frames: Option<Arc<AtomicUsize>>,
+    ) -> Result<(cpal::Stream, Arc<AtomicBool>), String> {
         let host = cpal::default_host();
         let preferred = preferred_name.and_then(|needle| {
-            host.output_devices().ok().and_then(|mut devices| {
-                devices.find(|device| {
+            let needle_lower = needle.to_ascii_lowercase();
+            let devices: Vec<cpal::Device> = host.output_devices().ok()?.collect();
+            devices
+                .iter()
+                .find(|device| {
                     device
                         .name()
-                        .map(|name| name.contains(needle))
+                        .map(|name| name.eq_ignore_ascii_case(needle))
                         .unwrap_or(false)
                 })
-            })
+                .or_else(|| {
+                    devices.iter().find(|device| {
+                        device
+                            .name()
+                            .map(|name| name.to_ascii_lowercase().contains(&needle_lower))
+                            .unwrap_or(false)
+                    })
+                })
+                .cloned()
         });
-        let dev = preferred
-            .or_else(|| host.default_output_device())
-            .ok_or("No output device")?;
+        let dev = if require_preferred {
+            preferred.ok_or_else(|| {
+                format!(
+                    "Required output device '{}' not found",
+                    preferred_name.unwrap_or("<none>")
+                )
+            })?
+        } else {
+            preferred
+                .or_else(|| host.default_output_device())
+                .ok_or("No output device")?
+        };
         let default_cfg = dev.default_output_config().map_err(|e| e.to_string())?;
         let sample_format = default_cfg.sample_format();
         match sample_format {
@@ -629,10 +795,6 @@ impl ClientPreviewSink {
         let dev_rate = default_cfg.sample_rate().0.max(1);
         let dev_channels = default_cfg.channels().max(1);
 
-        // A 240-frame (5 ms) callback matches the 2.5 ms network subframe and
-        // stops the OS from draining 10-21 ms in one pull. Some backends
-        // reject a fixed period, so fall back to the stereo default and then
-        // to whatever rate/channel layout the endpoint natively opens.
         let low_lat_cfg = cpal::StreamConfig {
             channels: 2,
             sample_rate: cpal::SampleRate(SAMPLE_RATE),
@@ -649,6 +811,7 @@ impl ClientPreviewSink {
             buffer_size: cpal::BufferSize::Default,
         };
 
+        let stream_error = Arc::new(AtomicBool::new(false));
         let build_for_cfg = |cfg: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
             let out_channels = cfg.channels.max(1) as usize;
             let out_rate = cfg.sample_rate.0;
@@ -660,13 +823,17 @@ impl ClientPreviewSink {
                     observed_cb_frames.clone(),
                 )
             };
+            let err_flag = Arc::clone(&stream_error);
+            let on_err = move |_err| {
+                err_flag.store(true, Ordering::Release);
+            };
             match sample_format {
                 cpal::SampleFormat::I16 => {
                     let mut pull = make_pull();
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [i16], _: &cpal::OutputCallbackInfo| pull.fill_i16(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -676,7 +843,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [u16], _: &cpal::OutputCallbackInfo| pull.fill_u16(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -686,7 +853,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [i32], _: &cpal::OutputCallbackInfo| pull.fill_i32(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -696,7 +863,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [f64], _: &cpal::OutputCallbackInfo| pull.fill_f64(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -706,7 +873,7 @@ impl ClientPreviewSink {
                     dev.build_output_stream(
                         cfg,
                         move |out: &mut [f32], _: &cpal::OutputCallbackInfo| pull.fill_f32(out),
-                        |_| {},
+                        on_err,
                         None,
                     )
                     .map_err(|e| e.to_string())
@@ -723,7 +890,7 @@ impl ClientPreviewSink {
             .or_else(|_| build_for_cfg(&native_fallback_cfg))
             .map_err(|e| format!("Failed to build preview output stream: {e}"))?;
         stream.play().map_err(|e| e.to_string())?;
-        Ok(stream)
+        Ok((stream, stream_error))
     }
 }
 
@@ -754,26 +921,23 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
                 continue;
             }
             let ip = iface.ip();
-            if !ip.is_ipv4() {
+            let IpAddr::V4(v4) = ip else {
+                continue;
+            };
+            if v4.is_link_local() || v4.is_unspecified() {
                 continue;
             }
-            let lower = iface.name.to_lowercase();
-            let is_virtual = lower.contains("docker")
-                || lower.contains("wsl")
-                || lower.contains("vethernet")
-                || lower.contains("vmware")
-                || lower.contains("vmnet")
-                || lower.contains("vbox")
-                || lower.contains("virbr")
-                || lower.contains("br-");
-            if is_virtual {
+            if discovery_and_os::is_virtual_interface_name(&iface.name) {
                 continue;
             }
 
             let ip_str = ip.to_string();
-            let is_usb = is_usb_interface_name(&iface.name)
-                || ip_str.starts_with("192.168.42.")
-                || ip_str.starts_with("192.168.137.");
+            // Do NOT hardcode 192.168.137.* as USB: on Windows 10/11 that is
+            // Microsoft's Wi-Fi Direct SoftAP / Mobile Hotspot subnet (802.11),
+            // so treating it as wired USB disabled Opus RED, pacing, and the
+            // BT+Wi-Fi guardrail. Real USB RNDIS/NCM adapters are caught by
+            // `is_usb_interface_name` or Android's legacy 192.168.42.* subnet.
+            let is_usb = is_usb_interface_name(&iface.name) || ip_str.starts_with("192.168.42.");
 
             valid.push(NetworkInterfaceInfo {
                 name: iface.name,
@@ -786,13 +950,15 @@ pub fn list_valid_host_interfaces() -> Vec<NetworkInterfaceInfo> {
     valid
 }
 
-/// Returns `true` for loopback, the legacy Android RNDIS subnets, or any IPv4
-/// address in the same `/24` as a local USB-tethering interface.
+/// Returns `true` for loopback, the legacy Android RNDIS subnet (`192.168.42.*`),
+/// or any IPv4 address in the same `/24` as a local USB-tethering interface.
 ///
 /// Android 11+ randomizes the RNDIS subnet for each tethering session, so a
-/// fixed `192.168.42.x` / `192.168.137.x` prefix check is not sufficient. The
-/// local interface list is queried on demand because USB tethering can be
-/// enabled after the host engine starts.
+/// fixed `192.168.42.x` prefix check is not sufficient. The local interface
+/// list is queried on demand because USB tethering can be enabled after the
+/// host engine starts. Windows Wi-Fi Direct SoftAP (`192.168.137.x`) is
+/// deliberately NOT hardcoded here so wireless hotspot clients keep full Wi-Fi
+/// FEC/RED and pacing protections.
 pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
     if addr_ip.is_loopback() {
         return true;
@@ -801,7 +967,7 @@ pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
         return false;
     };
     let t = target.octets();
-    if t[0] == 192 && t[1] == 168 && (t[2] == 42 || t[2] == 137) {
+    if t[0] == 192 && t[1] == 168 && t[2] == 42 {
         return true;
     }
 
@@ -819,25 +985,10 @@ pub fn is_usb_subnet_ip(addr_ip: IpAddr) -> bool {
     })
 }
 
-pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
-    let sock_ref = socket2::SockRef::from(socket);
-    // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
-    let _ = sock_ref.set_tos(0xA0);
-    // Asymmetric buffers: the send buffer must absorb a burst of split 24-bit
-    // datagrams while the Wi-Fi driver waits for a TXOP. The old tight 16 KB
-    // also overflowed after only a few large fast-scene allocations, and
-    // `send_to` runs on a non-blocking socket, so those drops were silent.
-    // 256 KB send buffer absorbs 250+ ms Wi-Fi driver TX stalls without
-    // silent non-blocking `send_to` drops (send_err).
-    // 128 KB SO_RCVBUF ensures the receiver never drops Wi-Fi aggregation
-    // bursts.
-    let _ = sock_ref.set_send_buffer_size(262_144);
-    let _ = sock_ref.set_recv_buffer_size(131_072);
-
-    // Disable Winsock's legacy SIO_UDP_CONNRESET behavior: without this, one
-    // ICMP Port Unreachable from a restarting/disconnected phone makes
-    // recv_from() fail with WSAECONNRESET (10054) and aborts the control drain
-    // (the host then goes deaf to all subsequent HELLO/feedback packets).
+/// Disable Winsock's legacy `SIO_UDP_CONNRESET` behavior on Windows so an
+/// ICMP Port Unreachable from a momentarily restarting peer cannot make
+/// `recv()`/`recv_from()` return `WSAECONNRESET` (10054).
+pub(crate) fn disable_windows_udp_connreset(socket: &UdpSocket) {
     #[cfg(target_os = "windows")]
     unsafe {
         use std::os::windows::io::AsRawSocket;
@@ -870,6 +1021,21 @@ pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> 
             core::ptr::null_mut(),
         );
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = socket;
+}
+
+pub fn configure_realtime_udp_socket(socket: &UdpSocket) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(socket);
+    // DSCP CS5 (0xA0) -> 802.11e WMM AC_VI (High-Priority Media Queue with full 802.11n/ax MCS & Block-ACK on 2.4GHz!)
+    let _ = sock_ref.set_tos(0xA0);
+    // 1 MB send & receive buffers absorb 5+ Mbps 24-bit Master bursts and
+    // 250-350 ms Wi-Fi driver TXOP/A-MPDU aggregation stalls without silent
+    // non-blocking `send_to` drops or kernel RX queue overflows.
+    let _ = sock_ref.set_send_buffer_size(1_048_576);
+    let _ = sock_ref.set_recv_buffer_size(1_048_576);
+
+    disable_windows_udp_connreset(socket);
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
@@ -1597,6 +1763,13 @@ pub struct HostEngine {
     running: Arc<AtomicBool>,
     pub telemetry: Arc<HostTelemetry>,
     clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+    /// Temporary per-IP kick cooldown so a kicked client's periodic 500 ms
+    /// feedback packet does not immediately re-admit it unmuted.
+    kicked_clients: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+    /// Bumped whenever `clients` is mutated from outside the TX loop (mute,
+    /// kick, or PIN change) so `cached_targets` refreshes on the very next
+    /// 2.5 ms tick instead of waiting up to 1 second for the periodic sweep.
+    clients_version: Arc<AtomicU64>,
     session_key: Arc<Mutex<Option<SessionKey>>>,
     /// Bumped whenever `session_key` is swapped (or its nonce salt rotated).
     /// The real-time TX loop only re-locks the key mutex when this changes.
@@ -1607,6 +1780,20 @@ pub struct HostEngine {
 
 impl HostEngine {
     pub fn start(config: HostConfig, initial_targets: Vec<SocketAddr>) -> Result<Self, String> {
+        Self::start_with_pin(config, initial_targets, None)
+    }
+
+    /// Start the host engine with an optional pairing PIN already active before
+    /// the UDP listener thread begins accepting handshakes/feedback.
+    pub fn start_with_pin(
+        config: HostConfig,
+        initial_targets: Vec<SocketAddr>,
+        pin: Option<&str>,
+    ) -> Result<Self, String> {
+        let initial_key = pin
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(SessionKey::from_pin);
         let running = Arc::new(AtomicBool::new(true));
         let telemetry = Arc::new(HostTelemetry {
             packets_sent: AtomicU64::new(0),
@@ -1675,7 +1862,9 @@ impl HostEngine {
             Ordering::Relaxed,
         );
         let clients = Arc::new(Mutex::new(client_map));
-        let session_key = Arc::new(Mutex::new(None));
+        let kicked_clients = Arc::new(Mutex::new(HashMap::<IpAddr, Instant>::new()));
+        let clients_version = Arc::new(AtomicU64::new(0));
+        let session_key = Arc::new(Mutex::new(initial_key));
         let key_version = Arc::new(AtomicU64::new(0));
 
         // Poll the OS master sink volume/mute state on a dedicated, non-RT
@@ -1696,6 +1885,8 @@ impl HostEngine {
         let running_clone = Arc::clone(&running);
         let telemetry_clone = Arc::clone(&telemetry);
         let clients_clone = Arc::clone(&clients);
+        let kicked_clients_clone = Arc::clone(&kicked_clients);
+        let clients_version_clone = Arc::clone(&clients_version);
         let key_clone = Arc::clone(&session_key);
         let key_version_clone = Arc::clone(&key_version);
 
@@ -1712,6 +1903,8 @@ impl HostEngine {
                     running_clone,
                     telemetry_clone,
                     clients_clone,
+                    kicked_clients_clone,
+                    clients_version_clone,
                     key_clone,
                     key_version_clone,
                 );
@@ -1734,6 +1927,8 @@ impl HostEngine {
             running,
             telemetry,
             clients,
+            kicked_clients,
+            clients_version,
             session_key,
             key_version,
             worker_handle: Some(worker_handle),
@@ -1742,11 +1937,11 @@ impl HostEngine {
     }
 
     pub fn set_encryption_pin(&self, pin: Option<&str>) {
-        let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = pin.map(SessionKey::from_pin);
-        drop(guard);
-        self.key_version.fetch_add(1, Ordering::AcqRel);
-        self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
+        let key = pin
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(SessionKey::from_pin);
+        self.set_session_key(key);
     }
 
     /// Replace the session key directly (e.g. one derived from a QR token)
@@ -1754,14 +1949,47 @@ impl HostEngine {
     /// cache instead of locking the key mutex on every packet.
     pub fn set_session_key(&self, key: Option<SessionKey>) {
         let mut guard = self.session_key.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = *guard != key;
         *guard = key;
         drop(guard);
         self.key_version.fetch_add(1, Ordering::AcqRel);
         self.telemetry.rejected_handshakes.store(0, Ordering::Relaxed);
+        if changed {
+            // Reset per-client replay windows so a legitimate client reconnecting
+            // with the updated PIN from the same socket at `feedback_seq = 1`
+            // is accepted immediately instead of rejected as a replay until idle
+            // expiry; when enabling/changing encryption, also clear stale
+            // previously-unauthenticated peers so they must re-authenticate.
+            let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
+            if key.is_some() {
+                map.clear();
+                self.telemetry
+                    .active_clients_count
+                    .store(0, Ordering::Relaxed);
+                Self::refresh_client_delay_telemetry(&map, &self.telemetry);
+                Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
+            } else {
+                for client in map.values_mut() {
+                    client.feedback_window = FeedbackReplayWindow::default();
+                }
+            }
+            drop(map);
+            self.clients_version.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn connected_clients(&self) -> Vec<ConnectedClient> {
-        self.clients.lock().unwrap().values().cloned().collect()
+        let mut list: Vec<ConnectedClient> = self
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        // Deterministic ordering so GUI client rows never jump under the cursor
+        // when HashMap rehashes on join/leave.
+        list.sort_by_key(|c| c.addr);
+        list
     }
 
     /// Count a rejected handshake and log only the first one and every 50th
@@ -1887,16 +2115,18 @@ impl HostEngine {
     }
 
     pub fn set_client_muted(&self, addr: SocketAddr, muted: bool) {
-        let mut map = self.clients.lock().unwrap();
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(client) = map.get_mut(&addr) {
             client.muted = muted;
         }
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
+        drop(map);
+        self.clients_version.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn kick_client(&self, addr: SocketAddr) {
-        let mut map = self.clients.lock().unwrap();
+        let mut map = self.clients.lock().unwrap_or_else(|e| e.into_inner());
         let removed = map.remove(&addr).is_some();
         self.telemetry
             .active_clients_count
@@ -1904,11 +2134,21 @@ impl HostEngine {
         Self::refresh_client_delay_telemetry(&map, &self.telemetry);
         Self::refresh_gaming_lock_telemetry(&map, &self.telemetry);
         drop(map);
+        // Hold a 15-second kick cooldown for this peer IP so its periodic
+        // 500 ms feedback heartbeat does not immediately re-admit it unmuted.
+        const KICK_COOLDOWN: Duration = Duration::from_secs(15);
+        {
+            let mut kicked = self.kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            kicked.retain(|_, until| *until > now);
+            kicked.insert(addr.ip(), now + KICK_COOLDOWN);
+        }
         if removed {
+            self.clients_version.fetch_add(1, Ordering::AcqRel);
             audioshare_protocol::diagnostics::info(
                 "host-clients",
                 format!(
-                    "kick {} (remaining {})",
+                    "kick {} (15s cooldown; remaining {})",
                     addr,
                     self.telemetry.active_clients_count.load(Ordering::Relaxed)
                 ),
@@ -1923,6 +2163,9 @@ impl HostEngine {
         }
         // Dropping the monitor stops and joins its polling thread.
         self.volume_monitor = None;
+        // Clear any leftover per-app isolation PID so a fresh HostEngine
+        // session does not silently inherit an old PID.
+        app_routing::clear_windows_target_capture_pid();
         // Final snapshot after the TX thread has stopped: useful when a
         // session ends unexpectedly and the report is pulled offline.
         audioshare_protocol::diagnostics::info(
@@ -1949,6 +2192,7 @@ impl HostEngine {
         let capture_active = Arc::clone(&stream_active);
         let capture_pid = Arc::clone(&child_pid);
         let capture_exited = Arc::clone(&child_exited);
+        let capture_nonblocking = Arc::clone(&uses_nonblocking_poll);
         let capture_running = Arc::clone(&running);
         let capture_ring = Arc::clone(&ring);
         let capture_wakeup = Arc::clone(&wakeup);
@@ -2040,7 +2284,10 @@ impl HostEngine {
 
                     match child {
                         Ok(mut child) => {
+                            capture_nonblocking.store(true, Ordering::Release);
                             capture_pid.store(child.id(), Ordering::Relaxed);
+                            let spawned_at = Instant::now();
+                            let hb_before = capture_heartbeat.load(Ordering::Relaxed);
                             if let Some(stdout) = child.stdout.take() {
                                 use std::os::fd::AsRawFd;
                                 pump_pcm_fd_nonblocking(
@@ -2061,11 +2308,37 @@ impl HostEngine {
                             let _ = child.kill();
                             let _ = child.wait();
                             capture_exited.store(true, Ordering::Release);
+                            // If `parec` died immediately without emitting any
+                            // samples (e.g. broken pipewire-pulse shim), try
+                            // the in-process libpulse-simple fallback instead
+                            // of tight-loop respawning `parec` 20x/sec.
+                            if spawned_at.elapsed() < Duration::from_millis(200)
+                                && capture_heartbeat.load(Ordering::Relaxed) == hb_before
+                                && capture_active.load(Ordering::Relaxed)
+                                && capture_running.load(Ordering::Relaxed)
+                                && sink_generation.load(Ordering::Acquire) == generation
+                            {
+                                capture_nonblocking.store(false, Ordering::Release);
+                                let _ = Self::try_inprocess_pulse_simple_capture(
+                                    &current_monitor,
+                                    &capture_ring,
+                                    &capture_wakeup,
+                                    &capture_heartbeat,
+                                    &capture_running,
+                                    &capture_active,
+                                    start_epoch,
+                                    &sink_generation,
+                                    generation,
+                                );
+                            }
                         }
                         Err(_) => {
                             // 2. Fallback: direct in-process
                             //    libpulse-simple.so.0 only when `parec` could
-                            //    not be spawned at all.
+                            //    not be spawned at all. `pa_simple_read` is
+                            //    blocking on a silent sink, so mark the thread
+                            //    non-joinable on Drop to prevent stop() deadlock.
+                            capture_nonblocking.store(false, Ordering::Release);
                             if Self::try_inprocess_pulse_simple_capture(
                                 &current_monitor,
                                 &capture_ring,
@@ -2576,6 +2849,8 @@ impl HostEngine {
         running: Arc<AtomicBool>,
         telemetry: Arc<HostTelemetry>,
         clients: Arc<Mutex<HashMap<SocketAddr, ConnectedClient>>>,
+        kicked_clients: Arc<Mutex<HashMap<IpAddr, Instant>>>,
+        clients_version: Arc<AtomicU64>,
         session_key: Arc<Mutex<Option<SessionKey>>>,
         key_version: Arc<AtomicU64>,
     ) {
@@ -2638,15 +2913,41 @@ impl HostEngine {
         let mut bound_target_pid: u32 = app_routing::windows_target_capture_pid();
         #[cfg(target_os = "windows")]
         let mut active_stream = if !config.use_test_tone {
-            Self::spawn_loopback_capture(
-                Arc::clone(&ring),
-                Arc::clone(&capture_wakeup),
-                Arc::clone(&capture_heartbeat_ms),
-                Arc::clone(&capture_stream_error),
-                Arc::clone(&running),
-                start_instant,
-            )
-            .ok()
+            if bound_target_pid != 0 {
+                match app_routing::spawn_windows_process_loopback(
+                    bound_target_pid,
+                    Arc::clone(&ring),
+                    Arc::clone(&capture_wakeup),
+                    Arc::clone(&capture_heartbeat_ms),
+                    Arc::clone(&capture_stream_error),
+                    Arc::clone(&running),
+                    start_instant,
+                ) {
+                    Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
+                    Err(_) => {
+                        bound_target_pid = 0;
+                        Self::spawn_loopback_capture(
+                            Arc::clone(&ring),
+                            Arc::clone(&capture_wakeup),
+                            Arc::clone(&capture_heartbeat_ms),
+                            Arc::clone(&capture_stream_error),
+                            Arc::clone(&running),
+                            start_instant,
+                        )
+                        .ok()
+                    }
+                }
+            } else {
+                Self::spawn_loopback_capture(
+                    Arc::clone(&ring),
+                    Arc::clone(&capture_wakeup),
+                    Arc::clone(&capture_heartbeat_ms),
+                    Arc::clone(&capture_stream_error),
+                    Arc::clone(&running),
+                    start_instant,
+                )
+                .ok()
+            }
         } else {
             None
         };
@@ -2682,12 +2983,8 @@ impl HostEngine {
         let mut fec_hist_len: usize = 0;
         // Opus RED [P-1]/[P-2]: exact previously-sent Opus packets piggybacked
         // in `fec_n1`/`fec_n2` while the wire mode is `OpusRld` on a Wi-Fi
-        // stream. Written against A1's `pack_opus_red_blob` contract. Reset on
-        // DTX silence, codec-mode switch and pure-USB sessions (see below).
-        let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
-        let mut opus_red_prev1_len: usize = 0;
-        let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
-        let mut opus_red_prev2_len: usize = 0;
+        // stream. Reset on DTX silence, codec-mode switch and pure-USB sessions.
+        let mut opus_red = OpusRedHistory::new();
 
         let mut silent_subframes: u32 = 0;
         let mut tone_phase: f32 = 0.0;
@@ -2695,6 +2992,7 @@ impl HostEngine {
         let mut dynamic_codec_mode;
         let mut tx_bitrate_kbps;
         let mut loss_governor = LossGovernor::new(Instant::now());
+        let mut clean_link_promoter = CleanLinkPromoter::new();
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         // Lazily created on the first compressed packet after the user enables
         // the Opus backend. Smart Auto also keeps it warm through Tier 0 so
@@ -2702,6 +3000,11 @@ impl HostEngine {
         // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
         let mut opus_encoder_failed = false;
+        // Retain the most recently transmitted live f32 subframe so switching
+        // from Lossless/24-bit/VBR into Opus mid-stream can immediately prime
+        // the new encoder's 2.5 ms lookahead instead of emitting a silence hole.
+        let mut prev_f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let mut has_prev_subframe = false;
         let mut cached_targets: Vec<SocketAddr> = Vec::with_capacity(8);
         let mut cached_all_usb = false;
         if let Ok(map) = clients.lock() {
@@ -2716,6 +3019,7 @@ impl HostEngine {
         // `set_session_key`/`set_encryption_pin`, which bump `key_version`; the
         // loop only re-locks the key mutex when the version actually changes.
         let mut key_version_seen = key_version.load(Ordering::Acquire);
+        let mut clients_version_seen = clients_version.load(Ordering::Acquire);
         let mut active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
         let mut last_salt_rotation = Instant::now();
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -2737,6 +3041,22 @@ impl HostEngine {
             if current_key_version != key_version_seen {
                 active_key_cache = *session_key.lock().unwrap_or_else(|e| e.into_inner());
                 key_version_seen = current_key_version;
+            }
+            let current_clients_version = clients_version.load(Ordering::Acquire);
+            if current_clients_version != clients_version_seen {
+                if let Ok(map) = clients.lock() {
+                    cached_targets.clear();
+                    for c in map.values() {
+                        if !c.muted {
+                            cached_targets.push(c.addr);
+                        }
+                    }
+                    cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    if map.is_empty() {
+                        loss_governor = LossGovernor::new(Instant::now());
+                    }
+                }
+                clients_version_seen = current_clients_version;
             }
             // Long-lived encrypted sessions rotate the 4-byte nonce salt so a
             // 32-bit salt cannot be reused into a two-time-pad. The salt travels
@@ -2797,19 +3117,26 @@ impl HostEngine {
                 };
                 let target_pid = app_routing::windows_target_capture_pid();
                 let pid_changed = target_pid != bound_target_pid;
+                // `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK` is endpoint-independent,
+                // so a default speaker change must NOT tear down an active
+                // isolated-app capture stream.
+                let endpoint_rebind_needed = device_changed && target_pid == 0;
                 // Only rebind when the stream is missing, reported a device error,
-                // the default output endpoint changed, or the isolated app changed.
+                // the default output endpoint changed (in full-system mode), or
+                // the isolated app changed.
                 if active_stream.is_none()
                     || capture_stream_error.load(Ordering::Acquire)
-                    || device_changed
+                    || endpoint_rebind_needed
                     || pid_changed
                 {
                     // Audio endpoint changed (HDMI monitor sleep / USB headset unplugged) -> Seamless Rebind!
                     // Drop the previous stream BEFORE creating a new SPSC
                     // producer so two backends never share the audio device.
                     drop(active_stream.take());
+                    capture_stream_error.store(false, Ordering::Release);
+                    let mut effective_pid = target_pid;
                     active_stream = if target_pid != 0 {
-                        app_routing::spawn_windows_process_loopback(
+                        match app_routing::spawn_windows_process_loopback(
                             target_pid,
                             Arc::clone(&ring),
                             Arc::clone(&capture_wakeup),
@@ -2817,19 +3144,29 @@ impl HostEngine {
                             Arc::clone(&capture_stream_error),
                             Arc::clone(&running),
                             start_instant,
-                        )
-                        .map(HostCaptureStream::WindowsProcess)
-                        .or_else(|_| {
-                            Self::spawn_loopback_capture(
-                                Arc::clone(&ring),
-                                Arc::clone(&capture_wakeup),
-                                Arc::clone(&capture_heartbeat_ms),
-                                Arc::clone(&capture_stream_error),
-                                Arc::clone(&running),
-                                start_instant,
-                            )
-                        })
-                        .ok()
+                        ) {
+                            Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
+                            Err(err) => {
+                                // Never silently fall back to full system audio
+                                // while leaving `WINDOWS_TARGET_CAPTURE_PID` set
+                                // (privacy leak): clear target PID and publish
+                                // the error so the GUI immediately shows it.
+                                app_routing::clear_windows_target_capture_pid();
+                                app_routing::set_windows_app_isolation_error(Some(format!(
+                                    "App isolation (PID {target_pid}) failed: {err} — fell back to Full System Audio"
+                                )));
+                                effective_pid = 0;
+                                Self::spawn_loopback_capture(
+                                    Arc::clone(&ring),
+                                    Arc::clone(&capture_wakeup),
+                                    Arc::clone(&capture_heartbeat_ms),
+                                    Arc::clone(&capture_stream_error),
+                                    Arc::clone(&running),
+                                    start_instant,
+                                )
+                                .ok()
+                            }
+                        }
                     } else {
                         Self::spawn_loopback_capture(
                             Arc::clone(&ring),
@@ -2844,7 +3181,7 @@ impl HostEngine {
                     if active_stream.is_some() {
                         bound_output_name = latest_name;
                         bound_output_generation = generation;
-                        bound_target_pid = target_pid;
+                        bound_target_pid = effective_pid;
                         capture_heartbeat_ms.store(now_ms, Ordering::Relaxed);
                         let rebinds =
                             telemetry.hotplug_rebinds.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2852,7 +3189,7 @@ impl HostEngine {
                             "host-capture",
                             format!(
                                 "hotplug rebind #{}: endpoint={:?} generation={} pid={}",
-                                rebinds, bound_output_name, generation, target_pid
+                                rebinds, bound_output_name, generation, effective_pid
                             ),
                         );
                     }
@@ -2886,8 +3223,6 @@ impl HostEngine {
 
             // 2. Process incoming Client HELLO or ClientFeedbackPacket (Dynamic Link Governor & BT Sync)
             while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
-                let is_usb = is_usb_subnet_ip(src_addr.ip());
-
                 if len >= 8 && &ctrl_buf[..8] == CONTROL_MAGIC_HELLO {
                     // A bare HELLO carries no PIN/MAC. When the host has a
                     // session key, only authenticated feedback may register a
@@ -2902,6 +3237,18 @@ impl HostEngine {
                         );
                         continue;
                     }
+                    // Reject recently kicked IPs during their cooldown window
+                    // so clicking Kick doesn't immediately re-admit the peer.
+                    {
+                        let kicked = kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+                        if kicked
+                            .get(&src_addr.ip())
+                            .map(|until| *until > Instant::now())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                    }
                     let mut map = clients.lock().unwrap();
                     Self::evict_same_ip_stale_ports(&mut map, src_addr);
                     if !Self::can_admit_client(&map, src_addr) {
@@ -2910,6 +3257,13 @@ impl HostEngine {
                         continue;
                     }
                     let newly_joined = !map.contains_key(&src_addr);
+                    // Only query OS interfaces when inserting a genuinely new
+                    // client (never on every 500 ms heartbeat in the RT loop!).
+                    let is_usb = if newly_joined {
+                        is_usb_subnet_ip(src_addr.ip())
+                    } else {
+                        false
+                    };
                     map.entry(src_addr)
                         .or_insert(ConnectedClient {
                             addr: src_addr,
@@ -2964,144 +3318,178 @@ impl HostEngine {
                         Self::note_rejected_handshake(&telemetry, "invalid feedback MAC");
                         continue;
                     };
-                    // Reject replayed authenticated feedback BEFORE any command
-                    // side effect. The sequence is nonce-bound, so an attacker
-                    // cannot simply bump it on a captured packet. `check_and_accept`
-                    // both filters the replay and records the newly accepted seq;
-                    // for a not-yet-registered peer we seed a temporary window and
-                    // carry it into the entry created below. Kicking a peer drops
-                    // its window, so a reconnect may legitimately restart at 1.
-                    let mut accepted_window = FeedbackReplayWindow::default();
-                    let replay = {
-                        let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
-                        match map.get_mut(&src_addr) {
-                            Some(entry) => !entry.feedback_window.check_and_accept(
-                                active_key.is_some(),
-                                fb.feedback_seq,
-                            ),
-                            None => !accepted_window.check_and_accept(
-                                active_key.is_some(),
-                                fb.feedback_seq,
-                            ),
-                        }
+                    // Atomically verify admission, check the replay window, and
+                    // insert/update the client under one lock so neither an
+                    // unadmitted peer at MAX_CONNECTED_CLIENTS nor a kicked/muted
+                    // peer can bypass replay tracking or issue global commands.
+                    let gaming_lock_update = match fb.requested_mode {
+                        40 => Some(false),
+                        41 => Some(true),
+                        _ => None,
                     };
-                    if replay {
-                        continue;
-                    }
-                    let mut gaming_lock_update: Option<bool> = None;
+                    let mut newly_joined = false;
+                    let mut newly_joined_usb = false;
+                    let allow_remote_commands: bool;
+                    {
+                        let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(entry) = map.get_mut(&src_addr) {
+                            if !entry.feedback_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ) {
+                                continue;
+                            }
+                            entry.last_seen = Instant::now();
+                            entry.fec_rate_permille = fb.fec_rate_permille;
+                            entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
+                            entry.hardware_delay_ms = fb.hardware_delay_ms;
+                            entry.client_volume = fb.client_volume;
+                            if let Some(gaming_lock) = gaming_lock_update {
+                                entry.gaming_lock = gaming_lock;
+                            }
+                            allow_remote_commands = !entry.muted;
+                        } else {
+                            // Reject continuing heartbeats (`feedback_seq > 1`)
+                            // from recently kicked IPs during their 15 s
+                            // cooldown so clicking Kick actually keeps an
+                            // active client out instead of auto-rejoining in
+                            // 500 ms. A deliberate fresh reconnect starts a new
+                            // `ClientEngine` at `feedback_seq == 1`, which is
+                            // admitted immediately and clears the cooldown.
+                            {
+                                let mut kicked =
+                                    kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
+                                if fb.feedback_seq == 1 {
+                                    kicked.remove(&src_addr.ip());
+                                } else if kicked
+                                    .get(&src_addr.ip())
+                                    .map(|until| *until > Instant::now())
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                            }
+                            // Validate feedback_seq BEFORE evicting any stale
+                            // port from the same IP so a malformed/zero-seq
+                            // packet cannot evict a live client.
+                            let mut accepted_window = FeedbackReplayWindow::default();
+                            if !accepted_window.check_and_accept(
+                                active_key.is_some(),
+                                fb.feedback_seq,
+                            ) {
+                                continue;
+                            }
+                            Self::evict_same_ip_stale_ports(&mut map, src_addr);
+                            if !Self::can_admit_client(&map, src_addr) {
+                                // At capacity: feedback from an unknown peer must not
+                                // grow the map or execute any remote commands.
+                                continue;
+                            }
+                            let is_usb = is_usb_subnet_ip(src_addr.ip());
+                            newly_joined = true;
+                            newly_joined_usb = is_usb;
+                            allow_remote_commands = true;
+                            map.insert(
+                                src_addr,
+                                ConnectedClient {
+                                    addr: src_addr,
+                                    last_seen: Instant::now(),
+                                    is_usb,
+                                    muted: false,
+                                    fec_rate_permille: fb.fec_rate_permille,
+                                    bluetooth_delay_ms: fb.bluetooth_delay_ms,
+                                    hardware_delay_ms: fb.hardware_delay_ms,
+                                    client_volume: fb.client_volume,
+                                    gaming_lock: gaming_lock_update.unwrap_or(false),
+                                    feedback_window: accepted_window,
+                                },
+                            );
+                        }
 
-                    // Compressed-codec backend selection from the phone UI:
-                    // 20 = pure-Rust VBR (default), 21 = bundled Opus RLD.
-                    // This is separate from the quality profile and only
-                    // affects compressed modes.
-                    // 40/41 carry the client's 5 ms hard-lock state so the
-                    // host can tighten packetization for the session.
-                    match fb.requested_mode {
-                        20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
-                        21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
-                        40 => gaming_lock_update = Some(false),
-                        41 => gaming_lock_update = Some(true),
-                        _ => {}
-                    }
-
-                    // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
-                    // Keep this range below 20 so codec-backend commands are
-                    // not mistaken for transport commands.
-                    if (10..20).contains(&fb.requested_mode) {
-                        let cmd = match fb.requested_mode {
-                            10 => bt_optimization::RemoteMediaCommand::PlayPause,
-                            11 => bt_optimization::RemoteMediaCommand::NextTrack,
-                            12 => bt_optimization::RemoteMediaCommand::PrevTrack,
-                            _ => bt_optimization::RemoteMediaCommand::None,
-                        };
-                        bt_optimization::execute_remote_media_command(cmd);
-                    }
-
-                    // Remote quality-mode selection from the phone UI:
-                    // 1=Smart Auto, 2=Studio Lossless, 3=Low-Latency Compressed,
-                    // 4=Max Stability (10 ms 2.4 GHz), 5=Studio Lossless 24-bit.
-                    // Bitrate selections are 30=96, 31=160, 32=256, 33=320 kbps.
-                    // Other values are media transport or codec-backend
-                    // commands handled above.
-                    if (1..=5).contains(&fb.requested_mode) {
                         telemetry
-                            .quality_profile
-                            .store(fb.requested_mode - 1, Ordering::Relaxed);
-                    } else {
-                        let kbps = match fb.requested_mode {
-                            30 => Some(96u16),
-                            31 => Some(160),
-                            32 => Some(256),
-                            33 => Some(320),
-                            _ => None,
-                        };
-                        if let Some(kbps) = kbps {
-                            telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                            .active_clients_count
+                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
+
+                        // Fast attack / paced release. A borderline link
+                        // that alternates between 5% and 0% loss must not
+                        // recreate the Opus encoder every 500 ms. Muted
+                        // clients do not receive audio, so they cannot drive
+                        // the governor.
+                        let raw_worst = map
+                            .values()
+                            .filter(|c| !c.muted)
+                            .map(|c| c.fec_rate_permille)
+                            .max()
+                            .unwrap_or(0);
+                        let now_fb = Instant::now();
+                        loss_governor.update(raw_worst, now_fb);
+                        Self::refresh_client_delay_telemetry(&map, &telemetry);
+                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
+
+                        cached_targets.clear();
+                        for c in map.values() {
+                            if !c.muted {
+                                cached_targets.push(c.addr);
+                            }
+                        }
+                        cached_all_usb = Self::all_active_targets_are_usb(&map);
+                        clean_link_promoter.update(
+                            raw_worst,
+                            loss_governor.value,
+                            telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
+                            cached_all_usb,
+                            !cached_targets.is_empty(),
+                            now_fb,
+                        );
+                    }
+
+                    if allow_remote_commands {
+                        // Compressed-codec backend selection from the phone UI:
+                        // 20 = pure-Rust VBR, 21 = bundled Opus RLD.
+                        match fb.requested_mode {
+                            20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
+                            21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
+                            _ => {}
+                        }
+
+                        // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
+                        if (10..20).contains(&fb.requested_mode) {
+                            let cmd = match fb.requested_mode {
+                                10 => bt_optimization::RemoteMediaCommand::PlayPause,
+                                11 => bt_optimization::RemoteMediaCommand::NextTrack,
+                                12 => bt_optimization::RemoteMediaCommand::PrevTrack,
+                                _ => bt_optimization::RemoteMediaCommand::None,
+                            };
+                            bt_optimization::execute_remote_media_command(cmd);
+                        }
+
+                        // Remote quality-mode (1..=5) and bitrate (30..=34) selection.
+                        if (1..=5).contains(&fb.requested_mode) {
+                            telemetry
+                                .quality_profile
+                                .store(fb.requested_mode - 1, Ordering::Relaxed);
+                        } else {
+                            let kbps = match fb.requested_mode {
+                                30 => Some(96u16),
+                                31 => Some(160),
+                                32 => Some(256),
+                                33 => Some(320),
+                                34 => Some(510),
+                                _ => None,
+                            };
+                            if let Some(kbps) = kbps {
+                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                            }
                         }
                     }
 
-                    let mut map = clients.lock().unwrap();
-                    Self::evict_same_ip_stale_ports(&mut map, src_addr);
-                    if !Self::can_admit_client(&map, src_addr) {
-                        // At capacity: feedback from an unknown peer must not
-                        // grow the map beyond the u8-safe cap.
-                        continue;
-                    }
-                    let newly_joined = !map.contains_key(&src_addr);
-                    let entry = map.entry(src_addr).or_insert(ConnectedClient {
-                        addr: src_addr,
-                        last_seen: Instant::now(),
-                        is_usb,
-                        muted: false,
-                        fec_rate_permille: fb.fec_rate_permille,
-                        bluetooth_delay_ms: fb.bluetooth_delay_ms,
-                        hardware_delay_ms: fb.hardware_delay_ms,
-                        client_volume: fb.client_volume,
-                        gaming_lock: false,
-                        feedback_window: accepted_window,
-                    });
-                    entry.last_seen = Instant::now();
-                    entry.fec_rate_permille = fb.fec_rate_permille;
-                    entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
-                    entry.hardware_delay_ms = fb.hardware_delay_ms;
-                    entry.client_volume = fb.client_volume;
-                    if let Some(gaming_lock) = gaming_lock_update {
-                        entry.gaming_lock = gaming_lock;
-                    }
-                    telemetry
-                        .active_clients_count
-                        .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
-
-                    // Fast attack / paced release. A borderline link
-                    // that alternates between 5% and 0% loss must not
-                    // recreate the Opus encoder every 500 ms. Muted
-                    // clients do not receive audio, so they cannot drive
-                    // the governor.
-                    let raw_worst = map
-                        .values()
-                        .filter(|c| !c.muted)
-                        .map(|c| c.fec_rate_permille)
-                        .max()
-                        .unwrap_or(0);
-                    loss_governor.update(raw_worst, Instant::now());
-                    Self::refresh_client_delay_telemetry(&map, &telemetry);
-                    Self::refresh_gaming_lock_telemetry(&map, &telemetry);
-
-                    cached_targets.clear();
-                    for c in map.values() {
-                        if !c.muted {
-                            cached_targets.push(c.addr);
-                        }
-                    }
-                    cached_all_usb = Self::all_active_targets_are_usb(&map);
-                    drop(map);
                     if newly_joined {
                         audioshare_protocol::diagnostics::info(
                             "host-clients",
                             format!(
                                 "join {} usb={} (total {})",
                                 src_addr,
-                                is_usb,
+                                newly_joined_usb,
                                 telemetry.active_clients_count.load(Ordering::Relaxed)
                             ),
                         );
@@ -3133,13 +3521,31 @@ impl HostEngine {
                             ),
                         );
                     }
-                    let raw_worst = map
+                    let now_sweep = Instant::now();
+                    if map.is_empty() {
+                        // Reset the loss governor once all clients have left so
+                        // a new clean session never inherits a stale 12-90 s hold.
+                        loss_governor = LossGovernor::new(now_sweep);
+                    } else {
+                        // Only include clients with fresh feedback (< 3 s) so a
+                        // crashed/disconnecting lossy peer cannot re-arm a 90 s
+                        // hold for 9 seconds while waiting for the 10 s expiry.
+                        let raw_worst = map
+                            .values()
+                            .filter(|c| {
+                                !c.muted && c.last_seen.elapsed() < Duration::from_secs(3)
+                            })
+                            .map(|c| c.fec_rate_permille)
+                            .max()
+                            .unwrap_or(0);
+                        loss_governor.update(raw_worst, now_sweep);
+                    }
+                    let raw_worst_for_promo = map
                         .values()
-                        .filter(|c| !c.muted)
+                        .filter(|c| !c.muted && c.last_seen.elapsed() < Duration::from_secs(3))
                         .map(|c| c.fec_rate_permille)
                         .max()
                         .unwrap_or(0);
-                    loss_governor.update(raw_worst, Instant::now());
                     Self::refresh_client_delay_telemetry(&map, &telemetry);
                     Self::refresh_gaming_lock_telemetry(&map, &telemetry);
                     cached_targets.clear();
@@ -3149,6 +3555,14 @@ impl HostEngine {
                         }
                     }
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
+                    clean_link_promoter.update(
+                        raw_worst_for_promo,
+                        loss_governor.value,
+                        telemetry.max_client_bt_delay_ms.load(Ordering::Relaxed) > 0,
+                        cached_all_usb,
+                        !cached_targets.is_empty(),
+                        now_sweep,
+                    );
                 }
             }
 
@@ -3160,7 +3574,7 @@ impl HostEngine {
             let selected_kbps = telemetry
                 .target_bitrate_kbps
                 .load(Ordering::Relaxed)
-                .clamp(96, 320);
+                .clamp(64, 510);
             // Framing/profile/bitrate decisions are factored into
             // `select_tx_profile` so the BT/gaming-lock guardrails are shared
             // with unit tests. Tier selection uses the governor's paced
@@ -3181,6 +3595,10 @@ impl HostEngine {
                 any_wifi,
                 cached_all_usb,
             );
+            let use_pcm24 = profile == QualityProfile::StudioLossless24Bit
+                || (profile == QualityProfile::SmartAuto
+                    && dynamic_codec_mode == CodecMode::StudioLosslessLpc
+                    && clean_link_promoter.is_master_24bit());
             // Compressed-codec backend selection. Opus is opt-in and only
             // replaces the payload of compressed profiles; lossless and
             // 24-bit modes are untouched. If encoder creation fails we stay
@@ -3352,7 +3770,7 @@ impl HostEngine {
 
                 // Studio Master 24-bit must preserve -85..-100 dBFS reverb
                 // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
-                let active_audio = if profile == QualityProfile::StudioLossless24Bit {
+                let active_audio = if use_pcm24 {
                     f32_subframe.iter().any(|s| s.abs() > 1.0e-5)
                 } else {
                     max_abs > 3
@@ -3388,11 +3806,12 @@ impl HostEngine {
             if !has_targets || is_dtx_active {
                 opus_encoder = None;
                 fec_hist_len = 0;
+                has_prev_subframe = false;
+                prev_f32_subframe.fill(0.0);
                 // DTX silence entry (and zero-client standby) invalidates the
                 // Opus RED ring: receivers reset their sequencer on the silence
                 // heartbeat, so old blobs must never be replayed afterwards.
-                opus_red_prev1_len = 0;
-                opus_red_prev2_len = 0;
+                opus_red.clear();
             }
             if !prefer_opus {
                 opus_encoder = None;
@@ -3401,7 +3820,9 @@ impl HostEngine {
             // Lazily allocate the Opus encoder only for a real, audible packet
             // with at least one receiver. Both zero-client standby and DTX
             // silence leave it None, so neither can trigger the old 200 Hz
-            // alloc/drop cycle.
+            // alloc/drop cycle. When switching into Opus mid-stream, prime the
+            // new encoder's 2.5 ms lookahead with the previous live subframe so
+            // the first transmitted Opus frame does not drop to digital silence.
             if has_targets
                 && !is_dtx_active
                 && dynamic_codec_mode == CodecMode::OpusRld
@@ -3415,6 +3836,8 @@ impl HostEngine {
                 opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                 if opus_encoder.is_none() {
                     opus_encoder_failed = true;
+                } else if has_prev_subframe {
+                    warm_opus_lookahead(&mut opus_encoder, &prev_f32_subframe, tx_bitrate_kbps);
                 }
             }
             if dynamic_codec_mode == CodecMode::OpusRld && opus_encoder_failed {
@@ -3511,7 +3934,20 @@ impl HostEngine {
                             primary_bundle[primary_cursor..primary_cursor + enc_len]
                                 .copy_from_slice(&enc_primary[..enc_len]);
                             primary_cursor += enc_len;
-                        } else if profile == QualityProfile::StudioLossless24Bit {
+                        } else if use_pcm24 {
+                            // Keep SmartAuto's warm Opus lookahead primed even
+                            // while promoted to 24-bit Master so a sudden Wi-Fi
+                            // fade never drops to silence on entry into Opus.
+                            if profile == QualityProfile::SmartAuto
+                                && prefer_opus
+                                && !cached_all_usb
+                            {
+                                warm_opus_lookahead(
+                                    &mut opus_encoder,
+                                    &f32_subframes[sub_idx],
+                                    tx_bitrate_kbps,
+                                );
+                            }
                             // Encode from the original f32 samples (not the i16
                             // noise-shaper output) so the lower 8 bits carry
                             // genuine 24-bit resolution when available.
@@ -3539,7 +3975,7 @@ impl HostEngine {
                             {
                                 warm_opus_lookahead(
                                     &mut opus_encoder,
-                                    &i16_subframes[sub_idx],
+                                    &f32_subframes[sub_idx],
                                     tx_bitrate_kbps,
                                 );
                             }
@@ -3556,7 +3992,21 @@ impl HostEngine {
                         }
                         subframe_ranges[sub_idx] = (entry_start, primary_cursor);
                     }
+                    // Leaving Opus for any non-SmartAuto-Tier0 profile (e.g.
+                    // manual StudioLossless / 24-bit / VBR): drop the stale
+                    // Opus encoder immediately so a later switch back to Opus
+                    // allocates a fresh encoder primed with live audio rather
+                    // than replaying stale lookahead samples from seconds ago.
+                    let keep_warm_for_smart_auto = profile == QualityProfile::SmartAuto
+                        && dynamic_codec_mode == CodecMode::StudioLosslessLpc
+                        && prefer_opus
+                        && !cached_all_usb;
+                    if !keep_warm_for_smart_auto {
+                        opus_encoder = None;
+                    }
                 }
+                prev_f32_subframe = f32_subframes[subframes_per_pkt - 1];
+                has_prev_subframe = true;
             } else if profile != QualityProfile::SmartAuto {
                 // Leaving compressed/SmartAuto: drop the codec state so a
                 // later compressed period starts clean. SmartAuto Tier 0
@@ -3580,8 +4030,7 @@ impl HostEngine {
             // empty ring instead of replaying blobs from a stale session.
             let opus_red_active = dynamic_codec_mode == CodecMode::OpusRld && !cached_all_usb;
             if !opus_red_active {
-                opus_red_prev1_len = 0;
-                opus_red_prev2_len = 0;
+                opus_red.clear();
             }
 
             let tx_timestamp_us = start_instant.elapsed().as_micros() as u32;
@@ -3639,7 +4088,7 @@ impl HostEngine {
                         &telemetry,
                     );
                 }
-            } else {
+            } else if has_targets {
                 let hdr = WireHeader {
                     mode: dynamic_codec_mode,
                     subframe_count: subframes_per_pkt as u8,
@@ -3668,14 +4117,21 @@ impl HostEngine {
                     },
                     header_crc16: 0,
                 };
-                // 2.4 GHz 10 ms framing carries the previous four subframes
-                // across the two FEC fields: [N-1,N-3] and [N-2,N-4]. Each
-                // field stays <= 255 bytes, so the wire header is unchanged;
-                // old clients decode the first 124-byte frame of each field
-                // (N-1/N-2) and ignore the rest. Opus skips ADPCM FEC on the
-                // client, so the pair is only packed for the pure-Rust VBR
-                // backend.
-                let pair_fec = subframes_per_pkt == 4 && dynamic_codec_mode != CodecMode::OpusRld;
+                // Pack paired 4-subframe ADPCM FEC ([N-1,N-3] + [N-2,N-4]) on
+                // 4-sf framing AND opportunistically on 2-sf framing whenever
+                // the full 496-byte pair fits inside the safe UDP MTU (e.g.
+                // LPC-compressed 16-bit Lossless and Adaptive VBR). That lets a
+                // Wi-Fi signal dip drop two consecutive 5 ms packets (10 ms)
+                // and still heal every subframe cleanly without PLC or extra
+                // packet splitting.
+                let pair_fec = dynamic_codec_mode != CodecMode::OpusRld
+                    && (subframes_per_pkt == 4
+                        || (subframes_per_pkt >= 2
+                            && datagram_fits(
+                                primary_cursor,
+                                active_key.is_some(),
+                                ADPCM_FEC_BYTES * 4,
+                            )));
                 let mut fec_pair_1 = [0u8; ADPCM_FEC_BYTES * 2];
                 let mut fec_pair_2 = [0u8; ADPCM_FEC_BYTES * 2];
                 // Non-Opus modes keep the existing ADPCM FEC packing exactly
@@ -3683,10 +4139,7 @@ impl HostEngine {
                 // packets ([P-1] in fec_n1, [P-2] in fec_n2); OpusRld on a pure
                 // USB session leaves both slots empty.
                 let (full_n1, full_n2): (&[u8], &[u8]) = if opus_red_active {
-                    (
-                        &opus_red_prev1[..opus_red_prev1_len],
-                        &opus_red_prev2[..opus_red_prev2_len],
-                    )
+                    opus_red.fec_slices()
                 } else if suppress_adpcm_fec {
                     (&[], &[])
                 } else {
@@ -3798,21 +4251,10 @@ impl HostEngine {
                 }
                 if ranges_ok {
                     // [P-1] becomes [P-2]; P becomes the new [P-1].
-                    opus_red_prev2[..opus_red_prev2_len]
-                        .copy_from_slice(&opus_red_prev1[..opus_red_prev1_len]);
-                    opus_red_prev2_len = opus_red_prev1_len;
-                    match pack_opus_red_blob(
-                        base_seq,
-                        &cur_opus_slices[..n],
-                        &mut opus_red_prev1,
-                    ) {
-                        Some(len) => opus_red_prev1_len = len,
-                        None => opus_red_prev1_len = 0,
-                    }
+                    opus_red.push_packet(base_seq, &cur_opus_slices[..n]);
                 } else {
                     // Defensive: no usable Opus payloads -> drop both slots.
-                    opus_red_prev1_len = 0;
-                    opus_red_prev2_len = 0;
+                    opus_red.clear();
                 }
             }
 
@@ -4389,7 +4831,9 @@ mod tests {
     fn test_is_usb_subnet_ip_recognizes_loopback_and_legacy_rndis() {
         assert!(is_usb_subnet_ip("127.0.0.1".parse().unwrap()));
         assert!(is_usb_subnet_ip("192.168.42.7".parse().unwrap()));
-        assert!(is_usb_subnet_ip("192.168.137.7".parse().unwrap()));
+        // Windows Wi-Fi Direct SoftAP / Mobile Hotspot uses 192.168.137.0/24
+        // and must NOT be hardcoded as wired USB (wireless clients need RED/pacing).
+        assert!(!is_usb_subnet_ip("192.168.137.7".parse().unwrap()));
         // TEST-NET-3 is never a local tethering subnet.
         assert!(!is_usb_subnet_ip("203.0.113.7".parse().unwrap()));
         assert!(!is_usb_subnet_ip("2001:db8::1".parse().unwrap()));
@@ -4639,10 +5083,13 @@ mod tests {
         assert_eq!(stability_bitrate_kbps(128, 0), 128);
         assert_eq!(stability_bitrate_kbps(160, 0), 160);
         assert_eq!(stability_bitrate_kbps(320, 0), 160);
-        // Exactly 20% loss keeps the normal stability rung; above it, 96.
+        // Exactly 20% loss keeps the normal stability rung; above it, 96;
+        // above 28% severe loss, the 64 kbps survival rung keeps weak links alive.
         assert_eq!(stability_bitrate_kbps(320, 200), 160);
         assert_eq!(stability_bitrate_kbps(320, 201), 96);
-        assert_eq!(stability_bitrate_kbps(96, 900), 96);
+        assert_eq!(stability_bitrate_kbps(320, 280), 96);
+        assert_eq!(stability_bitrate_kbps(320, 281), 64);
+        assert_eq!(stability_bitrate_kbps(96, 900), 64);
     }
 
     #[test]
@@ -4992,31 +5439,31 @@ mod tests {
 
         // 5% loss arms compressed mode.
         assert_eq!(governor.update(50, base), 50);
-        // The next 0% report cannot step back up while the hold is open.
+        // The next 0% report cannot step back up while the 12 s hold is open.
         assert_eq!(governor.update(0, base + Duration::from_millis(500)), 50);
-        assert_eq!(governor.update(0, base + Duration::from_millis(4_999)), 50);
+        assert_eq!(governor.update(0, base + Duration::from_millis(11_999)), 50);
         // The hold expires: first 25-permille step instead of a cliff to 0.
-        assert_eq!(governor.update(0, base + Duration::from_millis(5_000)), 25);
+        assert_eq!(governor.update(0, base + Duration::from_millis(12_000)), 25);
         // Once below the 4.5% tier boundary the residual estimate no longer
         // changes the profile, so the next report snaps to the live value.
-        assert_eq!(governor.update(0, base + Duration::from_millis(5_001)), 0);
+        assert_eq!(governor.update(0, base + Duration::from_millis(12_001)), 0);
 
         // A high-loss burst re-arms the window and walks Tier 2 -> Tier 1 ->
         // Tier 0 in 500 ms steps instead of a single 3.9x bitrate jump. Start
-        // it past the 15 s flapping window so this asserts paced release only
-        // (a quick re-exceedance would escalate the hold instead).
-        let t = base + Duration::from_millis(21_000);
+        // it past the 20 s flapping window (12 s + 20 s = 32 s) so this asserts
+        // paced release only (a quick re-exceedance would escalate the hold).
+        let t = base + Duration::from_secs(40);
         assert_eq!(governor.update(130, t), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(4_900)), 130);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_000)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(11_900)), 130);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_000)), 105);
         // Several clients may report inside one 500 ms interval; the decay
         // must not run once per call.
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_001)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_400)), 105);
-        assert_eq!(governor.update(0, t + Duration::from_millis(5_500)), 80);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_000)), 55);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_500)), 30);
-        assert_eq!(governor.update(0, t + Duration::from_millis(6_501)), 0);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_001)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_400)), 105);
+        assert_eq!(governor.update(0, t + Duration::from_millis(12_500)), 80);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_000)), 55);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_500)), 30);
+        assert_eq!(governor.update(0, t + Duration::from_millis(13_501)), 0);
 
         // Sub-threshold noise never arms the hold and does not linger.
         let mut governor = LossGovernor::new(base);
@@ -5029,68 +5476,68 @@ mod tests {
         let base = Instant::now();
         let mut governor = LossGovernor::new(base);
 
-        // Baseline: an attack uses the 5 s hold, then steps 50 -> 25. That
+        // Baseline: an attack uses the 12 s hold, then steps 50 -> 25. That
         // step is the release back below the compression threshold.
         assert_eq!(governor.update(50, base), 50);
-        assert_eq!(governor.hold_secs, 5);
-        assert_eq!(governor.update(0, base + Duration::from_secs(5)), 25);
+        assert_eq!(governor.hold_secs, 12);
+        assert_eq!(governor.update(0, base + Duration::from_secs(12)), 25);
         assert_eq!(
-            governor.update(0, base + Duration::from_secs(5) + Duration::from_millis(1)),
+            governor.update(0, base + Duration::from_secs(12) + Duration::from_millis(1)),
             0
         );
         assert_eq!(
             governor.last_release_at,
-            Some(base + Duration::from_secs(5))
+            Some(base + Duration::from_secs(12))
         );
 
         // Loss returns 1 s after the release: flapping. The hold backs off
-        // 5 -> 15 s and the estimate stays pinned past the old 5 s window.
-        let t1 = base + Duration::from_secs(6);
+        // 12 -> 36 s and the estimate stays pinned past the old 12 s window.
+        let t1 = base + Duration::from_secs(13);
         assert_eq!(governor.update(50, t1), 50);
-        assert_eq!(governor.hold_secs, 15);
-        assert_eq!(governor.update(0, t1 + Duration::from_secs(14)), 50);
-        assert_eq!(governor.update(0, t1 + Duration::from_secs(15)), 25);
+        assert_eq!(governor.hold_secs, 36);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(35)), 50);
+        assert_eq!(governor.update(0, t1 + Duration::from_secs(36)), 25);
         assert_eq!(
-            governor.update(0, t1 + Duration::from_secs(15) + Duration::from_millis(1)),
+            governor.update(0, t1 + Duration::from_secs(36) + Duration::from_millis(1)),
             0
         );
 
-        // A second quick re-exceedance backs off 15 -> 45 s (the cap).
-        let t2 = t1 + Duration::from_secs(16);
+        // A second quick re-exceedance backs off 36 -> 90 s (the cap).
+        let t2 = t1 + Duration::from_secs(37);
         assert_eq!(governor.update(50, t2), 50);
-        assert_eq!(governor.hold_secs, 45);
-        assert_eq!(governor.update(0, t2 + Duration::from_secs(30)), 50);
-        assert_eq!(governor.update(0, t2 + Duration::from_secs(45)), 25);
+        assert_eq!(governor.hold_secs, 90);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(60)), 50);
+        assert_eq!(governor.update(0, t2 + Duration::from_secs(90)), 25);
         assert_eq!(
-            governor.update(0, t2 + Duration::from_secs(45) + Duration::from_millis(1)),
+            governor.update(0, t2 + Duration::from_secs(90) + Duration::from_millis(1)),
             0
         );
 
-        // Further flapping stays capped at 45 s.
-        let t3 = t2 + Duration::from_secs(46);
+        // Further flapping stays capped at 90 s.
+        let t3 = t2 + Duration::from_secs(91);
         assert_eq!(governor.update(50, t3), 50);
-        assert_eq!(governor.hold_secs, 45);
-        let released_at = t3 + Duration::from_secs(45);
+        assert_eq!(governor.hold_secs, 90);
+        let released_at = t3 + Duration::from_secs(90);
         assert_eq!(governor.update(0, released_at), 25);
         assert_eq!(governor.update(0, released_at + Duration::from_millis(1)), 0);
-        assert_eq!(governor.hold_secs, 45);
+        assert_eq!(governor.hold_secs, 90);
 
-        // A long, uninterrupted sub-threshold stretch clears the back-off.
-        assert_eq!(governor.update(0, released_at + Duration::from_secs(60)), 0);
-        assert_eq!(governor.hold_secs, 5);
+        // A long, uninterrupted 90 s sub-threshold stretch clears the back-off.
+        assert_eq!(governor.update(0, released_at + Duration::from_secs(90)), 0);
+        assert_eq!(governor.hold_secs, 12);
     }
 
     #[test]
     fn test_warm_opus_lookahead_primes_first_packet() {
         use audioshare_protocol::opus_codec::{OpusStreamDecoder, TAG_OPUS_RLD};
 
-        fn tone(freq: f32, start_sample: usize) -> [i16; SUBFRAME_STEREO_SAMPLES] {
-            let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        fn tone(freq: f32, start_sample: usize) -> [f32; SUBFRAME_STEREO_SAMPLES] {
+            let mut pcm = [0.0f32; SUBFRAME_STEREO_SAMPLES];
             for i in 0..SUBFRAME_FRAMES {
                 let t = ((start_sample + i) as f32) / (SAMPLE_RATE as f32);
-                let sample = (t * freq * std::f32::consts::TAU).sin() * 0.25 * 32767.0;
-                pcm[i * 2] = sample as i16;
-                pcm[i * 2 + 1] = sample as i16;
+                let sample = (t * freq * std::f32::consts::TAU).sin() * 0.25;
+                pcm[i * 2] = sample;
+                pcm[i * 2 + 1] = sample;
             }
             pcm
         }
@@ -5099,13 +5546,13 @@ mod tests {
         let current = tone(1200.0, SUBFRAME_FRAMES);
         let mut encoder = Some(OpusStreamEncoder::new(128).expect("create Opus encoder"));
 
-        // Tier 0 keeps the encoder primed with live lossless audio.
+        // Tier 0 / mid-stream switch into Opus primes the encoder with live f32 audio.
         warm_opus_lookahead(&mut encoder, &previous, 128);
         let mut payload = [0u8; MAX_OPUS_SUBFRAME_BYTES];
         let len = encoder
             .as_mut()
             .expect("warm encoder")
-            .encode_subframe(&current, 128, &mut payload)
+            .encode_subframe_f32(&current, 128, &mut payload)
             .expect("encode first transmitted frame");
         assert_eq!(payload[0], TAG_OPUS_RLD);
 
@@ -5113,11 +5560,8 @@ mod tests {
         let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         assert!(decoder.decode_subframe(&payload[..len], &mut decoded));
 
-        let dot = |lhs: &[f32; SUBFRAME_STEREO_SAMPLES], rhs: &[i16; SUBFRAME_STEREO_SAMPLES]| {
-            lhs.iter()
-                .zip(rhs.iter())
-                .map(|(a, b)| *a * (*b as f32 / 32768.0))
-                .sum::<f32>()
+        let dot = |lhs: &[f32; SUBFRAME_STEREO_SAMPLES], rhs: &[f32; SUBFRAME_STEREO_SAMPLES]| {
+            lhs.iter().zip(rhs.iter()).map(|(a, b)| *a * *b).sum::<f32>()
         };
         let dot_previous = dot(&decoded, &previous);
         let dot_current = dot(&decoded, &current);
@@ -5721,6 +6165,168 @@ mod tests {
         assert!(
             !resampled.stereo_out.is_empty(),
             "resampling needs scratch"
+        );
+    }
+
+    /// P0 regression: driving >= 5 consecutive 4-subframe Opus RLD packets
+    /// through the live `HostEngine::realtime_tx_loop` starting from empty
+    /// RED history (`prev1_len = 0, prev2_len = 0`) must never panic on
+    /// shifting `[P-1] -> [P-2]`, and must attach valid `TAG_OPUS_RED` blobs
+    /// on packets 2..5.
+    #[test]
+    fn test_host_tx_opus_rld_max_stability_red_shift_no_panic() {
+        use audioshare_protocol::opus_codec::{unpack_opus_red_blob, TAG_OPUS_RED};
+        use audioshare_protocol::wire::ParsedPacket;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind loopback rx");
+        rx.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set read timeout");
+        let rx_addr = rx.local_addr().expect("rx local addr");
+        // Include one non-USB/non-loopback target (RFC 5737 TEST-NET-1) so
+        // `cached_all_usb` is false and `opus_red_active` stays enabled on the
+        // live TX loop while `rx_addr` receives every datagram locally.
+        let wifi_dummy = SocketAddr::from(([192, 0, 2, 1], 65530));
+
+        let config = HostConfig {
+            bind_port: 0,
+            use_test_tone: true,
+            subframes_per_packet: 4,
+            enable_smart_dtx: false,
+        };
+        let mut engine =
+            HostEngine::start(config, vec![rx_addr, wifi_dummy]).expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::MaxStability24Ghz as u8, Ordering::Relaxed);
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        let mut opus_packets_seen = 0usize;
+        let mut saw_n1_only = false;
+        let mut saw_both_red = 0usize;
+        let mut buf = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let deadline = Instant::now() + Duration::from_secs(3);
+
+        while opus_packets_seen < 6 && Instant::now() < deadline {
+            match rx.recv(&mut buf) {
+                Ok(len) => {
+                    let Ok(parsed) = ParsedPacket::parse_and_decrypt(&mut buf[..len], None) else {
+                        continue;
+                    };
+                    if parsed.header.mode != CodecMode::OpusRld
+                        || parsed.header.subframe_count != 4
+                    {
+                        continue;
+                    }
+                    let n1 = parsed.fec_n1_payload;
+                    let n2 = parsed.fec_n2_payload;
+                    if !n1.is_empty() {
+                        assert_eq!(n1[0], TAG_OPUS_RED, "fec_n1 must be TAG_OPUS_RED");
+                        let mut sf_count = 0usize;
+                        assert!(
+                            unpack_opus_red_blob(n1, |_, _| sf_count += 1),
+                            "fec_n1 RED blob must unpack cleanly"
+                        );
+                        assert_eq!(sf_count, 4);
+                        if n2.is_empty() {
+                            saw_n1_only = true;
+                        }
+                    }
+                    if !n2.is_empty() {
+                        assert_eq!(n2[0], TAG_OPUS_RED, "fec_n2 must be TAG_OPUS_RED");
+                        let mut sf_count = 0usize;
+                        assert!(
+                            unpack_opus_red_blob(n2, |_, _| sf_count += 1),
+                            "fec_n2 RED blob must unpack cleanly"
+                        );
+                        assert_eq!(sf_count, 4);
+                        if !n1.is_empty() {
+                            saw_both_red += 1;
+                        }
+                    }
+                    opus_packets_seen += 1;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        engine.stop();
+        assert!(
+            opus_packets_seen >= 5,
+            "expected >= 5 consecutive 4-subframe Opus RLD packets, got {opus_packets_seen}"
+        );
+        assert!(
+            saw_n1_only,
+            "expected ramp-up packet with [P-1] RED present and [P-2] empty"
+        );
+        assert!(
+            saw_both_red >= 3,
+            "expected steady-state packets with both [P-1] and [P-2] RED blobs, got {saw_both_red}"
+        );
+    }
+
+    #[test]
+    fn test_clean_link_promoter_upgrades_to_24bit_and_demotes_cleanly() {
+        let mut promoter = CleanLinkPromoter::new();
+        let t0 = Instant::now();
+
+        // Wi-Fi link stays 16-bit before 30 s of spotless reception.
+        assert!(!promoter.update(0, 0, false, false, true, t0));
+        assert!(!promoter.update(2, 2, false, false, true, t0 + Duration::from_secs(29)));
+        // At 30 s spotless, promotes to 24-bit Studio Master (~2.8-4.5+ Mbps).
+        assert!(promoter.update(1, 1, false, false, true, t0 + Duration::from_secs(30)));
+        assert!(promoter.is_master_24bit());
+
+        // Minor 4‰ blip holds 24-bit (hysteresis <= 5‰), >5‰ steps cleanly back to 16-bit.
+        assert!(promoter.update(4, 4, false, false, true, t0 + Duration::from_secs(31)));
+        assert!(!promoter.update(6, 6, false, false, true, t0 + Duration::from_secs(32)));
+
+        // Pure USB promotes immediately with zero wait.
+        assert!(promoter.update(0, 0, false, true, true, t0 + Duration::from_secs(33)));
+        // Active Bluetooth never promotes to 24-bit Master.
+        assert!(!promoter.update(0, 0, true, true, true, t0 + Duration::from_secs(34)));
+    }
+
+    #[test]
+    fn test_select_tx_profile_smooth_bandwidth_ladder() {
+        // Explicit LowLatencyCompressed supports up to 510 kbps when user requests it.
+        assert_eq!(
+            select_tx_profile(
+                QualityProfile::LowLatencyCompressed,
+                2,
+                510,
+                0,
+                false,
+                false,
+                true,
+                false
+            ),
+            (CodecMode::CompressedLowDelay, 2, 510)
+        );
+        // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf -> 96k 4sf -> 64k 4sf.
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 0, false, false, true, false),
+            (CodecMode::StudioLosslessLpc, 2, 510)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 50, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 2, 320)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 90, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 2, 224)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 150, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 160)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 220, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 96)
+        );
+        assert_eq!(
+            select_tx_profile(QualityProfile::SmartAuto, 2, 510, 320, false, false, true, false),
+            (CodecMode::CompressedLowDelay, 4, 64)
         );
     }
 }

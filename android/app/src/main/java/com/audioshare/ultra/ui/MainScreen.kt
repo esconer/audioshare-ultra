@@ -511,7 +511,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         read: (AudioShareUiState) -> T,
         write: (AudioShareUiState, T) -> AudioShareUiState
     ): ReadWriteProperty<Any?, T> = object : ReadWriteProperty<Any?, T> {
-        override fun getValue(thisRef: Any?, property: KProperty<*>): T = read(state)
+        override fun getValue(thisRef: Any?, property: KProperty<*>): T {
+            // Subscribe this composition scope to `state`, while reading the
+            // live StateFlow value so synchronous read-after-write callbacks
+            // (applyDspLive / syncAndSaveDsp) always see the newly written value.
+            @Suppress("UNUSED_VARIABLE")
+            val trackedSnapshot = read(state)
+            return read(vm.uiState.value)
+        }
         override fun setValue(thisRef: Any?, property: KProperty<*>, value: T) {
             vm.update { write(it, value) }
         }
@@ -624,6 +631,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         { it.muteHostSpeakerInParty },
         { s, v -> s.copy(muteHostSpeakerInParty = v) }
     )
+    // User-locked Party Host codec & bitrate (never auto-switches mid-stream).
+    var partyCodecProfile by vmField(
+        { it.partyCodecProfile },
+        { s, v -> s.copy(partyCodecProfile = v) }
+    )
+    var partyBitrateKbps by vmField(
+        { it.partyBitrateKbps },
+        { s, v -> s.copy(partyBitrateKbps = v) }
+    )
     var sleepTimerMinutes by vmField(
         { it.sleepRemainingMins },
         { s, v -> s.copy(sleepRemainingMins = v) }
@@ -648,8 +664,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     var showCodecDrawer by vmField({ it.showCodecDrawer }, { s, v -> s.copy(showCodecDrawer = v) })
 
     /** Zero-allocation live DSP update: JNI only, no SharedPreferences or intents. */
-    fun applyDspLive() {
-        AudioEngineService.nativeSetGainDb(preampGainDb)
+    fun applyDspLive(updatePreamp: Boolean = false) {
+        if (updatePreamp || !AudioEngineService.isLocallyMutedState) {
+            AudioEngineService.nativeSetGainDb(preampGainDb)
+        }
         AudioEngineService.nativeConfigureDsp(
             bassDb, vocalDb, trebleDb, channelRole,
             crossfeed, nightMode, gamingLock, dolbyEffects
@@ -657,7 +675,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     }
 
     /** Flush the final DSP values to prefs and the service after a gesture ends. */
-    fun syncAndSaveDsp() {
+    fun syncAndSaveDsp(updatePreamp: Boolean = false) {
         prefs.edit()
             .putFloat("gain_db", preampGainDb)
             .putFloat("bass_db", bassDb)
@@ -669,11 +687,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             .putBoolean("dolby_fx", dolbyEffects)
             .putInt("channel_role", channelRole)
             .apply()
-        applyDspLive()
+        applyDspLive(updatePreamp = updatePreamp)
         // Changing the preamp unmutes audio via nativeSetGainDb above. Clear
-        // the service's notification mute flag in the same gesture so the
-        // notification cannot stay stuck on "MUTED".
-        if (isConnected) {
+        // the service's notification mute flag only when the user actually
+        // adjusted the preamp while muted, so touching EQ/switches never
+        // accidentally unmutes a muted stream.
+        if (updatePreamp && isConnected && AudioEngineService.isLocallyMutedState) {
             context.startService(
                 Intent(context, AudioEngineService::class.java).apply {
                     action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
@@ -696,6 +715,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         }
     }
 
+    var showPinMismatchDialog by remember { mutableStateOf(false) }
+    var pinMismatchDraft by remember { mutableStateOf("") }
+    var lastHandledAuthFailures by remember { mutableLongStateOf(0L) }
+    var connectAttemptId by remember { mutableIntStateOf(0) }
+    var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
+    var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
+
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
     // switch back even when this screen was not the caller.
@@ -710,11 +736,19 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     // The service restores the saved music volume on every
                     // stop path, so the UI must not touch it here.
                     castPhoneInternalAudio = active
+                    val err = intent.getStringExtra(AudioEngineService.EXTRA_PARTY_CAST_ERROR)
+                    if (!err.isNullOrBlank()) {
+                        scope.launch { snackbarHostState.showSnackbar(err) }
+                    }
                 } else if (intent?.action == AudioEngineService.ACTION_PHONE_MIC_STATE) {
                     sharePhoneMic = intent.getBooleanExtra(
                         AudioEngineService.EXTRA_PHONE_MIC_ACTIVE,
                         false
                     )
+                    val err = intent.getStringExtra(AudioEngineService.EXTRA_PHONE_MIC_ERROR)
+                    if (!err.isNullOrBlank()) {
+                        scope.launch { snackbarHostState.showSnackbar(err) }
+                    }
                 } else if (intent?.action == AudioEngineService.ACTION_SLEEP_TIMER_STATE) {
                     sleepTimerMinutes = intent.getIntExtra(
                         AudioEngineService.EXTRA_SLEEP_REMAINING_MINS,
@@ -729,6 +763,16 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     if (!err.isNullOrBlank()) {
                         scope.launch { snackbarHostState.showSnackbar(err) }
                     }
+                } else if (intent?.action == AudioEngineService.ACTION_DEEP_LINK_HOST) {
+                    val linkedHost = intent.getStringExtra("HOST_ADDR").orEmpty().trim()
+                    val linkedPin = intent.getStringExtra("PIN").orEmpty().trim()
+                    if (linkedHost.isNotEmpty()) {
+                        hostAddress = linkedHost
+                        pinCode = linkedPin
+                        connectAttemptId += 1
+                        lastHandledAuthFailures = 0L
+                        showPinMismatchDialog = false
+                    }
                 }
             }
         }
@@ -737,6 +781,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             addAction(AudioEngineService.ACTION_PHONE_MIC_STATE)
             addAction(AudioEngineService.ACTION_SLEEP_TIMER_STATE)
             addAction(AudioEngineService.ACTION_STREAM_STATE)
+            addAction(AudioEngineService.ACTION_DEEP_LINK_HOST)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -755,24 +800,41 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     // Route every "connect" gesture through one place. True connection state
     // comes back via ACTION_STREAM_STATE, so we never claim success optimistically.
     fun connectToHost(addr: String, isUsb: Boolean? = null, pin: String) {
+        val cleanPin = pin.trim()
         hostAddress = addr
-        pinCode = pin
-        prefs.edit()
-            .putString("last_host_addr", addr)
-            .putString("pin_code", pin)
-            .apply()
+        pinCode = cleanPin
+        lastConnectIsUsb = isUsb
+        connectAttemptId += 1
+        lastHandledAuthFailures = 0L
+        showPinMismatchDialog = false
+        prefs.edit().putString("last_host_addr", addr).apply()
+        HostPinStore.savePin(prefs, addr, cleanPin)
         val intent = Intent(context, AudioEngineService::class.java).apply {
             putExtra("HOST_ADDR", addr)
             // A null value omits IS_USB so the service falls back to
             // auto-detecting RNDIS/USB hosts from the address.
             if (isUsb != null) putExtra("IS_USB", isUsb)
             putExtra("GAIN_DB", preampGainDb)
-            putExtra("PIN", pin)
+            putExtra("PIN", cleanPin)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
             context.startService(intent)
+        }
+        // If Phone Mic is active when switching PCs or toggling USB <-> Wi-Fi,
+        // retarget the native mic transmitter so it matches the new host & PIN.
+        if (sharePhoneMic && !castPhoneInternalAudio) {
+            val micIntent = Intent(context, AudioEngineService::class.java).apply {
+                action = AudioEngineService.ACTION_START_PHONE_MIC
+                putExtra("HOST_ADDR", addr)
+                putExtra("PIN", cleanPin)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(micIntent)
+            } else {
+                context.startService(micIntent)
+            }
         }
     }
 
@@ -797,6 +859,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             startPhoneMicInService()
         } else {
             sharePhoneMic = false
+            scope.launch {
+                snackbarHostState.showSnackbar("Microphone permission is required to share phone mic")
+            }
         }
     }
 
@@ -822,11 +887,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             if (sharePhoneMic) {
                 sharePhoneMic = false
             }
+            val cleanPin = pinCode.trim()
+            HostPinStore.savePin(prefs, hostAddress, cleanPin)
             val svcIntent = Intent(context, AudioEngineService::class.java).apply {
                 action = AudioEngineService.ACTION_START_PARTY_CAST
                 putExtra("PROJECTION_RESULT_CODE", result.resultCode)
                 putExtra("PROJECTION_DATA", resultData)
                 putExtra("TARGET_HOSTS", if (forwardPartyToPc) hostAddress else "")
+                putExtra("PIN", cleanPin)
             }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -857,6 +925,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             projectionLauncher.launch(createAudioCaptureProjectionIntent())
         } else if (!granted) {
             castPhoneInternalAudio = false
+            scope.launch {
+                snackbarHostState.showSnackbar("Audio capture permission is required for Party Mode")
+            }
         }
     }
 
@@ -869,12 +940,57 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             while (true) {
                 isConnected = AudioEngineService.isStreaming
+                castPhoneInternalAudio = AudioEngineService.isPartyCasting
+                sharePhoneMic = AudioEngineService.isPhoneMicActive
+                sleepTimerMinutes = AudioEngineService.sleepRemainingMinutes
+                if (!isConnected && !castPhoneInternalAudio && !sharePhoneMic &&
+                    (telemetry.rxPackets != 0L || telemetry.partyPacked != 0L || telemetry.vuPeak != 0L)
+                ) {
+                    telemetry = TelemetrySnapshot()
+                }
                 discoveredHosts = withContext(Dispatchers.IO) {
                     runCatching { AudioEngineService.nativeGetDiscoveredHosts() }
                         .getOrDefault("").lines().filter { it.isNotBlank() }
                 }
                 delay(2000)
             }
+        }
+    }
+
+    // Reset auth-mismatch baseline whenever disconnecting or switching targets.
+    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
+        if (!isConnected) {
+            lastHandledAuthFailures = 0L
+            showPinMismatchDialog = false
+        }
+    }
+
+    // Encrypted hosts drop feedback packets whose PIN/MAC does not verify,
+    // sending zero datagrams back. Prompt once after 2.5 s of 0 packets when
+    // the target advertises `enc=1` OR when connecting via USB (`127.0.0.1`)
+    // / manual IP (neither emits LAN discovery beacons for that exact address).
+    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
+        if (!isConnected) return@LaunchedEffect
+        val attempt = connectAttemptId
+        delay(2500)
+        if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
+            return@LaunchedEffect
+        }
+        val targetNorm = HostPinStore.normalizeHost(hostAddress)
+        val matchedLanEntry = discoveredHosts.firstOrNull { entry ->
+            val parts = entry.split("|")
+            val addr = HostPinStore.normalizeHost(parts.getOrNull(1).orEmpty())
+            addr.isNotEmpty() && addr == targetNorm
+        }
+        val targetEncryptedOnLan = matchedLanEntry?.split("|")?.getOrNull(3) == "1"
+        val isUsbOrManual = matchedLanEntry == null
+        val anyLanHostEncrypted = discoveredHosts.any { it.split("|").getOrNull(3) == "1" }
+        val shouldPromptForPin =
+            targetEncryptedOnLan || (isUsbOrManual && (anyLanHostEncrypted || pinCode.isNotEmpty()))
+        if (shouldPromptForPin && telemetry.rxPackets == 0L) {
+            promptedSilentRejectAttempt = attempt
+            pinMismatchDraft = ""
+            showPinMismatchDialog = true
         }
     }
 
@@ -888,10 +1004,22 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 if (isConnected && !AudioEngineService.isStreaming) {
                     isConnected = false
                 }
-                val raw = withContext(Dispatchers.IO) {
-                    AudioEngineService.nativeGetTelemetry()
+                val (raw, nativeAuthFailures) = withContext(Dispatchers.IO) {
+                    val stats = AudioEngineService.nativeGetTelemetry()
+                    val authFails = runCatching { AudioEngineService.nativeGetAuthFailures() }
+                        .getOrDefault(stats.getOrElse(5) { 0L })
+                    stats to authFails
                 }
                 vm.updateTelemetry(raw)
+
+                val currentAuthFailures = maxOf(raw.getOrElse(5) { 0L }, nativeAuthFailures)
+                if (isConnected && currentAuthFailures > lastHandledAuthFailures) {
+                    lastHandledAuthFailures = currentAuthFailures
+                    if (!showPinMismatchDialog) {
+                        pinMismatchDraft = ""
+                        showPinMismatchDialog = true
+                    }
+                }
 
                 if (!isConnected) {
                     delay(250)
@@ -990,6 +1118,34 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 latencyDebug = latencyDebug
             )
 
+            // Surface local speaker mute in-app (e.g. after headphone unplug or
+            // AUDIOFOCUS_LOSS) so users with notifications disabled on Android
+            // 13+ are never stranded in silent playback with no Unmute button.
+            if (isConnected && AudioEngineService.isLocallyMutedState) {
+                StudioCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Audio Muted (Headphones unplugged or focus lost)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudioColors.WarnFg,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(onClick = {
+                            val i = Intent(context, AudioEngineService::class.java).apply {
+                                action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
+                            }
+                            context.startService(i)
+                        }) {
+                            Text("Unmute")
+                        }
+                    }
+                }
+            }
+
             // Tab navigation moved to the ergonomic bottom NavigationBar above.
 
             if (selectedTab == 0) {
@@ -1075,15 +1231,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val kind = if (name.contains("Party")) "Party Phone" else "PC"
                             FilledTonalButton(
                                 onClick = {
-                                    if (encrypted && pinCode.isBlank()) {
+                                    val savedPinForHost = HostPinStore.getSavedPinForHost(prefs, addr)
+                                    val isUsbMode = mode.equals("USB", ignoreCase = true)
+                                    if (encrypted && savedPinForHost.isNullOrBlank()) {
                                         pendingEncryptedHost = entry
                                         promptPinInput = ""
                                     } else {
-                                        connectToHost(
-                                            addr,
-                                            mode.equals("USB", ignoreCase = true),
-                                            pinCode
-                                        )
+                                        val effectivePin = if (encrypted) savedPinForHost.orEmpty() else ""
+                                        connectToHost(addr, isUsbMode, effectivePin)
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth()
@@ -1159,11 +1314,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     ) {
                         FilledTonalButton(
                             onClick = {
-                                if (!isConnected) {
-                                    connectToHost("127.0.0.1:65530", true, pinCode)
-                                } else {
-                                    hostAddress = "127.0.0.1:65530"
-                                }
+                                val usbAddr = "127.0.0.1:65530"
+                                val usbPin = HostPinStore.getPin(prefs, usbAddr)
+                                connectToHost(usbAddr, true, usbPin)
                             },
                             shape = RoundedCornerShape(14.dp),
                             modifier = Modifier.weight(1f)
@@ -1202,7 +1355,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             if (showManualConnect || discoveredHosts.isEmpty()) {
                                 OutlinedTextField(
                                     value = hostAddress,
-                                    onValueChange = { hostAddress = it },
+                                    onValueChange = { nextAddr ->
+                                        hostAddress = nextAddr
+                                        pinCode = HostPinStore.getSavedPinForHost(prefs, nextAddr).orEmpty()
+                                    },
                                     label = { Text("Host IP:Port (USB RNDIS or Wi-Fi)") },
                                     singleLine = true,
                                     modifier = Modifier.fillMaxWidth()
@@ -1213,7 +1369,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 onValueChange = {
                                     pinCode = it
                                     showManualConnect = true
-                                    prefs.edit().putString("pin_code", it).apply()
+                                    HostPinStore.savePin(prefs, hostAddress, it)
                                 },
                                 label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                                 singleLine = true,
@@ -1353,7 +1509,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             bassDb = 0f
                             vocalDb = 0f
                             trebleDb = 0f
-                            syncAndSaveDsp()
+                            syncAndSaveDsp(updatePreamp = true)
                         }) {
                             Text("Reset All")
                         }
@@ -1393,9 +1549,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         valueRange = -12.0f..24.0f,
                         onValueChange = {
                             preampGainDb = it
-                            applyDspLive()
+                            applyDspLive(updatePreamp = true)
                         },
-                        onValueChangeFinished = { syncAndSaveDsp() }
+                        onValueChangeFinished = { syncAndSaveDsp(updatePreamp = true) }
                     )
                 }
 
@@ -1528,7 +1684,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 // =====================================================================
                 val modeSummary = when (qualityMode) {
                     1 -> "16-Bit"
-                    2 -> "VBR ${compressedBitrateKbps}k"
+                    2 -> "${if (useOpus) "Opus" else "VBR"} ${compressedBitrateKbps}k"
                     3 -> "10ms 2.4G"
                     4 -> "24-Bit"
                     else -> "Smart Auto"
@@ -1606,7 +1762,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val stabilityMode = qualityMode == 3
                             val bitrateChoices =
                                 if (stabilityMode) listOf(96, 160)
-                                else listOf(96, 160, 256, 320)
+                                else listOf(96, 160, 256, 320, 510)
                             val effectiveBitrate =
                                 if (stabilityMode) compressedBitrateKbps.coerceIn(96, 160)
                                 else compressedBitrateKbps
@@ -1635,7 +1791,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             }
                             if (stabilityMode) {
                                 Text(
-                                    "2.4G stability caps the target at 160 kbps and uses 96 kbps above 200‰ loss.",
+                                    "2.4G stability caps the target at 160 kbps, steps to 96 kbps above 200‰ loss, and 64 kbps above 280‰.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1708,18 +1864,90 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             title = "Also Forward to PC Receiver (Port 65532)",
                             subtitle = "Unicast stream to $hostAddress (OFF = Pure Peer Auto-Discovery)",
                             checked = forwardPartyToPc,
+                            enabled = !castPhoneInternalAudio,
                             onCheckedChange = { enabled ->
                                 forwardPartyToPc = enabled
                                 prefs.edit().putBoolean("party_forward_pc", enabled).apply()
                             }
                         )
 
+                        HorizontalDivider(color = Color(0xFF243047))
+                        Text(
+                            "Party Broadcast Codec (Locked — Never Auto-Switches)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            listOf(
+                                0 to "Opus RLD",
+                                1 to "16-Bit Lossless",
+                                2 to "10ms Stability",
+                                3 to "Rust VBR"
+                            ).forEach { (profileIdx, label) ->
+                                FilterChip(
+                                    selected = partyCodecProfile == profileIdx,
+                                    onClick = {
+                                        partyCodecProfile = profileIdx
+                                        prefs.edit().putInt("party_codec_profile", profileIdx).apply()
+                                        AudioEngineService.nativeSetPartyCodecConfig(
+                                            profileIdx,
+                                            partyBitrateKbps
+                                        )
+                                    },
+                                    label = { Text(label) }
+                                )
+                            }
+                        }
+
+                        if (partyCodecProfile != 1) {
+                            val partyStability = partyCodecProfile == 2
+                            val partyBitrateChoices =
+                                if (partyStability) listOf(96, 160)
+                                else listOf(96, 160, 256, 320)
+                            val effectivePartyBitrate =
+                                if (partyStability) partyBitrateKbps.coerceIn(96, 160)
+                                else partyBitrateKbps
+                            Text(
+                                "Party Bitrate",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            FlowRow(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                partyBitrateChoices.forEach { kbps ->
+                                    FilterChip(
+                                        selected = effectivePartyBitrate == kbps,
+                                        onClick = {
+                                            partyBitrateKbps = kbps
+                                            prefs.edit().putInt("party_bitrate_kbps", kbps).apply()
+                                            AudioEngineService.nativeSetPartyCodecConfig(
+                                                partyCodecProfile,
+                                                kbps
+                                            )
+                                        },
+                                        label = { Text("$kbps kbps") }
+                                    )
+                                }
+                            }
+                        }
+
                         AnimatedVisibility(visible = castPhoneInternalAudio) {
                             PartyTelemetrySection(
                                 telemetry = { telemetry },
                                 partySilenceWarning = partySilenceWarning,
                                 showPartyQrDialog = showPartyQrDialog,
-                                pinCode = pinCode,
+                                pinCode = if (castPhoneInternalAudio) {
+                                    AudioEngineService.activePartyPin
+                                } else {
+                                    pinCode
+                                },
                                 onSilenceWarning = { partySilenceWarning = it },
                                 onShowQr = { showPartyQrDialog = true },
                                 onDismissQr = { showPartyQrDialog = false },
@@ -1734,7 +1962,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
                     SettingSwitchRow(
                         title = "Share Phone Microphone",
-                        subtitle = "Streams low-latency AAudio hardware mic to PC Virtual Mic on Port 65532",
+                        subtitle = "Streams low-latency AAudio mic to $hostAddress (Port 65532)",
                         checked = sharePhoneMic,
                         enabled = !castPhoneInternalAudio,
                         badgeText = if (sharePhoneMic) "MIC LIVE" else null,
@@ -1745,6 +1973,23 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 }
                                 context.startService(stopIntent)
                             } else {
+                                // If the user hasn't picked a PC yet and is still
+                                // on the legacy RNDIS default, auto-pick the first
+                                // discovered PC host on LAN (excluding Party phones).
+                                if (hostAddress == "192.168.42.129:65530") {
+                                    val firstDiscovered = discoveredHosts
+                                        .firstOrNull { entry ->
+                                            val name = entry.split("|").getOrNull(0).orEmpty()
+                                            !name.contains("Party", ignoreCase = true)
+                                        }
+                                        ?.split("|")
+                                        ?.getOrNull(1)
+                                        ?.trim()
+                                    if (!firstDiscovered.isNullOrEmpty()) {
+                                        hostAddress = firstDiscovered
+                                        pinCode = HostPinStore.getPin(prefs, firstDiscovered)
+                                    }
+                                }
                                 val hasPerm = ContextCompat.checkSelfPermission(
                                     context,
                                     Manifest.permission.RECORD_AUDIO
@@ -1757,6 +2002,22 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             }
                         }
                     )
+                    AnimatedVisibility(visible = sharePhoneMic && !castPhoneInternalAudio) {
+                        val micVu = ((telemetry.partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            HorizontalDivider(color = Color(0xFF243047))
+                            Text(
+                                "Mic Target: $hostAddress -> Port 65532  •  Input Level: $micVu%",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                            Text(
+                                "On Windows: open 'App Audio Picker & Phone Microphone', click 'Start Phone Receiver', and pick 'CABLE Output (VB-Audio Virtual Cable)' as your mic.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                 }
             } // End Tab 2
         }
@@ -1830,7 +2091,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 SectionEyebrow("Manual Host IP & PIN")
                 OutlinedTextField(
                     value = hostAddress,
-                    onValueChange = { hostAddress = it },
+                    onValueChange = { nextAddr ->
+                        hostAddress = nextAddr
+                        pinCode = HostPinStore.getSavedPinForHost(prefs, nextAddr).orEmpty()
+                    },
                     label = { Text("Host IP:Port") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -1839,7 +2103,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     value = pinCode,
                     onValueChange = {
                         pinCode = it
-                        prefs.edit().putString("pin_code", it).apply()
+                        HostPinStore.savePin(prefs, hostAddress, it)
                     },
                     label = { Text("PIN (Optional, ChaCha20-Poly1305 AEAD)") },
                     singleLine = true,
@@ -1859,7 +2123,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             onDismiss = { showQrScanner = false },
             onScanned = { host, pin ->
                 showQrScanner = false
-                connectToHost(host, false, pin)
+                connectToHost(host.trim(), null, pin.trim())
             }
         )
     }
@@ -1901,6 +2165,56 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             },
             dismissButton = {
                 TextButton(onClick = { pendingEncryptedHost = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Automatically prompt when the target host rejects the active PIN.
+    if (showPinMismatchDialog) {
+        val targetNorm = hostAddress.trim().lowercase()
+        val hostLabel = discoveredHosts.firstNotNullOfOrNull { entry ->
+            val parts = entry.split("|")
+            val name = parts.getOrNull(0)
+            val addr = parts.getOrNull(1)
+            if (addr?.trim()?.lowercase() == targetNorm && !name.isNullOrBlank()) {
+                "$name ($hostAddress)"
+            } else {
+                null
+            }
+        } ?: hostAddress
+
+        AlertDialog(
+            onDismissRequest = { showPinMismatchDialog = false },
+            title = { Text("Authentication Failed — Enter Host PIN") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Authentication failed for $hostLabel. " +
+                            "Enter the PIN shown on this PC (or leave blank if PIN is disabled)."
+                    )
+                    OutlinedTextField(
+                        value = pinMismatchDraft,
+                        onValueChange = { pinMismatchDraft = it },
+                        label = { Text("Host PIN") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val newPin = pinMismatchDraft.trim()
+                    showPinMismatchDialog = false
+                    HostPinStore.savePin(prefs, hostAddress, newPin)
+                    connectToHost(hostAddress, lastConnectIsUsb, newPin)
+                }) {
+                    Text("Connect")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPinMismatchDialog = false }) {
+                    Text("Cancel")
+                }
             }
         )
     }

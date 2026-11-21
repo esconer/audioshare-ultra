@@ -4,9 +4,9 @@
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU16, Ordering};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::sync::Mutex;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::{Duration, Instant};
 
 #[repr(u8)]
@@ -116,16 +116,14 @@ static LIPSYNC_APPLY_LOCK: Mutex<()> = Mutex::new(());
 static LIPSYNC_APPLIED_TARGETS: std::sync::OnceLock<Mutex<Vec<LinuxSinkInfo>>> =
     std::sync::OnceLock::new();
 
-/// Minimum spacing between remote media subprocess launches. This is called
-/// from the host's hard real-time TX loop; an unauthenticated LAN peer sending
-/// hundreds of feedback packets per second must not be able to fork that many
-/// `playerctl`/`xdotool` processes.
-#[cfg(target_os = "linux")]
+/// Minimum spacing between remote media key dispatches. Called from the
+/// host's hard real-time TX loop; rate-limits bursts from replayed/noisy LAN peers.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const MEDIA_CMD_MIN_INTERVAL: Duration = Duration::from_millis(150);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static LAST_MEDIA_CMD: Mutex<Option<Instant>> = Mutex::new(None);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn media_command_due(last: Option<Instant>, now: Instant) -> bool {
     last.map_or(true, |prev| now.saturating_duration_since(prev) >= MEDIA_CMD_MIN_INTERVAL)
 }
@@ -155,15 +153,25 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
     let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
     let us_str = offset_us.to_string();
     for sink in &targets {
+        // Apply EITHER native PipeWire node latency offset OR PulseAudio port
+        // offset — never both sequentially, because PipeWire-Pulse exposes both
+        // `object.id` and `Card`/`Active Port`, and applying both stacks them
+        // into a 2x video lip-sync offset. On reset (`bt_delay_ms == 0`), clear
+        // both defensively to recover from any prior session.
+        let mut pw_applied = false;
         if let Some(ref node_id) = sink.node_id {
-            let _ = Command::new("pw-cli")
+            pw_applied = Command::new("pw-cli")
                 .args(["s", node_id, "Props", &prop])
-                .output();
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
         }
-        if let (Some(ref card), Some(ref port)) = (&sink.card_idx, &sink.active_port) {
-            let _ = Command::new("pactl")
-                .args(["set-port-latency-offset", card, port, &us_str])
-                .output();
+        if !pw_applied || bt_delay_ms == 0 {
+            if let (Some(ref card), Some(ref port)) = (&sink.card_idx, &sink.active_port) {
+                let _ = Command::new("pactl")
+                    .args(["set-port-latency-offset", card, port, &us_str])
+                    .output();
+            }
         }
     }
 }
@@ -250,10 +258,14 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
     }
 
     #[cfg(target_os = "windows")]
-    unsafe {
-        #[link(name = "user32")]
-        extern "system" {
-            fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
+    {
+        {
+            let mut last = LAST_MEDIA_CMD.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+            if !media_command_due(*last, now) {
+                return;
+            }
+            *last = Some(now);
         }
         const VK_MEDIA_NEXT_TRACK: u8 = 0xB0;
         const VK_MEDIA_PREV_TRACK: u8 = 0xB1;
@@ -266,8 +278,16 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
             RemoteMediaCommand::PrevTrack => VK_MEDIA_PREV_TRACK,
             RemoteMediaCommand::None => return,
         };
-        keybd_event(vk, 0, 0, 0);
-        keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+        let _ = std::thread::Builder::new()
+            .name("as-ultra-media-key".into())
+            .spawn(move || unsafe {
+                #[link(name = "user32")]
+                extern "system" {
+                    fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
+                }
+                keybd_event(vk, 0, 0, 0);
+                keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);
+            });
     }
 }
 

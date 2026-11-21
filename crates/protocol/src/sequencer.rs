@@ -93,7 +93,8 @@ impl ZeroJitterSequencer {
         self.pending_fade_in = true;
     }
 
-    /// Arm a 0.33 ms linear splice from the last played sample on the next subframe.
+    /// Arm a 1.0 ms raised-cosine splice from the last played sample on the
+    /// next subframe (post-stall fast-forward / codec switch).
     #[inline]
     pub fn arm_declick(&mut self) {
         self.pending_declick = true;
@@ -113,13 +114,16 @@ impl ZeroJitterSequencer {
         } else if self.pending_declick {
             let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
             let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
-            let dl = last_l - out[0];
-            let dr = last_r - out[1];
-            const SPLICE_FRAMES: usize = 16;
+            // 48 frames = 1.0 ms C1-continuous convex raised-cosine crossfade:
+            // hides both DC steps and lookahead/phase jumps across codec
+            // transitions (e.g. Lossless 0 ms <-> Opus 2.5 ms) or post-stall
+            // skips without ever overshooting ±1.0 and slamming the limiter.
+            const SPLICE_FRAMES: usize = 48;
             for i in 0..SPLICE_FRAMES {
-                let w = 1.0 - (i as f32) / (SPLICE_FRAMES as f32);
-                out[i * 2] += dl * w;
-                out[i * 2 + 1] += dr * w;
+                let alpha = (i as f32) / (SPLICE_FRAMES as f32);
+                let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
+                out[i * 2] = last_l * w + out[i * 2] * (1.0 - w);
+                out[i * 2 + 1] = last_r * w + out[i * 2 + 1] * (1.0 - w);
             }
             self.pending_declick = false;
         }
@@ -142,10 +146,40 @@ impl ZeroJitterSequencer {
                     out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * (1.0 - w_in);
             }
             self.consecutive_plc_count = 0;
+            self.pending_declick = false;
         }
         self.apply_boundary_ramps(out);
         self.last_pop_was_fec = false;
         self.append_to_history(out);
+    }
+
+    /// Invalidate a single ring slot if it currently belongs to `seq` so
+    /// skipped or Opus-superseded subframes can never resurface 65,536
+    /// subframes (~2.73 min) later after a 16-bit sequence wraparound.
+    /// Uses an atomic CAS so it never races a concurrent `STATUS_BUSY` writer
+    /// or wipes an unrelated epoch sharing the same ring index.
+    #[inline]
+    pub fn clear_slot(&self, seq: u16) {
+        let slot = &self.slots[(seq as usize) & RING_MASK];
+        loop {
+            let cur = slot.state.load(Ordering::Acquire);
+            let cur_seq = (cur >> 16) as u16;
+            let cur_status = cur & 0xFFFF;
+            if cur_status == STATUS_EMPTY || cur_seq != seq {
+                return;
+            }
+            if cur_status == STATUS_BUSY {
+                std::hint::spin_loop();
+                continue;
+            }
+            if slot
+                .state
+                .compare_exchange_weak(cur, STATUS_EMPTY, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
     }
 
     /// Fast O(1) check before decoding FEC payloads: returns true ONLY if `target_seq` is still missing
@@ -682,5 +716,74 @@ mod tests {
         }
         let tail_peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(tail_peak < 1e-6, "PLC must fade to silence after 60 ms, got {tail_peak}");
+    }
+
+    #[test]
+    fn test_arm_declick_applies_raised_cosine_splice() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Establish steady +0.5 output history (pop two frames so the initial
+        // fade-in on frame 0 is complete).
+        let hi = [0.5f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &hi));
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(seq.push_primary(1, &hi));
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Arm declick before a full-scale polarity flip (-0.5) such as a
+        // Lossless <-> Opus lookahead jump.
+        seq.arm_declick();
+        let lo = [-0.5f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(2, &lo));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Frame 0 starts exactly at the previous sample (+0.5) with zero jump.
+        assert!((out[0] - 0.5).abs() < 1e-6, "frame 0 stepped to {}", out[0]);
+        // Midpoint (frame 24) sits at 0.0 (halfway through raised cosine).
+        assert!(out[24 * 2].abs() < 1e-5, "midpoint was {}", out[24 * 2]);
+        // Monotonically decreasing across the 48-frame splice window.
+        for i in 1..48 {
+            assert!(
+                out[i * 2] <= out[(i - 1) * 2] + 1e-6,
+                "non-monotonic splice at frame {i}"
+            );
+        }
+        // Unmodified from frame 48 onward.
+        for i in 48..SUBFRAME_FRAMES {
+            assert_eq!(out[i * 2], -0.5, "splice leaked past frame {i}");
+        }
+    }
+
+    #[test]
+    fn test_arm_declick_never_overshoots_on_ac_phase_flip() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        // Previous frame ends at +0.95.
+        let prev = [0.95f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &prev));
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert!(seq.push_primary(1, &prev));
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        // Next frame starts at -0.95 then swings to +0.95 within 12 frames (a
+        // 2 kHz full-scale tone). The old additive `out + dl * w` pushed peaks
+        // to +2.45 and slammed the limiter; convex blending stays strictly <= 0.95.
+        let mut ac = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let v = -((i as f32) * std::f32::consts::TAU * 2000.0 / 48_000.0).cos() * 0.95;
+            ac[i * 2] = v;
+            ac[i * 2 + 1] = v;
+        }
+        seq.arm_declick();
+        assert!(seq.push_primary(2, &ac));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_PRIMARY_LOSSLESS);
+
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak <= 0.95 + 1e-5,
+            "convex declick overshot input peak: {peak}"
+        );
     }
 }

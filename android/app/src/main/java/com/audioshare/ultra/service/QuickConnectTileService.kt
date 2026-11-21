@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import com.audioshare.ultra.ui.HostPinStore
 
 class QuickConnectTileService : TileService() {
 
@@ -21,17 +22,19 @@ class QuickConnectTileService : TileService() {
         val intent = Intent(this, AudioEngineService::class.java)
         if (AudioEngineService.isStreaming) {
             intent.action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
-            startService(intent)
+            runCatching { startService(intent) }
             syncTileState(false)
         } else {
             intent.putExtra("HOST_ADDR", lastHost)
-            intent.putExtra("PIN", prefs.getString("pin_code", "") ?: "")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-            syncTileState(true)
+            intent.putExtra("PIN", HostPinStore.getPin(prefs, lastHost))
+            val launched = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent)
+                } else {
+                    startService(intent)
+                }
+            }.isSuccess
+            syncTileState(launched)
         }
     }
 
