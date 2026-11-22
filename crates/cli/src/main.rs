@@ -131,7 +131,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     for a in args {
         if let Some(rest) = a.strip_prefix(&eq_prefix) {
             let trimmed = rest.trim();
-            if !trimmed.is_empty() && !trimmed.starts_with("--") {
+            if !trimmed.is_empty() && !trimmed.starts_with("--") && trimmed != "-h" {
                 return Some(trimmed);
             }
         }
@@ -139,7 +139,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|w| w[0] == flag)
         .map(|w| w[1].trim())
-        .filter(|v| !v.is_empty() && !v.starts_with("--"))
+        .filter(|v| !v.is_empty() && !v.starts_with("--") && *v != "-h")
 }
 
 /// True if `--pin` or `--pin=` was passed on the command line without a valid
@@ -154,6 +154,15 @@ fn has_missing_pin_value(args: &[String]) -> bool {
 fn has_help_flag(args: &[String]) -> bool {
     let mut skip_next = false;
     for a in args {
+        if a == "--help"
+            || a == "-h"
+            || a == "help"
+            || a == "--pin=help"
+            || a == "--pin=-h"
+            || a == "--pin=--help"
+        {
+            return true;
+        }
         if skip_next {
             skip_next = false;
             continue;
@@ -161,9 +170,6 @@ fn has_help_flag(args: &[String]) -> bool {
         if a == "--pin" {
             skip_next = true;
             continue;
-        }
-        if a == "--help" || a == "-h" || a == "help" {
-            return true;
         }
     }
     false
@@ -988,6 +994,15 @@ mod tests {
 
         assert_eq!(flag_value(&args(&["--vbr"]), "--pin"), None);
         assert!(!has_missing_pin_value(&args(&["--vbr"])));
+    }
+
+    #[test]
+    fn test_has_help_flag_handles_pin_help() {
+        assert!(has_help_flag(&args(&["--pin", "help"])));
+        assert!(has_help_flag(&args(&["--pin", "-h"])));
+        assert!(has_help_flag(&args(&["--pin", "--help"])));
+        assert!(has_help_flag(&args(&["--pin=help"])));
+        assert!(!has_help_flag(&args(&["--pin", "4829", "--usb"])));
     }
 
     #[test]
