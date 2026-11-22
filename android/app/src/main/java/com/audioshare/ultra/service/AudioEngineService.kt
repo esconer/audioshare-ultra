@@ -93,6 +93,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         var isLocallyMutedState: Boolean = false
             private set
 
+        @Volatile
+        var isMicMutedState: Boolean = false
+            private set
+
         // Process-wide single-thread executor and generation counters matching
         // the process-wide Rust statics (`GLOBAL_ANDROID_CLIENT` /
         // `GLOBAL_PHONE_MIC_TX`). Keeping these in the companion object ensures
@@ -211,6 +215,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // keep working. Default local-speaker mute is ON (party_mute_local = true).
     private var isPartyCastMuted: Boolean = false
     private var isMicMuted: Boolean = false
+        set(value) {
+            field = value
+            isMicMutedState = value
+        }
     private var serviceDestroyed: Boolean = false
     private var serviceStopped: Boolean = false
     private var savedPartyMusicVolume: Int = -1
@@ -1014,8 +1022,24 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // Playback capture is not microphone capture. A previous video-call
         // session may still hold the native hardware-mic transmitter; release
         // it here so the service stays the single owner of phone-mic state.
-        micGen.incrementAndGet()
-        nativeStopPhoneMic()
+        val stopGen = micGen.incrementAndGet()
+        // The generation bump above cancels a START still queued on the single
+        // engine thread (ACTION_START_PHONE_MIC gen guard). This bounded barrier
+        // additionally waits for a START already executing nativeStartPhoneMic,
+        // so the stop cannot be overtaken before caster.startCasting() below.
+        val stoppedOnExecutor = runCatching {
+            engineExecutor.submit {
+                if (stopGen == micGen.get()) {
+                    runCatching { nativeStopPhoneMic() }
+                }
+            }.get(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            true
+        }.getOrDefault(false)
+        // Timeout / rejection fallback: must NOT stop a mic session that began
+        // while this thread was blocked — hence the generation re-check.
+        if (!stoppedOnExecutor && stopGen == micGen.get()) {
+            runCatching { nativeStopPhoneMic() }
+        }
         broadcastPhoneMicState(false)
         micCaptureActive = false
         projectionActive = true
@@ -1381,9 +1405,14 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val playPauseLabel = if (remoteMediaPlaying) "Pause PC" else "Play PC"
             val badge = if (isUsb) "USB Lossless (<11ms)" else "Wi-Fi Lossless + FEC"
             val statusText = if (isLocallyMuted) "MUTED • $hostAddr" else "Streaming • $hostAddr"
+            val micSuffix = if (micCaptureActive) {
+                if (isMicMuted) " • MIC MUTED" else " • MIC LIVE"
+            } else {
+                ""
+            }
             builder
                 .setContentTitle("AudioShare Ultra • $badge")
-                .setContentText(statusText)
+                .setContentText(statusText + micSuffix)
                 .addAction(playPauseIcon, playPauseLabel, playPausePending)
                 .addAction(
                     android.R.drawable.ic_lock_silent_mode,

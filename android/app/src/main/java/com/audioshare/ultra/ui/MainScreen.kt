@@ -972,7 +972,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
         if (!isConnected) return@LaunchedEffect
         val attempt = connectAttemptId
-        delay(2500)
+        delay(3500)
         if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
             return@LaunchedEffect
         }
@@ -2004,13 +2004,29 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     )
                     AnimatedVisibility(visible = sharePhoneMic && !castPhoneInternalAudio) {
                         val micVu = ((telemetry.partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
+                        val micMuted = AudioEngineService.isMicMutedState
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             HorizontalDivider(color = Color(0xFF243047))
-                            Text(
-                                "Mic Target: $hostAddress -> Port 65532  •  Input Level: $micVu%",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.secondary
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "Mic Target: $hostAddress -> 65532 • ${if (micMuted) "MUTED" else "Level: $micVu%"}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (micMuted) StudioColors.WarnFg else MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                FilledTonalButton(onClick = {
+                                    val toggleIntent = Intent(context, AudioEngineService::class.java).apply {
+                                        action = AudioEngineService.ACTION_TOGGLE_MIC_MUTE
+                                    }
+                                    context.startService(toggleIntent)
+                                }) {
+                                    Text(if (micMuted) "Unmute Mic" else "Mute Mic")
+                                }
+                            }
                             Text(
                                 "On Windows: open 'App Audio Picker & Phone Microphone', click 'Start Phone Receiver', and pick 'CABLE Output (VB-Audio Virtual Cable)' as your mic.",
                                 style = MaterialTheme.typography.bodySmall,
