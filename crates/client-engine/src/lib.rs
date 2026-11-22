@@ -517,6 +517,31 @@ fn resync_ahead_subframes(fifo_now_subframes: i16) -> i16 {
         .min((RING_SLOTS as i16) - 4)
 }
 
+/// Emergency PLC watermark for the output decoupler, in samples.
+///
+/// During healthy playback the burst floor is capped at two subframes so a
+/// large Dolby/BT callback never trips PLC on every drain. Once a real stall is
+/// underway (`consecutive_empty_ticks > 0`) the floor lifts to one full HAL
+/// burst so those callbacks receive continuous, smooth PLC fade-out instead of
+/// chopped underruns. The result stays below one subframe of FIFO headroom.
+#[inline]
+fn plc_emergency_watermark_samples(
+    base_plc_samples: usize,
+    hal_burst_samples: usize,
+    one_subframe_samples: usize,
+    fifo_watermark: usize,
+    consecutive_empty_ticks: u16,
+) -> usize {
+    let plc_burst_floor = if consecutive_empty_ticks > 0 {
+        hal_burst_samples
+    } else {
+        hal_burst_samples.min(one_subframe_samples * 2)
+    };
+    base_plc_samples
+        .max(plc_burst_floor)
+        .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2))
+}
+
 /// Dynamic backward resync threshold, bounded by the sequencer ring.
 ///
 /// During an active Wi-Fi background scan or scan-shield window, emergency PLC
@@ -2952,15 +2977,13 @@ impl ClientEngine {
             // full `hal_burst_samples` so BT A2DP (20 ms) and Dolby (26-40 ms)
             // callbacks receive continuous smooth PLC fade-out instead of
             // 25-50 Hz chopped underruns.
-            let plc_burst_floor = if consecutive_empty_ticks > 0 {
-                hal_burst_samples
-            } else {
-                hal_burst_samples.min(one_subframe_samples * 2)
-            };
-            let plc_emergency_watermark = resampler
-                .subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES)
-                .max(plc_burst_floor)
-                .min(fifo_watermark.saturating_sub(one_subframe_samples).max(2));
+            let plc_emergency_watermark = plc_emergency_watermark_samples(
+                resampler.subframes_to_samples(PLC_EMERGENCY_WATERMARK_SUBFRAMES),
+                hal_burst_samples,
+                one_subframe_samples,
+                fifo_watermark,
+                consecutive_empty_ticks,
+            );
             last_fifo_watermark = fifo_watermark;
             last_plc_watermark = plc_emergency_watermark;
 
@@ -5511,6 +5534,54 @@ mod tests {
             |i, s| out[i] = s,
         ));
         assert!(out.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_plc_emergency_watermark_lifts_only_during_active_stall() {
+        let one_sf = 240usize; // 120 stereo frames @ 48 kHz
+        let bt_burst = 1764usize; // 882 stereo frames
+        let fifo_wm = bt_burst + one_sf * 3;
+
+        let steady = plc_emergency_watermark_samples(one_sf, bt_burst, one_sf, fifo_wm, 0);
+        assert_eq!(steady, one_sf * 2);
+
+        let stall = plc_emergency_watermark_samples(one_sf, bt_burst, one_sf, fifo_wm, 1);
+        assert_eq!(stall, bt_burst);
+    }
+
+    #[test]
+    fn test_backwards_resync_guard_handles_u16_wraparound() {
+        // Playhead just wrapped past 65535 -> 10; delayed packet at 65480 has seq_delta = -66.
+        let next_play_seq: u16 = 10;
+        let delayed_a: u16 = 65_480;
+        let delayed_b: u16 = 65_482;
+        let resync_behind = resync_behind_subframes(8.0, 0); // -32
+        assert_eq!(resync_behind, -32);
+        assert!((delayed_a.wrapping_sub(next_play_seq) as i16) < resync_behind);
+
+        let mut candidate: Option<(u16, u8)> = None;
+        let streak1 = match candidate {
+            Some((prev, count))
+                if (delayed_a.wrapping_sub(prev) as i16) > 0
+                    && (delayed_a.wrapping_sub(prev) as i16) <= 16 =>
+            {
+                count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        candidate = Some((delayed_a, streak1));
+        assert_eq!(streak1, 1);
+
+        let streak2 = match candidate {
+            Some((prev, count))
+                if (delayed_b.wrapping_sub(prev) as i16) > 0
+                    && (delayed_b.wrapping_sub(prev) as i16) <= 16 =>
+            {
+                count.saturating_add(1)
+            }
+            _ => 1,
+        };
+        assert_eq!(streak2, 2);
     }
 }
 
