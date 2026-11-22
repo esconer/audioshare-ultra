@@ -57,10 +57,10 @@ fn parse_beacon_fields(rest: &str) -> Option<(&str, u16, bool)> {
     Some((hostname, port, encrypted))
 }
 
-/// Docker/WSL/VMware/VirtualBox and Linux bridge interfaces are virtual links,
-/// not real LAN segments. Broadcasting discovery beacons on them leaks traffic
-/// into virtual subnets and makes phones advertise phantom hosts.
-fn is_virtual_interface_name(name: &str) -> bool {
+/// Docker/WSL/VMware/VirtualBox, VPN/tunnel, and bridge interfaces are not real
+/// LAN segments. Broadcasting discovery beacons on them leaks traffic into
+/// virtual/VPN subnets and makes phones advertise phantom or unreachable hosts.
+pub(crate) fn is_virtual_interface_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("docker")
         || lower.contains("wsl")
@@ -72,6 +72,22 @@ fn is_virtual_interface_name(name: &str) -> bool {
         || lower.contains("virtualbox")
         || lower.contains("virbr")
         || lower.contains("br-")
+        || lower.contains("tailscale")
+        || lower.contains("wireguard")
+        || lower.starts_with("wg")
+        || lower.contains("wintun")
+        || lower.contains("openvpn")
+        || lower.contains("zerotier")
+        || lower.starts_with("zt")
+        || lower.contains("nordlynx")
+        || lower.contains("cloudflare")
+        || lower.contains("warp")
+        || lower.contains("hamachi")
+        || lower.contains("radmin")
+        || lower.contains("bluetooth")
+        || lower.contains("npcap")
+        || lower.starts_with("tun")
+        || lower.starts_with("tap")
 }
 
 #[cfg(target_os = "windows")]
@@ -132,8 +148,8 @@ impl DiscoveryBeacon {
                 // Link-local scope: never leak discovery beacons past the LAN.
                 let _ = sock.set_multicast_ttl_v4(1);
                 // Interface enumeration is comparatively expensive. Cache the
-                // per-interface broadcast targets and refresh only every 5 s.
-                let mut broadcast_targets: Vec<SocketAddr> = Vec::new();
+                // per-interface (local_ip, broadcast_addr) pairs and refresh only every 5 s.
+                let mut iface_targets: Vec<(Ipv4Addr, SocketAddr)> = Vec::new();
                 let mut last_iface_scan: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
                     let payload = beacon_payload(
@@ -145,17 +161,15 @@ impl DiscoveryBeacon {
                         payload.as_bytes(),
                         SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
                     );
-                    let _ = sock.send_to(
-                        payload.as_bytes(),
-                        SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT)),
-                    );
+                    let mcast_dest = SocketAddr::from((DISCOVERY_MULTICAST_GROUP, DISCOVERY_PORT));
+                    let _ = sock.send_to(payload.as_bytes(), mcast_dest);
 
                     if last_iface_scan
                         .map(|t| t.elapsed() >= BEACON_IFACE_REFRESH)
                         .unwrap_or(true)
                     {
                         last_iface_scan = Some(Instant::now());
-                        broadcast_targets.clear();
+                        iface_targets.clear();
                         // Use the OS-reported broadcast address (correct for
                         // /16, /23, point-to-point and USB tethering links)
                         // instead of assuming /24. Fall back to the legacy
@@ -167,20 +181,37 @@ impl DiscoveryBeacon {
                                     continue;
                                 }
                                 if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                                    if v4.ip.is_link_local() || v4.ip.is_unspecified() {
+                                        continue;
+                                    }
                                     let bcast = v4.broadcast.unwrap_or_else(|| {
                                         let o = v4.ip.octets();
                                         Ipv4Addr::new(o[0], o[1], o[2], 255)
                                     });
-                                    broadcast_targets
-                                        .push(SocketAddr::from((bcast, DISCOVERY_PORT)));
+                                    iface_targets
+                                        .push((v4.ip, SocketAddr::from((bcast, DISCOVERY_PORT))));
                                 }
                             }
                         }
                     }
-                    for target in &broadcast_targets {
-                        let _ = sock.send_to(payload.as_bytes(), *target);
+                    let sock_ref = socket2::SockRef::from(&sock);
+                    for &(local_ip, bcast_target) in &iface_targets {
+                        let _ = sock.send_to(payload.as_bytes(), bcast_target);
+                        // Also emit the link-local multicast beacon explicitly out
+                        // of each physical NIC so multi-homed hosts (Ethernet +
+                        // Wi-Fi / Hotspot / USB RNDIS) discover cleanly even when
+                        // the default route points at Ethernet.
+                        if sock_ref.set_multicast_if_v4(&local_ip).is_ok() {
+                            let _ = sock.send_to(payload.as_bytes(), mcast_dest);
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = sock_ref.set_multicast_if_v4(&Ipv4Addr::UNSPECIFIED);
+                    for _ in 0..10 {
+                        if !run_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
                 }
             })
             .ok();
@@ -330,7 +361,14 @@ impl DiscoveryScanner {
     }
 
     pub fn discovered_hosts(&self) -> Vec<DiscoveredHost> {
-        let mut list: Vec<DiscoveredHost> = self.hosts.lock().unwrap().values().cloned().collect();
+        let mut list: Vec<DiscoveredHost> = self
+            .hosts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v.last_seen.elapsed() < Duration::from_secs(4))
+            .cloned()
+            .collect();
         list.sort_by_key(|h| !h.is_usb);
         list
     }
@@ -369,17 +407,40 @@ impl AdbUsbWatcher {
                 let mut was_connected = false;
                 let mut last_reverse: Option<Instant> = None;
                 while run_clone.load(Ordering::Relaxed) {
-                    let has_device = silent_command("adb")
-                        .args(["get-state"])
+                    // Enumerate all attached ADB devices in the "device" state so
+                    // `adb reverse` still succeeds when multiple phones or an
+                    // emulator + phone are connected simultaneously (bare
+                    // `adb get-state` / `adb reverse` fails with "more than one
+                    // device/emulator").
+                    let serials: Vec<String> = silent_command("adb")
+                        .args(["devices"])
                         .output()
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| {
+                            String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .skip(1)
+                                .filter_map(|line| {
+                                    let mut parts = line.split_whitespace();
+                                    let serial = parts.next()?;
+                                    let state = parts.next()?;
+                                    if state == "device" && !serial.is_empty() {
+                                        Some(serial.to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let has_device = !serials.is_empty();
 
                     usb_clone.store(has_device, Ordering::Relaxed);
 
                     // `adb reverse` is not durable across a USB cable yank or
                     // an ADB daemon restart: the tunnel silently disappears
-                    // while `adb get-state` still reports a device. Re-arm it
+                    // while `adb devices` still reports a device. Re-arm it
                     // on the initial attach (fast path) and then every 10 s
                     // for as long as the device stays attached.
                     if has_device {
@@ -389,16 +450,26 @@ impl AdbUsbWatcher {
                             .unwrap_or(false);
                         if initial_attach || periodic {
                             let port_spec = format!("tcp:{}", port);
-                            let _ = silent_command("adb")
-                                .args(["reverse", &port_spec, &port_spec])
-                                .output();
+                            for serial in &serials {
+                                let _ = silent_command("adb")
+                                    .args(["-s", serial, "reverse", &port_spec, &port_spec])
+                                    .output();
+                            }
                             last_reverse = Some(Instant::now());
                         }
                     } else {
                         last_reverse = None;
                     }
                     was_connected = has_device;
-                    std::thread::sleep(Duration::from_secs(2));
+                    // Poll `run_clone` every 50 ms instead of blocking in an
+                    // uninterruptible 2 s sleep so `AdbUsbWatcher::drop()`
+                    // returns immediately without freezing the desktop GUI.
+                    for _ in 0..40 {
+                        if !run_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                 }
             })
             .ok();
@@ -463,8 +534,58 @@ impl Drop for AdbSessionSlot {
     }
 }
 
+/// Read a 2-byte big-endian frame length prefix while allowing the connection
+/// to remain idle between frames (`filled == 0`) as long as `alive` and
+/// `running` hold. Once the first byte of a frame arrives (`filled == 1`),
+/// enforces `ADB_TCP_READ_DEADLINE` so a half-open stalled peer still times out.
+fn read_frame_len_interruptible<T: Read>(
+    reader: &mut T,
+    alive: &AtomicBool,
+    running: &AtomicBool,
+) -> std::io::Result<u16> {
+    let mut len_buf = [0u8; 2];
+    let mut filled = 0usize;
+    let mut partial_deadline: Option<Instant> = None;
+    while filled < 2 {
+        if !alive.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "ADB TCP session stopping",
+            ));
+        }
+        if let Some(dl) = partial_deadline {
+            if Instant::now() >= dl {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "ADB TCP length prefix read deadline exceeded",
+                ));
+            }
+        }
+        match reader.read(&mut len_buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "ADB TCP peer closed connection",
+                ));
+            }
+            Ok(n) => {
+                filled += n;
+                if filled == 1 && partial_deadline.is_none() {
+                    partial_deadline = Some(Instant::now() + ADB_TCP_READ_DEADLINE);
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(u16::from_be_bytes(len_buf))
+}
+
 /// Read exactly `buf.len()` bytes, preserving partial progress across
-/// `WouldBlock` / `TimedOut` (e.g. a socket read timeout) instead of restarting
+/// `WouldBlock` / `TimedOut` / `Interrupted` instead of restarting
 /// at offset 0 and corrupting the wire framing. The deadline is rechecked on
 /// every retry so a peer that trickles bytes cannot pin a worker forever.
 fn read_exact_interruptible<T: Read>(
@@ -490,7 +611,8 @@ fn read_exact_interruptible<T: Read>(
             Ok(n) => filled += n,
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
     }
@@ -524,6 +646,13 @@ fn spawn_host_adb_tcp_session(
     }
     let slot = Arc::new(AdbSessionSlot(Arc::clone(&active_sessions)));
 
+    // CRITICAL (Windows Winsock2): `accept()` inherits `FIONBIO` non-blocking
+    // mode from `TcpListener::set_nonblocking(true)`. Leaving the accepted
+    // stream non-blocking makes `SO_RCVTIMEO`/`SO_SNDTIMEO` ignored, causing
+    // `read_frame_len_interruptible` to spin at 100% CPU on `WouldBlock` and
+    // `tcp_writer.write_all` to disconnect immediately on transient send
+    // backpressure (`WSAEWOULDBLOCK`). Explicitly restore blocking mode!
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
@@ -538,6 +667,7 @@ fn spawn_host_adb_tcp_session(
     let Ok(udp_rx) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) else {
         return;
     };
+    crate::disable_windows_udp_connreset(&udp_rx);
     if udp_rx.connect((Ipv4Addr::LOCALHOST, host_udp_port)).is_err() {
         return;
     }
@@ -554,19 +684,14 @@ fn spawn_host_adb_tcp_session(
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-in".into())
         .spawn(move || {
-            let mut len_buf = [0u8; 2];
             let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
-                if read_exact_interruptible(
-                    &mut tcp_reader,
-                    &mut len_buf,
-                    Instant::now() + ADB_TCP_READ_DEADLINE,
-                )
-                .is_err()
-                {
+                let Ok(raw_len) =
+                    read_frame_len_interruptible(&mut tcp_reader, &alive_in, &run_in)
+                else {
                     break;
-                }
-                let len = u16::from_be_bytes(len_buf) as usize;
+                };
+                let len = raw_len as usize;
                 if len == 0 || len > pkt.len() {
                     break;
                 }
@@ -604,7 +729,9 @@ fn spawn_host_adb_tcp_session(
                     Ok(_) => {}
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                            || e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::Interrupted
+                            || e.kind() == std::io::ErrorKind::ConnectionReset => {}
                     Err(_) => break,
                 }
             }
@@ -617,9 +744,12 @@ fn spawn_host_adb_tcp_session(
 impl Drop for AdbUsbWatcher {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        // Do NOT block the caller/GUI thread joining `as-ultra-adb-watcher`:
+        // it may be waiting on a slow/cold-starting `adb` child process and
+        // holds no network sockets. It checks `running` every 50 ms and exits
+        // promptly on its own. Always join `tcp_bridge_handle` (<=50 ms) so
+        // the loopback TCP port is released cleanly before any restart.
+        let _ = self.handle.take();
         if let Some(h) = self.tcp_bridge_handle.take() {
             let _ = h.join();
         }
@@ -677,7 +807,13 @@ impl DirectHotspotController {
                  $cred.Password = '{}'; \
                  $legacy.Passphrase = $cred; \
                  $pub.Start(); \
-                 Write-Output 'ASULTRA_SOFTAP_READY'; \
+                 for ($i = 0; $i -lt 40; $i++) {{ \
+                     $st = $pub.Status.ToString(); \
+                     if ($st -eq 'Started') {{ Write-Output 'ASULTRA_SOFTAP_READY'; break }} \
+                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ Write-Output \"ASULTRA_SOFTAP_FAILED:$st\"; exit 1 }} \
+                     Start-Sleep -Milliseconds 100 \
+                 }}; \
+                 if ($pub.Status.ToString() -ne 'Started') {{ Write-Output 'ASULTRA_SOFTAP_FAILED:Timeout'; exit 1 }}; \
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
@@ -688,10 +824,22 @@ impl DirectHotspotController {
                 .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| format!("Failed to launch WinRT SoftAP host: {}", e))?;
-            // `$pub.Start()` is asynchronous. Returning before the SoftAP is
-            // actually up makes the phone's first connection fail, so wait
-            // for the sentinel emitted by the script (or kill + fail).
+            // `$pub.Start()` is asynchronous. Take stdout BEFORE storing the
+            // child in `windows_hotspot_holder()` so if the user quits during
+            // the 8 s startup wait, `stop_direct_hotspot()` kills the hidden
+            // PowerShell process instead of leaking it permanently.
             let stdout = child.stdout.take();
+            let child_pid = child.id();
+            {
+                let mut holder = windows_hotspot_holder()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(mut prev) = holder.take() {
+                    let _ = prev.kill();
+                    let _ = prev.wait();
+                }
+                *holder = Some(child);
+            }
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
             let _ = std::thread::Builder::new()
                 .name("as-ultra-softap-ready".into())
@@ -708,24 +856,34 @@ impl DirectHotspotController {
                                         let _ = ready_tx.send(true);
                                         return;
                                     }
+                                    if line.contains("ASULTRA_SOFTAP_FAILED") {
+                                        let _ = ready_tx.send(false);
+                                        return;
+                                    }
                                 }
                             }
                         }
                     }
                     let _ = ready_tx.send(false);
                 });
-            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+            match ready_rx.recv_timeout(Duration::from_secs(8)) {
                 Ok(true) => {}
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let mut holder = windows_hotspot_holder()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if holder.as_ref().map(|c| c.id()) == Some(child_pid) {
+                        if let Some(mut c) = holder.take() {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                    }
                     return Err(format!(
-                        "Wi-Fi Direct SoftAP '{}' did not become ready within 3 s",
+                        "Wi-Fi Direct SoftAP '{}' could not start (check Wi-Fi adapter is enabled)",
                         ssid
                     ));
                 }
             }
-            *windows_hotspot_holder().lock().unwrap() = Some(child);
             Ok(format!(
                 "1-Hop Direct Link '{}' Active (IP: 192.168.137.1)",
                 ssid
@@ -786,9 +944,31 @@ pub fn is_windows_firewall_configured() -> bool {
     #[cfg(target_os = "windows")]
     {
         silent_command("netsh")
-            .args(["advfirewall", "firewall", "show", "rule", "name=AudioShare_Ultra_UDP"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=AudioShare_Ultra_UDP",
+            ])
             .output()
-            .map(|o| o.status.success())
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let out = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+                // Reject disabled or block rules; accept locale-agnostic
+                // non-"no" enabled rules that cover port 65530-65532.
+                let explicitly_disabled = out.lines().any(|l| {
+                    let trimmed = l.trim();
+                    trimmed.starts_with("enabled:") && trimmed.ends_with("no")
+                });
+                let explicitly_block = out.lines().any(|l| {
+                    let trimmed = l.trim();
+                    trimmed.starts_with("action:") && trimmed.contains("block")
+                });
+                !explicitly_disabled && !explicitly_block && out.contains("65530")
+            })
             .unwrap_or(false)
     }
     #[cfg(not(target_os = "windows"))]
@@ -887,7 +1067,7 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
     #[cfg(target_os = "windows")]
     {
         if enable {
-            let _ = silent_command("reg")
+            match silent_command("reg")
                 .args([
                     "add",
                     r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -899,8 +1079,15 @@ pub fn set_os_boot_autostart(enable: bool) -> String {
                     &format!("\"{}\" --autostart", exe_str),
                     "/f",
                 ])
-                .output();
-            "Enabled Windows Boot Auto-Start (HKCU Run)".into()
+                .output()
+            {
+                Ok(o) if o.status.success() => "Enabled Windows Boot Auto-Start (HKCU Run)".into(),
+                Ok(o) => format!(
+                    "Failed to enable Boot Auto-Start: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => format!("Failed to enable Boot Auto-Start: {e}"),
+            }
         } else {
             let _ = silent_command("reg")
                 .args([
@@ -953,20 +1140,36 @@ impl HostVolumeMonitor {
                                 last_os_volume = Some(volume);
                             }
                         }
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !run_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
                 #[cfg(target_os = "windows")]
                 {
-                    // A single COM apartment + IMMDeviceEnumerator for the
-                    // whole thread (not one per 500 ms poll).
-                    run_windows_volume_monitor(&telemetry, &run_clone);
+                    // On Windows, keep `host_volume` at full 100% digital unity
+                    // (0 dBFS) unless the user adjusts the AudioShare Ultra
+                    // Master Volume slider. Mirroring Windows physical speaker
+                    // endpoint volume halved/muted phone audio whenever the user
+                    // turned down laptop speakers to avoid echo, and doubled
+                    // attenuation on APO endpoints where WASAPI loopback already
+                    // reflects software volume.
+                    let _ = telemetry;
+                    let _ = run_clone;
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     let _ = telemetry;
                     while run_clone.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !run_clone.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
             })
@@ -1025,6 +1228,7 @@ fn read_linux_master_volume() -> Option<u8> {
 /// for the whole monitor thread lifetime. Rebuilding them on every 500 ms poll
 /// repeatedly tore down COM apartment state and cost far more than the read.
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn run_windows_volume_monitor(telemetry: &HostTelemetry, running: &AtomicBool) {
     use core::ffi::c_void;
 
@@ -1229,6 +1433,11 @@ pub struct VirtualSpeakerAndRadioGuard {
     prev_default_sink_id: Option<Vec<u16>>,
     #[cfg(target_os = "windows")]
     virtual_sink_id: Option<Vec<u16>>,
+    /// Keeps the `WlanOpenHandle` session open so Windows `Wlansvc` actually
+    /// holds `wlan_intf_opcode_media_streaming_mode = 1` for the duration of
+    /// the stream (closing the handle immediately reverts the setting!).
+    #[cfg(target_os = "windows")]
+    wlan_streaming_guard: Option<WindowsWlanMediaStreamingGuard>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1356,8 +1565,9 @@ impl VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "windows")]
         {
-            // Suppress Windows 60-second background Wi-Fi roaming/location channel scans
-            set_windows_wlan_media_streaming_mode(true);
+            // Keep the WlanOpenHandle alive until Drop so Windows actually
+            // suppresses 60-second background Wi-Fi channel scans.
+            let wlan_streaming_guard = WindowsWlanMediaStreamingGuard::acquire();
             let virtual_sink_id = if enable_virtual_speaker {
                 crate::app_routing::windows_endpoint_switch::find_virtual_playback_id()
             } else {
@@ -1365,6 +1575,7 @@ impl VirtualSpeakerAndRadioGuard {
             };
             let prev_default_sink_id = if virtual_sink_id.is_some() {
                 crate::app_routing::windows_endpoint_switch::default_playback_id()
+                    .filter(|id| Some(id) != virtual_sink_id.as_ref())
             } else {
                 None
             };
@@ -1373,6 +1584,7 @@ impl VirtualSpeakerAndRadioGuard {
                 active: false,
                 prev_default_sink_id,
                 virtual_sink_id,
+                wlan_streaming_guard,
             }
         }
 
@@ -1407,6 +1619,15 @@ impl VirtualSpeakerAndRadioGuard {
         #[cfg(target_os = "windows")]
         {
             if let Some(ref id) = self.virtual_sink_id {
+                // Re-snapshot the user's current default playback device right
+                // before switching (if it's not already the virtual cable), so
+                // plugging in headphones between Start and client connect
+                // restores the headphones on disconnect rather than stale speakers.
+                if let Some(cur) = crate::app_routing::windows_endpoint_switch::default_playback_id()
+                    .filter(|cur| cur != id)
+                {
+                    self.prev_default_sink_id = Some(cur);
+                }
                 crate::app_routing::windows_endpoint_switch::set_default_endpoint(id);
             }
             self.active = true;
@@ -1452,89 +1673,99 @@ impl Drop for VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "windows")]
         {
-            set_windows_wlan_media_streaming_mode(false);
+            let _ = self.wlan_streaming_guard.take();
         }
     }
 }
 
-/// Dynamically invokes Win32 `wlanapi.dll` `WlanSetInterface(..., wlan_intf_opcode_media_streaming_mode)`
-/// to prevent Windows from scanning other Wi-Fi channels every 60 seconds during real-time audio streaming.
+/// RAII guard that holds an open Win32 `wlanapi.dll` `WlanOpenHandle` with
+/// `wlan_intf_opcode_media_streaming_mode = 1` for the lifetime of the stream.
+/// Windows `Wlansvc` reference-counts media streaming mode per open client
+/// handle and reverts it immediately when `WlanCloseHandle` is called.
 #[cfg(target_os = "windows")]
-fn set_windows_wlan_media_streaming_mode(enable: bool) {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Guid {
-        data1: u32,
-        data2: u16,
-        data3: u16,
-        data4: [u8; 8],
-    }
+struct WindowsWlanMediaStreamingGuard {
+    hmod: usize,
+    client_handle: usize,
+}
 
-    #[repr(C)]
-    struct WlanInterfaceInfo {
-        interface_guid: Guid,
-        interface_description: [u16; 256],
-        is_state: u32,
-    }
-
-    #[repr(C)]
-    struct WlanInterfaceInfoList {
-        number_of_items: u32,
-        index: u32,
-        interface_info: [WlanInterfaceInfo; 1],
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
-        fn GetProcAddress(
-            module: *mut core::ffi::c_void,
-            name: *const u8,
-        ) -> *mut core::ffi::c_void;
-        fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
-    }
-
-    type FnWlanOpenHandle = unsafe extern "system" fn(
-        u32,
-        *mut core::ffi::c_void,
-        *mut u32,
-        *mut *mut core::ffi::c_void,
-    ) -> u32;
-    type FnWlanEnumInterfaces = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        *mut core::ffi::c_void,
-        *mut *mut WlanInterfaceInfoList,
-    ) -> u32;
-    type FnWlanSetInterface = unsafe extern "system" fn(
-        *mut core::ffi::c_void,
-        *const Guid,
-        u32,
-        u32,
-        *const core::ffi::c_void,
-        *mut core::ffi::c_void,
-    ) -> u32;
-    type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
-    type FnWlanCloseHandle =
-        unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
-
-    unsafe {
-        let hmod = LoadLibraryA(b"wlanapi.dll\0".as_ptr());
-        if hmod.is_null() {
-            return;
+#[cfg(target_os = "windows")]
+impl WindowsWlanMediaStreamingGuard {
+    fn acquire() -> Option<Self> {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
         }
 
-        let p_open = GetProcAddress(hmod, b"WlanOpenHandle\0".as_ptr());
-        let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
-        let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
-        let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
-        let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+        #[repr(C)]
+        struct WlanInterfaceInfo {
+            interface_guid: Guid,
+            interface_description: [u16; 256],
+            is_state: u32,
+        }
 
-        if !p_open.is_null()
-            && !p_enum.is_null()
-            && !p_set.is_null()
-            && !p_free.is_null()
-            && !p_close.is_null()
-        {
+        #[repr(C)]
+        struct WlanInterfaceInfoList {
+            number_of_items: u32,
+            index: u32,
+            interface_info: [WlanInterfaceInfo; 1],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+        }
+
+        type FnWlanOpenHandle = unsafe extern "system" fn(
+            u32,
+            *mut core::ffi::c_void,
+            *mut u32,
+            *mut *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanEnumInterfaces = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut *mut WlanInterfaceInfoList,
+        ) -> u32;
+        type FnWlanSetInterface = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *const Guid,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
+        type FnWlanCloseHandle =
+            unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
+
+        unsafe {
+            let hmod = LoadLibraryA(b"wlanapi.dll\0".as_ptr());
+            if hmod.is_null() {
+                return None;
+            }
+            let p_open = GetProcAddress(hmod, b"WlanOpenHandle\0".as_ptr());
+            let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
+            let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
+            let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
+            let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+            if p_open.is_null()
+                || p_enum.is_null()
+                || p_set.is_null()
+                || p_free.is_null()
+                || p_close.is_null()
+            {
+                FreeLibrary(hmod);
+                return None;
+            }
             let wlan_open: FnWlanOpenHandle = core::mem::transmute(p_open);
             let wlan_enum: FnWlanEnumInterfaces = core::mem::transmute(p_enum);
             let wlan_set: FnWlanSetInterface = core::mem::transmute(p_set);
@@ -1543,41 +1774,152 @@ fn set_windows_wlan_media_streaming_mode(enable: bool) {
 
             let mut negotiated_version = 0u32;
             let mut client_handle: *mut core::ffi::c_void = core::ptr::null_mut();
-
             if wlan_open(
                 2,
                 core::ptr::null_mut(),
                 &mut negotiated_version,
                 &mut client_handle,
-            ) == 0
+            ) != 0
+                || client_handle.is_null()
             {
-                let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
-                if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
-                    && !list_ptr.is_null()
-                {
-                    let count = (*list_ptr).number_of_items as usize;
-                    let first_ptr = (*list_ptr).interface_info.as_ptr();
-                    let val_bool: i32 = if enable { 1 } else { 0 };
-                    // wlan_intf_opcode_media_streaming_mode = 3
-                    const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
-
-                    for i in 0..count {
-                        let info = &*first_ptr.add(i);
-                        let _ = wlan_set(
-                            client_handle,
-                            &info.interface_guid,
-                            OPCODE_MEDIA_STREAMING_MODE,
-                            core::mem::size_of::<i32>() as u32,
-                            &val_bool as *const _ as *const core::ffi::c_void,
-                            core::ptr::null_mut(),
-                        );
-                    }
-                    wlan_free(list_ptr as *mut core::ffi::c_void);
-                }
-                let _ = wlan_close(client_handle, core::ptr::null_mut());
+                FreeLibrary(hmod);
+                return None;
             }
+
+            let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
+            let mut enabled_any = false;
+            if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
+                && !list_ptr.is_null()
+            {
+                let count = (*list_ptr).number_of_items as usize;
+                let first_ptr = (*list_ptr).interface_info.as_ptr();
+                let val_bool: i32 = 1;
+                const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
+                for i in 0..count {
+                    let info = &*first_ptr.add(i);
+                    if wlan_set(
+                        client_handle,
+                        &info.interface_guid,
+                        OPCODE_MEDIA_STREAMING_MODE,
+                        core::mem::size_of::<i32>() as u32,
+                        &val_bool as *const _ as *const core::ffi::c_void,
+                        core::ptr::null_mut(),
+                    ) == 0
+                    {
+                        enabled_any = true;
+                    }
+                }
+                wlan_free(list_ptr as *mut core::ffi::c_void);
+            }
+            if !enabled_any {
+                let _ = wlan_close(client_handle, core::ptr::null_mut());
+                FreeLibrary(hmod);
+                return None;
+            }
+            Some(Self {
+                hmod: hmod as usize,
+                client_handle: client_handle as usize,
+            })
         }
-        FreeLibrary(hmod);
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsWlanMediaStreamingGuard {
+    fn drop(&mut self) {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
+        }
+
+        #[repr(C)]
+        struct WlanInterfaceInfo {
+            interface_guid: Guid,
+            interface_description: [u16; 256],
+            is_state: u32,
+        }
+
+        #[repr(C)]
+        struct WlanInterfaceInfoList {
+            number_of_items: u32,
+            index: u32,
+            interface_info: [WlanInterfaceInfo; 1],
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetProcAddress(
+                module: *mut core::ffi::c_void,
+                name: *const u8,
+            ) -> *mut core::ffi::c_void;
+            fn FreeLibrary(module: *mut core::ffi::c_void) -> i32;
+        }
+
+        type FnWlanEnumInterfaces = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut *mut WlanInterfaceInfoList,
+        ) -> u32;
+        type FnWlanSetInterface = unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            *const Guid,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> u32;
+        type FnWlanFreeMemory = unsafe extern "system" fn(*mut core::ffi::c_void);
+        type FnWlanCloseHandle =
+            unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> u32;
+
+        unsafe {
+            let hmod = self.hmod as *mut core::ffi::c_void;
+            let client_handle = self.client_handle as *mut core::ffi::c_void;
+            if hmod.is_null() {
+                return;
+            }
+            if !client_handle.is_null() {
+                let p_enum = GetProcAddress(hmod, b"WlanEnumInterfaces\0".as_ptr());
+                let p_set = GetProcAddress(hmod, b"WlanSetInterface\0".as_ptr());
+                let p_free = GetProcAddress(hmod, b"WlanFreeMemory\0".as_ptr());
+                let p_close = GetProcAddress(hmod, b"WlanCloseHandle\0".as_ptr());
+                if !p_enum.is_null() && !p_set.is_null() && !p_free.is_null() {
+                    let wlan_enum: FnWlanEnumInterfaces = core::mem::transmute(p_enum);
+                    let wlan_set: FnWlanSetInterface = core::mem::transmute(p_set);
+                    let wlan_free: FnWlanFreeMemory = core::mem::transmute(p_free);
+                    let mut list_ptr: *mut WlanInterfaceInfoList = core::ptr::null_mut();
+                    if wlan_enum(client_handle, core::ptr::null_mut(), &mut list_ptr) == 0
+                        && !list_ptr.is_null()
+                    {
+                        let count = (*list_ptr).number_of_items as usize;
+                        let first_ptr = (*list_ptr).interface_info.as_ptr();
+                        let val_bool: i32 = 0;
+                        const OPCODE_MEDIA_STREAMING_MODE: u32 = 3;
+                        for i in 0..count {
+                            let info = &*first_ptr.add(i);
+                            let _ = wlan_set(
+                                client_handle,
+                                &info.interface_guid,
+                                OPCODE_MEDIA_STREAMING_MODE,
+                                core::mem::size_of::<i32>() as u32,
+                                &val_bool as *const _ as *const core::ffi::c_void,
+                                core::ptr::null_mut(),
+                            );
+                        }
+                        wlan_free(list_ptr as *mut core::ffi::c_void);
+                    }
+                }
+                if !p_close.is_null() {
+                    let wlan_close: FnWlanCloseHandle = core::mem::transmute(p_close);
+                    let _ = wlan_close(client_handle, core::ptr::null_mut());
+                }
+            }
+            FreeLibrary(hmod);
+        }
     }
 }
 

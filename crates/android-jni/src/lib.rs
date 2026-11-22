@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
@@ -21,9 +22,7 @@ use audioshare_protocol::lpc_lossless::{
     encode_fec_subframe, encode_lossless_subframe, encode_vbr_subframe, ADPCM_FEC_BYTES,
     MAX_LOSSLESS_SUBFRAME_BYTES,
 };
-use audioshare_protocol::opus_codec::{
-    pack_opus_red_blob, OpusStreamEncoder, MAX_OPUS_RED_BYTES,
-};
+use audioshare_protocol::opus_codec::{OpusRedHistory, OpusStreamEncoder};
 use audioshare_protocol::wire::{
     pack_datagram_with_key, ClientFeedbackPacket, CodecMode, FeedbackReplayWindow, WireHeader,
     CONTROL_FEEDBACK_MAGIC,
@@ -33,14 +32,49 @@ use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 static GLOBAL_ANDROID_CLIENT: RwLock<Option<ClientEngine>> = RwLock::new(None);
 static GLOBAL_PHONE_MIC_TX: RwLock<Option<PhoneMicTransmitter>> = RwLock::new(None);
 static GLOBAL_SCANNER: OnceLock<DiscoveryScanner> = OnceLock::new();
+/// User-selected Party codec profile (persisted by Android UI):
+/// 0 = Opus RLD (5 ms, default stable), 1 = Studio Lossless 16-bit,
+/// 2 = Max Stability Opus (10 ms), 3 = Pure-Rust VBR (0 ms).
+static PARTY_DESIRED_CODEC_PROFILE: AtomicU8 = AtomicU8::new(0);
+/// User-selected Party compressed bitrate in kbps (64..=320, default 256).
+static PARTY_DESIRED_BITRATE_KBPS: AtomicU16 = AtomicU16::new(256);
+/// Last Bluetooth downstream delay reported by Android AudioManager. Stored
+/// globally so a route report that runs before `android_start_stream` still
+/// seeds the new `ClientEngine` immediately.
+static LAST_REPORTED_BT_DELAY_MS: AtomicU16 = AtomicU16::new(0);
 
 pub fn get_or_start_scanner() -> &'static DiscoveryScanner {
     GLOBAL_SCANNER.get_or_init(DiscoveryScanner::start)
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartyCodecProfile {
+    OpusRld = 0,
+    StudioLossless = 1,
+    MaxStabilityOpus10ms = 2,
+    PureRustVbr = 3,
+}
+
+impl PartyCodecProfile {
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::StudioLossless,
+            2 => Self::MaxStabilityOpus10ms,
+            3 => Self::PureRustVbr,
+            _ => Self::OpusRld,
+        }
+    }
+}
+
 pub struct PartyHostTelemetry {
     pub listener_count: AtomicU8,
     pub active_codec_mode: AtomicU8,
+    /// User-locked Party codec profile (`PartyCodecProfile as u8`).
+    pub desired_codec_profile: AtomicU8,
+    /// User-locked Party compressed bitrate in kbps.
+    pub desired_bitrate_kbps: AtomicU16,
     /// Live capture peak (0..100) so the UI can warn about DRM/OEM silence.
     pub capture_vu_peak_pct: AtomicU8,
     /// Mute the cast stream at the capture source (service-owned Party mute).
@@ -107,40 +141,49 @@ fn trim_phone_mic_backlog(
 const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 
 const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
-const PARTY_VBR_LOSS_THRESHOLD_PERMILLE: u16 = 45;
-const PARTY_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
-const PARTY_CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
-const PARTY_LOSS_HOLD: Duration = Duration::from_secs(3);
+#[cfg(test)]
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
 const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
 const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
+/// Periodic AEAD session salt rotation interval so >71-minute encrypted Party
+/// casts never wrap the 32-bit `tx_timestamp_us` nonce on the same salt.
+const PARTY_SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Hard cap on distinct Party listener IPs. An unbounded unicast fan-out from a
 /// phone host saturates its 2.4 GHz TX queue; 16 is the tested ceiling.
 const MAX_PARTY_PEERS: usize = 16;
 
-/// Select Party compressed bitrate based on peer fan-out and worst link loss.
-/// Phone-to-phone traffic traverses the AP twice (uplink + downlink), so 3+
-/// peers or heavy loss steps down from 256 kbps to 160 / 96 kbps to prevent
-/// 802.11 TX queue saturation.
+/// Resolve the user-locked Party transmission parameters:
+/// `(wire_codec, prefer_opus, subframes_per_packet, bitrate_kbps)`.
+///
+/// Party Mode NEVER switches codecs or framing automatically on network loss
+/// or peer count changes — doing so caused continuous audible jitter/crackles.
+/// The codec, framing, and bitrate change ONLY when the user explicitly changes
+/// them in the UI.
 #[inline]
-fn party_target_bitrate_kbps(listener_ips: usize, worst_loss_permille: u16) -> u16 {
-    if worst_loss_permille > PARTY_CRITICAL_LOSS_THRESHOLD_PERMILLE {
-        96
-    } else if listener_ips >= 3 || worst_loss_permille > PARTY_HIGH_LOSS_THRESHOLD_PERMILLE {
-        160
-    } else {
-        PARTY_VBR_BITRATE_KBPS
-    }
-}
-
-/// Dynamically bundle 10 ms (4 subframes = 100 pps) instead of 5 ms when
-/// serving 3+ peers or heavy Wi-Fi loss, halving 802.11 airtime contention.
-#[inline]
-fn party_subframes_per_packet(listener_ips: usize, worst_loss_permille: u16) -> usize {
-    if listener_ips >= 3 || worst_loss_permille > PARTY_HIGH_LOSS_THRESHOLD_PERMILLE {
-        4
-    } else {
-        2
+fn resolve_party_tx_params(
+    profile: PartyCodecProfile,
+    user_bitrate_kbps: u16,
+) -> (CodecMode, bool, usize, u16) {
+    match profile {
+        PartyCodecProfile::OpusRld => (
+            CodecMode::CompressedLowDelay,
+            true,
+            2,
+            user_bitrate_kbps.clamp(96, 320),
+        ),
+        PartyCodecProfile::StudioLossless => (CodecMode::StudioLosslessLpc, false, 2, 256),
+        PartyCodecProfile::MaxStabilityOpus10ms => (
+            CodecMode::CompressedLowDelay,
+            true,
+            4,
+            user_bitrate_kbps.clamp(64, 160),
+        ),
+        PartyCodecProfile::PureRustVbr => (
+            CodecMode::CompressedLowDelay,
+            false,
+            2,
+            user_bitrate_kbps.clamp(96, 320),
+        ),
     }
 }
 
@@ -213,6 +256,7 @@ fn db_to_tenths(db: f32, min: f32, max: f32) -> i32 {
 struct PartyPeerState {
     last_seen: Instant,
     delay_ms: u16,
+    #[cfg_attr(not(test), allow(dead_code))]
     fec_permille: u16,
     /// Anti-replay sliding window for authenticated Party feedback (AEAD v2).
     /// Unencrypted LAN feedback has no sequence guarantee, so the gate is a
@@ -221,8 +265,9 @@ struct PartyPeerState {
     feedback_replay: FeedbackReplayWindow,
 }
 
-fn parse_target_endpoints_with_locals(
+fn parse_target_endpoints_for_mode(
     target_hosts: &str,
+    use_hardware_mic: bool,
     local_ips: &[IpAddr],
     has_usb_iface: bool,
 ) -> Vec<SocketAddr> {
@@ -246,14 +291,24 @@ fn parse_target_endpoints_with_locals(
         } else {
             continue;
         };
-        let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
 
-        // A unicast phone-to-phone transmitter must never send to a broadcast,
-        // multicast or unspecified address: 802.11 transmits those at the
-        // mandatory basic rate, which can consume the entire channel airtime.
-        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+        // A unicast transmitter must never send to a broadcast, multicast, or
+        // unspecified address. Loopback (`127.0.0.1` / `::1`) is only allowed
+        // in hardware-mic mode, where it tunnels over `adb reverse tcp:65532`
+        // to the PC's `PhoneMicReceiver` over USB.
+        if ip.is_unspecified() || ip.is_multicast() {
             continue;
         }
+        if ip.is_loopback() {
+            if use_hardware_mic {
+                let adb_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), PHONE_MIC_PORT);
+                if !targets.contains(&adb_addr) {
+                    targets.push(adb_addr);
+                }
+            }
+            continue;
+        }
+        let addr = SocketAddr::new(ip, PHONE_MIC_PORT);
         if let IpAddr::V4(ipv4) = addr.ip() {
             if ipv4.is_broadcast() {
                 continue;
@@ -274,11 +329,20 @@ fn parse_target_endpoints_with_locals(
     targets
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_target_endpoints_with_locals(
+    target_hosts: &str,
+    local_ips: &[IpAddr],
+    has_usb_iface: bool,
+) -> Vec<SocketAddr> {
+    parse_target_endpoints_for_mode(target_hosts, false, local_ips, has_usb_iface)
+}
+
 pub fn parse_target_endpoints(target_hosts: &str) -> Vec<SocketAddr> {
     let ifaces = list_valid_host_interfaces();
     let local_ips: Vec<IpAddr> = ifaces.iter().map(|iface| iface.ip).collect();
     let has_usb_iface = ifaces.iter().any(|iface| iface.is_usb_tethering);
-    parse_target_endpoints_with_locals(target_hosts, &local_ips, has_usb_iface)
+    parse_target_endpoints_for_mode(target_hosts, false, &local_ips, has_usb_iface)
 }
 
 fn initial_party_peers(
@@ -417,14 +481,6 @@ fn expire_party_peers(
     });
 }
 
-fn party_codec_mode(peer_count: usize, worst_loss_permille: u16) -> CodecMode {
-    if peer_count >= 2 || worst_loss_permille > PARTY_VBR_LOSS_THRESHOLD_PERMILLE {
-        CodecMode::CompressedLowDelay
-    } else {
-        CodecMode::StudioLosslessLpc
-    }
-}
-
 fn party_dtx_active(packet_is_silent: bool, silent_subframes: u32) -> bool {
     packet_is_silent && silent_subframes > PARTY_DTX_SILENT_SUBFRAMES
 }
@@ -466,7 +522,11 @@ impl PhoneMicTransmitter {
         use_hardware_mic: bool,
         pin: Option<&str>,
     ) -> Result<Self, String> {
-        let static_targets = parse_target_endpoints(target_hosts);
+        let ifaces = list_valid_host_interfaces();
+        let local_ips: Vec<IpAddr> = ifaces.iter().map(|iface| iface.ip).collect();
+        let has_usb_iface = ifaces.iter().any(|iface| iface.is_usb_tethering);
+        let static_targets =
+            parse_target_endpoints_for_mode(target_hosts, use_hardware_mic, &local_ips, has_usb_iface);
         // Hardware-mic mode streams to explicitly configured PC receivers. A
         // Party host is allowed to start with only its beacon: peer phones
         // register themselves by HELLO/feedback and never rely on broadcast.
@@ -486,9 +546,24 @@ impl PhoneMicTransmitter {
         let running = Arc::new(AtomicBool::new(true));
         let mic_input_ring = Arc::new(BurstDecouplerRing::new());
         let initial_peers = initial_party_peers(&static_targets, Instant::now());
+        let initial_profile = PARTY_DESIRED_CODEC_PROFILE.load(Ordering::Relaxed);
+        let initial_bitrate = PARTY_DESIRED_BITRATE_KBPS.load(Ordering::Relaxed);
+        let initial_mode = if use_hardware_mic {
+            CodecMode::StudioLosslessLpc
+        } else {
+            let (codec, prefer_opus, _, _) =
+                resolve_party_tx_params(PartyCodecProfile::from_u8(initial_profile), initial_bitrate);
+            if prefer_opus {
+                CodecMode::OpusRld
+            } else {
+                codec
+            }
+        };
         let party_telemetry = Arc::new(PartyHostTelemetry {
             listener_count: AtomicU8::new(unique_peer_ip_count(&initial_peers) as u8),
-            active_codec_mode: AtomicU8::new(CodecMode::StudioLosslessLpc as u8),
+            active_codec_mode: AtomicU8::new(initial_mode as u8),
+            desired_codec_profile: AtomicU8::new(initial_profile),
+            desired_bitrate_kbps: AtomicU16::new(initial_bitrate),
             capture_vu_peak_pct: AtomicU8::new(0),
             cast_muted: AtomicBool::new(false),
             max_group_delay_ms: AtomicU16::new(0),
@@ -496,7 +571,7 @@ impl PhoneMicTransmitter {
             bound_port,
             rt_thread_tid: AtomicI32::new(0),
         });
-        let session_key = pin
+        let mut session_key = pin
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(SessionKey::from_pin);
@@ -549,13 +624,10 @@ impl PhoneMicTransmitter {
                 let mut fec_hist = [[0u8; ADPCM_FEC_BYTES]; 4];
                 let mut fec_hist_len = 0usize;
                 // Exact Opus RED ring ([P-1] / [P-2]) for `OpusRld` packets.
-                // Self-describing blobs from `pack_opus_red_blob` ride in
+                // Self-describing blobs from `OpusRedHistory` ride in
                 // `WireHeader::fec_n1` / `fec_n2`, so two consecutive dropped
                 // 10 ms Opus packets heal with zero CELT PLC frames.
-                let mut opus_red_prev1 = [0u8; MAX_OPUS_RED_BYTES];
-                let mut opus_red_prev1_len: usize = 0;
-                let mut opus_red_prev2 = [0u8; MAX_OPUS_RED_BYTES];
-                let mut opus_red_prev2_len: usize = 0;
+                let mut opus_red = OpusRedHistory::new();
                 let mut dither_rng = 1u32;
                 let mut noise_shaper =
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
@@ -567,10 +639,19 @@ impl PhoneMicTransmitter {
                 let mut opus_encoder = if use_hardware_mic {
                     None
                 } else {
-                    let encoder = OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS);
+                    let encoder = OpusStreamEncoder::new(
+                        party_telem_clone
+                            .desired_bitrate_kbps
+                            .load(Ordering::Relaxed)
+                            .clamp(64, 320),
+                    );
                     opus_available = encoder.is_some();
                     encoder
                 };
+                // Retain the previous live subframe so a manual user switch
+                // into Opus RLD mid-stream primes the 2.5 ms lookahead cleanly.
+                let mut prev_f32_subframe = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                let mut has_prev_subframe = false;
                 let mut ctrl_buf = [0u8; 64];
                 let mut peers = initial_peers;
                 // Per-peer authenticated feedback history lives in
@@ -578,8 +659,7 @@ impl PhoneMicTransmitter {
                 // cannot reset the anti-replay watermark.
                 let mut last_sweep = Instant::now();
                 let mut last_iface_refresh = Instant::now();
-                let mut governed_loss_permille: u16 = 0;
-                let mut loss_hold_until = Instant::now();
+                let mut last_salt_rotation = Instant::now();
                 let mut silent_subframes: u32 = 0;
                 // Keep 2.5 ms (400 pps) single-subframe mic pacing only on USB;
                 // bundle 5.0 ms (200 pps) over Wi-Fi to avoid 802.11 TX saturation.
@@ -599,7 +679,24 @@ impl PhoneMicTransmitter {
                     2
                 };
                 let mut last_tx: Option<Instant> = None;
+                let mut last_vu_update = Instant::now();
                 let mut last_party_dtx_heartbeat = Instant::now();
+                // Separate IPv6 socket when any target is IPv6 (the primary
+                // socket binds `0.0.0.0`, which cannot send to IPv6 peers).
+                let mut socket_v6: Option<UdpSocket> = if static_targets.iter().any(|t| t.is_ipv6())
+                {
+                    UdpSocket::bind("[::]:0").ok().inspect(|s| {
+                        let _ = s.set_nonblocking(true);
+                    })
+                } else {
+                    None
+                };
+                // Persistent TCP_NODELAY stream for USB ADB reverse (`127.0.0.1:65532`)
+                // hardware-mic mode, using the exact 2-byte big-endian length-prefixed
+                // framing expected by `AdbUsbWatcher::spawn_host_adb_tcp_session`.
+                let mut adb_mic_tcp: Option<TcpStream> = None;
+                let mut last_adb_tcp_attempt: Option<Instant> = None;
+                let mut tcp_frame = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
 
                 while run_clone.load(Ordering::Relaxed) {
                     #[cfg(target_os = "android")]
@@ -627,7 +724,7 @@ impl PhoneMicTransmitter {
                         while let Ok((len, src_addr)) = socket.recv_from(&mut ctrl_buf) {
                             // A phone that receives its own beacon/feedback
                             // must never register itself as a listener.
-                            if local_ips.contains(&src_addr.ip()) {
+                            if local_ips.contains(&src_addr.ip()) || src_addr.ip().is_loopback() {
                                 continue;
                             }
                             if len >= 8 && &ctrl_buf[..8] == b"ASULTRA1" {
@@ -690,27 +787,40 @@ impl PhoneMicTransmitter {
                                 .collect();
                         }
                     }
-
-                    let raw_worst_loss = peers.values().map(|p| p.fec_permille).max().unwrap_or(0);
-                    let loop_now = Instant::now();
-                    if raw_worst_loss > PARTY_VBR_LOSS_THRESHOLD_PERMILLE {
-                        governed_loss_permille = governed_loss_permille.max(raw_worst_loss);
-                        loss_hold_until = loop_now + PARTY_LOSS_HOLD;
-                    } else if loop_now >= loss_hold_until {
-                        governed_loss_permille = raw_worst_loss;
+                    // Rotate the AEAD session salt every 30 minutes in BOTH
+                    // Party Mode and hardware Phone Mic mode so `tx_timestamp_us`
+                    // (which wraps at 71.58 minutes) never causes ChaCha20-Poly1305
+                    // nonce reuse on long encrypted calls.
+                    if last_salt_rotation.elapsed() >= PARTY_SALT_ROTATION_INTERVAL {
+                        last_salt_rotation = Instant::now();
+                        if let Some(ref mut key) = session_key {
+                            key.rotate_session_salt();
+                        }
                     }
-                    let worst_loss_permille = governed_loss_permille;
+
                     // A single listener may be registered on two ports (a
                     // configured PC endpoint plus its dynamic HELLO source),
-                    // so codec policy must count distinct listener IPs.
+                    // so peer telemetry counts distinct listener IPs.
                     let listener_ips = unique_peer_ip_count(&peers);
                     party_telem_clone
                         .listener_count
                         .store(listener_ips.min(255) as u8, Ordering::Relaxed);
+                    // User-locked Party codec/framing/bitrate: never auto-flip
+                    // mid-stream on loss or peer fluctuations.
+                    let desired_profile = PartyCodecProfile::from_u8(
+                        party_telem_clone
+                            .desired_codec_profile
+                            .load(Ordering::Relaxed),
+                    );
+                    let desired_kbps = party_telem_clone
+                        .desired_bitrate_kbps
+                        .load(Ordering::Relaxed);
+                    let (party_packet_codec, party_prefer_opus, party_subframes, party_kbps) =
+                        resolve_party_tx_params(desired_profile, desired_kbps);
                     let subframes_per_pkt = if use_hardware_mic {
                         hw_mic_subframes
                     } else {
-                        party_subframes_per_packet(listener_ips, worst_loss_permille)
+                        party_subframes
                     };
                     let min_tx_gap = Duration::from_micros(phone_mic_min_gap_us(subframes_per_pkt));
 
@@ -727,7 +837,19 @@ impl PhoneMicTransmitter {
                         party_telem_clone
                             .max_group_delay_ms
                             .store(0, Ordering::Relaxed);
+                        let idle_mode = if use_hardware_mic {
+                            CodecMode::StudioLosslessLpc
+                        } else if party_prefer_opus {
+                            CodecMode::OpusRld
+                        } else {
+                            party_packet_codec
+                        };
+                        party_telem_clone
+                            .active_codec_mode
+                            .store(idle_mode as u8, Ordering::Relaxed);
                         silent_subframes = 0;
+                        has_prev_subframe = false;
+                        prev_f32_subframe.fill(0.0);
                         if ring_clone.available_samples() >= SUBFRAME_STEREO_SAMPLES {
                             let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
                             ring_clone.pop_exact_or_dither(&mut f32_buf, &mut dither_rng);
@@ -740,11 +862,11 @@ impl PhoneMicTransmitter {
                                 (peak.clamp(0.0, 1.0).sqrt() * 100.0).min(100.0) as u8,
                                 Ordering::Relaxed,
                             );
+                            last_vu_update = Instant::now();
                             opus_encoder = None;
                             fec_hist_len = 0;
                             // No listener means no Opus chain to continue.
-                            opus_red_prev1_len = 0;
-                            opus_red_prev2_len = 0;
+                            opus_red.clear();
                         } else {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -807,6 +929,7 @@ impl PhoneMicTransmitter {
                             (pkt_peak.clamp(0.0, 1.0).sqrt() * 100.0).min(100.0) as u8,
                             Ordering::Relaxed,
                         );
+                        last_vu_update = Instant::now();
 
                         seq = seq.wrapping_add(subframes_per_pkt as u16);
 
@@ -822,10 +945,11 @@ impl PhoneMicTransmitter {
                         if dtx {
                             opus_encoder = None;
                             fec_hist_len = 0;
+                            has_prev_subframe = false;
+                            prev_f32_subframe.fill(0.0);
                             // Silence breaks the exact-Opus chain: the next
                             // real Opus packet starts with no prior blobs.
-                            opus_red_prev1_len = 0;
-                            opus_red_prev2_len = 0;
+                            opus_red.clear();
                             let now = Instant::now();
                             if !party_dtx_heartbeat_due(last_party_dtx_heartbeat, now) {
                                 // Nothing goes out: leave last_tx at the last
@@ -836,39 +960,44 @@ impl PhoneMicTransmitter {
                             last_party_dtx_heartbeat = now;
                         }
 
-                        // A Party host feeding several phones cannot afford a
-                        // lossless unicast copy per listener on 2.4 GHz. Step
-                        // down to 256 kbps compressed when a second listener
-                        // joins or when any listener reports more than 4.5%
-                        // loss. Opus RLD replaces VBR when the encoder is
-                        // available; VBR remains the fallback. Hardware-mic
-                        // mode always stays lossless so the wire header and
-                        // payload agree even with multiple PC targets.
+                        // Strictly honor the user-locked Party codec/bitrate so
+                        // Party Mode never flips codecs mid-stream unless the
+                        // user explicitly selects another codec. Hardware-mic
+                        // mode always stays lossless for PC Virtual Mic.
                         let packet_codec = if use_hardware_mic {
                             CodecMode::StudioLosslessLpc
                         } else {
-                            party_codec_mode(listener_ips, worst_loss_permille)
+                            party_packet_codec
                         };
-                        let target_kbps =
-                            party_target_bitrate_kbps(listener_ips, worst_loss_permille);
+                        let target_kbps = party_kbps;
                         let use_compressed =
                             !use_hardware_mic && packet_codec == CodecMode::CompressedLowDelay;
+                        let want_opus = use_compressed && party_prefer_opus;
 
                         // Opus is stateful and the receiver drops its decoder
                         // on every non-Opus frame. Mirror that here: drop the
-                        // encoder when leaving compressed mode so a later
-                        // return starts from clean history, and recreate it
-                        // only if creation has not already failed.
+                        // encoder when leaving Opus so a later user switch
+                        // starts cleanly, and prime its 2.5 ms lookahead with
+                        // `prev_f32_subframe` so manual switches don't click.
                         if !dtx {
-                            if !use_compressed {
+                            if !want_opus {
                                 opus_encoder = None;
                                 // Leaving Opus invalidates the exact-Opus RED
                                 // history; ADPCM FEC takes over again.
-                                opus_red_prev1_len = 0;
-                                opus_red_prev2_len = 0;
+                                opus_red.clear();
                             } else if opus_encoder.is_none() && opus_available {
                                 opus_encoder = OpusStreamEncoder::new(target_kbps);
                                 opus_available = opus_encoder.is_some();
+                                if let Some(enc_opus) = opus_encoder.as_mut() {
+                                    if has_prev_subframe {
+                                        let mut discard = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                                        let _ = enc_opus.encode_subframe_f32(
+                                            &prev_f32_subframe,
+                                            target_kbps,
+                                            &mut discard,
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -879,7 +1008,7 @@ impl PhoneMicTransmitter {
                         let mut opus_sf_count = 0usize;
                         if !dtx {
                             let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                            let mut opus_primary = use_compressed && opus_encoder.is_some();
+                            let mut opus_primary = want_opus && opus_encoder.is_some();
                             if opus_primary {
                                 for f32_frame in f32_frames.iter().take(subframes_per_pkt) {
                                     let encoded = opus_encoder.as_mut().and_then(|enc_opus| {
@@ -896,8 +1025,7 @@ impl PhoneMicTransmitter {
                                         opus_available = false;
                                         opus_primary = false;
                                         opus_sf_count = 0;
-                                        opus_red_prev1_len = 0;
-                                        opus_red_prev2_len = 0;
+                                        opus_red.clear();
                                         break;
                                     };
                                     let len_be = (enc_len as u16).to_be_bytes();
@@ -928,6 +1056,8 @@ impl PhoneMicTransmitter {
                                     cursor += enc_len;
                                 }
                             }
+                            prev_f32_subframe = f32_frames[subframes_per_pkt - 1];
+                            has_prev_subframe = true;
                             codec_mode = if opus_primary {
                                 CodecMode::OpusRld
                             } else {
@@ -1022,10 +1152,7 @@ impl PhoneMicTransmitter {
                         let (f1, f2): (&[u8], &[u8]) = if dtx {
                             (&[], &[])
                         } else if codec_mode == CodecMode::OpusRld {
-                            (
-                                &opus_red_prev1[..opus_red_prev1_len],
-                                &opus_red_prev2[..opus_red_prev2_len],
-                            )
+                            opus_red.fec_slices()
                         } else {
                             (&fec_pair_1[..n1_len], &fec_pair_2[..n2_len])
                         };
@@ -1053,7 +1180,46 @@ impl PhoneMicTransmitter {
                         });
                         if let Ok(pkt_len) = packed {
                             for target in peers.keys() {
-                                let _ = socket.send_to(&dgram[..pkt_len], *target);
+                                if use_hardware_mic && target.ip().is_loopback() {
+                                    if adb_mic_tcp.is_none()
+                                        && last_adb_tcp_attempt
+                                            .map(|t| t.elapsed() >= Duration::from_secs(1))
+                                            .unwrap_or(true)
+                                    {
+                                        last_adb_tcp_attempt = Some(Instant::now());
+                                        if let Ok(stream) = TcpStream::connect_timeout(
+                                            target,
+                                            Duration::from_millis(250),
+                                        ) {
+                                            let _ = stream.set_nodelay(true);
+                                            let _ = stream.set_write_timeout(Some(
+                                                Duration::from_millis(250),
+                                            ));
+                                            adb_mic_tcp = Some(stream);
+                                        }
+                                    }
+                                    if let Some(ref mut stream) = adb_mic_tcp {
+                                        let len_be = (pkt_len as u16).to_be_bytes();
+                                        tcp_frame[0] = len_be[0];
+                                        tcp_frame[1] = len_be[1];
+                                        tcp_frame[2..2 + pkt_len]
+                                            .copy_from_slice(&dgram[..pkt_len]);
+                                        if stream.write_all(&tcp_frame[..2 + pkt_len]).is_err() {
+                                            adb_mic_tcp = None;
+                                        }
+                                    }
+                                } else if target.is_ipv6() {
+                                    if socket_v6.is_none() {
+                                        socket_v6 = UdpSocket::bind("[::]:0").ok().inspect(|s| {
+                                            let _ = s.set_nonblocking(true);
+                                        });
+                                    }
+                                    if let Some(ref s6) = socket_v6 {
+                                        let _ = s6.send_to(&dgram[..pkt_len], *target);
+                                    }
+                                } else {
+                                    let _ = socket.send_to(&dgram[..pkt_len], *target);
+                                }
                             }
                             last_tx = Some(Instant::now());
 
@@ -1062,17 +1228,19 @@ impl PhoneMicTransmitter {
                             // cannot fit in 255 B leaves [P-1] empty for one
                             // packet instead of dropping the whole datagram.
                             if !dtx && codec_mode == CodecMode::OpusRld {
-                                opus_red_prev2.copy_from_slice(&opus_red_prev1);
-                                opus_red_prev2_len = opus_red_prev1_len;
-                                opus_red_prev1_len = pack_opus_red_blob(
-                                    base_seq,
-                                    &opus_slices[..opus_sf_count],
-                                    &mut opus_red_prev1,
-                                )
-                                .unwrap_or(0);
+                                opus_red.push_packet(base_seq, &opus_slices[..opus_sf_count]);
                             }
                         }
                     } else {
+                        // If capture stalls (AAudio disconnect or MediaProjection
+                        // silence/revoke), zero the VU meter after 250 ms so the UI
+                        // never stays frozen on the last peak and Party Mode's
+                        // silence warning can trigger.
+                        if last_vu_update.elapsed() >= Duration::from_millis(250) {
+                            party_telem_clone
+                                .capture_vu_peak_pct
+                                .store(0, Ordering::Relaxed);
+                        }
                         std::thread::sleep(Duration::from_micros(800));
                     }
                 }
@@ -1146,6 +1314,13 @@ pub fn android_start_stream(
         );
         e
     })?;
+    let initial_bt_delay = LAST_REPORTED_BT_DELAY_MS.load(Ordering::Relaxed);
+    if initial_bt_delay > 0 {
+        client
+            .telemetry
+            .downstream_bt_delay_ms
+            .store(initial_bt_delay, Ordering::Relaxed);
+    }
     // Log the parsed host/port, never the raw input or PIN: the PIN is a
     // separate argument and must not end up in a pasteable diagnostics bundle.
     diagnostics::info(
@@ -1199,6 +1374,23 @@ pub fn android_set_party_cast_muted(muted: bool) {
     }
 }
 
+/// Set the user-locked Party codec profile and target bitrate. Updates both
+/// global defaults (for future Party sessions) and any live Party transmitter.
+pub fn android_set_party_codec_config(profile: u8, bitrate_kbps: u16) {
+    let clamped_profile = PartyCodecProfile::from_u8(profile) as u8;
+    let clamped_kbps = bitrate_kbps.clamp(64, 320);
+    PARTY_DESIRED_CODEC_PROFILE.store(clamped_profile, Ordering::Relaxed);
+    PARTY_DESIRED_BITRATE_KBPS.store(clamped_kbps, Ordering::Relaxed);
+    if let Some(ref tx) = *GLOBAL_PHONE_MIC_TX.read().unwrap_or_else(|e| e.into_inner()) {
+        tx.party_telemetry
+            .desired_codec_profile
+            .store(clamped_profile, Ordering::Relaxed);
+        tx.party_telemetry
+            .desired_bitrate_kbps
+            .store(clamped_kbps, Ordering::Relaxed);
+    }
+}
+
 pub fn android_set_gain_db(gain_db: f32) {
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
@@ -1209,6 +1401,7 @@ pub fn android_set_gain_db(gain_db: f32) {
 }
 
 pub fn android_report_bt_delay_ms(delay_ms: u16) {
+    LAST_REPORTED_BT_DELAY_MS.store(delay_ms, Ordering::Relaxed);
     if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
         client
             .telemetry
@@ -1227,7 +1420,7 @@ pub fn android_send_media_command(cmd_code: u8) {
                 .telemetry
                 .pending_codec_backend_command
                 .store(cmd_code, Ordering::Relaxed);
-        } else if (30..=33).contains(&cmd_code) {
+        } else if (30..=34).contains(&cmd_code) {
             client
                 .telemetry
                 .pending_bitrate_command
@@ -1310,7 +1503,7 @@ pub fn android_get_discovered_hosts_csv() -> String {
 pub mod android_native {
     use super::*;
     use jni::objects::{JClass, JString};
-    use jni::sys::{jboolean, jfloat, jint, jintArray, jlongArray, jstring};
+    use jni::sys::{jboolean, jfloat, jint, jintArray, jlong, jlongArray, jstring};
     use jni::JNIEnv;
 
     #[no_mangle]
@@ -1397,6 +1590,20 @@ pub mod android_native {
         muted: jboolean,
     ) {
         android_set_party_cast_muted(muted != 0);
+    }
+
+    /// User-locked Party codec profile and bitrate configuration.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeSetPartyCodecConfig(
+        _env: JNIEnv,
+        _class: JClass,
+        codec_profile: jint,
+        bitrate_kbps: jint,
+    ) {
+        android_set_party_codec_config(
+            codec_profile.clamp(0, 3) as u8,
+            bitrate_kbps.clamp(64, 320) as u16,
+        );
     }
 
     #[no_mangle]
@@ -1653,6 +1860,20 @@ pub mod android_native {
         }
     }
 
+    /// Return the current client authentication failure count so Android UI
+    /// can prompt for a corrected host PIN on mismatch.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeGetAuthFailures(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jlong {
+        if let Some(ref client) = *GLOBAL_ANDROID_CLIENT.read().unwrap_or_else(|e| e.into_inner()) {
+            client.telemetry.auth_failures.load(Ordering::Relaxed) as jlong
+        } else {
+            0
+        }
+    }
+
     /// Bridge Kotlin-side state transitions into the shared ring-buffered
     /// diagnostics log. Mirrors
     /// `AudioEngineService.nativeLogEvent(level, component, message)`:
@@ -1707,14 +1928,14 @@ mod tests {
     #[test]
     fn test_party_targets_filter_self_broadcast_and_legacy_rndis() {
         let local = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
-        let input = "192.168.1.50, 192.168.1.60, 255.255.255.255, \
-                     255.255.255.255:65530, 239.255.77.77, 0.0.0.0, \
+        let input = "192.168.1.50, 192.168.1.60, 127.0.0.1, 127.0.0.1:65530, [::1]:65530, \
+                     255.255.255.255, 255.255.255.255:65530, 239.255.77.77, 0.0.0.0, \
                      0.0.0.0:65530, [ff02::1]:65530, 192.168.42.129:65530";
         let targets = parse_target_endpoints_with_locals(input, &[local], false);
         assert_eq!(
             targets,
             vec!["192.168.1.60:65532".parse().unwrap()],
-            "self, broadcast, multicast, unspecified and dead RNDIS hosts must be dropped"
+            "self, loopback, broadcast, multicast, unspecified and dead RNDIS hosts must be dropped"
         );
 
         // A real USB tethering interface makes the legacy RNDIS target reachable.
@@ -1725,6 +1946,20 @@ mod tests {
         let local_v6: IpAddr = "fe80::1".parse().unwrap();
         assert!(
             parse_target_endpoints_with_locals("[fe80::1]:65530", &[local_v6], false).is_empty()
+        );
+
+        // Hardware-mic mode allows ADB USB loopback (`127.0.0.1:65530` ->
+        // `127.0.0.1:65532`), while Party mode keeps rejecting loopback.
+        let usb_mic_targets =
+            parse_target_endpoints_for_mode("127.0.0.1:65530", true, &[local], false);
+        assert_eq!(
+            usb_mic_targets,
+            vec!["127.0.0.1:65532".parse().unwrap()],
+            "hardware mic mode must tunnel loopback targets over ADB port 65532"
+        );
+        assert!(
+            parse_target_endpoints_for_mode("127.0.0.1:65530", false, &[local], false).is_empty(),
+            "Party mode must continue rejecting loopback targets"
         );
     }
 
@@ -1841,17 +2076,43 @@ mod tests {
     }
 
     #[test]
-    fn test_party_codec_vbr_engages_for_multi_peer_or_loss() {
-        assert_eq!(party_codec_mode(0, 0), CodecMode::StudioLosslessLpc);
+    fn test_party_codec_is_user_locked_and_stable() {
+        // Opus RLD default: locked at 2 sf (5 ms), user bitrate clamped 96..=320.
         assert_eq!(
-            party_codec_mode(1, PARTY_VBR_LOSS_THRESHOLD_PERMILLE),
-            CodecMode::StudioLosslessLpc
+            resolve_party_tx_params(PartyCodecProfile::OpusRld, 256),
+            (CodecMode::CompressedLowDelay, true, 2, 256)
         );
         assert_eq!(
-            party_codec_mode(1, PARTY_VBR_LOSS_THRESHOLD_PERMILLE + 1),
-            CodecMode::CompressedLowDelay
+            resolve_party_tx_params(PartyCodecProfile::OpusRld, 320),
+            (CodecMode::CompressedLowDelay, true, 2, 320)
         );
-        assert_eq!(party_codec_mode(2, 0), CodecMode::CompressedLowDelay);
+        assert_eq!(
+            resolve_party_tx_params(PartyCodecProfile::OpusRld, 510),
+            (CodecMode::CompressedLowDelay, true, 2, 320)
+        );
+
+        // Studio Lossless: locked on 16-bit lossless LPC, 2 sf.
+        assert_eq!(
+            resolve_party_tx_params(PartyCodecProfile::StudioLossless, 160),
+            (CodecMode::StudioLosslessLpc, false, 2, 256)
+        );
+
+        // Max Stability Opus: locked at 4 sf (10 ms), bitrate clamped 64..=160
+        // so 4-subframe exact RED blobs always fit inside 255 bytes.
+        assert_eq!(
+            resolve_party_tx_params(PartyCodecProfile::MaxStabilityOpus10ms, 256),
+            (CodecMode::CompressedLowDelay, true, 4, 160)
+        );
+        assert_eq!(
+            resolve_party_tx_params(PartyCodecProfile::MaxStabilityOpus10ms, 96),
+            (CodecMode::CompressedLowDelay, true, 4, 96)
+        );
+
+        // Pure-Rust VBR: locked on VBR without Opus.
+        assert_eq!(
+            resolve_party_tx_params(PartyCodecProfile::PureRustVbr, 256),
+            (CodecMode::CompressedLowDelay, false, 2, 256)
+        );
     }
 
     #[test]
@@ -1880,41 +2141,6 @@ mod tests {
             unique_peer_ip_count(&peers),
             2,
             "a second IP must count as the second listener"
-        );
-    }
-
-    #[test]
-    fn test_party_codec_mode_uses_unique_listener_ips() {
-        let now = Instant::now();
-        let pc_static: SocketAddr = "192.168.1.60:65532".parse().unwrap();
-        let pc_dynamic: SocketAddr = "192.168.1.60:65530".parse().unwrap();
-        let phone: SocketAddr = "192.168.1.70:40000".parse().unwrap();
-        let static_targets = [pc_static];
-
-        // Static PC endpoint plus its dynamic HELLO source: one IP, two
-        // ports. This must stay lossless, not step down to VBR.
-        let mut peers = initial_party_peers(&static_targets, now);
-        register_party_peer(&mut peers, pc_dynamic, &static_targets, now);
-        let listener_ips = unique_peer_ip_count(&peers);
-        assert_eq!(listener_ips, 1);
-        assert_eq!(
-            party_codec_mode(listener_ips, 0),
-            CodecMode::StudioLosslessLpc
-        );
-
-        // Loss still forces VBR even with a single listener IP.
-        assert_eq!(
-            party_codec_mode(listener_ips, PARTY_VBR_LOSS_THRESHOLD_PERMILLE + 1),
-            CodecMode::CompressedLowDelay
-        );
-
-        // A genuinely different IP is the second listener and forces VBR.
-        register_party_peer(&mut peers, phone, &static_targets, now);
-        let listener_ips = unique_peer_ip_count(&peers);
-        assert_eq!(listener_ips, 2);
-        assert_eq!(
-            party_codec_mode(listener_ips, 0),
-            CodecMode::CompressedLowDelay
         );
     }
 
@@ -2161,22 +2387,15 @@ mod tests {
     }
 
     #[test]
-    fn test_party_target_bitrate_adapts_to_peers_and_loss() {
-        // 1-2 peers and low loss -> 256 kbps
-        assert_eq!(party_target_bitrate_kbps(1, 0), 256);
-        assert_eq!(party_target_bitrate_kbps(2, 45), 256);
-        assert_eq!(party_target_bitrate_kbps(2, 120), 256);
-
-        // 3+ peers -> 160 kbps (saves AP airtime)
-        assert_eq!(party_target_bitrate_kbps(3, 0), 160);
-        assert_eq!(party_target_bitrate_kbps(4, 50), 160);
-
-        // High loss (>12%) -> 160 kbps
-        assert_eq!(party_target_bitrate_kbps(1, 121), 160);
-
-        // Critical loss (>20%) -> 96 kbps
-        assert_eq!(party_target_bitrate_kbps(1, 201), 96);
-        assert_eq!(party_target_bitrate_kbps(5, 250), 96);
+    fn test_party_codec_config_updates_live_and_default_state() {
+        android_set_party_codec_config(PartyCodecProfile::StudioLossless as u8, 320);
+        assert_eq!(
+            PARTY_DESIRED_CODEC_PROFILE.load(Ordering::Relaxed),
+            PartyCodecProfile::StudioLossless as u8
+        );
+        assert_eq!(PARTY_DESIRED_BITRATE_KBPS.load(Ordering::Relaxed), 320);
+        // Restore default Opus RLD 256 kbps so parallel tests see default state.
+        android_set_party_codec_config(PartyCodecProfile::OpusRld as u8, 256);
     }
 
     #[test]
@@ -2235,28 +2454,6 @@ mod tests {
         let mut tx = tx.unwrap();
         assert_eq!(tx.party_telemetry.listener_count.load(Ordering::Relaxed), 0);
         tx.stop();
-    }
-
-    #[test]
-    fn test_party_subframes_per_packet_thresholds() {
-        // 1-2 peers and <=12% loss keep the 5 ms / 200 pps cadence.
-        assert_eq!(party_subframes_per_packet(0, 0), 2);
-        assert_eq!(party_subframes_per_packet(1, 0), 2);
-        assert_eq!(
-            party_subframes_per_packet(2, PARTY_HIGH_LOSS_THRESHOLD_PERMILLE),
-            2
-        );
-
-        // 3+ peers -> 4 subframes (10 ms / 100 pps).
-        assert_eq!(party_subframes_per_packet(3, 0), 4);
-        assert_eq!(party_subframes_per_packet(5, 0), 4);
-
-        // >12% loss -> 4 subframes even with a single listener.
-        assert_eq!(
-            party_subframes_per_packet(1, PARTY_HIGH_LOSS_THRESHOLD_PERMILLE + 1),
-            4
-        );
-        assert_eq!(party_subframes_per_packet(2, 200), 4);
     }
 
     #[test]

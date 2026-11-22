@@ -220,28 +220,38 @@ pub(crate) mod windows_endpoint_switch {
             let col_vtbl = *(col as *const *const IMMDeviceCollectionVtbl);
             let mut count = 0u32;
             let _ = ((*col_vtbl).get_count)(col, &mut count);
-            let mut found = None;
+            let mut best_preferred: Option<(u8, Vec<u16>)> = None;
+            let mut fallback = None;
             for i in 0..count {
                 let mut dev: *mut c_void = core::ptr::null_mut();
                 if ((*col_vtbl).item)(col, i, &mut dev) >= 0 && !dev.is_null() {
                     if let Some(name) = device_friendly_name(dev) {
                         let lower = name.to_ascii_lowercase();
-                        if lower.contains("cable input")
-                            || lower.contains("audioshare")
-                            || lower.contains("virtual")
-                        {
-                            found = device_id(dev);
+                        // Prioritize VB-Cable (including renamed "Speakers
+                        // (VB-Audio Virtual Cable)" and "CABLE Input") and
+                        // AudioShare virtual speakers over generic "virtual"
+                        // devices so unrelated drivers never hijack VB-Cable.
+                        let prio = if lower.contains("audioshare") {
+                            Some(0u8)
+                        } else {
+                            crate::vbcable_output_match_priority(&name)
+                        };
+                        if let Some(p) = prio {
+                            if best_preferred.as_ref().map(|(bp, _)| p < *bp).unwrap_or(true) {
+                                if let Some(id) = device_id(dev) {
+                                    best_preferred = Some((p, id));
+                                }
+                            }
+                        } else if fallback.is_none() && lower.contains("virtual") {
+                            fallback = device_id(dev);
                         }
                     }
                     let dev_vtbl = *(dev as *const *const IMMDeviceVtbl);
                     ((*dev_vtbl).unk.release)(dev);
-                    if found.is_some() {
-                        break;
-                    }
                 }
             }
             ((*col_vtbl).unk.release)(col);
-            found
+            best_preferred.map(|(_, id)| id).or(fallback)
         }
     }
 
@@ -466,12 +476,36 @@ pub(crate) fn spawn_windows_process_loopback(
                     let _ = ready_tx.send(Ok(()));
 
                     let silence = [0.0f32; 2048];
+                    let mut last_liveness_check = std::time::Instant::now();
                     'capture: while active_t.load(std::sync::atomic::Ordering::Relaxed)
                         && running.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         let _ = WaitForSingleObject(sample_evt.0, 20);
-                        while let Ok(pkt_frames) = capture.GetNextPacketSize() {
-                            if pkt_frames == 0 { break; }
+                        if last_liveness_check.elapsed() >= std::time::Duration::from_millis(500) {
+                            last_liveness_check = std::time::Instant::now();
+                            if !is_windows_pid_alive(target_pid) {
+                                set_windows_app_isolation_error(Some(format!(
+                                    "Isolated app (PID {target_pid}) exited — returned to Full System Audio"
+                                )));
+                                clear_windows_target_capture_pid();
+                                stream_error.store(true, std::sync::atomic::Ordering::Release);
+                                break 'capture;
+                            }
+                        }
+                        loop {
+                            let pkt_frames = match capture.GetNextPacketSize() {
+                                Ok(n) => n,
+                                Err(_) => {
+                                    // Endpoint/service invalidated: signal the
+                                    // host watchdog so it rebinds cleanly
+                                    // instead of spinning silently forever.
+                                    stream_error.store(true, std::sync::atomic::Ordering::Release);
+                                    break 'capture;
+                                }
+                            };
+                            if pkt_frames == 0 {
+                                break;
+                            }
                             let mut data_ptr = core::ptr::null_mut();
                             let mut frames = 0u32;
                             let mut buf_flags = 0u32;
@@ -509,7 +543,12 @@ pub(crate) fn spawn_windows_process_loopback(
                     if !started_ok {
                         let _ = ready_tx.send(Err(err));
                     }
-                    stream_error.store(true, std::sync::atomic::Ordering::Release);
+                    // Only flag `stream_error` if this stream was not already
+                    // cancelled/timed-out by the host watchdog; otherwise a
+                    // late timeout failure would poison the replacement stream.
+                    if active_t.load(std::sync::atomic::Ordering::Relaxed) {
+                        stream_error.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 if com_ok { CoUninitialize(); }
             }
@@ -557,6 +596,26 @@ pub fn list_active_audio_apps() -> Vec<AudioAppEntry> {
 /// Live sink-input IDs currently routed to `sink_name` (PipeWire/Pulse).
 #[cfg(target_os = "linux")]
 fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
+    // Column 2 of `pactl list short sink-inputs` is the numeric sink index
+    // (not the sink name), so resolve `sink_name` -> numeric index first.
+    let target_sink_idx: Option<String> = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let idx = fields.next()?;
+                let name = fields.next()?;
+                if name == sink_name {
+                    Some(idx.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
     let Ok(output) = Command::new("pactl")
         .args(["list", "short", "sink-inputs"])
         .output()
@@ -570,8 +629,10 @@ fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
         let Some(id) = fields.next().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if fields.next() == Some(sink_name) {
-            ids.push(id);
+        if let Some(col2) = fields.next() {
+            if col2 == sink_name || target_sink_idx.as_deref() == Some(col2) {
+                ids.push(id);
+            }
         }
     }
     ids
@@ -643,37 +704,97 @@ fn list_windows_audio_processes() -> Vec<AudioAppEntry> {
     list_windows_audio_processes_tasklist()
 }
 
-/// Enumerate the PIDs behind every active CoreAudio render session via
+/// Check whether a Windows process ID is still alive (`STILL_ACTIVE`).
+#[cfg(target_os = "windows")]
+fn is_windows_pid_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code).is_ok();
+        let _ = CloseHandle(handle);
+        ok && code == STILL_ACTIVE.0 as u32
+    }
+}
+
+static WINDOWS_APP_ISOLATION_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_windows_app_isolation_error(err: Option<String>) {
+    if let Ok(mut guard) = WINDOWS_APP_ISOLATION_ERROR.lock() {
+        *guard = err;
+    }
+}
+
+pub fn take_windows_app_isolation_error() -> Option<String> {
+    WINDOWS_APP_ISOLATION_ERROR
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
+
+pub fn clear_windows_target_capture_pid() {
+    #[cfg(target_os = "windows")]
+    WINDOWS_TARGET_CAPTURE_PID.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Enumerate the PIDs behind every active/inactive CoreAudio render session on
+/// both the Multimedia and Communications default endpoints via
 /// `IAudioSessionManager2::GetSessionEnumerator` ->
-/// `IAudioSessionControl2::GetProcessId`.
+/// `IAudioSessionControl2::GetProcessId`. Filters out expired sessions,
+/// System Sounds, and AudioShare's own process.
 #[cfg(target_os = "windows")]
 fn windows_audio_session_pids() -> Vec<u32> {
     use windows::core::Interface;
     use windows::Win32::Media::Audio::{
-        IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDeviceEnumerator,
-        MMDeviceEnumerator,
+        eCommunications, eMultimedia, eRender, AudioSessionStateExpired, IAudioSessionControl2,
+        IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator,
     };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
+    let self_pid = std::process::id();
     let mut pids = Vec::new();
     unsafe {
         let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
         let enumerated = (|| -> windows::core::Result<()> {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let endpoint = enumerator.GetDefaultAudioEndpoint(
-                windows::Win32::Media::Audio::eRender,
-                windows::Win32::Media::Audio::eMultimedia,
-            )?;
-            let manager: IAudioSessionManager2 = endpoint.Activate(CLSCTX_ALL, None)?;
-            let sessions: IAudioSessionEnumerator = manager.GetSessionEnumerator()?;
-            for index in 0..sessions.GetCount()? {
-                if let Ok(control) = sessions.GetSession(index) {
-                    if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
-                        if let Ok(pid) = control2.GetProcessId() {
-                            pids.push(pid);
+            for role in [eMultimedia, eCommunications] {
+                let Ok(endpoint) = enumerator.GetDefaultAudioEndpoint(eRender, role) else {
+                    continue;
+                };
+                let Ok(manager) = endpoint.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)
+                else {
+                    continue;
+                };
+                let Ok(sessions) = manager.GetSessionEnumerator() else {
+                    continue;
+                };
+                let Ok(count) = sessions.GetCount() else {
+                    continue;
+                };
+                for index in 0..count {
+                    if let Ok(control) = sessions.GetSession(index) {
+                        if let Ok(state) = control.GetState() {
+                            if state == AudioSessionStateExpired {
+                                continue;
+                            }
+                        }
+                        if let Ok(control2) = control.cast::<IAudioSessionControl2>() {
+                            if control2.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
+                                continue;
+                            }
+                            if let Ok(pid) = control2.GetProcessId() {
+                                if pid != 0 && pid != self_pid && is_windows_pid_alive(pid) {
+                                    pids.push(pid);
+                                }
+                            }
                         }
                     }
                 }
@@ -699,7 +820,7 @@ fn windows_process_image_name(pid: u32) -> Option<String> {
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut buffer = [0u16; 260];
+        let mut buffer = [0u16; 1024];
         let mut len = buffer.len() as u32;
         let ok = QueryFullProcessImageNameW(
             handle,
@@ -785,10 +906,28 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
                 .output();
         }
 
-        // Capture the sink's monitor as the default input.
-        let _ = Command::new("pactl")
-            .args(["set-default-source", "AudioShare_Ultra.monitor"])
-            .output();
+        // Return any previously isolated apps back to @DEFAULT_SINK@ before
+        // isolating the newly selected app so switching App A -> App B never
+        // leaves App A muted on the null sink.
+        let prev_routed: Vec<u32> = {
+            let mut routed = ROUTED_SINK_INPUTS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut prev = std::mem::take(&mut *routed);
+            for id in sink_inputs_on_sink("AudioShare_Ultra") {
+                if !prev.contains(&id) {
+                    prev.push(id);
+                }
+            }
+            prev
+        };
+        for id in prev_routed {
+            if id != app.id {
+                let _ = Command::new("pactl")
+                    .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
+                    .output();
+            }
+        }
 
         let status = Command::new("pactl")
             .args(["move-sink-input", &app.id.to_string(), "AudioShare_Ultra"])
@@ -796,6 +935,12 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             .map_err(|e| format!("Failed to move sink-input: {}", e))?;
 
         if status.success() {
+            // Only switch the capture source AFTER move-sink-input succeeded so
+            // a failed route never leaves @DEFAULT_SOURCE@ stranded on an empty
+            // null sink monitor.
+            let _ = Command::new("pactl")
+                .args(["set-default-source", "AudioShare_Ultra.monitor"])
+                .output();
             if let Ok(mut routed) = ROUTED_SINK_INPUTS.lock() {
                 if !routed.contains(&app.id) {
                     routed.push(app.id);
@@ -853,7 +998,16 @@ pub fn restore_all_apps_to_default_sink() -> String {
                 .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
                 .output();
         }
-        if !to_restore.is_empty() {
+        // Always restore `@DEFAULT_SOURCE@` if it is still pointing at
+        // `AudioShare_Ultra.monitor`, even if the isolated app already exited
+        // (`to_restore.is_empty()`).
+        let current_source = Command::new("pactl")
+            .arg("get-default-source")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !to_restore.is_empty() || current_source == "AudioShare_Ultra.monitor" {
             if let Ok(out) = Command::new("pactl").arg("get-default-sink").output() {
                 let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !sink.is_empty() && sink != "AudioShare_Ultra" {

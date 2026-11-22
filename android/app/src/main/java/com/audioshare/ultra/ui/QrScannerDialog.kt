@@ -145,9 +145,13 @@ fun QrScannerDialog(
                                         ).text
                                         val uri = Uri.parse(text)
                                         if (uri.scheme == "asultra" && uri.host == "connect") {
-                                            val host = uri.getQueryParameter("host").orEmpty()
-                                            val pin = uri.getQueryParameter("pin").orEmpty()
-                                            if (host.isNotBlank() && handled.compareAndSet(false, true)) {
+                                            val host = uri.getQueryParameter("host").orEmpty().trim()
+                                            val pin = uri.getQueryParameter("pin").orEmpty().trim()
+                                            if (host.isNotBlank() &&
+                                                host.length <= 64 &&
+                                                host.matches(Regex("^[0-9a-fA-F.:\\[\\]]+$")) &&
+                                                handled.compareAndSet(false, true)
+                                            ) {
                                                 ContextCompat.getMainExecutor(ctx).execute {
                                                     onScanned(host, pin)
                                                 }

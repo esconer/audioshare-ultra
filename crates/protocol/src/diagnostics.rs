@@ -81,19 +81,22 @@ pub fn install_crash_hook(crash_log_path: std::path::PathBuf) {
         let s = store();
         let secs = s.epoch.elapsed().as_secs_f64();
         let line = format!("[+{secs:8.3}s] [ERR ] [panic] {panic_info}");
+        let mut pushed_to_store = false;
         match s.entries.try_lock() {
             Ok(mut guard) => {
                 if guard.len() >= MAX_LOG_ENTRIES {
                     guard.pop_front();
                 }
-                guard.push_back(line);
+                guard.push_back(line.clone());
+                pushed_to_store = true;
             }
             Err(TryLockError::Poisoned(e)) => {
                 let mut guard = e.into_inner();
                 if guard.len() >= MAX_LOG_ENTRIES {
                     guard.pop_front();
                 }
-                guard.push_back(line);
+                guard.push_back(line.clone());
+                pushed_to_store = true;
             }
             Err(TryLockError::WouldBlock) => {}
         }
@@ -109,12 +112,14 @@ pub fn install_crash_hook(crash_log_path: std::path::PathBuf) {
             env!("CARGO_PKG_VERSION"),
             "Status  : FATAL PANIC".trim()
         );
+        let mut dumped_store = false;
         match s.entries.try_lock() {
             Ok(guard) => {
                 for entry in guard.iter() {
                     out.push_str(entry);
                     out.push('\n');
                 }
+                dumped_store = true;
             }
             Err(TryLockError::Poisoned(e)) => {
                 let guard = e.into_inner();
@@ -122,8 +127,13 @@ pub fn install_crash_hook(crash_log_path: std::path::PathBuf) {
                     out.push_str(entry);
                     out.push('\n');
                 }
+                dumped_store = true;
             }
             Err(TryLockError::WouldBlock) => {}
+        }
+        if !pushed_to_store || !dumped_store {
+            out.push_str(&line);
+            out.push('\n');
         }
         let _ = std::fs::write(&crash_log_path, out);
         prev(panic_info);

@@ -26,7 +26,7 @@ use audioshare_protocol::wire::{
 };
 use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_FRAMES, SUBFRAME_STEREO_SAMPLES};
 
-use crate::{configure_realtime_udp_socket, promote_thread_realtime};
+use crate::configure_realtime_udp_socket;
 
 pub const PHONE_MIC_PORT: u16 = 65532;
 
@@ -125,6 +125,37 @@ pub enum PhoneRxRoutingMode {
 /// next sequence to play, using wrapping 16-bit arithmetic.
 fn buffered_subframes(latest_seq: u16, next_seq: u16) -> i16 {
     (latest_seq.wrapping_add(1).wrapping_sub(next_seq) as i16).max(0)
+}
+
+/// Pure backoff state for CPAL sink reopen attempts. Unit-testable without OS audio hardware.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+#[derive(Debug, Default)]
+struct SinkReopenState {
+    pending: bool,
+    last_attempt: Option<Instant>,
+}
+
+impl SinkReopenState {
+    const BACKOFF: Duration = Duration::from_millis(500);
+
+    fn mark_failed(&mut self) {
+        self.pending = true;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.pending
+            && self
+                .last_attempt
+                .map(|t| now.saturating_duration_since(t) >= Self::BACKOFF)
+                .unwrap_or(true)
+    }
+
+    fn record_attempt(&mut self, now: Instant, succeeded: bool) {
+        self.last_attempt = Some(now);
+        if succeeded {
+            self.pending = false;
+        }
+    }
 }
 
 /// Phone-mic playhead rule: advance only when the slot contained audio or a
@@ -486,9 +517,17 @@ fn push_one_subframe(
         } else {
             sequencer.pop_next(play_seq, &mut frame)
         }
-    } else if *opus_stream_active && sequencer.is_slot_missing(play_seq) && opus_decoder.is_some() {
-        // Playhead miss on an Opus stream: phase-locked CELT PLC instead of
-        // WSOLA, which would jump timbre on a CELT-encoded stream.
+    } else if *opus_stream_active
+        && sequencer.is_slot_missing(play_seq)
+        && opus_decoder.is_some()
+        && should_advance_mic_playhead(STATUS_EMPTY, latest_seq, play_seq)
+    {
+        // Playhead miss on an Opus stream where `next_seq` will actually
+        // advance past `play_seq`: phase-locked CELT PLC instead of WSOLA.
+        // When pinned at the live edge (`latest_seq < play_seq`), we must NOT
+        // call `decode_plc(play_seq)` because that advances `decoder.last_seq`
+        // to `play_seq` and causes the arriving real Opus frame `play_seq` to
+        // be rejected as duplicate (`delta <= 0`).
         let plc_ok = opus_decoder
             .as_mut()
             .map(|decoder| decoder.decode_plc(play_seq, &mut frame))
@@ -628,12 +667,26 @@ pub struct PhoneMicReceiver {
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
     pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
+    /// Incremented whenever an `ASULTRA2` packet fails PIN/AEAD verification
+    /// so the Desktop GUI can surface a clear PIN mismatch warning instead of
+    /// silently displaying `0 pkts`.
+    pub auth_failures: Arc<AtomicU64>,
+    /// Human-readable output endpoint the receiver routed to (e.g.
+    /// `"Speakers (VB-Audio Virtual Cable)"`, `"AudioShare_Phone_Mic"`, or
+    /// `"Default PC Speakers"`).
+    pub output_device_name: String,
     #[cfg(target_os = "linux")]
     pactl_mic_module_id: Option<String>,
     #[cfg(target_os = "linux")]
     pactl_mic_source_module_id: Option<String>,
     #[cfg(target_os = "linux")]
+    prev_default_source: Option<String>,
+    #[cfg(target_os = "linux")]
     linux_output: Option<LinuxVirtualMicOutput>,
+    /// Bridges `adb reverse tcp:65532 tcp:65532` into the local UDP receiver
+    /// socket so USB-connected phones can share their microphone without Wi-Fi
+    /// or Windows Firewall rules, even when PC->Phone Broadcast is stopped.
+    adb_usb_watcher: Option<crate::discovery_and_os::AdbUsbWatcher>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -654,6 +707,35 @@ impl PhoneMicReceiver {
         mode: PhoneRxRoutingMode,
         pin: Option<&str>,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "windows")]
+        let windows_vbcable_name: Option<String> = if mode == PhoneRxRoutingMode::VirtualMicForCalls
+        {
+            match crate::find_vbcable_output_device_name() {
+                Some(name) => Some(name),
+                None => {
+                    return Err(
+                        "VB-Cable output device not found. Install VB-Audio Virtual Cable for Virtual Mic mode, or switch to 'Play on PC Speakers'."
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "windows")]
+        let output_device_name = windows_vbcable_name
+            .clone()
+            .unwrap_or_else(|| "Default PC Speakers".to_string());
+        #[cfg(target_os = "linux")]
+        let output_device_name = if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+            "AudioShare_Phone_Microphone".to_string()
+        } else {
+            "Default PC Speakers".to_string()
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let output_device_name = "Default Output".to_string();
+
         let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
@@ -662,8 +744,25 @@ impl PhoneMicReceiver {
         let _ = socket.set_nonblocking(true);
 
         #[cfg(target_os = "linux")]
-        let (pactl_mic_module_id, pactl_mic_source_module_id) =
+        let (pactl_mic_module_id, pactl_mic_source_module_id, prev_default_source) =
             if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                let prev_src = Command::new("pactl")
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        if o.status.success() {
+                            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            if !s.is_empty() && s != "AudioShare_Phone_Mic" {
+                                Some(s)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    });
+
                 // 1. Create underlying null sink to receive the phone's audio stream silently
                 let sink_id = Command::new("pactl")
                     .args([
@@ -702,18 +801,23 @@ impl PhoneMicReceiver {
                         }
                     });
 
-                let _ = Command::new("pactl")
-                    .args(["set-default-source", "AudioShare_Phone_Mic"])
-                    .output();
-                (sink_id, remap_id)
+                // Do not overwrite `AudioShare_Ultra.monitor` if Linux per-app
+                // capture is currently isolating an application.
+                if prev_src.as_deref() != Some("AudioShare_Ultra.monitor") {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", "AudioShare_Phone_Mic"])
+                        .output();
+                }
+                (sink_id, remap_id, prev_src)
             } else {
-                (None, None)
+                (None, None, None)
             };
 
         let running = Arc::new(AtomicBool::new(true));
         let mic_packets_received = Arc::new(AtomicU64::new(0));
         let mic_peak_level_pct = Arc::new(AtomicU64::new(0));
         let last_chirp_rx_timestamp_us = Arc::new(AtomicU64::new(0));
+        let auth_failures = Arc::new(AtomicU64::new(0));
         // Default to the low-latency 240-frame callback the sink asks for,
         // expressed in 48 kHz-equivalent frames. `ClientPreviewSink`
         // overwrites this with the backend's real callback duration as soon
@@ -735,13 +839,15 @@ impl PhoneMicReceiver {
         let pkts_clone = Arc::clone(&mic_packets_received);
         let peak_clone = Arc::clone(&mic_peak_level_pct);
         let chirp_clone = Arc::clone(&last_chirp_rx_timestamp_us);
+        let auth_fail_clone = Arc::clone(&auth_failures);
         let mic_fifo_thread = Arc::clone(&mic_fifo);
         let session_key_thread = Arc::clone(&session_key);
+        let (sink_ready_tx, sink_ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-phone-mic-rx".into())
             .spawn(move || {
-                promote_thread_realtime();
+                let _rt_guard = crate::RealtimeThreadGuard::enter();
                 let mut sequencer = ZeroJitterSequencer::new();
                 // +6 dB is a voice-mic pre-amp. Music cast to PC speakers must
                 // stay at unity gain and only use the true-peak ceiling.
@@ -753,67 +859,95 @@ impl PhoneMicReceiver {
                 let mut limiter = TruePeakLimiter::new(preamp_db);
                 let mut mic_gate = audioshare_protocol::sync_and_eq::MicRumbleAndNoiseGate::new();
 
-                // On Linux the pacat writer consumes the FIFO and feeds the
-                // AudioShare_Phone_Mic_Sink. On Windows, prefer VB-Cable's
-                // "CABLE Input" endpoint; otherwise use the default output.
-                // Do not retarget `PULSE_SINK`: mutating the process
-                // environment from this thread races with libc getenv() in
-                // every other thread (POSIX setenv is not thread-safe).
+                // Helper to open (and reopen on hotplug/sleep-resume error) the
+                // CPAL output sink. VirtualMicForCalls uses `require_preferred = true`
+                // so it NEVER silently falls back to PC Speakers and howls.
                 #[cfg(not(target_os = "android"))]
-                let _mic_out = {
+                let open_sink = || -> Result<Option<(cpal::Stream, Arc<AtomicBool>)>, String> {
                     #[cfg(target_os = "linux")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
                             if linux_output_active {
-                                None
+                                Ok(None)
                             } else {
-                                crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
+                                crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
                                     Arc::clone(&mic_fifo_thread),
                                     Some("AudioShare_Phone_Mic_Sink"),
+                                    true,
                                     Some(Arc::clone(&observed_cb_frames)),
                                 )
-                                .ok()
+                                .map(Some)
                             }
                         } else {
-                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
-                                Arc::clone(&mic_fifo_thread),
-                                None,
-                                Some(Arc::clone(&observed_cb_frames)),
+                            Ok(
+                                crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
+                                    Arc::clone(&mic_fifo_thread),
+                                    None,
+                                    false,
+                                    Some(Arc::clone(&observed_cb_frames)),
+                                )
+                                .ok(),
                             )
-                            .ok()
                         }
                     }
                     #[cfg(target_os = "windows")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
+                            crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
                                 Arc::clone(&mic_fifo_thread),
-                                Some("CABLE Input"),
+                                windows_vbcable_name.as_deref(),
+                                true,
                                 Some(Arc::clone(&observed_cb_frames)),
                             )
-                            .ok()
+                            .map(Some)
                         } else {
-                            crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
-                                Arc::clone(&mic_fifo_thread),
-                                None,
-                                Some(Arc::clone(&observed_cb_frames)),
+                            Ok(
+                                crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
+                                    Arc::clone(&mic_fifo_thread),
+                                    None,
+                                    false,
+                                    Some(Arc::clone(&observed_cb_frames)),
+                                )
+                                .ok(),
                             )
-                            .ok()
                         }
                     }
                     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                     {
-                        crate::ClientPreviewSink::spawn_preferred_with_cb_frames(
-                            Arc::clone(&mic_fifo_thread),
-                            None,
-                            Some(Arc::clone(&observed_cb_frames)),
+                        Ok(
+                            crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
+                                Arc::clone(&mic_fifo_thread),
+                                None,
+                                false,
+                                Some(Arc::clone(&observed_cb_frames)),
+                            )
+                            .ok(),
                         )
-                        .ok()
                     }
                 };
 
                 #[cfg(not(target_os = "android"))]
-                let pull_sink_active = _mic_out.is_some();
+                let mut mic_out: Option<(cpal::Stream, Arc<AtomicBool>)> = match open_sink() {
+                    Ok(s) => {
+                        let _ = sink_ready_tx.send(Ok(()));
+                        s
+                    }
+                    Err(err) => {
+                        let _ = sink_ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                #[cfg(target_os = "android")]
+                {
+                    let _ = sink_ready_tx.send(Ok(()));
+                }
+                #[cfg(not(target_os = "android"))]
+                let mut sink_reopen = SinkReopenState::default();
+
+                #[cfg(target_os = "linux")]
+                let mut pull_sink_active = mic_out.is_some() || linux_output_active;
+                #[cfg(all(not(target_os = "android"), not(target_os = "linux")))]
+                let mut pull_sink_active = mic_out.is_some();
                 #[cfg(target_os = "android")]
                 let pull_sink_active = false;
 
@@ -855,6 +989,7 @@ impl PhoneMicReceiver {
                 let mut feedback_seq: u32 = wall_clock_ticks.max(1);
                 let mut fb_primary_frames: u32 = 0;
                 let mut fb_recovered_or_lost: u32 = 0;
+                let mut last_target_depth: i16 = 0;
 
                 while run_clone.load(Ordering::Relaxed) {
                     // PIN edits from the UI land between batches; snapshot once
@@ -897,13 +1032,31 @@ impl PhoneMicReceiver {
                     };
                     let fifo_watermark = resampler
                         .subframes_to_samples(target_subframes.ceil() as usize)
-                        .min(mic_fifo_thread.capacity_samples());
+                        .min(
+                            mic_fifo_thread
+                                .capacity_samples()
+                                .saturating_sub(SUBFRAME_STEREO_SAMPLES + 16),
+                        );
 
                     while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
-                        if let Ok(parsed) = ParsedPacket::parse_and_decrypt(
-                            &mut recv_buf[..len],
-                            key_for_batch.as_ref(),
-                        ) {
+                        let parsed =
+                            match ParsedPacket::parse_and_decrypt(
+                                &mut recv_buf[..len],
+                                key_for_batch.as_ref(),
+                            ) {
+                                Ok(parsed) => parsed,
+                                // AuthenticationFailed is WireError's ONLY
+                                // PIN/AEAD variant: bad tag, encrypted packet
+                                // with no key, or plaintext while a key is set
+                                // (wire.rs:379,397,400). All other variants are
+                                // structural corruption and must not be counted.
+                                Err(audioshare_protocol::wire::WireError::AuthenticationFailed) => {
+                                    auth_fail_clone.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(_) => continue,
+                            };
+                        {
                             last_sender_addr = Some(src_addr);
                             max_group_delay_ms = (parsed.header.stream_id as u16) * 2;
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
@@ -954,12 +1107,13 @@ impl PhoneMicReceiver {
                             let resync_ahead = 48i16
                                 .max(fifo_now_sf + 16)
                                 .min((audioshare_protocol::sequencer::RING_SLOTS as i16) - 4);
-                            if dtx_silent || seq_delta > resync_ahead || seq_delta < -32 {
+                            if dtx_silent || seq_delta > resync_ahead || seq_delta < -160 {
                                 dtx_silent = false;
                                 sequencer.reset();
                                 opus_decoder = None;
                                 for slot in &mut opus_ring {
                                     slot.seq = None;
+                                    slot.from_red = false;
                                 }
                                 next_seq = base_seq;
                                 latest_seq = base_seq;
@@ -987,13 +1141,30 @@ impl PhoneMicReceiver {
                             // subframes per datagram; reading only the first
                             // one discarded 50% of the audio.
                             let bundle_is_opus = primary_bundle_is_opus(parsed.primary_payload);
-                            opus_stream_active = bundle_is_opus;
+                            if bundle_is_opus {
+                                opus_stream_active = true;
+                            } else {
+                                for sub_idx in 0..parsed.header.subframe_count {
+                                    let s = base_seq.wrapping_add(sub_idx as u16);
+                                    if (s.wrapping_sub(next_seq) as i16) >= 0 {
+                                        let idx = (s as usize) & (RING_SLOTS - 1);
+                                        opus_ring[idx].seq = None;
+                                        opus_ring[idx].from_red = false;
+                                    }
+                                }
+                            }
                             let mut opus_latest = latest_seq;
+                            // Pass `None` for `opus_decoder` on arrival: Opus
+                            // payloads are always buffered in `opus_ring` and
+                            // decoded at playhead pop time (`push_one_subframe`),
+                            // which drops `opus_decoder` and `opus_stream_active`
+                            // at the exact playhead boundary instead of 15-40 ms
+                            // early while Opus frames remain queued in `opus_ring`.
                             decode_primary_bundle(
                                 parsed.primary_payload,
                                 parsed.header.subframe_count,
                                 base_seq,
-                                Some(&mut opus_decoder),
+                                None,
                                 |missed_seq, plc_pcm| {
                                     // Opus PLC is phase-aligned with the
                                     // lookahead, so it can fill an empty slot
@@ -1020,16 +1191,19 @@ impl PhoneMicReceiver {
                                     // strict in-order decode at the playhead.
                                     // A late packet must never rewind the CELT
                                     // predictor, so drop it here.
-                                    if (s.wrapping_sub(next_seq) as i16) >= 0 {
+                                    if (s.wrapping_sub(next_seq) as i16) >= 0
+                                        && payload.len() <= MAX_OPUS_SUBFRAME_BYTES
+                                    {
                                         let slot = &mut opus_ring[(s as usize) & (RING_SLOTS - 1)];
-                                        if slot.seq != Some(s) {
-                                            let len = payload.len().min(MAX_OPUS_SUBFRAME_BYTES);
+                                        if slot.seq != Some(s) || slot.from_red {
+                                            let len = payload.len();
                                             slot.data[..len].copy_from_slice(&payload[..len]);
                                             slot.len = len as u16;
                                             slot.seq = Some(s);
                                             // A primary always wins over any RED
                                             // heal that previously occupied the slot.
                                             slot.from_red = false;
+                                            sequencer.clear_slot(s);
                                         }
                                         if (s.wrapping_sub(opus_latest) as i16) > 0 {
                                             opus_latest = s;
@@ -1076,13 +1250,26 @@ impl PhoneMicReceiver {
                             // never forced past the fixed 48-subframe guard.
                             let max_depth = base_depth + 8;
                             if buf_depth > max_depth {
-                                next_seq = latest_seq
+                                let new_next_seq = latest_seq
                                     .wrapping_add(1)
                                     .wrapping_sub(base_depth as u16);
+                                let mut s = next_seq;
+                                while s != new_next_seq {
+                                    sequencer.clear_slot(s);
+                                    let idx = (s as usize) & (RING_SLOTS - 1);
+                                    if opus_ring[idx].seq == Some(s) {
+                                        opus_ring[idx].seq = None;
+                                        opus_ring[idx].from_red = false;
+                                    }
+                                    s = s.wrapping_add(1);
+                                }
+                                next_seq = new_next_seq;
                                 sequencer.arm_declick();
                             }
+                            let target_jumped = target_depth >= last_target_depth + 4;
                             if !prebuffer_ready && buf_depth >= base_depth {
                                 prebuffer_ready = true;
+                                last_target_depth = target_depth;
                                 sequencer.arm_fade_in();
                                 let group_extra = (target_depth - base_depth).max(0) as usize;
                                 if group_extra > 0 {
@@ -1104,6 +1291,39 @@ impl PhoneMicReceiver {
                                         }
                                     }
                                 }
+                            } else if prebuffer_ready && target_jumped {
+                                // A Bluetooth peer joined mid-stream: pad the
+                                // FIFO immediately to the new group-sync depth
+                                // instead of forcing the ±400 ppm clock loop to
+                                // take ~5.8 minutes to build 140 ms of delay.
+                                last_target_depth = target_depth;
+                                let fifo_now_sf = resampler
+                                    .samples_to_subframes(mic_fifo_thread.available_samples())
+                                    as i16;
+                                let total_now = buf_depth + fifo_now_sf;
+                                let need_extra = (target_depth - total_now).max(0) as usize;
+                                if need_extra > 0 {
+                                    let mut rem = resampler.subframes_to_samples(need_extra);
+                                    let mut pad = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+                                    let mut rng = 0x7F4A_7C15u32;
+                                    while rem > 0 {
+                                        let step = rem.min(pad.len()) & !1;
+                                        if step == 0 {
+                                            break;
+                                        }
+                                        audioshare_protocol::dsp::inject_bluetooth_keepalive_dither(
+                                            &mut pad[..step], &mut rng,
+                                        );
+                                        let pushed = mic_fifo_thread.push_samples(&pad[..step]);
+                                        rem = rem.saturating_sub(pushed);
+                                        if pushed < step {
+                                            break;
+                                        }
+                                    }
+                                    sequencer.arm_fade_in();
+                                }
+                            } else if prebuffer_ready {
+                                last_target_depth = target_depth;
                             }
                         }
                     }
@@ -1138,8 +1358,68 @@ impl PhoneMicReceiver {
 
                     // A silent sender (or a disconnected phone) must not leave
                     // the peak meter frozen at the last real audio level.
-                    if last_packet_arrival.elapsed() >= Duration::from_millis(250) {
+                    let idle_for = last_packet_arrival.elapsed();
+                    if idle_for >= Duration::from_millis(250) {
                         peak_clone.store(0, Ordering::Relaxed);
+                    }
+                    // After 1.5 s with no incoming packets, transition cleanly
+                    // to idle standby so the receiver does not burn 400 Hz CPU
+                    // on endless WSOLA PLC, wind the resampler to -400 ppm,
+                    // spam feedback to a dead phone, or drop up to 400 ms when
+                    // the phone restarts at seq=0.
+                    if initialized && idle_for >= Duration::from_millis(1500) {
+                        initialized = false;
+                        prebuffer_ready = false;
+                        dtx_silent = false;
+                        last_sender_addr = None;
+                        sequencer.reset();
+                        opus_decoder = None;
+                        opus_stream_active = false;
+                        for slot in &mut opus_ring {
+                            slot.seq = None;
+                            slot.from_red = false;
+                        }
+                        resampler = ClockDriftResampler::new();
+                    }
+
+                    // Auto-recover the CPAL output stream if Windows/OS
+                    // invalidates the endpoint (sleep/resume, rate change,
+                    // headphone switch in PC Speakers mode).
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        let sink_failed = mic_out
+                            .as_ref()
+                            .map(|(_, err)| err.load(Ordering::Acquire))
+                            .unwrap_or(false);
+                        if sink_failed {
+                            mic_out = None;
+                            sink_reopen.mark_failed();
+                        }
+                        // `now` is defined below at :1374; use a distinct name.
+                        let reopen_now = Instant::now();
+                        if mic_out.is_none() && sink_reopen.due(reopen_now) {
+                            mic_fifo_thread.clear_when_quiescent();
+                            // open_sink() takes NO args and returns the final
+                            // Option<(Stream, Arc<AtomicBool>)>: Ok(None) is
+                            // legitimate on Linux (pacat) / fallback paths.
+                            match open_sink() {
+                                Ok(reopened) => {
+                                    mic_out = reopened;
+                                    sink_reopen.record_attempt(reopen_now, true);
+                                }
+                                Err(_) => {
+                                    sink_reopen.record_attempt(reopen_now, false);
+                                }
+                            }
+                            #[cfg(target_os = "linux")]
+                            {
+                                pull_sink_active = mic_out.is_some() || linux_output_active;
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                pull_sink_active = mic_out.is_some();
+                            }
+                        }
                     }
 
                     let now = Instant::now();
@@ -1255,18 +1535,46 @@ impl PhoneMicReceiver {
             })
             .map_err(|e| format!("Failed to spawn PhoneMicReceiver thread: {}", e))?;
 
+        match sink_ready_rx.recv_timeout(Duration::from_secs(4)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                running.store(false, Ordering::Release);
+                let _ = handle.join();
+                return Err(format!("Failed to open output device '{}': {}", output_device_name, err));
+            }
+            Err(_) => {
+                running.store(false, Ordering::Release);
+                let _ = handle.join();
+                return Err(format!("Timed out opening output device '{}'", output_device_name));
+            }
+        }
+
+        #[cfg(not(target_os = "android"))]
+        let adb_usb_watcher = if port == PHONE_MIC_PORT {
+            Some(crate::discovery_and_os::AdbUsbWatcher::start(port))
+        } else {
+            None
+        };
+        #[cfg(target_os = "android")]
+        let adb_usb_watcher = None;
+
         Ok(Self {
             running,
             session_key,
             mic_packets_received,
             mic_peak_level_pct,
             last_chirp_rx_timestamp_us,
+            auth_failures,
+            output_device_name,
             #[cfg(target_os = "linux")]
             pactl_mic_module_id,
             #[cfg(target_os = "linux")]
             pactl_mic_source_module_id,
             #[cfg(target_os = "linux")]
+            prev_default_source,
+            #[cfg(target_os = "linux")]
             linux_output,
+            adb_usb_watcher,
             handle: Some(handle),
         })
     }
@@ -1279,6 +1587,7 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = session_key_from_pin(pin);
+        self.auth_failures.store(0, Ordering::Relaxed);
     }
 
     /// Install an already-derived session key (e.g. the single key shared by
@@ -1289,17 +1598,33 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = key;
+        self.auth_failures.store(0, Ordering::Relaxed);
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        drop(self.adb_usb_watcher.take());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
         #[cfg(target_os = "linux")]
         {
-            // Stop pacat first, then remove the remap source and sink.
+            // Stop pacat first, restore previous default source if it still
+            // points at AudioShare_Phone_Mic, then remove remap source and sink.
             drop(self.linux_output.take());
+            if let Some(prev_src) = self.prev_default_source.take() {
+                let current_src = Command::new("pactl")
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if current_src.is_empty() || current_src == "AudioShare_Phone_Mic" {
+                    let _ = Command::new("pactl")
+                        .args(["set-default-source", &prev_src])
+                        .output();
+                }
+            }
             if let Some(id) = self.pactl_mic_source_module_id.take() {
                 let _ = Command::new("pactl").args(["unload-module", &id]).output();
             }
@@ -1326,6 +1651,113 @@ mod tests {
     use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
     use audioshare_protocol::wire::{pack_datagram_with_key, WireHeader};
     use audioshare_protocol::SAMPLE_RATE;
+
+    #[test]
+    fn test_sink_reopen_state_retries_after_failures_and_clears_on_success() {
+        let mut state = SinkReopenState::default();
+        let t0 = Instant::now();
+        state.mark_failed();
+        assert!(state.due(t0), "first failure is immediately due (no last_attempt yet)");
+
+        state.record_attempt(t0, false);
+        assert!(!state.due(t0 + Duration::from_millis(499)));
+        assert!(state.due(t0 + Duration::from_millis(500)));
+
+        let t1 = t0 + Duration::from_millis(500);
+        state.record_attempt(t1, false);
+        assert!(state.pending, "must stay armed across consecutive failures");
+        assert!(!state.due(t1 + Duration::from_millis(499)));
+        assert!(state.due(t1 + Duration::from_millis(500)));
+
+        let t2 = t1 + Duration::from_millis(500);
+        state.record_attempt(t2, true);
+        assert!(!state.pending);
+        assert!(!state.due(t2 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn test_phone_mic_aead_salt_rotation_preserves_continuity_with_zero_auth_failures() {
+        use audioshare_protocol::crypto::SessionKey;
+        use audioshare_protocol::lpc_lossless::{
+            encode_lossless_subframe, MAX_LOSSLESS_SUBFRAME_BYTES,
+        };
+        use audioshare_protocol::wire::{
+            pack_datagram_with_key, CodecMode, ParsedPacket, WireHeader,
+        };
+        use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
+
+        let mut tx_key = SessionKey::from_pin("4829");
+        let rx_key = SessionKey::from_pin("4829"); // receiver key is never rotated
+
+        let pcm = [1200i16; SUBFRAME_STEREO_SAMPLES];
+        let mut prim = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let prim_len = encode_lossless_subframe(&pcm, &mut prim);
+
+        // WireHeader has no Default: spell out all fields.
+        let hdr_before = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 1,
+            encrypted: false,
+            sequence: 100,
+            tx_timestamp_us: 1_000_000,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+
+        // 1. Pre-rotation datagram must decrypt with the unchanged receiver key.
+        let mut dgram_before = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len_before = pack_datagram_with_key(
+            hdr_before,
+            &prim[..prim_len],
+            &[],
+            &[],
+            Some(&tx_key),
+            &mut dgram_before,
+        )
+        .expect("pre-rotation pack must succeed");
+        let parsed_before =
+            ParsedPacket::parse_and_decrypt(&mut dgram_before[..len_before], Some(&rx_key))
+                .expect("pre-rotation unpack must succeed");
+        assert_eq!(parsed_before.header.sequence, 100);
+
+        // 2. Prove rotation via the public encrypt API (session_salt is private).
+        let mut hdr_bytes = [0u8; 16]; // HEADER_LEN
+        hdr_before.encode(&mut hdr_bytes);
+        let mut hdr14 = [0u8; 14];
+        hdr14.copy_from_slice(&hdr_bytes[..14]);
+        let mut probe = [0x5Au8; 8];
+        let (salt_before, _) = tx_key.encrypt_audio_in_place(&hdr14, &hdr_before, &mut probe);
+        tx_key.rotate_session_salt();
+        probe = [0x5Au8; 8];
+        let (salt_after, _) = tx_key.encrypt_audio_in_place(&hdr14, &hdr_before, &mut probe);
+        assert_ne!(salt_before, salt_after, "rotation must change the session salt");
+
+        // 3. Post-rotation datagram must decrypt with the SAME receiver key.
+        let hdr_after = WireHeader {
+            sequence: 101,
+            tx_timestamp_us: 1_002_500,
+            ..hdr_before
+        };
+        let mut dgram_after = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len_after = pack_datagram_with_key(
+            hdr_after,
+            &prim[..prim_len],
+            &[],
+            &[],
+            Some(&tx_key),
+            &mut dgram_after,
+        )
+        .expect("post-rotation pack must succeed");
+        let parsed_after =
+            ParsedPacket::parse_and_decrypt(&mut dgram_after[..len_after], Some(&rx_key))
+                .expect("post-rotation unpack must succeed with 0 auth failures");
+        assert_eq!(parsed_after.header.sequence, 101);
+        assert!(parsed_after.header.sequence > parsed_before.header.sequence);
+    }
 
     #[test]
     fn test_pull_sink_holds_live_edge_until_real_audio_is_nearly_drained() {
@@ -2181,5 +2613,31 @@ mod tests {
         let old_len = pack_opus_red_blob(99, &[sf2], &mut old_blob).unwrap();
         heal_opus_red_slots(&old_blob[..old_len], next_seq, &sequencer, &mut opus_ring);
         assert_ne!(opus_ring[99 & (RING_SLOTS - 1)].seq, Some(99));
+    }
+
+    #[test]
+    fn test_vbcable_output_device_priority_matches_renamed_windows_endpoints() {
+        use crate::vbcable_output_match_priority;
+
+        assert_eq!(
+            vbcable_output_match_priority("CABLE Input (VB-Audio Virtual Cable)"),
+            Some(0)
+        );
+        // Windows 11 / VB-Cable commonly exposes the 2-ch playback side as
+        // "Speakers (VB-Audio Virtual Cable)" alongside "CABLE In 16 Ch".
+        // The 2-ch endpoint must match and beat the 16-ch endpoint.
+        let renamed_2ch =
+            vbcable_output_match_priority("Speakers (VB-Audio Virtual Cable)").unwrap();
+        let cable_16ch =
+            vbcable_output_match_priority("CABLE In 16 Ch (VB-Audio Virtual Cable)").unwrap();
+        assert!(
+            renamed_2ch < cable_16ch,
+            "2-ch VB-Cable ({renamed_2ch}) must be preferred over 16-ch ({cable_16ch})"
+        );
+        // Physical speakers must never match as VB-Cable.
+        assert_eq!(
+            vbcable_output_match_priority("Speakers (2- High Definition Audio Device)"),
+            None
+        );
     }
 }

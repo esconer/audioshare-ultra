@@ -1,6 +1,9 @@
 pluginManagement {
     repositories {
         google()
+        // Google's official Maven Central mirror avoids HTTP 429 rate-limiting
+        // on shared GitHub Actions runners.
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
         mavenCentral()
         gradlePluginPortal()
     }
@@ -9,10 +12,10 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
+        // Google's official Maven Central mirror avoids HTTP 429 rate-limiting
+        // from repo.maven.apache.org on shared GitHub Actions runners.
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2") }
         mavenCentral()
-        // Redundant mirrors: GitHub runners occasionally cache a stale
-        // "module not found" from repo.maven.apache.org / dl.google.com.
-        maven { url = uri("https://repo1.maven.org/maven2") }
         maven { url = uri("https://maven.google.com") }
     }
 }

@@ -60,8 +60,9 @@ pub struct ClientFeedbackPacket {
     /// 2 = Studio Lossless, 3 = Low-Latency Compressed, 4 = Max Stability 10ms,
     /// 5 = Studio Master 24-bit), a media transport command (10 = play/pause,
     /// 11 = next, 12 = previous), a compressed-codec backend selection
-    /// (20 = pure-Rust VBR default, 21 = bundled Opus RLD), or a compressed
-    /// bitrate target (30 = 96, 31 = 160, 32 = 256, 33 = 320 kbps).
+    /// (20 = pure-Rust VBR, 21 = bundled Opus RLD), a compressed bitrate target
+    /// (30 = 96, 31 = 160, 32 = 256, 33 = 320, 34 = 510 kbps), or the 5 ms
+    /// competitive gaming hard-lock (40 = off, 41 = on).
     pub requested_mode: u8,
     /// Measured downstream hardware/DAC presentation latency in milliseconds.
     /// This is intentionally separate from `bluetooth_delay_ms`: the host uses
@@ -346,6 +347,9 @@ impl<'a> ParsedPacket<'a> {
     #[inline]
     pub fn parse(datagram: &'a [u8]) -> Result<Self, WireError> {
         let header = WireHeader::decode(datagram)?;
+        if header.encrypted {
+            return Err(WireError::AuthenticationFailed);
+        }
         let p_start = HEADER_LEN;
         let p_end = p_start + header.primary_len as usize;
         let f1_end = p_end + header.fec_n1_len as usize;
@@ -428,6 +432,11 @@ pub fn pack_datagram_with_key(
     session_key: Option<&SessionKey>,
     out_buf: &mut [u8; MAX_SAFE_UDP_PAYLOAD],
 ) -> Result<usize, WireError> {
+    if header.subframe_count > 4
+        || (header.mode != CodecMode::SilenceHeartbeat && header.subframe_count == 0)
+    {
+        return Err(WireError::InvalidSubframeCount);
+    }
     header.encrypted = session_key.is_some();
     let mac_extra = if header.encrypted { MAC_TAG_LEN } else { 0 };
     let total_len = HEADER_LEN + primary.len() + fec_n1.len() + fec_n2.len() + mac_extra;
