@@ -177,22 +177,28 @@ impl OpusRedHistory {
                 &mut self.prev2,
             )
             .unwrap_or(0);
-            // If each half still exceeds 255 bytes (e.g. 510 kbps with 4
-            // subframes where 2 subframes = ~326 B), fall back to packing the
-            // trailing two individual subframes across both RED slots so
-            // redundancy never silently drops to zero.
-            if len1 == 0 && len2 == 0 {
-                let last_idx = subframes.len() - 1;
-                let prev_idx = last_idx - 1;
+            // Apply the trailing-subframe fallback to EACH half independently.
+            // An asymmetric 510 kbps VBR burst can overflow only one half
+            // (e.g. [80, 80, 200, 200]: first half 166 B fits, second half
+            // 406 B does not); the old `len1 == 0 && len2 == 0` guard left
+            // that half's FEC slot empty. Keep the trailing subframe of
+            // whichever half failed so both RED slots stay populated.
+            // `prev1` stays the first half and `prev2` the second half,
+            // preserving `fec_slices()` ordering.
+            if len1 == 0 {
+                let idx = mid - 1; // trailing subframe of the first half
                 len1 = pack_opus_red_blob(
-                    base_seq.wrapping_add(prev_idx as u16),
-                    &subframes[prev_idx..prev_idx + 1],
+                    base_seq.wrapping_add(idx as u16),
+                    &subframes[idx..idx + 1],
                     &mut self.prev1,
                 )
                 .unwrap_or(0);
+            }
+            if len2 == 0 {
+                let idx = subframes.len() - 1; // trailing subframe of the second half
                 len2 = pack_opus_red_blob(
-                    base_seq.wrapping_add(last_idx as u16),
-                    &subframes[last_idx..last_idx + 1],
+                    base_seq.wrapping_add(idx as u16),
+                    &subframes[idx..idx + 1],
                     &mut self.prev2,
                 )
                 .unwrap_or(0);
@@ -1087,6 +1093,27 @@ mod tests {
         assert!(unpack_opus_red_blob(n1, |seq, p| recovered.push((seq, p[0]))));
         assert!(unpack_opus_red_blob(n2, |seq, p| recovered.push((seq, p[0]))));
         assert_eq!(recovered, vec![(500, 0x11), (501, 0x22)]);
+    }
+
+    #[test]
+    fn test_opus_red_history_asymmetric_vbr_fallback_per_half() {
+        let mut hist = OpusRedHistory::new();
+        // Full 4-sf blob = 4 + 81+81+201+201 = 568 > 255;
+        // first half = 166 <= 255, second = 406 > 255.
+        let a = [0x11u8; 80];
+        let b = [0x22u8; 80];
+        let c = [0x33u8; 200];
+        let d = [0x44u8; 200];
+        let sfs: [&[u8]; 4] = [&a, &b, &c, &d];
+        hist.push_packet(900, &sfs);
+        let (n1, n2) = hist.fec_slices();
+        assert_eq!(n1.len(), 4 + 2 * (1 + 80), "first half must stay intact");
+        assert_eq!(n2.len(), 4 + 1 + 200, "second half must fall back to its trailing subframe");
+
+        let mut seen = Vec::new();
+        assert!(unpack_opus_red_blob(n1, |seq, p| seen.push((seq, p[0]))));
+        assert!(unpack_opus_red_blob(n2, |seq, p| seen.push((seq, p[0]))));
+        assert_eq!(seen, vec![(900, 0x11), (901, 0x22), (903, 0x44)]);
     }
 }
 
