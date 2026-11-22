@@ -127,6 +127,37 @@ fn buffered_subframes(latest_seq: u16, next_seq: u16) -> i16 {
     (latest_seq.wrapping_add(1).wrapping_sub(next_seq) as i16).max(0)
 }
 
+/// Pure backoff state for CPAL sink reopen attempts. Unit-testable without OS audio hardware.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+#[derive(Debug, Default)]
+struct SinkReopenState {
+    pending: bool,
+    last_attempt: Option<Instant>,
+}
+
+impl SinkReopenState {
+    const BACKOFF: Duration = Duration::from_millis(500);
+
+    fn mark_failed(&mut self) {
+        self.pending = true;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.pending
+            && self
+                .last_attempt
+                .map(|t| now.saturating_duration_since(t) >= Self::BACKOFF)
+                .unwrap_or(true)
+    }
+
+    fn record_attempt(&mut self, now: Instant, succeeded: bool) {
+        self.last_attempt = Some(now);
+        if succeeded {
+            self.pending = false;
+        }
+    }
+}
+
 /// Phone-mic playhead rule: advance only when the slot contained audio or a
 /// newer packet is already buffered.
 ///
@@ -911,7 +942,7 @@ impl PhoneMicReceiver {
                     let _ = sink_ready_tx.send(Ok(()));
                 }
                 #[cfg(not(target_os = "android"))]
-                let mut last_sink_reopen = Instant::now();
+                let mut sink_reopen = SinkReopenState::default();
 
                 #[cfg(target_os = "linux")]
                 let mut pull_sink_active = mic_out.is_some() || linux_output_active;
@@ -1008,16 +1039,23 @@ impl PhoneMicReceiver {
                         );
 
                     while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
-                        let is_v2_magic = len >= 8 && &recv_buf[..8] == b"ASULTRA2";
-                        let Ok(parsed) = ParsedPacket::parse_and_decrypt(
-                            &mut recv_buf[..len],
-                            key_for_batch.as_ref(),
-                        ) else {
-                            if is_v2_magic {
-                                auth_fail_clone.fetch_add(1, Ordering::Relaxed);
-                            }
-                            continue;
-                        };
+                        let parsed =
+                            match ParsedPacket::parse_and_decrypt(
+                                &mut recv_buf[..len],
+                                key_for_batch.as_ref(),
+                            ) {
+                                Ok(parsed) => parsed,
+                                // AuthenticationFailed is WireError's ONLY
+                                // PIN/AEAD variant: bad tag, encrypted packet
+                                // with no key, or plaintext while a key is set
+                                // (wire.rs:379,397,400). All other variants are
+                                // structural corruption and must not be counted.
+                                Err(audioshare_protocol::wire::WireError::AuthenticationFailed) => {
+                                    auth_fail_clone.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
+                                Err(_) => continue,
+                            };
                         {
                             last_sender_addr = Some(src_addr);
                             max_group_delay_ms = (parsed.header.stream_id as u16) * 2;
@@ -1353,12 +1391,25 @@ impl PhoneMicReceiver {
                             .as_ref()
                             .map(|(_, err)| err.load(Ordering::Acquire))
                             .unwrap_or(false);
-                        if sink_failed && last_sink_reopen.elapsed() >= Duration::from_millis(500) {
-                            last_sink_reopen = Instant::now();
+                        if sink_failed {
                             mic_out = None;
+                            sink_reopen.mark_failed();
+                        }
+                        // `now` is defined below at :1374; use a distinct name.
+                        let reopen_now = Instant::now();
+                        if mic_out.is_none() && sink_reopen.due(reopen_now) {
                             mic_fifo_thread.clear_when_quiescent();
-                            if let Ok(reopened) = open_sink() {
-                                mic_out = reopened;
+                            // open_sink() takes NO args and returns the final
+                            // Option<(Stream, Arc<AtomicBool>)>: Ok(None) is
+                            // legitimate on Linux (pacat) / fallback paths.
+                            match open_sink() {
+                                Ok(reopened) => {
+                                    mic_out = reopened;
+                                    sink_reopen.record_attempt(reopen_now, true);
+                                }
+                                Err(_) => {
+                                    sink_reopen.record_attempt(reopen_now, false);
+                                }
                             }
                             #[cfg(target_os = "linux")]
                             {
@@ -1600,6 +1651,113 @@ mod tests {
     use audioshare_protocol::opus_codec::{OpusStreamEncoder, MAX_OPUS_SUBFRAME_BYTES};
     use audioshare_protocol::wire::{pack_datagram_with_key, WireHeader};
     use audioshare_protocol::SAMPLE_RATE;
+
+    #[test]
+    fn test_sink_reopen_state_retries_after_failures_and_clears_on_success() {
+        let mut state = SinkReopenState::default();
+        let t0 = Instant::now();
+        state.mark_failed();
+        assert!(state.due(t0), "first failure is immediately due (no last_attempt yet)");
+
+        state.record_attempt(t0, false);
+        assert!(!state.due(t0 + Duration::from_millis(499)));
+        assert!(state.due(t0 + Duration::from_millis(500)));
+
+        let t1 = t0 + Duration::from_millis(500);
+        state.record_attempt(t1, false);
+        assert!(state.pending, "must stay armed across consecutive failures");
+        assert!(!state.due(t1 + Duration::from_millis(499)));
+        assert!(state.due(t1 + Duration::from_millis(500)));
+
+        let t2 = t1 + Duration::from_millis(500);
+        state.record_attempt(t2, true);
+        assert!(!state.pending);
+        assert!(!state.due(t2 + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn test_phone_mic_aead_salt_rotation_preserves_continuity_with_zero_auth_failures() {
+        use audioshare_protocol::crypto::SessionKey;
+        use audioshare_protocol::lpc_lossless::{
+            encode_lossless_subframe, MAX_LOSSLESS_SUBFRAME_BYTES,
+        };
+        use audioshare_protocol::wire::{
+            pack_datagram_with_key, CodecMode, ParsedPacket, WireHeader,
+        };
+        use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
+
+        let mut tx_key = SessionKey::from_pin("4829");
+        let rx_key = SessionKey::from_pin("4829"); // receiver key is never rotated
+
+        let pcm = [1200i16; SUBFRAME_STEREO_SAMPLES];
+        let mut prim = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let prim_len = encode_lossless_subframe(&pcm, &mut prim);
+
+        // WireHeader has no Default: spell out all fields.
+        let hdr_before = WireHeader {
+            mode: CodecMode::StudioLosslessLpc,
+            subframe_count: 1,
+            encrypted: false,
+            sequence: 100,
+            tx_timestamp_us: 1_000_000,
+            primary_len: 0,
+            fec_n1_len: 0,
+            fec_n2_len: 0,
+            host_volume: 100,
+            stream_id: 0,
+            header_crc16: 0,
+        };
+
+        // 1. Pre-rotation datagram must decrypt with the unchanged receiver key.
+        let mut dgram_before = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len_before = pack_datagram_with_key(
+            hdr_before,
+            &prim[..prim_len],
+            &[],
+            &[],
+            Some(&tx_key),
+            &mut dgram_before,
+        )
+        .expect("pre-rotation pack must succeed");
+        let parsed_before =
+            ParsedPacket::parse_and_decrypt(&mut dgram_before[..len_before], Some(&rx_key))
+                .expect("pre-rotation unpack must succeed");
+        assert_eq!(parsed_before.header.sequence, 100);
+
+        // 2. Prove rotation via the public encrypt API (session_salt is private).
+        let mut hdr_bytes = [0u8; 16]; // HEADER_LEN
+        hdr_before.encode(&mut hdr_bytes);
+        let mut hdr14 = [0u8; 14];
+        hdr14.copy_from_slice(&hdr_bytes[..14]);
+        let mut probe = [0x5Au8; 8];
+        let (salt_before, _) = tx_key.encrypt_audio_in_place(&hdr14, &hdr_before, &mut probe);
+        tx_key.rotate_session_salt();
+        probe = [0x5Au8; 8];
+        let (salt_after, _) = tx_key.encrypt_audio_in_place(&hdr14, &hdr_before, &mut probe);
+        assert_ne!(salt_before, salt_after, "rotation must change the session salt");
+
+        // 3. Post-rotation datagram must decrypt with the SAME receiver key.
+        let hdr_after = WireHeader {
+            sequence: 101,
+            tx_timestamp_us: 1_002_500,
+            ..hdr_before
+        };
+        let mut dgram_after = [0u8; MAX_SAFE_UDP_PAYLOAD];
+        let len_after = pack_datagram_with_key(
+            hdr_after,
+            &prim[..prim_len],
+            &[],
+            &[],
+            Some(&tx_key),
+            &mut dgram_after,
+        )
+        .expect("post-rotation pack must succeed");
+        let parsed_after =
+            ParsedPacket::parse_and_decrypt(&mut dgram_after[..len_after], Some(&rx_key))
+                .expect("post-rotation unpack must succeed with 0 auth failures");
+        assert_eq!(parsed_after.header.sequence, 101);
+        assert!(parsed_after.header.sequence > parsed_before.header.sequence);
+    }
 
     #[test]
     fn test_pull_sink_holds_live_edge_until_real_audio_is_nearly_drained() {
