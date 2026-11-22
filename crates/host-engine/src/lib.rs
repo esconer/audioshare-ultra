@@ -49,15 +49,35 @@ const MAX_CONNECTED_CLIENTS: usize = 32;
 
 /// Smart Auto selects compressed audio above this reported loss.
 const SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE: u16 = 45;
-/// Above this loss Smart Auto also drops to the fixed 160 kbps profile.
+/// Above this loss Smart Auto also drops to 4-subframe (10 ms) stability
+/// framing. Escalating from 2 sf to 4 sf additionally requires two consecutive
+/// high-loss feedback windows (see [`HighLossWindowGate`]); one Wi-Fi scan-like
+/// spike must not immediately change the packetization.
 const SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE: u16 = 120;
 /// Above this loss even the 2.4 GHz stability framing steps down to the
 /// 96 kbps rung. 200 permille = 20% packet loss.
 const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
-/// Above 28% packet loss on severe/slow networks, step smoothly down to the
-/// 64 kbps survival rung (with 4-subframe framing + exact [P-1]/[P-2] Opus RED)
-/// so audio stays continuous instead of stalling.
+/// Severe/slow networks (above 28% loss) no longer drop to a 64 kbps survival
+/// rung. Exact [P-1]/[P-2] Opus RED still fits at the floors below, so the
+/// stability ladder keeps audio continuous without the audible 64 kbps floor.
 const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
+/// Smart Auto's compressed Opus floor. Four 2.5 ms subframes at 128 kbps pack
+/// into ~172 B (4 B RED header + 4 x (1 B length + 41 B tagged Opus payload))
+/// inside the 255 B `OpusRedHistory` slot, leaving ~83 B of headroom.
+const SMART_AUTO_OPUS_FLOOR_KBPS: u16 = 128;
+/// Floor for the explicit 2.4 GHz stability profile under severe loss.
+const MAX_STABILITY_OPUS_FLOOR_KBPS: u16 = 96;
+/// Consecutive ~500 ms feedback windows above
+/// [`SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE`] required before Smart Auto may
+/// escalate from 5 ms (2 sf) to 10 ms (4 sf) framing.
+const SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS: u8 = 2;
+/// Feedback heartbeats arrive at roughly this cadence; several clients
+/// reporting inside one such window count as a single observation.
+const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(500);
+/// Minimum interval between Opus encoder recreation attempts after a genuine
+/// creation/encode failure. One attempt per 2 s instead of one per 2.5 ms TX
+/// tick (200 Hz) keeps recovery bounded while still healing transient errors.
+const OPUS_ENCODER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Sustained spotless lossless operation required before SmartAuto promotes
 /// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
 /// (~2.8-4.5+ Mbps) on Wi-Fi links.
@@ -186,6 +206,125 @@ impl LossGovernor {
     }
 }
 
+/// Consecutive-high-loss-window gate for Smart Auto's 2 sf -> 4 sf escalation.
+///
+/// `LossGovernor` is fast-attack but purely time-based: a single 500 ms
+/// feedback window reporting a high FEC rate immediately drives
+/// `select_tx_profile` to 10 ms framing. On real Wi-Fi a ~225 ms scan can make
+/// one whole window look lossy, and the resulting framing/bitrate churn is
+/// audible. This gate requires two *consecutive* windows above the high-loss
+/// threshold. Reports from several clients inside one window are collapsed via
+/// a wall-clock gate, so a 5-client session cannot arm it in one tick.
+///
+/// Once armed, the gate stays armed while the governor's paced estimate still
+/// reports high loss (its 12-90 s hold), so framing does not flap back to 5 ms
+/// during the hold. It disarms only after the estimate falls below the
+/// high-loss tier.
+#[derive(Debug)]
+struct HighLossWindowGate {
+    consecutive_windows: u8,
+    armed: bool,
+    last_observed_at: Option<Instant>,
+}
+
+impl HighLossWindowGate {
+    fn new() -> Self {
+        Self {
+            consecutive_windows: 0,
+            armed: false,
+            last_observed_at: None,
+        }
+    }
+
+    /// Feed one window's worst *raw* client report plus the governor's paced
+    /// estimate. Returns whether 4-subframe framing is permitted.
+    fn observe(&mut self, raw_loss_permille: u16, governed_loss_permille: u16, now: Instant) -> bool {
+        if self
+            .last_observed_at
+            .map(|t| now.saturating_duration_since(t) < SMART_AUTO_FEEDBACK_WINDOW)
+            .unwrap_or(false)
+        {
+            // Same feedback window: a second client's report must not count.
+            return self.armed;
+        }
+        self.last_observed_at = Some(now);
+        if raw_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+            self.consecutive_windows = self
+                .consecutive_windows
+                .saturating_add(1)
+                .min(SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS);
+        } else {
+            self.consecutive_windows = 0;
+        }
+        if self.consecutive_windows >= SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS {
+            self.armed = true;
+        }
+        if governed_loss_permille <= SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+            self.armed = false;
+        }
+        self.armed
+    }
+
+    #[inline]
+    fn allows_four_subframes(&self) -> bool {
+        self.armed
+    }
+}
+
+/// Bounded retry state for Opus encoder creation after a genuine failure.
+///
+/// `OpusStreamEncoder::new` failing, or a transient `encode_subframe_f32`
+/// error, used to latch `opus_encoder_failed` permanently until the user
+/// toggled the codec backend. Clearing that latch on every tick would instead
+/// allocate an encoder at 200 Hz during a persistent outage. One recreate
+/// attempt per [`OPUS_ENCODER_RETRY_INTERVAL`] recovers from transient errors
+/// without an allocation storm; the VBR fallback stays active between tries.
+#[derive(Debug)]
+struct OpusEncoderRetry {
+    failed: bool,
+    next_attempt_at: Instant,
+}
+
+impl OpusEncoderRetry {
+    fn new(now: Instant) -> Self {
+        Self {
+            failed: false,
+            next_attempt_at: now,
+        }
+    }
+
+    #[inline]
+    fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// True when the backoff has expired and a recreate may be attempted.
+    #[inline]
+    fn retry_due(&self, now: Instant) -> bool {
+        self.failed && now >= self.next_attempt_at
+    }
+
+    /// Consume the single retry slot granted by the backoff window.
+    fn take_retry(&mut self, now: Instant) {
+        if self.retry_due(now) {
+            self.failed = false;
+            // Arm the next slot now so a persistent failure cannot be retried
+            // again on the very next 2.5 ms tick.
+            self.next_attempt_at = now + OPUS_ENCODER_RETRY_INTERVAL;
+        }
+    }
+
+    fn note_failure(&mut self, now: Instant) {
+        self.failed = true;
+        self.next_attempt_at = now + OPUS_ENCODER_RETRY_INTERVAL;
+    }
+
+    fn clear(&mut self) {
+        self.failed = false;
+        self.next_attempt_at = Instant::now();
+    }
+}
+
 /// Advance a warm Opus encoder with one live subframe while Smart Auto is in
 /// its lossless tier or immediately after allocating a fresh Opus encoder
 /// mid-stream. The encoded output is intentionally discarded: this primes the
@@ -273,17 +412,19 @@ impl CleanLinkPromoter {
 /// The profile exists for long-range links through walls, so the primary
 /// stream is capped at 160 kbps even when the user selected 256/320/510. A
 /// user-selected 96 kbps is honored rather than silently raised to 160.
-/// Above 20% loss the 96 kbps rung is the better tradeoff, and above 28%
-/// loss the 64 kbps survival rung keeps slow/weak networks flowing smoothly
-/// with exact `[P-1]/[P-2]` Opus RED.
+/// Above 20% loss the 96 kbps rung is the better tradeoff. The old survival
+/// rung above 28% loss was 64 kbps; it is removed because exact `[P-1]/[P-2]`
+/// Opus RED still fits at 96 kbps (~172 B at 128 kbps in a 255 B slot).
 #[inline]
 fn stability_bitrate_kbps(selected_kbps: u16, worst_loss_permille: u16) -> u16 {
-    if worst_loss_permille > SEVERE_LOSS_THRESHOLD_PERMILLE {
-        64
-    } else if worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE {
-        96
+    let severe = worst_loss_permille > SEVERE_LOSS_THRESHOLD_PERMILLE;
+    let critical = severe || worst_loss_permille > CRITICAL_LOSS_THRESHOLD_PERMILLE;
+    if critical {
+        // Severe and critical loss share the 96 kbps floor: there is no
+        // lower 64 kbps rung any more.
+        MAX_STABILITY_OPUS_FLOOR_KBPS
     } else {
-        selected_kbps.clamp(96, 160)
+        selected_kbps.clamp(MAX_STABILITY_OPUS_FLOOR_KBPS, 160)
     }
 }
 
@@ -372,10 +513,16 @@ fn select_tx_profile(
         }
         QualityProfile::SmartAuto => {
             if worst_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+                // Pure selector: 4 sf is the *candidate* framing. The live TX
+                // loop additionally requires two consecutive high-loss windows
+                // before actually using it (HighLossWindowGate). The bitrate
+                // never goes below 128 kbps: four 2.5 ms Opus subframes plus
+                // exact [P-1]/[P-2] RED are ~172 B inside the 255 B slot.
                 (
                     CodecMode::CompressedLowDelay,
                     if gaming_lock { 2 } else { 4 },
-                    stability_bitrate_kbps(selected_kbps, worst_loss_permille),
+                    stability_bitrate_kbps(selected_kbps, worst_loss_permille)
+                        .max(SMART_AUTO_OPUS_FLOOR_KBPS),
                 )
             } else if bt_active && any_wifi_client {
                 // Single-antenna Wi-Fi + A2DP link: stay on transparent Opus
@@ -1454,7 +1601,11 @@ pub struct HostTelemetry {
     pub all_clients_usb: AtomicBool,
     pub enable_group_sync: AtomicBool,
     pub manual_group_sync_trim_ms: AtomicU16,
+    /// Raw user/UI bitrate selection. Diagnostics reports the effective rate
+    /// below instead, since profile/loss decisions can clamp or floor it.
     pub target_bitrate_kbps: AtomicU16,
+    /// Effective TX bitrate chosen by `select_tx_profile` on the latest tick.
+    pub effective_bitrate_kbps: AtomicU16,
     pub host_volume: AtomicU8,
     pub host_vu_peak_pct: AtomicU8,
     pub active_clients_count: AtomicU8,
@@ -1505,6 +1656,7 @@ impl Default for HostTelemetry {
             enable_group_sync: AtomicBool::new(false),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
+            effective_bitrate_kbps: AtomicU16::new(256),
             host_volume: AtomicU8::new(100),
             host_vu_peak_pct: AtomicU8::new(0),
             active_clients_count: AtomicU8::new(0),
@@ -1548,7 +1700,9 @@ impl HostTelemetry {
             profile,
             codec,
             self.prefer_opus.load(Ordering::Relaxed),
-            self.target_bitrate_kbps.load(Ordering::Relaxed),
+            // Report the bitrate actually used by the TX loop, not the raw
+            // UI selection (which can be clamped/floored by the profile).
+            self.effective_bitrate_kbps.load(Ordering::Relaxed),
             self.tx_packet_interval_us.load(Ordering::Relaxed) as f32 / 1000.0,
             self.tx_subframes_per_packet.load(Ordering::Relaxed),
             self.dtx_silent_mode.load(Ordering::Relaxed),
@@ -1813,6 +1967,7 @@ impl HostEngine {
             enable_group_sync: AtomicBool::new(true),
             manual_group_sync_trim_ms: AtomicU16::new(0),
             target_bitrate_kbps: AtomicU16::new(256),
+            effective_bitrate_kbps: AtomicU16::new(256),
             host_volume: AtomicU8::new(100),
             host_vu_peak_pct: AtomicU8::new(0),
             active_clients_count: AtomicU8::new(initial_targets.len().min(u8::MAX as usize) as u8),
@@ -2991,7 +3146,12 @@ impl HostEngine {
         let mut ctrl_buf = [0u8; 64];
         let mut dynamic_codec_mode;
         let mut tx_bitrate_kbps;
-        let mut loss_governor = LossGovernor::new(Instant::now());
+        let loop_started_at = Instant::now();
+        let mut loss_governor = LossGovernor::new(loop_started_at);
+        // Two consecutive high-loss windows gate Smart Auto's 2 sf -> 4 sf
+        // escalation. Session-local (single TX thread), so no atomic needed.
+        let mut high_loss_gate = HighLossWindowGate::new();
+        let mut opus_retry = OpusEncoderRetry::new(loop_started_at);
         let mut clean_link_promoter = CleanLinkPromoter::new();
         let mut noise_shaper = audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
         // Lazily created on the first compressed packet after the user enables
@@ -2999,7 +3159,6 @@ impl HostEngine {
         // entering the compressed tier does not emit lookahead silence.
         // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
-        let mut opus_encoder_failed = false;
         // Retain the most recently transmitted live f32 subframe so switching
         // from Lossless/24-bit/VBR into Opus mid-stream can immediately prime
         // the new encoder's 2.5 ms lookahead instead of emitting a silence hole.
@@ -3036,6 +3195,7 @@ impl HostEngine {
 
         while running.load(Ordering::Relaxed) {
             let use_test_tone = telemetry.use_test_tone.load(Ordering::Relaxed);
+            let tick_now = Instant::now();
 
             let current_key_version = key_version.load(Ordering::Acquire);
             if current_key_version != key_version_seen {
@@ -3054,6 +3214,7 @@ impl HostEngine {
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
                     if map.is_empty() {
                         loss_governor = LossGovernor::new(Instant::now());
+                        high_loss_gate = HighLossWindowGate::new();
                     }
                 }
                 clients_version_seen = current_clients_version;
@@ -3423,6 +3584,9 @@ impl HostEngine {
                             .unwrap_or(0);
                         let now_fb = Instant::now();
                         loss_governor.update(raw_worst, now_fb);
+                        // Raw report drives the consecutive-window counter;
+                        // the paced estimate keeps it armed through the hold.
+                        high_loss_gate.observe(raw_worst, loss_governor.value, now_fb);
                         Self::refresh_client_delay_telemetry(&map, &telemetry);
                         Self::refresh_gaming_lock_telemetry(&map, &telemetry);
 
@@ -3526,6 +3690,7 @@ impl HostEngine {
                         // Reset the loss governor once all clients have left so
                         // a new clean session never inherits a stale 12-90 s hold.
                         loss_governor = LossGovernor::new(now_sweep);
+                        high_loss_gate = HighLossWindowGate::new();
                     } else {
                         // Only include clients with fresh feedback (< 3 s) so a
                         // crashed/disconnecting lossy peer cannot re-arm a 90 s
@@ -3539,6 +3704,7 @@ impl HostEngine {
                             .max()
                             .unwrap_or(0);
                         loss_governor.update(raw_worst, now_sweep);
+                        high_loss_gate.observe(raw_worst, loss_governor.value, now_sweep);
                     }
                     let raw_worst_for_promo = map
                         .values()
@@ -3595,6 +3761,20 @@ impl HostEngine {
                 any_wifi,
                 cached_all_usb,
             );
+            // Publish the bitrate actually driving the TX codec on every tick.
+            // Diagnostics reports this instead of the raw UI selection.
+            telemetry
+                .effective_bitrate_kbps
+                .store(tx_bitrate_kbps, Ordering::Relaxed);
+            // Hysteresis lives in session state, not in the pure 8-arg
+            // `select_tx_profile` helper used by unit tests: a single lossy
+            // feedback window must not jump Smart Auto from 5 ms to 10 ms.
+            if profile == QualityProfile::SmartAuto
+                && subframes_per_pkt == 4
+                && !high_loss_gate.allows_four_subframes()
+            {
+                subframes_per_pkt = 2;
+            }
             let use_pcm24 = profile == QualityProfile::StudioLossless24Bit
                 || (profile == QualityProfile::SmartAuto
                     && dynamic_codec_mode == CodecMode::StudioLosslessLpc
@@ -3611,8 +3791,12 @@ impl HostEngine {
             if !prefer_opus {
                 // A disabled backend must not pin a stale creation failure:
                 // re-enabling Opus has to be allowed to try again.
-                opus_encoder_failed = false;
+                opus_retry.clear();
             }
+            // A genuine failure used to latch Opus off for the whole session.
+            // Now a single recreate is permitted once the 2 s backoff expires;
+            // the slot is consumed only when the allocation below actually runs.
+            let opus_retry_ok = !opus_retry.is_failed() || opus_retry.retry_due(tick_now);
             // Publish the *intended* codec mode here so the UI and the next
             // client see the right mode even during silence. The actual
             // OpusStreamEncoder allocation and all primary/FEC encoding are
@@ -3621,7 +3805,7 @@ impl HostEngine {
             // whole duration of PC silence.
             if prefer_opus
                 && dynamic_codec_mode == CodecMode::CompressedLowDelay
-                && !opus_encoder_failed
+                && opus_retry_ok
             {
                 dynamic_codec_mode = CodecMode::OpusRld;
             }
@@ -3827,23 +4011,28 @@ impl HostEngine {
                 && !is_dtx_active
                 && dynamic_codec_mode == CodecMode::OpusRld
                 && opus_encoder.is_none()
-                && !opus_encoder_failed
+                && opus_retry_ok
             {
+                // Consume the single retry slot this backoff window grants.
+                // After a fresh failure a new 2 s window starts, so a broken
+                // encoder cannot be recreated on every 2.5 ms TX tick.
+                opus_retry.take_retry(tick_now);
                 #[cfg(test)]
                 telemetry
                     .opus_encoder_allocs
                     .fetch_add(1, Ordering::Relaxed);
                 opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                 if opus_encoder.is_none() {
-                    opus_encoder_failed = true;
+                    opus_retry.note_failure(tick_now);
                 } else if has_prev_subframe {
                     warm_opus_lookahead(&mut opus_encoder, &prev_f32_subframe, tx_bitrate_kbps);
                 }
             }
-            if dynamic_codec_mode == CodecMode::OpusRld && opus_encoder_failed {
+            if dynamic_codec_mode == CodecMode::OpusRld && opus_retry.is_failed() {
                 // OpusStreamEncoder::new failed for a real audible packet:
-                // fall back to the pure-Rust VBR path. Standby/silence never
-                // attempts allocation and keeps publishing the intended mode.
+                // fall back to the pure-Rust VBR path until the bounded retry
+                // succeeds. Standby/silence never attempts allocation and keeps
+                // publishing the intended mode.
                 dynamic_codec_mode = CodecMode::CompressedLowDelay;
             }
 
@@ -3896,7 +4085,9 @@ impl HostEngine {
                                 // Drop the encoder, rewind the cursor and let
                                 // the loop below rebuild EVERY subframe as VBR.
                                 opus_encoder = None;
-                                opus_encoder_failed = true;
+                                // One transient encode error no longer latches
+                                // Opus off forever; retry once per backoff.
+                                opus_retry.note_failure(tick_now);
                                 dynamic_codec_mode = CodecMode::CompressedLowDelay;
                                 primary_cursor = 0;
                                 opus_ok = false;
@@ -5083,13 +5274,14 @@ mod tests {
         assert_eq!(stability_bitrate_kbps(128, 0), 128);
         assert_eq!(stability_bitrate_kbps(160, 0), 160);
         assert_eq!(stability_bitrate_kbps(320, 0), 160);
-        // Exactly 20% loss keeps the normal stability rung; above it, 96;
-        // above 28% severe loss, the 64 kbps survival rung keeps weak links alive.
+        // Exactly 20% loss keeps the normal stability rung; above it the floor
+        // is 96 kbps and stays there through the >28% severe tier. The old
+        // 64 kbps survival rung is gone: ~172 B still fits the 255 B RED slot.
         assert_eq!(stability_bitrate_kbps(320, 200), 160);
         assert_eq!(stability_bitrate_kbps(320, 201), 96);
         assert_eq!(stability_bitrate_kbps(320, 280), 96);
-        assert_eq!(stability_bitrate_kbps(320, 281), 64);
-        assert_eq!(stability_bitrate_kbps(96, 900), 64);
+        assert_eq!(stability_bitrate_kbps(320, 281), 96);
+        assert_eq!(stability_bitrate_kbps(96, 900), 96);
     }
 
     #[test]
@@ -6303,7 +6495,8 @@ mod tests {
             ),
             (CodecMode::CompressedLowDelay, 2, 510)
         );
-        // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf -> 96k 4sf -> 64k 4sf.
+        // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf
+        // -> 128k 4sf floor. There is no 64 kbps rung any more.
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 0, false, false, true, false),
             (CodecMode::StudioLosslessLpc, 2, 510)
@@ -6322,11 +6515,181 @@ mod tests {
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 220, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 96)
+            (CodecMode::CompressedLowDelay, 4, 128)
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 320, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 64)
+            (CodecMode::CompressedLowDelay, 4, 128)
+        );
+    }
+
+    // ---- P2: bitrate floors, loss hysteresis, Opus recovery, effective rate ----
+
+    #[test]
+    fn test_smart_auto_high_loss_floors_opus_at_128kbps() {
+        // 350 permille > SEVERE_LOSS_THRESHOLD_PERMILLE (280) => high-loss tier.
+        let (mode, sf, kbps) = select_tx_profile(
+            QualityProfile::SmartAuto,
+            2,      // configured_subframes
+            510,    // selected_kbps
+            350,    // worst_loss_permille
+            false,  // raw_gaming_lock
+            false,  // bt_active
+            true,   // any_wifi_client
+            false,  // all_clients_usb
+        );
+        assert_eq!(mode, CodecMode::CompressedLowDelay);
+        assert_eq!(sf, 4, "expected 10 ms (4 sf) framing at 350 permille");
+        assert!(kbps >= 128, "SmartAuto 350 permille selected {kbps} kbps (<128)");
+        assert_ne!(kbps, 64);
+        assert_ne!(kbps, 96);
+    }
+
+    #[test]
+    fn test_max_stability_high_loss_floors_opus_at_96kbps() {
+        let (mode, sf, kbps) = select_tx_profile(
+            QualityProfile::MaxStability24Ghz,
+            2, 510, 350, false, false, true, false,
+        );
+        assert_eq!((mode, sf), (CodecMode::CompressedLowDelay, 4));
+        assert!(kbps >= 96, "MaxStability 350 permille selected {kbps} kbps (<96)");
+        assert_ne!(kbps, 64);
+    }
+
+    #[test]
+    fn test_smart_auto_high_loss_stays_opus_rld_when_prefer_opus() {
+        use audioshare_protocol::crypto::AEAD_TAG_LEN;
+        use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
+
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = rx.local_addr().unwrap();
+        // A non-loopback target keeps `cached_all_usb` false on the live loop.
+        let wifi_dummy: SocketAddr = "192.0.2.1:65530".parse().unwrap();
+        let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut engine = HostEngine::start(
+            HostConfig {
+                bind_port: port,
+                use_test_tone: true,
+                subframes_per_packet: 1,
+                enable_smart_dtx: false,
+            },
+            vec![target, wifi_dummy],
+        )
+        .expect("start host engine");
+        engine
+            .telemetry
+            .quality_profile
+            .store(QualityProfile::SmartAuto as u8, Ordering::Relaxed);
+        engine.telemetry.prefer_opus.store(true, Ordering::Relaxed);
+
+        // `select_tx_profile` only ever returns CompressedLowDelay; the OpusRld
+        // promotion happens in the TX loop, so retention must be asserted on
+        // live telemetry rather than on the pure selector.
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        let mut fb_buf = [0u8; CONTROL_FEEDBACK_LEN];
+        ClientFeedbackPacket {
+            fec_rate_permille: 350,
+            bluetooth_delay_ms: 0,
+            client_volume: 100,
+            requested_mode: 0,
+            hardware_delay_ms: 0,
+            feedback_seq: 1,
+            auth_tag: [0u8; AEAD_TAG_LEN],
+        }
+        .encode_signed(None, &mut fb_buf);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut mode = 0u8;
+        let mut kbps = 0u16;
+        while Instant::now() < deadline {
+            client.send_to(&fb_buf, dest).expect("send feedback");
+            mode = engine.telemetry.active_codec_mode.load(Ordering::Relaxed);
+            kbps = engine.telemetry.effective_bitrate_kbps.load(Ordering::Relaxed);
+            if mode == CodecMode::OpusRld as u8 && kbps >= 128 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        engine.stop();
+        assert!(engine.telemetry.prefer_opus.load(Ordering::Relaxed));
+        assert_eq!(
+            mode,
+            CodecMode::OpusRld as u8,
+            "high loss must keep the Opus RLD backend selected"
+        );
+        assert!(kbps >= 128, "effective high-loss bitrate was {kbps} kbps");
+    }
+
+    #[test]
+    fn test_high_loss_window_gate_requires_two_consecutive_windows() {
+        let t = Instant::now();
+        let mut gate = HighLossWindowGate::new();
+
+        // One lossy window (e.g. a single Wi-Fi scan) is not enough.
+        assert!(!gate.observe(350, 350, t));
+        assert!(!gate.allows_four_subframes());
+        // Additional clients inside the same ~500 ms window do not count.
+        assert!(!gate.observe(350, 350, t + Duration::from_millis(100)));
+        // A second consecutive high-loss window arms 4 sf.
+        assert!(gate.observe(350, 350, t + Duration::from_millis(500)));
+        assert!(gate.allows_four_subframes());
+        // A clean raw window resets the counter but the governor still holds
+        // the estimate high, so framing must not flap back to 2 sf yet.
+        assert!(gate.observe(0, 350, t + Duration::from_millis(1_000)));
+        assert!(gate.allows_four_subframes());
+        // Only after the paced estimate itself falls below the high-loss tier
+        // does the gate disarm.
+        assert!(!gate.observe(0, 40, t + Duration::from_millis(1_500)));
+        assert!(!gate.allows_four_subframes());
+
+        // Two high windows separated by a clean window never arm the gate.
+        let mut flapping = HighLossWindowGate::new();
+        assert!(!flapping.observe(350, 350, t));
+        assert!(!flapping.observe(0, 0, t + Duration::from_millis(500)));
+        assert!(!flapping.observe(350, 350, t + Duration::from_millis(1_000)));
+        assert!(!flapping.allows_four_subframes());
+    }
+
+    #[test]
+    fn test_opus_encoder_retry_backoff_is_bounded() {
+        let base = Instant::now();
+        let mut retry = OpusEncoderRetry::new(base);
+        assert!(!retry.is_failed());
+
+        retry.note_failure(base);
+        assert!(retry.is_failed());
+        assert!(!retry.retry_due(base + Duration::from_millis(1_999)));
+        assert!(retry.retry_due(base + Duration::from_secs(2)));
+        retry.take_retry(base + Duration::from_secs(2));
+        assert!(!retry.is_failed(), "one retry slot must clear the latch");
+
+        // A persistent failure re-arms a fresh 2 s window: no 200 Hz churn.
+        retry.note_failure(base + Duration::from_secs(2));
+        assert!(retry.is_failed());
+        assert!(!retry.retry_due(base + Duration::from_secs(3)));
+        assert!(retry.retry_due(base + Duration::from_secs(4)));
+        retry.take_retry(base + Duration::from_secs(4));
+        assert!(!retry.is_failed());
+
+        // Disabling the backend clears any stale failure state.
+        retry.note_failure(base + Duration::from_secs(5));
+        retry.clear();
+        assert!(!retry.is_failed());
+        assert!(!retry.retry_due(base + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_diagnostics_summary_reports_effective_bitrate() {
+        let t = HostTelemetry::new();
+        t.target_bitrate_kbps.store(510, Ordering::Relaxed);
+        t.effective_bitrate_kbps.store(128, Ordering::Relaxed);
+        let summary = t.diagnostics_summary();
+        assert!(
+            summary.contains("bitrate=128kbps"),
+            "diagnostics must print the effective TX bitrate, not the raw selection: {summary}"
         );
     }
 }
