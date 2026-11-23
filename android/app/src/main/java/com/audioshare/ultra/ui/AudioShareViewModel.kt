@@ -171,7 +171,9 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
         val savedBitrate = prefs.getInt("target_bitrate_kbps", 256).let {
             if (it == 96 || it == 160 || it == 256 || it == 320 || it == 510) it else 256
         }
-        val savedPartyCodec = prefs.getInt("party_codec_profile", 0).coerceIn(0, 3)
+        val savedPartyCodec = prefs.getInt("party_codec_profile", 0).let {
+            if (it in 0..2) it else 0
+        }
         val savedPartyBitrate = prefs.getInt("party_bitrate_kbps", 256).let {
             if (it == 96 || it == 160 || it == 256 || it == 320) it else 256
         }
@@ -198,7 +200,7 @@ class AudioShareViewModel(app: Application) : AndroidViewModel(app) {
             channelRole = prefs.getInt("channel_role", 0),
             qualityMode = prefs.getInt("quality_mode", 0),
             compressedBitrateKbps = savedBitrate,
-            useOpus = prefs.getBoolean("use_opus", true),
+            useOpus = true,
             btDelayOverrideMs = prefs.getInt("bt_delay_override_ms", 0),
             forwardPartyToPc = prefs.getBoolean("party_forward_pc", false),
             muteHostSpeakerInParty = prefs.getBoolean("party_mute_local", true),

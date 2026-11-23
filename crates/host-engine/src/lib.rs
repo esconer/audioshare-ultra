@@ -3609,11 +3609,12 @@ impl HostEngine {
 
                     if allow_remote_commands {
                         // Compressed-codec backend selection from the phone UI:
-                        // 20 = pure-Rust VBR, 21 = bundled Opus RLD.
-                        match fb.requested_mode {
-                            20 => telemetry.prefer_opus.store(false, Ordering::Relaxed),
-                            21 => telemetry.prefer_opus.store(true, Ordering::Relaxed),
-                            _ => {}
+                        // 21 selects bundled Opus RLD. Legacy command 20 (pure-
+                        // Rust VBR) is deliberately ignored so an older client
+                        // cannot flip the host back to VBR; the failure-driven
+                        // VBR fallback in the TX loop stays fully intact.
+                        if fb.requested_mode == 21 {
+                            telemetry.prefer_opus.store(true, Ordering::Relaxed);
                         }
 
                         // Execute remote Bluetooth earbud media command (Play/Pause/Next/Prev) if present.
