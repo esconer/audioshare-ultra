@@ -2141,4 +2141,36 @@ mod tests {
             assert_eq!(vbr_encoded_len(kbps), expected);
         }
     }
+
+    #[test]
+    fn test_vbr_subframe_sine_roundtrip_snr_across_bitrates() {
+        let mut pcm_in = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for f in 0..SUBFRAME_FRAMES {
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * (f as f32) / 48_000.0;
+            let sample = (phase.sin() * 16_000.0) as i16;
+            pcm_in[f * 2] = sample;
+            pcm_in[f * 2 + 1] = -sample;
+        }
+        for kbps in [96u16, 160, 256, 320, 510] {
+            let mut encoded = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+            let enc_len = encode_vbr_subframe(&pcm_in, kbps, &mut encoded);
+            assert!(enc_len > 0, "kbps={kbps}: empty VBR frame");
+            let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert!(decode_vbr_subframe_to_f32(&encoded[..enc_len], &mut decoded),
+                    "kbps={kbps}: VBR decode failed");
+            let mut sig_power = 0.0f64;
+            let mut err_power = 0.0f64;
+            for i in 0..SUBFRAME_STEREO_SAMPLES {
+                let orig = f64::from(pcm_in[i]) / 32768.0;
+                let diff = orig - f64::from(decoded[i]);
+                sig_power += orig * orig;
+                err_power += diff * diff;
+            }
+            let snr_db = 10.0 * (sig_power / err_power.max(1e-12)).log10();
+            // Calibrated floors (original p2.txt floors were mis-set; see 4d):
+            let min_snr_db = if kbps >= 256 { 24.0 } else if kbps >= 160 { 14.0 } else { 8.0 };
+            assert!(snr_db >= min_snr_db,
+                    "kbps={kbps}: VBR round-trip SNR {snr_db:.1} dB < {min_snr_db:.1} dB");
+        }
+    }
 }
