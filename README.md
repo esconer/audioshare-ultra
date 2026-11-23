@@ -1,38 +1,36 @@
 # AudioShare Ultra
 
-A hard real-time, studio-grade wireless and wired audio routing system that turns
-an Android phone (or secondary PC) into a zero-configuration, ultra-low-latency
-speaker and microphone for Windows and Linux.
+**Stream PC audio to Android and use your phone as a wireless or USB PC microphone — ultra-low-latency, lossless, and open source for Windows, Linux, and Android.**
 
-Inspired by the original audio-share project, this is an independent
-reimplementation focused on deterministic latency, loss resilience, and a shared
-Rust core across desktop and Android.
+[![Release](https://img.shields.io/github/v/release/esconer/audioshare-ultra?include_prereleases)](https://github.com/esconer/audioshare-ultra/releases)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20Linux%20%7C%20Android-2ea44f)
+![Built with Rust](https://img.shields.io/badge/Core-Pure%20Rust-orange)
 
-## Highlights
+AudioShare Ultra is a real-time wireless and wired audio bridge written in Rust. Turn any Android phone (or secondary PC) into a **low-latency wireless speaker** or **PC microphone** over Wi-Fi, USB ADB, or USB tethering—with no accounts, no ads, and no kernel drivers required.
 
-- **Bit-perfect lossless audio** — causal 2nd-order LPC with zero codec lookahead,
-  16-bit and true 24-bit studio master modes, typically 25–35% smaller than raw PCM16.
-- **Loss resilience** — `[N-1]`/`[N-2]` forward error correction plus pitch-period
-  WSOLA and Opus CELT packet-loss concealment with raised-cosine crossfades.
-- **Clock-drift immunity** — error-relative PI clock loop and an anti-aliased
-  4-point Hermite cubic fractional resampler (44.1 / 48 / 96 kHz); stable over
-  multi-hour sessions.
-- **Low jitter** — 128-slot wait-free sequencer and lock-free burst-decoupler ring
-  decouple the network quantum from the audio device burst size.
-- **Smart DTX** — silence is not transmitted; a −90 dBFS keep-alive keeps
-  Bluetooth earbuds awake without draining the battery.
-- **Pure-Rust Opus RLD default** — live-switchable pure-Rust Opus for compressed
-  profiles, with automatic per-packet detection and VBR fallback.
-- **Dual Wired USB Paths** — zero-touch USB ADB (`TCP_NODELAY` loopback tunnel
-  with auto-reconnect) and zero-ADB USB Tethering (RNDIS/NCM) alongside Wi-Fi.
-- **Authenticated Encryption** — optional PIN/QR pairing using RFC 8439
-  ChaCha20-Poly1305 (128-bit Poly1305 tag, 65,536-round PBKDF2-SHA256,
-  per-session random nonce salt, and monotonic anti-replay feedback).
-- **Bluetooth Video Lip-Sync (Linux)** — automatic PipeWire/PulseAudio latency
-  compensation (`pw-cli` + `pactl`) paired with a live Android BT calibration slider.
-- **Cross-platform** — native Rust desktop GUI (egui), CLI, Windows/Linux host
-  engine, and a Kotlin/Jetpack Compose Android app backed by a Rust JNI core.
+> Inspired by the original `audio-share` project, AudioShare Ultra is an independent Rust reimplementation built for deterministic low latency, 2.4 GHz Wi-Fi scan resilience, studio lossless audio, and cross-platform reliability.
 
+<!-- Add a side-by-side screenshot of Desktop GUI + Android App here -->
+<!-- ![AudioShare Ultra Desktop and Android](docs/screenshots/hero.png) -->
+
+## Download & Quick Start
+
+1. Download the latest **Windows**, **Linux**, and **Android APK** binaries from [GitHub Releases](https://github.com/esconer/audioshare-ultra/releases).
+2. Start **AudioShare Ultra** on your PC and click **Start Host** (allow UDP ports `65530–65532` if prompted by your firewall).
+3. Open the Android app on the same Wi-Fi network (or plug in via USB), tap your PC or scan the **QR code**, and stream instantly.
+
+## Key Features
+
+- **Bit-Perfect Lossless & High-Bitrate Opus Audio** — Zero-lookahead causal 2nd-order LPC (16-bit and true 24-bit studio master) plus bundled pure-Rust **Opus RLD** (`RestrictedLowDelay`, 2.5 ms frames up to **510 kbps**) with automatic per-packet switching and internal VBR fallback.
+- **Built for Real 2.4 GHz Wi-Fi & Bluetooth** — `[N-1]`/`[N-2]` forward error correction (Opus RED & ADPCM FEC), WSOLA/CELT packet-loss concealment with raised-cosine crossfades, and Windows 60-second background Wi-Fi scan suppression (`WlanOpenHandle`).
+- **Studio Clock-Drift Immunity** — Error-relative PI clock loop and a **20-tap Kaiser-windowed sinc fractional resampler** (`44.1 / 48 / 96 kHz`) built for multi-hour sessions without pitch drift or XRuns.
+- **Phone-to-PC Virtual Microphone (Wi-Fi & USB)** — Stream your Android hardware mic to Windows (auto-detects **VB-Cable** endpoints) or Linux (PipeWire/PulseAudio) over UDP or USB ADB (`port 65532`) with automatic sink recovery.
+- **Per-App Audio Isolation** — Stream a single game, browser, or music app instead of full system audio using Windows CoreAudio Process Loopback or Linux PipeWire/PulseAudio routing.
+- **Multi-Device Sync & Party Mode** — Stream from one PC to multiple phones simultaneously, or broadcast internal Android audio directly from one phone to nearby phones with user-locked codecs.
+- **Dual Wired USB Paths** — Zero-touch USB ADB (`TCP_NODELAY` tunnel with auto-reconnect) and zero-ADB USB Tethering (RNDIS/NCM) alongside Wi-Fi.
+- **Authenticated Encryption & Per-Host PINs** — Optional PIN/QR pairing with RFC 8439 **ChaCha20-Poly1305** AEAD (65,536-round PBKDF2-SHA256, 30-minute session salt rotation, monotonic anti-replay feedback) and automatic per-host PIN memory on Android.
+- **Native Low-Latency Clients** — Android Jetpack Compose app with AAudio Exclusive MMAP (plus Dolby shared-mixer and `PCM_I16`/mono fallbacks), Linux Bluetooth video lip-sync compensation (`pw-cli` / `pactl`), native `egui` desktop GUI, and `as-ultra` CLI.
 ## Workspace Layout
 
 ```
