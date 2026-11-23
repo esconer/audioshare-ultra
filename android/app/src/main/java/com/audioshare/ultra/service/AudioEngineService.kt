@@ -655,8 +655,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             else -> 32
         }
         nativeSendMediaCommand(savedBitrateCmd)
-        // Default compressed codec is Opus RLD (matches HostEngine's default).
-        nativeSendMediaCommand(if (prefs.getBoolean("use_opus", true)) 21 else 20)
+        // Compressed codec is always Opus RLD: pure-Rust VBR is no longer a
+        // user-selectable backend (legacy prefs must not re-enable it).
+        nativeSendMediaCommand(21)
         refreshAdpfHintSession()
         scheduleAdpfRefresh()
     }
@@ -1063,7 +1064,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             activePartyPin = pin
             // Apply the user's locked Party codec & bitrate before starting the
             // transmitter so Party Mode never auto-switches mid-stream.
-            val partyCodecProfile = prefs.getInt("party_codec_profile", 0).coerceIn(0, 3)
+            val partyCodecProfile = prefs.getInt("party_codec_profile", 0).let {
+                if (it in 0..2) it else 0
+            }
             val partyBitrateKbps = prefs.getInt("party_bitrate_kbps", 256).coerceIn(96, 320)
             runCatching { nativeSetPartyCodecConfig(partyCodecProfile, partyBitrateKbps) }
 

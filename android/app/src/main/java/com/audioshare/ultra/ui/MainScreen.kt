@@ -1466,7 +1466,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     ModePresetCard(
                         title = "Smooth Wi-Fi",
                         subtitle = "Best for 2.4G / BT",
-                        badge = "${if (useOpus) "Opus" else "VBR"} ${compressedBitrateKbps}k",
+                        badge = "Opus ${compressedBitrateKbps}k",
                         selected = qualityMode == 2,
                         onClick = {
                             qualityMode = 2
@@ -1684,12 +1684,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 // =====================================================================
                 val modeSummary = when (qualityMode) {
                     1 -> "16-Bit"
-                    2 -> "${if (useOpus) "Opus" else "VBR"} ${compressedBitrateKbps}k"
+                    2 -> "Opus ${compressedBitrateKbps}k"
                     3 -> "10ms 2.4G"
                     4 -> "24-Bit"
                     else -> "Smart Auto"
                 }
-                val engineSummary = if (useOpus) "Opus RLD" else "Rust VBR"
+                val engineSummary = "Opus RLD"
                 ProDrawerHeader(
                     title = "Host Quality, Codec Engine & Bitrate",
                     badge = "$modeSummary • $engineSummary",
@@ -1713,7 +1713,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 0 to "Smart Auto",
                                 1 to "16-Bit Lossless",
                                 4 to "24-Bit Master",
-                                2 to "Low-Latency VBR",
+                                2 to "Low-Latency Opus",
                                 3 to "10ms 2.4G"
                             ).forEach { (idx, label) ->
                                 FilterChip(
@@ -1726,36 +1726,6 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     label = { Text(label) }
                                 )
                             }
-                        }
-
-                        Text(
-                            "Compressed Codec Module",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        FlowRow(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            FilterChip(
-                                selected = !useOpus,
-                                onClick = {
-                                    useOpus = false
-                                    prefs.edit().putBoolean("use_opus", false).apply()
-                                    AudioEngineService.nativeSendMediaCommand(20)
-                                },
-                                label = { Text("Pure-Rust VBR (0ms)") }
-                            )
-                            FilterChip(
-                                selected = useOpus,
-                                onClick = {
-                                    useOpus = true
-                                    prefs.edit().putBoolean("use_opus", true).apply()
-                                    AudioEngineService.nativeSendMediaCommand(21)
-                                },
-                                label = { Text("Opus RLD (Pure Rust)") }
-                            )
                         }
 
                         if (qualityMode == 0 || qualityMode == 2 || qualityMode == 3) {
@@ -1791,7 +1761,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             }
                             if (stabilityMode) {
                                 Text(
-                                    "2.4G stability caps the target at 160 kbps, steps to 96 kbps above 200‰ loss, and 64 kbps above 280‰.",
+                                    "2.4G stability caps the target at 160 kbps, steps to 96 kbps above 200‰ loss.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -1885,8 +1855,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             listOf(
                                 0 to "Opus RLD",
                                 1 to "16-Bit Lossless",
-                                2 to "10ms Stability",
-                                3 to "Rust VBR"
+                                2 to "10ms Stability"
                             ).forEach { (profileIdx, label) ->
                                 FilterChip(
                                     selected = partyCodecProfile == profileIdx,

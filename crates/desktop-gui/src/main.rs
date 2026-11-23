@@ -730,7 +730,9 @@ impl AudioShareApp {
                             self.quality_profile = QualityProfile::from_u8(n);
                         }
                     }
-                    "prefer_opus" => self.prefer_opus = v.trim() != "false",
+                    // Pure-Rust VBR is no longer user-selectable: migrate any
+                    // legacy opt-out in the config to Opus RLD on load.
+                    "prefer_opus" => self.prefer_opus = true,
                     "target_bitrate_kbps" => {
                         if let Ok(n) = v.trim().parse::<u16>() {
                             self.target_bitrate_kbps = n.clamp(96, 510);
@@ -1232,7 +1234,6 @@ impl eframe::App for AudioShareApp {
             self.host_master_volume = host.telemetry.host_volume.load(Ordering::Relaxed);
             self.quality_profile =
                 QualityProfile::from_u8(host.telemetry.quality_profile.load(Ordering::Relaxed));
-            self.prefer_opus = host.telemetry.prefer_opus.load(Ordering::Relaxed);
             self.target_bitrate_kbps = host
                 .telemetry
                 .target_bitrate_kbps
@@ -2188,11 +2189,7 @@ impl AudioShareApp {
         } else {
             "16-Bit"
         };
-        let smooth_badge = format!(
-            "{} {}k",
-            if self.prefer_opus { "Opus" } else { "VBR" },
-            self.target_bitrate_kbps
-        );
+        let smooth_badge = format!("Opus {}k", self.target_bitrate_kbps);
         let mode_bar_id = ui.make_persistent_id("host_quality_mode_bar");
         if let Some(idx) = uw::segmented_mode_bar(
             ui,
@@ -2314,14 +2311,10 @@ impl AudioShareApp {
             QualityProfile::SmartAuto => "Smart Auto",
             QualityProfile::StudioLossless => "16-Bit Lossless",
             QualityProfile::StudioLossless24Bit => "24-Bit Master",
-            QualityProfile::LowLatencyCompressed => "Compressed VBR",
+            QualityProfile::LowLatencyCompressed => "Compressed Opus",
             QualityProfile::MaxStability24Ghz => "10ms 2.4G",
         };
-        let engine_badge = if self.prefer_opus {
-            "Opus RLD"
-        } else {
-            "Rust VBR"
-        };
+        let engine_badge = "Opus RLD";
         let pacing_badge = if self.usb_low_latency_pacing {
             "2.5ms USB"
         } else {
@@ -2370,37 +2363,6 @@ impl AudioShareApp {
                                     .quality_profile
                                     .store(self.quality_profile as u8, Ordering::Relaxed);
                             }
-                        }
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Compressed Codec Module")
-                        .size(12.0)
-                        .strong(),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    if uw::pill_choice(
-                        ui,
-                        dark,
-                        !self.prefer_opus,
-                        "Pure-Rust VBR (0ms Fallback)",
-                    ) {
-                        self.prefer_opus = false;
-                        if let Some(ref host) = self.host_engine {
-                            host.telemetry.prefer_opus.store(false, Ordering::Relaxed);
-                        }
-                    }
-                    if uw::pill_choice(
-                        ui,
-                        dark,
-                        self.prefer_opus,
-                        "Opus RLD (Default, Pure Rust)",
-                    ) {
-                        self.prefer_opus = true;
-                        if let Some(ref host) = self.host_engine {
-                            host.telemetry.prefer_opus.store(true, Ordering::Relaxed);
                         }
                     }
                 });
@@ -3820,13 +3782,12 @@ phone_rx_mode=1
     }
 
     #[test]
-    fn test_prefer_opus_config_only_false_disables() {
+    fn test_prefer_opus_config_always_migrates_to_true() {
         let mut app = AudioShareApp::test_instance();
-        // Explicit opt-out disables Opus.
+        // Legacy VBR opt-outs and arbitrary values must all migrate to Opus:
+        // Pure-Rust VBR is no longer a user-selectable codec backend.
         app.parse_config_string("prefer_opus=false\n");
-        assert!(!app.prefer_opus);
-        // Legacy value "1", arbitrary text, and an empty value must all keep
-        // the Opus RLD default (regression: `== "true"` treated them as off).
+        assert!(app.prefer_opus);
         app.parse_config_string("prefer_opus=1\n");
         assert!(app.prefer_opus);
         app.parse_config_string("prefer_opus=anything\n");

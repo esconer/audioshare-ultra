@@ -84,7 +84,7 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
     if target_buffer_subframes <= 2.5 {
         4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
     } else {
-        target_buffer_subframes.max(8.0) // 20.0ms baseline on Wi-Fi absorbs minor 802.11 retries
+        target_buffer_subframes.max(6.0) // 15.0ms baseline on Wi-Fi cuts steady latency but still absorbs minor 802.11 retries
     }
 }
 
@@ -99,7 +99,7 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
 /// A stall of `D` ms drains `D` ms of audio from the buffer while the sender
 /// keeps transmitting, so the recovery burst is covered by a TOTAL cushion of
 /// about `D` plus one subframe of margin. The old formula added 1.15x `D` on
-/// top of the floor, which overshot to the 100-120 ms ceiling on a single
+/// top of the floor, which overshot the route's cushion ceiling on a single
 /// Wi-Fi hiccup and then took ~90 s to decay back (170 ms -> 70 ms of audible
 /// lag after every connect or signal dip).
 #[inline]
@@ -478,10 +478,12 @@ fn effective_wifi_ceiling(
     shield_until: &mut Option<Instant>,
     shield_subframes: &mut f32,
 ) -> f32 {
-    let base_cap: f32 = if bt_active || pkt_subframes >= 4 {
-        48.0
+    let base_cap: f32 = if bt_active {
+        48.0 // 120 ms: BT keeps its generous scan headroom
+    } else if pkt_subframes >= 4 {
+        36.0 // 90 ms: non-BT 10 ms framing
     } else {
-        40.0
+        28.0 // 70 ms: non-BT 2-subframe Wi-Fi (down from 40 sf / 100 ms)
     };
     if let Some(until) = *shield_until {
         if now < until && (bt_active || pkt_subframes >= 4) {
@@ -1790,9 +1792,10 @@ impl ClientEngine {
         let mut crossfeed = audioshare_protocol::sync_and_eq::BauerCrossfeedFilter::new();
         let mut night_compressor = audioshare_protocol::sync_and_eq::NightModeCompressor::new();
         let group_sync = audioshare_protocol::sync_and_eq::GroupSyncEstimator::new();
-        // Hold the grown Wi-Fi jitter cushion for 10 s after any PLC, FEC
-        // burst, or ring underrun so fluctuating Wi-Fi never oscillates back
-        // into crackles 2 seconds after recovering.
+        // Hold the grown Wi-Fi jitter cushion for 6 s after a single-event
+        // spike or isolated PLC, and 8 s after elevated loss, burst FEC heals,
+        // or a ring underrun, so Wi-Fi never oscillates back into crackles
+        // seconds after recovering while latency still decays promptly.
         let mut cushion_hold_until = Instant::now();
         // Created lazily on the first Opus packet. Dropped on DTX/resync and
         // whenever the host switches back to VBR.
@@ -2123,11 +2126,11 @@ impl ClientEngine {
 
                     // Decay the Wi-Fi cushion only after the stability hold
                     // expires and the link is healthy enough that FEC is
-                    // keeping up. Holding for 15 s after any burst eliminates
+                    // keeping up. Holding for 8 s after elevated loss removes
                     // periodic sawtooth underrun crackles on fluctuating Wi-Fi.
                     let now_fb = Instant::now();
                     if closed > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
-                        cushion_hold_until = now_fb + Duration::from_secs(15);
+                        cushion_hold_until = now_fb + Duration::from_secs(8);
                     } else if now_fb >= cushion_hold_until {
                         adaptive_wifi_subframes = decay_adaptive_cushion(
                             adaptive_wifi_subframes,
@@ -2245,8 +2248,9 @@ impl ClientEngine {
                 }
             }
 
-            // Route-aware Wi-Fi cushion ceiling (40 sf = 100 ms wired, 48 sf =
-            // 120 ms BT/10ms, or up to 110 sf during an active scan-burst shield).
+            // Route-aware Wi-Fi cushion ceiling (28 sf = 70 ms non-BT 2-sf,
+            // 36 sf = 90 ms non-BT 4-sf, 48 sf = 120 ms BT, or up to 110 sf
+            // during an active scan-burst shield).
             // Recomputed via `effective_wifi_ceiling` so FEC/RED heals and ring
             // underruns never clamp a grown cushion down to a stale lower cap.
             let bt_pass = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
@@ -2378,8 +2382,9 @@ impl ClientEngine {
                         // jitter/spike estimator so a host restart or DTX wake
                         // never feeds a bogus 150 ms timestamp jump into
                         // `spike_cushion_subframes` (which previously slammed
-                        // `adaptive_wifi_subframes` to its 100-120 ms ceiling
-                        // for 15 s right before line 2283 cleared `prev_rx_us`).
+                        // `adaptive_wifi_subframes` to its ceiling and held it
+                        // through the stability window right before the resync
+                        // path cleared `prev_rx_us`).
                         let seq_delta = base_seq.wrapping_sub(next_play_seq) as i16;
                         let fifo_now_subframes =
                             resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
@@ -2828,7 +2833,7 @@ impl ClientEngine {
             {
                 sequencer.arm_fade_in();
                 adaptive_wifi_subframes = (adaptive_wifi_subframes + 2.0).min(adaptive_ceiling);
-                cushion_hold_until = Instant::now() + Duration::from_secs(15);
+                cushion_hold_until = Instant::now() + Duration::from_secs(8);
             }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
             let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
@@ -3111,7 +3116,7 @@ impl ClientEngine {
                             // on burst heals or elevated loss (>1.5%) so
                             // isolated ~0.03% Wi-Fi drops cannot permanently
                             // block `decay_adaptive_cushion` and ratchet
-                            // latency up to the 100-120 ms ceiling.
+                            // latency up to the route-aware ceiling.
                             window.record_fec();
                             consecutive_fec_heals = consecutive_fec_heals.saturating_add(1);
                             let elevated_loss =
@@ -3119,7 +3124,7 @@ impl ClientEngine {
                             if consecutive_fec_heals >= 2 || elevated_loss {
                                 adaptive_wifi_subframes =
                                     (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
-                                cushion_hold_until = Instant::now() + Duration::from_secs(10);
+                                cushion_hold_until = Instant::now() + Duration::from_secs(8);
                             } else {
                                 adaptive_wifi_subframes =
                                     (adaptive_wifi_subframes + 0.15).min(adaptive_ceiling);
@@ -3144,7 +3149,7 @@ impl ClientEngine {
                         if consecutive_fec_heals >= 2 || elevated_loss {
                             adaptive_wifi_subframes =
                                 (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
-                            cushion_hold_until = Instant::now() + Duration::from_secs(10);
+                            cushion_hold_until = Instant::now() + Duration::from_secs(8);
                         } else {
                             adaptive_wifi_subframes =
                                 (adaptive_wifi_subframes + 0.15).min(adaptive_ceiling);
@@ -3175,7 +3180,7 @@ impl ClientEngine {
                         // +1.0 subframe, clamped to the route-aware ceiling.
                         let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                         let now_empty = Instant::now();
-                        cushion_hold_until = now_empty + Duration::from_secs(15);
+                        cushion_hold_until = now_empty + Duration::from_secs(6);
                         let shield_armed = update_scan_shield(
                             bt_now,
                             last_pkt_subframe_count,
@@ -3999,6 +4004,33 @@ mod tests {
     }
 
     #[test]
+    fn test_non_bt_wifi_floor_ceiling_and_bt_preservation() {
+        // Wi-Fi (3.5 configured subframes) now starts at 6 sf = 15 ms.
+        assert_eq!(configured_wifi_floor(3.5), 6.0);
+        // USB / 2.5 ms framing keeps the 4 sf = 10 ms floor.
+        assert_eq!(configured_wifi_floor(2.5), 4.0);
+
+        let now = Instant::now();
+        let mut until = None;
+        let mut shield = 0.0f32;
+        // BT keeps its 8 sf floor (restored by `bt_coex_floor`) and 48 sf ceiling.
+        assert_eq!(configured_wifi_floor(3.5).max(8.0), 8.0);
+        assert_eq!(
+            effective_wifi_ceiling(true, 2, now, &mut until, &mut shield),
+            48.0
+        );
+        // Non-BT ceilings: 28 sf = 70 ms (2-sf), 36 sf = 90 ms (4-sf).
+        assert_eq!(
+            effective_wifi_ceiling(false, 2, now, &mut until, &mut shield),
+            28.0
+        );
+        assert_eq!(
+            effective_wifi_ceiling(false, 4, now, &mut until, &mut shield),
+            36.0
+        );
+    }
+
+    #[test]
     fn test_in_flight_wait_scales_with_packet_size() {
         assert_eq!(in_flight_wait_subframes(1), 3);
         assert_eq!(in_flight_wait_subframes(2), 4);
@@ -4770,9 +4802,9 @@ mod tests {
         let mut until = None;
         let mut shield = 0.0f32;
 
-        // Low-latency speaker/wired 5 ms stream caps at 40 sf (100 ms).
+        // Low-latency non-BT 2-sf stream caps at 28 sf (70 ms).
         assert!(!update_scan_shield(false, 2, 40, now, &mut until, &mut shield));
-        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 40.0);
+        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 28.0);
 
         // Bluetooth stream with a 225 ms (90 sf) scan freeze arms the shield.
         assert!(update_scan_shield(true, 2, 90, now, &mut until, &mut shield));
@@ -5304,7 +5336,7 @@ mod tests {
         for hal_frames in [192usize, 256, 882, 1280] {
             let hal_burst_samples = hal_frames * 2;
             let fifo_watermark = resampler
-                .subframes_to_samples(fifo_target_subframes(8.0))
+                .subframes_to_samples(fifo_target_subframes(6.0))
                 .max(hal_burst_samples + one_subframe_samples * 3)
                 .min(fifo_capacity);
             let after_drain = fifo_watermark.saturating_sub(hal_burst_samples);
