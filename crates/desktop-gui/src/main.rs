@@ -35,58 +35,6 @@ use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
 use ui_widgets as uw;
 
-// ---------------------------------------------------------------------------
-// Compile-time bridge for the session-key API supplied by lanes A/D/E.
-// ---------------------------------------------------------------------------
-// Those lanes add `set_session_key(Option<SessionKey>)` to HostEngine,
-// ClientEngine and PhoneMicReceiver. Until they land this local trait keeps the
-// desktop crate compiling and preserves the old `set_encryption_pin` behavior.
-// Rust always prefers an inherent method over a same-named trait method, so
-// once the lanes merge the calls in `apply_pin_now` transparently switch to the
-// optimized single-derivation path without any further edits here.
-thread_local! {
-    static FALLBACK_PIN: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn set_fallback_pin(pin: Option<&str>) {
-    FALLBACK_PIN.with(|slot| *slot.borrow_mut() = pin.map(str::to_owned));
-}
-
-#[allow(dead_code)] // only reached by the pre-merge fallback impls
-fn fallback_pin() -> Option<String> {
-    FALLBACK_PIN.with(|slot| slot.borrow().clone())
-}
-
-#[allow(dead_code)]
-trait SetSessionKeyCompat {
-    fn set_session_key(&self, key: Option<SessionKey>);
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for HostEngine {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for ClientEngine {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for PhoneMicReceiver {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
 fn main() -> eframe::Result<()> {
     // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
     let crash_path = AudioShareApp::config_file_path().with_file_name("audioshare-ultra-crash.log");
@@ -573,12 +521,29 @@ impl AudioShareApp {
         {
             app.windows_firewall_ok = is_windows_firewall_configured();
         }
-        app.load_persistent_config();
+        if Self::config_file_path().exists() {
+            app.load_persistent_config();
+        } else {
+            app.pairing_pin = Self::generate_initial_pairing_pin();
+        }
         let launched_via_autostart = std::env::args().any(|a| a == "--autostart");
         if app.autostart_stream_on_launch || launched_via_autostart {
             app.toggle_host();
         }
         app
+    }
+
+    /// Generate a 6-digit OS-CSPRNG-seeded PIN for first-run installs so no
+    /// two machines share a static default PIN on public/campus Wi-Fi.
+    ///
+    /// `RandomState::new()` seeds its SipHash-1-3 keys from the OS random
+    /// source (`hashmap_random_keys`); the process ID is the hashed payload.
+    fn generate_initial_pairing_pin() -> String {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(std::process::id() as u64);
+        format!("{:06}", 100_000 + (h.finish() % 900_000))
     }
 
     #[cfg(test)]
@@ -878,6 +843,10 @@ impl AudioShareApp {
                         .store(self.target_bitrate_kbps, Ordering::Relaxed);
                     engine
                         .telemetry
+                        .effective_bitrate_kbps
+                        .store(self.target_bitrate_kbps, Ordering::Relaxed);
+                    engine
+                        .telemetry
                         .enable_group_sync
                         .store(self.enable_group_sync, Ordering::Relaxed);
                     engine
@@ -1102,22 +1071,12 @@ impl AudioShareApp {
         // share the resulting SessionKey (Copy) with all three engines. The old
         // path called set_encryption_pin() three times, re-running 65,536
         // PBKDF2 rounds per engine (~3x) on every PIN apply.
-        //
-        // `set_session_key(Option<SessionKey>)` is supplied by the
-        // client-engine / host-engine / virtual-mic lanes (A/D/E). Until those
-        // inherent methods exist, the local SetSessionKeyCompat trait above
-        // routes the call through `set_encryption_pin` (and the one PBKDF2
-        // derivation we just did is discarded — a correctness-only fallback).
-        // After merge the inherent method wins and the single derived key is
-        // used directly on all three engines.
         let key = pin.map(|p| {
             let mut derived = SessionKey::from_pin(p);
             // Fresh nonce salt so a live re-apply never reuses a keystream.
             derived.rotate_session_salt();
             derived
         });
-        set_fallback_pin(pin);
-
         if let Some(ref host) = self.host_engine {
             host.set_session_key(key);
         }
@@ -1475,11 +1434,10 @@ impl eframe::App for AudioShareApp {
                         let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
                         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
                         let kb = host.telemetry.bytes_sent.load(Ordering::Relaxed) / 1024;
-                        let display_kbps = if self.quality_profile == QualityProfile::MaxStability24Ghz {
-                            self.target_bitrate_kbps.clamp(96, 160)
-                        } else {
-                            self.target_bitrate_kbps
-                        };
+                        let display_kbps = host
+                            .telemetry
+                            .effective_bitrate_kbps
+                            .load(Ordering::Relaxed);
                         let codec_label = if dtx {
                             "Smart DTX Sleep (0.6 kbps)".to_string()
                         } else if mode_id == 4 {
@@ -1614,11 +1572,11 @@ impl eframe::App for AudioShareApp {
             self.direct_hotspot_active = false;
             self.hotspot_task_in_flight = false;
         }
-        if self.selected_app_idx.is_some() {
-            let _ = restore_all_apps_to_default_sink();
-        }
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
+        }
+        if self.selected_app_idx.is_some() {
+            let _ = restore_all_apps_to_default_sink();
         }
         if let Some(mut client) = self.client_engine.take() {
             client.stop();
@@ -1882,6 +1840,14 @@ impl AudioShareApp {
                             if ui.button(lbl).clicked() || enter_pressed {
                                 self.apply_pin_now();
                             }
+                            if ui.button("New PIN").clicked() {
+                                self.pairing_pin = Self::generate_initial_pairing_pin();
+                                if self.enable_pin_encryption {
+                                    self.apply_pin_now();
+                                } else {
+                                    self.pin_dirty = true;
+                                }
+                            }
                         });
                     }
                     SettingsTab::GeneralAndDiagnostics => {
@@ -1929,6 +1895,16 @@ impl AudioShareApp {
                         ui.label(
                             egui::RichText::new("Diagnostics").size(13.5).strong(),
                         );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "AudioShare Ultra v{} ({}/{})",
+                                env!("CARGO_PKG_VERSION"),
+                                std::env::consts::OS,
+                                std::env::consts::ARCH,
+                            ))
+                            .size(11.5)
+                            .color(p.muted_text),
+                        );
                         if ui.button("Copy Diagnostics Report").clicked() {
                             let mut summary = format!(
                                 "HostMsg : {}\nClientMg: {}",
@@ -1958,6 +1934,21 @@ impl AudioShareApp {
                                         .diagnostics_summary(DESKTOP_OUTPUT_BUFFER_MS),
                                 );
                             }
+                            if let Some(ref mic) = self.phone_mic_receiver {
+                                summary.push_str(&format!(
+                                    "\nPhoneRx : mode={:?} out={} rx_pkts={} peak={}% auth_fail={}",
+                                    self.phone_rx_mode,
+                                    mic.output_device_name,
+                                    mic.mic_packets_received.load(Ordering::Relaxed),
+                                    mic.mic_peak_level_pct.load(Ordering::Relaxed),
+                                    mic.auth_failures.load(Ordering::Relaxed),
+                                ));
+                            }
+                            #[cfg(target_os = "windows")]
+                            summary.push_str(&format!(
+                                "\nWinFW   : configured={}",
+                                self.windows_firewall_ok
+                            ));
                             ui.ctx().copy_text(
                                 audioshare_protocol::diagnostics::export_report(&summary),
                             );

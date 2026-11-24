@@ -114,13 +114,11 @@ the host supports two interchangeable backends:
 | Opus RLD (`opus-rs`) | `0x7F` | 2.5 ms | Default for compressed profiles (bundled pure Rust) |
 | Pure-Rust VBR | `0x7E` | 0 ms | Zero-lookahead fallback (`--vbr`) |
 
-The default is the pure-Rust Opus RLD codec. Select VBR with
-`as-ultra host --vbr`, the desktop GUI's **Compressed codec** selector, or
-the Android **Compressed Codec Module** switch (feedback codes `20`/`21`). The
-choice is persisted and can be changed while streaming: every packet is
-self-identifying, so the receiver switches decoders without a restart. If the
-Opus encoder cannot be created or rejects a frame, the host falls back to VBR
-for that packet rather than dropping audio.
+Opus RLD is the built-in compressed codec in both the desktop GUI and Android
+app. Pure-Rust VBR remains available via the CLI (`as-ultra host --vbr`) and as
+an automatic internal fallback if the Opus encoder ever fails to initialize or
+rejects a frame—every packet is self-identifying, so receivers decode either
+format seamlessly without a restart.
 
 Opus uses `RestrictedLowDelay` at 48 kHz with 2.5 ms stereo frames. Its 2.5 ms
 lookahead is included in the client latency estimate and shown separately in the
