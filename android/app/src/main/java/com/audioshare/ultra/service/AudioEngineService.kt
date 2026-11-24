@@ -28,6 +28,9 @@ import androidx.core.app.NotificationCompat
 import com.audioshare.ultra.MainActivity
 import com.audioshare.ultra.R
 import com.audioshare.ultra.ui.HostPinStore
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
@@ -92,10 +95,14 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         @Volatile
         var isLocallyMutedState: Boolean = false
             private set
+        private val _isLocallyMutedFlow = MutableStateFlow(false)
+        val isLocallyMutedFlow: StateFlow<Boolean> = _isLocallyMutedFlow.asStateFlow()
 
         @Volatile
         var isMicMutedState: Boolean = false
             private set
+        private val _isMicMutedFlow = MutableStateFlow(false)
+        val isMicMutedFlow: StateFlow<Boolean> = _isMicMutedFlow.asStateFlow()
 
         // Process-wide single-thread executor and generation counters matching
         // the process-wide Rust statics (`GLOBAL_ANDROID_CLIENT` /
@@ -126,6 +133,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeReportBluetoothDelayMs(delayMs: Int)
+
+        @JvmStatic
+        external fun nativeRequestExclusiveMmapReclaim()
 
         @JvmStatic
         external fun nativeSendMediaCommand(cmdCode: Int)
@@ -177,9 +187,21 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeSetScannerPaused(paused: Boolean)
+
+        @JvmStatic
+        external fun nativeInstallCrashHook(crashLogPath: String)
     }
 
     private var wifiLock: WifiManager.WifiLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        runCatching {
+            val crashPath = java.io.File(filesDir, "audioshare-ultra-crash.log").absolutePath
+            nativeInstallCrashHook(crashPath)
+        }
+    }
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var perfHintSession: PerformanceHintManager.Session? = null
     private var audioManager: AudioManager? = null
@@ -191,6 +213,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         set(value) {
             field = value
             isLocallyMutedState = value
+            _isLocallyMutedFlow.value = value
         }
     // Last value handed to native A/V sync. Device callbacks can re-report the
     // same route repeatedly; log only real transitions to keep the report useful.
@@ -202,6 +225,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // Raw low-latency output is the default. `true` opts into the shared
     // mixer so OEM post-processing (Dolby Atmos, Dirac, system EQ) applies.
     private var dolbyEffects: Boolean = false
+    // Tracks whether audio focus was interrupted (call / notification / loss)
+    // so regaining focus triggers one bounded Exclusive MMAP reclaim attempt
+    // if AAudio was kicked down to the shared mixer.
+    private var lostAudioFocus: Boolean = false
     // Only microphone / internal-audio capture may declare the MICROPHONE
     // foreground-service type. Plain playback must never request it.
     private var micCaptureActive: Boolean = false
@@ -218,6 +245,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         set(value) {
             field = value
             isMicMutedState = value
+            _isMicMutedFlow.value = value
         }
     private var serviceDestroyed: Boolean = false
     private var serviceStopped: Boolean = false
@@ -504,6 +532,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 nativeSetGainDb(savedGain)
                 if (isStreaming) {
                     requestAudioFocus(dolbyEffects)
+                    if (lostAudioFocus && !dolbyEffects) {
+                        lostAudioFocus = false
+                        runCatching { nativeRequestExclusiveMmapReclaim() }
+                    }
                 }
                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
             }
@@ -534,6 +566,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 // Re-claim audio focus so the app that stole it pauses instead
                 // of playing over us after the user unmutes.
                 requestAudioFocus(dolbyEffects)
+                if (lostAudioFocus && !dolbyEffects) {
+                    lostAudioFocus = false
+                    runCatching { nativeRequestExclusiveMmapReclaim() }
+                }
             }
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
@@ -638,25 +674,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         // ClientEngine exists, and restore saved Studio EQ / DSP settings.
         reportBluetoothRoute()
         applyDspFromPrefs()
-        // Restore both the saved Host Quality Mode (1..=5) and the compressed
-        // codec backend (20 = Rust VBR, 21 = Opus RLD) on every stream start.
-        // The native client keeps these in separate pending slots, so the two
-        // calls cannot overwrite each other before the RX thread sends them.
-        val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
-        val savedQuality = prefs.getInt("quality_mode", 0).coerceIn(0, 4)
-        nativeSendMediaCommand(savedQuality + 1)
-        // Restore the compressed bitrate target (30..34 = 96/160/256/320/510 kbps)
-        // in its own slot as well.
-        val savedBitrateCmd = when (prefs.getInt("target_bitrate_kbps", 256)) {
-            96 -> 30
-            160 -> 31
-            320 -> 33
-            510 -> 34
-            else -> 32
-        }
-        nativeSendMediaCommand(savedBitrateCmd)
         // Compressed codec is always Opus RLD: pure-Rust VBR is no longer a
-        // user-selectable backend (legacy prefs must not re-enable it).
+        // user-selectable backend (legacy prefs must not re-enable it). Host
+        // quality profile and bitrate are only sent on explicit UI taps so a
+        // joining phone never overrides an already-configured PC host.
         nativeSendMediaCommand(21)
         refreshAdpfHintSession()
         scheduleAdpfRefresh()
@@ -1467,6 +1488,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 "Audio focus change: $focusLabel"
             )
         }
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        ) {
+            lostAudioFocus = true
+        }
         if (isLocallyMuted) {
             // Never unmute a user-muted or headphone-unplugged stream when a
             // transient notification finishes and returns AUDIOFOCUS_GAIN.
@@ -1488,7 +1515,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK ->
                 nativeSetGainDb((liveGainDb - 12.0f).coerceAtLeast(-96.0f))
-            AudioManager.AUDIOFOCUS_GAIN -> nativeSetGainDb(liveGainDb)
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                nativeSetGainDb(liveGainDb)
+                if (lostAudioFocus && isStreaming && !dolbyEffects) {
+                    lostAudioFocus = false
+                    runCatching { nativeRequestExclusiveMmapReclaim() }
+                }
+            }
         }
     }
 
@@ -1529,6 +1562,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private fun releaseClientPlaybackResources() {
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
+        lostAudioFocus = false
         audioDeviceCallback?.let { callback ->
             try {
                 val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
