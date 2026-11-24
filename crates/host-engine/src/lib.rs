@@ -2375,7 +2375,7 @@ impl HostEngine {
                 promote_thread_realtime();
 
                 fn query_default_monitor() -> Option<String> {
-                    if let Ok(out) = Command::new("pactl").arg("get-default-source").output() {
+                    if let Ok(out) = crate::discovery_and_os::pactl_command().arg("get-default-source").output() {
                         if out.status.success() {
                             let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
                             if src == "AudioShare_Ultra.monitor" {
@@ -2383,7 +2383,7 @@ impl HostEngine {
                             }
                         }
                     }
-                    Command::new("pactl")
+                    crate::discovery_and_os::pactl_command()
                         .arg("get-default-sink")
                         .output()
                         .ok()

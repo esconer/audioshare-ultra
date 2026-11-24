@@ -108,6 +108,14 @@ pub(crate) fn silent_command(program: &str) -> Command {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn pactl_command() -> Command {
+    let mut cmd = Command::new("pactl");
+    cmd.env("LC_ALL", "C").env("LANG", "C");
+    cmd
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredHost {
     pub hostname: String,
@@ -809,11 +817,11 @@ impl DirectHotspotController {
                  $pub.Start(); \
                  for ($i = 0; $i -lt 40; $i++) {{ \
                      $st = $pub.Status.ToString(); \
-                     if ($st -eq 'Started') {{ Write-Output 'ASULTRA_SOFTAP_READY'; break }} \
-                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ Write-Output \"ASULTRA_SOFTAP_FAILED:$st\"; exit 1 }} \
+                     if ($st -eq 'Started') {{ [Console]::Out.WriteLine('ASULTRA_SOFTAP_READY'); [Console]::Out.Flush(); break }} \
+                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ [Console]::Out.WriteLine(\"ASULTRA_SOFTAP_FAILED:$st\"); [Console]::Out.Flush(); exit 1 }} \
                      Start-Sleep -Milliseconds 100 \
                  }}; \
-                 if ($pub.Status.ToString() -ne 'Started') {{ Write-Output 'ASULTRA_SOFTAP_FAILED:Timeout'; exit 1 }}; \
+                 if ($pub.Status.ToString() -ne 'Started') {{ [Console]::Out.WriteLine('ASULTRA_SOFTAP_FAILED:Timeout'); [Console]::Out.Flush(); exit 1 }}; \
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
@@ -943,6 +951,22 @@ fn encode_powershell_utf16le_base64(script: &str) -> String {
 pub fn is_windows_firewall_configured() -> bool {
     #[cfg(target_os = "windows")]
     {
+        // Prefer structured PowerShell NetSecurity properties (`Enabled == True`,
+        // `Action == Allow`) because `netsh advfirewall` localizes field names
+        // and values on non-English Windows installs.
+        if let Ok(o) = silent_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$r = Get-NetFirewallRule -DisplayName 'AudioShare_Ultra_UDP' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $r -and $r.Enabled.ToString() -eq 'True' -and $r.Action.ToString() -eq 'Allow') { 'OK' }",
+            ])
+            .output()
+        {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).trim() == "OK";
+            }
+        }
         silent_command("netsh")
             .args([
                 "advfirewall",
@@ -1198,7 +1222,7 @@ fn parse_pactl_volume_percent(output: &str) -> Option<u8> {
 
 #[cfg(target_os = "linux")]
 fn read_linux_master_volume() -> Option<u8> {
-    let mute = Command::new("pactl")
+    let mute = pactl_command()
         .args(["get-sink-mute", "@DEFAULT_SINK@"])
         .output()
         .ok()?;
@@ -1212,7 +1236,7 @@ fn read_linux_master_volume() -> Option<u8> {
         return Some(0);
     }
 
-    let volume = Command::new("pactl")
+    let volume = pactl_command()
         .args(["get-sink-volume", "@DEFAULT_SINK@"])
         .output()
         .ok()?;
@@ -1443,7 +1467,7 @@ pub struct VirtualSpeakerAndRadioGuard {
 #[cfg(target_os = "linux")]
 fn pactl_get_default(kind: &str) -> Option<String> {
     let arg = format!("get-default-{}", kind);
-    let output = Command::new("pactl").arg(arg).output().ok()?;
+    let output = pactl_command().arg(arg).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1458,13 +1482,13 @@ fn pactl_get_default(kind: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn pactl_set_default(kind: &str, value: &str) {
     let arg = format!("set-default-{}", kind);
-    let _ = Command::new("pactl").args([arg.as_str(), value]).output();
+    let _ = pactl_command().args([arg.as_str(), value]).output();
 }
 
 /// True when a PulseAudio sink with this exact name is already registered.
 #[cfg(target_os = "linux")]
 fn pactl_sink_exists(name: &str) -> bool {
-    let Ok(output) = Command::new("pactl")
+    let Ok(output) = pactl_command()
         .args(["list", "short", "sinks"])
         .output()
     else {
@@ -1526,12 +1550,13 @@ impl VirtualSpeakerAndRadioGuard {
             let mut pactl_module_id = None;
             let sink_ready = if enable_virtual_speaker {
                 if pactl_sink_exists("AudioShare_Ultra") {
-                    // A previous session (or another guard) already registered
-                    // this sink. Reuse it, but never unload a module we did
-                    // not create in Drop.
+                    // Reuse an existing sink. If per-app routing created it in
+                    // this process, adopt ownership so Drop unloads it cleanly
+                    // without leaving a zombie null-sink behind.
+                    pactl_module_id = crate::app_routing::take_created_sink_module_id();
                     true
                 } else {
-                    if let Ok(output) = Command::new("pactl")
+                    if let Ok(output) = pactl_command()
                         .args([
                             "load-module",
                             "module-null-sink",
@@ -1668,7 +1693,7 @@ impl Drop for VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "linux")]
         if let Some(ref id) = self.pactl_module_id {
-            let _ = Command::new("pactl").args(["unload-module", id]).output();
+            let _ = pactl_command().args(["unload-module", id]).output();
         }
 
         #[cfg(target_os = "windows")]

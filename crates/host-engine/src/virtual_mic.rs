@@ -746,7 +746,7 @@ impl PhoneMicReceiver {
         #[cfg(target_os = "linux")]
         let (pactl_mic_module_id, pactl_mic_source_module_id, prev_default_source) =
             if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                let prev_src = Command::new("pactl")
+                let prev_src = crate::discovery_and_os::pactl_command()
                     .arg("get-default-source")
                     .output()
                     .ok()
@@ -764,7 +764,7 @@ impl PhoneMicReceiver {
                     });
 
                 // 1. Create underlying null sink to receive the phone's audio stream silently
-                let sink_id = Command::new("pactl")
+                let sink_id = crate::discovery_and_os::pactl_command()
                     .args([
                         "load-module",
                         "module-null-sink",
@@ -783,7 +783,7 @@ impl PhoneMicReceiver {
 
                 // 2. Create a true non-monitor Virtual Microphone (`module-remap-source`)
                 //    so Zoom, Discord, Google Meet, Teams & Chrome show it as a real Microphone Input!
-                let remap_id = Command::new("pactl")
+                let remap_id = crate::discovery_and_os::pactl_command()
                     .args([
                         "load-module",
                         "module-remap-source",
@@ -804,7 +804,7 @@ impl PhoneMicReceiver {
                 // Do not overwrite `AudioShare_Ultra.monitor` if Linux per-app
                 // capture is currently isolating an application.
                 if prev_src.as_deref() != Some("AudioShare_Ultra.monitor") {
-                    let _ = Command::new("pactl")
+                    let _ = crate::discovery_and_os::pactl_command()
                         .args(["set-default-source", "AudioShare_Phone_Mic"])
                         .output();
                 }
@@ -1405,7 +1405,13 @@ impl PhoneMicReceiver {
                             match open_sink() {
                                 Ok(reopened) => {
                                     mic_out = reopened;
-                                    sink_reopen.record_attempt(reopen_now, true);
+                                    #[cfg(target_os = "linux")]
+                                    let sink_live = mic_out.is_some() || linux_output_active;
+                                    #[cfg(not(target_os = "linux"))]
+                                    let sink_live = mic_out.is_some();
+                                    // PlayOnPcSpeakers maps transient open failures to Ok(None);
+                                    // stay armed with 500 ms backoff until a real sink opens.
+                                    sink_reopen.record_attempt(reopen_now, sink_live);
                                 }
                                 Err(_) => {
                                     sink_reopen.record_attempt(reopen_now, false);
@@ -1535,16 +1541,61 @@ impl PhoneMicReceiver {
             })
             .map_err(|e| format!("Failed to spawn PhoneMicReceiver thread: {}", e))?;
 
+        #[cfg(target_os = "linux")]
+        let cleanup_linux_on_err = |linux_out: Option<LinuxVirtualMicOutput>,
+                                    prev_src: Option<String>,
+                                    src_mod: Option<String>,
+                                    sink_mod: Option<String>| {
+            drop(linux_out);
+            if let Some(prev) = prev_src {
+                let cur = crate::discovery_and_os::pactl_command()
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if cur.is_empty() || cur == "AudioShare_Phone_Mic" {
+                    let _ = crate::discovery_and_os::pactl_command()
+                        .args(["set-default-source", &prev])
+                        .output();
+                }
+            }
+            if let Some(id) = src_mod {
+                let _ = crate::discovery_and_os::pactl_command()
+                    .args(["unload-module", &id])
+                    .output();
+            }
+            if let Some(id) = sink_mod {
+                let _ = crate::discovery_and_os::pactl_command()
+                    .args(["unload-module", &id])
+                    .output();
+            }
+        };
+
         match sink_ready_rx.recv_timeout(Duration::from_secs(4)) {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 running.store(false, Ordering::Release);
                 let _ = handle.join();
+                #[cfg(target_os = "linux")]
+                cleanup_linux_on_err(
+                    linux_output,
+                    prev_default_source,
+                    pactl_mic_source_module_id,
+                    pactl_mic_module_id,
+                );
                 return Err(format!("Failed to open output device '{}': {}", output_device_name, err));
             }
             Err(_) => {
                 running.store(false, Ordering::Release);
                 let _ = handle.join();
+                #[cfg(target_os = "linux")]
+                cleanup_linux_on_err(
+                    linux_output,
+                    prev_default_source,
+                    pactl_mic_source_module_id,
+                    pactl_mic_module_id,
+                );
                 return Err(format!("Timed out opening output device '{}'", output_device_name));
             }
         }
@@ -1613,23 +1664,23 @@ impl PhoneMicReceiver {
             // points at AudioShare_Phone_Mic, then remove remap source and sink.
             drop(self.linux_output.take());
             if let Some(prev_src) = self.prev_default_source.take() {
-                let current_src = Command::new("pactl")
+                let current_src = crate::discovery_and_os::pactl_command()
                     .arg("get-default-source")
                     .output()
                     .ok()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
                 if current_src.is_empty() || current_src == "AudioShare_Phone_Mic" {
-                    let _ = Command::new("pactl")
+                    let _ = crate::discovery_and_os::pactl_command()
                         .args(["set-default-source", &prev_src])
                         .output();
                 }
             }
             if let Some(id) = self.pactl_mic_source_module_id.take() {
-                let _ = Command::new("pactl").args(["unload-module", &id]).output();
+                let _ = crate::discovery_and_os::pactl_command().args(["unload-module", &id]).output();
             }
             if let Some(id) = self.pactl_mic_module_id.take() {
-                let _ = Command::new("pactl").args(["unload-module", &id]).output();
+                let _ = crate::discovery_and_os::pactl_command().args(["unload-module", &id]).output();
             }
         }
     }

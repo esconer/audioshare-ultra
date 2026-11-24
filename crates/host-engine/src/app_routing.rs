@@ -1,11 +1,23 @@
-#[cfg(target_os = "linux")]
-use std::process::Command;
-
 /// Sink-input IDs this host moved into `AudioShare_Ultra`. Only these are
 /// restored on `restore_all_apps_to_default_sink`; unrelated applications must
 /// keep whatever output the user chose.
 #[cfg(target_os = "linux")]
 static ROUTED_SINK_INPUTS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Module ID of `AudioShare_Ultra` when created on-demand by per-app isolation
+/// (Virtual Speaker OFF). Adopted by `VirtualSpeakerAndRadioGuard` if Virtual
+/// Speaker is enabled later; otherwise unloaded when restoring Full System Audio.
+#[cfg(target_os = "linux")]
+static CREATED_APP_ROUTING_SINK_MODULE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn take_created_sink_module_id() -> Option<String> {
+    CREATED_APP_ROUTING_SINK_MODULE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
 
 #[cfg(target_os = "windows")]
 use crate::discovery_and_os::silent_command;
@@ -598,7 +610,7 @@ pub fn list_active_audio_apps() -> Vec<AudioAppEntry> {
 fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
     // Column 2 of `pactl list short sink-inputs` is the numeric sink index
     // (not the sink name), so resolve `sink_name` -> numeric index first.
-    let target_sink_idx: Option<String> = Command::new("pactl")
+    let target_sink_idx: Option<String> = crate::discovery_and_os::pactl_command()
         .args(["list", "short", "sinks"])
         .output()
         .ok()
@@ -616,7 +628,7 @@ fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
             })
         });
 
-    let Ok(output) = Command::new("pactl")
+    let Ok(output) = crate::discovery_and_os::pactl_command()
         .args(["list", "short", "sink-inputs"])
         .output()
     else {
@@ -641,7 +653,7 @@ fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
 #[cfg(target_os = "linux")]
 fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
     let mut apps = Vec::new();
-    let Ok(output) = Command::new("pactl").args(["list", "sink-inputs"]).output() else {
+    let Ok(output) = crate::discovery_and_os::pactl_command().args(["list", "sink-inputs"]).output() else {
         return apps;
     };
     let text = String::from_utf8_lossy(&output.stdout);
@@ -890,20 +902,34 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
     {
         // Ensure the sink that the host captures exists. Do not make it the
         // default output, so only explicitly routed apps are streamed.
-        let sink_exists = Command::new("pactl")
+        let sink_exists = crate::discovery_and_os::pactl_command()
             .args(["list", "short", "sinks"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("AudioShare_Ultra"))
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(1) == Some("AudioShare_Ultra"))
+            })
             .unwrap_or(false);
         if !sink_exists {
-            let _ = Command::new("pactl")
+            if let Ok(output) = crate::discovery_and_os::pactl_command()
                 .args([
                     "load-module",
                     "module-null-sink",
                     "sink_name=AudioShare_Ultra",
                     "sink_properties=device.description=AudioShare_Wireless_Speaker",
                 ])
-                .output();
+                .output()
+            {
+                if output.status.success() {
+                    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !id.is_empty() {
+                        *CREATED_APP_ROUTING_SINK_MODULE
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(id);
+                    }
+                }
+            }
         }
 
         // Return any previously isolated apps back to @DEFAULT_SINK@ before
@@ -923,13 +949,13 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
         };
         for id in prev_routed {
             if id != app.id {
-                let _ = Command::new("pactl")
+                let _ = crate::discovery_and_os::pactl_command()
                     .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
                     .output();
             }
         }
 
-        let status = Command::new("pactl")
+        let status = crate::discovery_and_os::pactl_command()
             .args(["move-sink-input", &app.id.to_string(), "AudioShare_Ultra"])
             .status()
             .map_err(|e| format!("Failed to move sink-input: {}", e))?;
@@ -938,7 +964,7 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             // Only switch the capture source AFTER move-sink-input succeeded so
             // a failed route never leaves @DEFAULT_SOURCE@ stranded on an empty
             // null sink monitor.
-            let _ = Command::new("pactl")
+            let _ = crate::discovery_and_os::pactl_command()
                 .args(["set-default-source", "AudioShare_Ultra.monitor"])
                 .output();
             if let Ok(mut routed) = ROUTED_SINK_INPUTS.lock() {
@@ -994,28 +1020,33 @@ pub fn restore_all_apps_to_default_sink() -> String {
             }
         }
         for id in &to_restore {
-            let _ = Command::new("pactl")
+            let _ = crate::discovery_and_os::pactl_command()
                 .args(["move-sink-input", &id.to_string(), "@DEFAULT_SINK@"])
                 .output();
         }
         // Always restore `@DEFAULT_SOURCE@` if it is still pointing at
         // `AudioShare_Ultra.monitor`, even if the isolated app already exited
         // (`to_restore.is_empty()`).
-        let current_source = Command::new("pactl")
+        let current_source = crate::discovery_and_os::pactl_command()
             .arg("get-default-source")
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         if !to_restore.is_empty() || current_source == "AudioShare_Ultra.monitor" {
-            if let Ok(out) = Command::new("pactl").arg("get-default-sink").output() {
+            if let Ok(out) = crate::discovery_and_os::pactl_command().arg("get-default-sink").output() {
                 let sink = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !sink.is_empty() && sink != "AudioShare_Ultra" {
-                    let _ = Command::new("pactl")
+                    let _ = crate::discovery_and_os::pactl_command()
                         .args(["set-default-source", &format!("{}.monitor", sink)])
                         .output();
                 }
             }
+        }
+        if let Some(module_id) = take_created_sink_module_id() {
+            let _ = crate::discovery_and_os::pactl_command()
+                .args(["unload-module", &module_id])
+                .output();
         }
         "Restored: Capturing Full System Audio (All Applications)".into()
     }

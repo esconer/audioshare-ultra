@@ -89,7 +89,7 @@ fn parse_default_sink_card_and_port(text: &str, default_sink: &str) -> Option<(S
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_lipsync_targets() -> Vec<LinuxSinkInfo> {
-    let Ok(sinks_out) = Command::new("pactl").args(["list", "sinks"]).output() else {
+    let Ok(sinks_out) = crate::discovery_and_os::pactl_command().args(["list", "sinks"]).output() else {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&sinks_out.stdout);
@@ -97,7 +97,7 @@ fn resolve_linux_lipsync_targets() -> Vec<LinuxSinkInfo> {
     if let Some(virt) = parse_sink_info(&text, "AudioShare_Ultra") {
         targets.push(virt);
     }
-    if let Ok(def) = Command::new("pactl").arg("get-default-sink").output() {
+    if let Ok(def) = crate::discovery_and_os::pactl_command().arg("get-default-sink").output() {
         let default_sink = String::from_utf8_lossy(&def.stdout).trim().to_string();
         if !default_sink.is_empty() && default_sink != "AudioShare_Ultra" {
             if let Some(info) = parse_sink_info(&text, &default_sink) {
@@ -148,7 +148,12 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
             }
         }
     } else {
-        *history.lock().unwrap_or_else(|e| e.into_inner()) = targets.clone();
+        let mut hist = history.lock().unwrap_or_else(|e| e.into_inner());
+        for t in &targets {
+            if !hist.contains(t) {
+                hist.push(t.clone());
+            }
+        }
     }
     let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
     let us_str = offset_us.to_string();
@@ -168,7 +173,7 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
         }
         if !pw_applied || bt_delay_ms == 0 {
             if let (Some(ref card), Some(ref port)) = (&sink.card_idx, &sink.active_port) {
-                let _ = Command::new("pactl")
+                let _ = crate::discovery_and_os::pactl_command()
                     .args(["set-port-latency-offset", card, port, &us_str])
                     .output();
             }
