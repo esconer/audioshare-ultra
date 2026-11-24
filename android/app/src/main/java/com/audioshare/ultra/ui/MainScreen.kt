@@ -413,6 +413,47 @@ private fun PartyTelemetrySection(
     }
 }
 
+private fun appVersionLabel(context: Context): String = runCatching {
+    val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        context.packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.PackageInfoFlags.of(0)
+        )
+    } else {
+        @Suppress("DEPRECATION")
+        context.packageManager.getPackageInfo(context.packageName, 0)
+    }
+    val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        info.longVersionCode
+    } else {
+        @Suppress("DEPRECATION")
+        info.versionCode.toLong()
+    }
+    "v${info.versionName ?: "unknown"} ($code)"
+}.getOrDefault("unknown")
+
+private fun buildAndroidDiagnosticsReport(context: Context): String? {
+    val nativeDiag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+        .getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+    val header = buildString {
+        appendLine("App     : AudioShare Ultra ${appVersionLabel(context)}")
+        appendLine(
+            "Device  : ${Build.MANUFACTURER} ${Build.MODEL} " +
+                "(Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})"
+        )
+    }
+    val crashFile = java.io.File(context.filesDir, "audioshare-ultra-crash.log")
+    val crashTail = runCatching {
+        if (crashFile.isFile && crashFile.length() > 0L) {
+            val text = crashFile.readText()
+            "\n--- Last Native Crash Log ---\n" + text.takeLast(4000)
+        } else {
+            ""
+        }
+    }.getOrDefault("")
+    return header + nativeDiag + crashTail
+}
+
 /**
  * Shared Copy/Share diagnostics actions used by both the Tools bottom sheet and
  * the Connect-tab telemetry drawer. [onDone] runs before any Snackbar is shown
@@ -431,8 +472,7 @@ private fun DiagnosticsActionsRow(
     ) {
         OutlinedButton(
             onClick = {
-                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                    .getOrNull()?.takeIf { it.isNotBlank() }
+                val diag = buildAndroidDiagnosticsReport(context)
                 // Dismiss first so the Snackbar is not hidden behind the sheet.
                 onDone()
                 if (diag == null) {
@@ -465,8 +505,7 @@ private fun DiagnosticsActionsRow(
         }
         OutlinedButton(
             onClick = {
-                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                    .getOrNull()?.takeIf { it.isNotBlank() }
+                val diag = buildAndroidDiagnosticsReport(context)
                 onDone()
                 if (diag != null) {
                     // Capture the nullable local into a non-null local before use.
@@ -501,6 +540,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by vm.uiState.collectAsState()
+    val isLocallyMuted by AudioEngineService.isLocallyMutedFlow.collectAsState()
+    val isMicMuted by AudioEngineService.isMicMutedFlow.collectAsState()
 
     /**
      * Reads are served from the collected [state] so Compose observes every
@@ -610,8 +651,6 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         { it.compressedBitrateKbps },
         { s, v -> s.copy(compressedBitrateKbps = v) }
     )
-    // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
-    var useOpus by vmField({ it.useOpus }, { s, v -> s.copy(useOpus = v) })
     var btDelayOverrideMs by vmField(
         { it.btDelayOverrideMs },
         { s, v -> s.copy(btDelayOverrideMs = v) }
@@ -721,6 +760,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     var connectAttemptId by remember { mutableIntStateOf(0) }
     var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
     var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
+    var awaitingConnectResult by remember { mutableStateOf(false) }
 
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
@@ -759,6 +799,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         AudioEngineService.EXTRA_STREAM_ACTIVE,
                         false
                     )
+                    awaitingConnectResult = false
+                    lastHandledAuthFailures = 0L
                     val err = intent.getStringExtra(AudioEngineService.EXTRA_STREAM_ERROR)
                     if (!err.isNullOrBlank()) {
                         scope.launch { snackbarHostState.showSnackbar(err) }
@@ -769,6 +811,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     if (linkedHost.isNotEmpty()) {
                         hostAddress = linkedHost
                         pinCode = linkedPin
+                        awaitingConnectResult = true
                         connectAttemptId += 1
                         lastHandledAuthFailures = 0L
                         showPinMismatchDialog = false
@@ -804,6 +847,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         hostAddress = addr
         pinCode = cleanPin
         lastConnectIsUsb = isUsb
+        awaitingConnectResult = true
         connectAttemptId += 1
         lastHandledAuthFailures = 0L
         showPinMismatchDialog = false
@@ -969,8 +1013,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     // sending zero datagrams back. Prompt once after 2.5 s of 0 packets when
     // the target advertises `enc=1` OR when connecting via USB (`127.0.0.1`)
     // / manual IP (neither emits LAN discovery beacons for that exact address).
-    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
-        if (!isConnected) return@LaunchedEffect
+    LaunchedEffect(isConnected, awaitingConnectResult, hostAddress, connectAttemptId) {
+        if (!isConnected || awaitingConnectResult) return@LaunchedEffect
         val attempt = connectAttemptId
         delay(3500)
         if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
@@ -986,7 +1030,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         val isUsbOrManual = matchedLanEntry == null
         val anyLanHostEncrypted = discoveredHosts.any { it.split("|").getOrNull(3) == "1" }
         val shouldPromptForPin =
-            targetEncryptedOnLan || (isUsbOrManual && (anyLanHostEncrypted || pinCode.isNotEmpty()))
+            targetEncryptedOnLan || pinCode.isNotEmpty() ||
+                (isUsbOrManual && anyLanHostEncrypted)
         if (shouldPromptForPin && telemetry.rxPackets == 0L) {
             promptedSilentRejectAttempt = attempt
             pinMismatchDraft = ""
@@ -1013,7 +1058,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 vm.updateTelemetry(raw)
 
                 val currentAuthFailures = maxOf(raw.getOrElse(5) { 0L }, nativeAuthFailures)
-                if (isConnected && currentAuthFailures > lastHandledAuthFailures) {
+                if (isConnected && !awaitingConnectResult && currentAuthFailures > lastHandledAuthFailures) {
                     lastHandledAuthFailures = currentAuthFailures
                     if (!showPinMismatchDialog) {
                         pinMismatchDraft = ""
@@ -1121,7 +1166,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             // Surface local speaker mute in-app (e.g. after headphone unplug or
             // AUDIOFOCUS_LOSS) so users with notifications disabled on Android
             // 13+ are never stranded in silent playback with no Unmute button.
-            if (isConnected && AudioEngineService.isLocallyMutedState) {
+            if (isConnected && isLocallyMuted) {
                 StudioCard {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1973,7 +2018,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     )
                     AnimatedVisibility(visible = sharePhoneMic && !castPhoneInternalAudio) {
                         val micVu = ((telemetry.partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
-                        val micMuted = AudioEngineService.isMicMutedState
+                        val micMuted = isMicMuted
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             HorizontalDivider(color = Color(0xFF243047))
                             Row(
@@ -2098,6 +2143,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     snackbarHostState = snackbarHostState,
                     onDone = { showToolsSheet = false }
                 )
+                val versionText = remember(context) { appVersionLabel(context) }
+                Text(
+                    "AudioShare Ultra $versionText",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StudioColors.Muted
+                )
                 Spacer(Modifier.height(12.dp))
             }
         }
@@ -2156,12 +2207,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
     // Automatically prompt when the target host rejects the active PIN.
     if (showPinMismatchDialog) {
-        val targetNorm = hostAddress.trim().lowercase()
+        val targetNorm = HostPinStore.normalizeHost(hostAddress)
         val hostLabel = discoveredHosts.firstNotNullOfOrNull { entry ->
             val parts = entry.split("|")
             val name = parts.getOrNull(0)
-            val addr = parts.getOrNull(1)
-            if (addr?.trim()?.lowercase() == targetNorm && !name.isNullOrBlank()) {
+            val addr = HostPinStore.normalizeHost(parts.getOrNull(1).orEmpty())
+            if (targetNorm.isNotEmpty() && addr == targetNorm && !name.isNullOrBlank()) {
                 "$name ($hostAddress)"
             } else {
                 null
