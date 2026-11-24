@@ -895,6 +895,30 @@ fn aaudio_latency_tuner_growth(
     }
 }
 
+/// Pure decision helper for soft AAudio output reopens (Bluetooth route flips
+/// and one-shot Exclusive MMAP reclaim after `AUDIOFOCUS_GAIN`).
+///
+/// - When `want_dolby` is true, AAudio already runs on the shared normal mixer,
+///   so a BT route-only flip does not need a redundant reopen (any real HAL
+///   disconnect still sets `disconnected = true` via `aaudio_error_callback`).
+/// - Exclusive reclaim fires only on raw non-BT streams currently downgraded
+///   to shared mode, and respects the 300 ms debounce window.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn should_reopen_aaudio_soft(
+    want_dolby: bool,
+    bt_active: bool,
+    route_change: bool,
+    reclaim_requested: bool,
+    is_exclusive: bool,
+    recent_open: bool,
+) -> (bool, bool) {
+    let bt_route_reopen = route_change && !want_dolby && !recent_open;
+    let exclusive_reclaim =
+        reclaim_requested && !want_dolby && !bt_active && !is_exclusive && !recent_open;
+    (bt_route_reopen, exclusive_reclaim)
+}
+
 pub struct ClientTelemetry {
     pub packets_received: AtomicU64,
     pub primary_frames_played: AtomicU64,
@@ -915,6 +939,10 @@ pub struct ClientTelemetry {
     /// Android: `true` keeps the shared mixer + OEM post-processing path
     /// (Dolby/Atmos/system EQ); `false` selects the raw low-latency path.
     pub enable_dolby_effects: AtomicBool,
+    /// Android: one-shot request from `AUDIOFOCUS_GAIN` to try reclaiming
+    /// Exclusive MMAP if the current raw AAudio stream was previously kicked
+    /// down to the shared mixer.
+    pub reclaim_exclusive_mmap: AtomicBool,
     pub downstream_bt_delay_ms: AtomicU16,
     /// Hardware/DAC latency measured with `AAudioStream_getTimestamp` on
     /// Android. Kept separate from the A2DP codec estimate reported by Kotlin;
@@ -1380,10 +1408,23 @@ impl ClientEngine {
     }
 
     pub fn connect_with_pin(config: ClientConfig, pin: Option<&str>) -> Result<Self, String> {
+        Self::connect_with_pin_and_bt_delay(config, pin, 0)
+    }
+
+    pub fn connect_with_pin_and_bt_delay(
+        config: ClientConfig,
+        pin: Option<&str>,
+        initial_bt_delay_ms: u16,
+    ) -> Result<Self, String> {
         let running = Arc::new(AtomicBool::new(true));
         // Mirror the RX loop's initial cushion so the debug view has sensible
         // values before the first packet arrives.
-        let initial_floor_subframes = configured_wifi_floor(config.target_buffer_subframes);
+        let configured_floor = configured_wifi_floor(config.target_buffer_subframes);
+        let initial_floor_subframes = if initial_bt_delay_ms > 0 {
+            configured_floor.max(8.0)
+        } else {
+            configured_floor
+        };
         let initial_target_subframes = (initial_floor_subframes.ceil() as u32).clamp(4, 12);
         let telemetry = Arc::new(ClientTelemetry {
             packets_received: AtomicU64::new(0),
@@ -1402,7 +1443,8 @@ impl ClientEngine {
             enable_night_mode: AtomicBool::new(false),
             gaming_mode_hard_lock: AtomicBool::new(false),
             enable_dolby_effects: AtomicBool::new(config.dolby_effects),
-            downstream_bt_delay_ms: AtomicU16::new(0),
+            reclaim_exclusive_mmap: AtomicBool::new(false),
+            downstream_bt_delay_ms: AtomicU16::new(initial_bt_delay_ms),
             downstream_hw_delay_ms: AtomicU16::new(0),
             pending_media_command: AtomicU8::new(0),
             pending_codec_backend_command: AtomicU8::new(0),
@@ -1523,7 +1565,7 @@ impl ClientEngine {
             format!(
                 "connected to {} (pin={}, target_buffer_subframes={}, dolby={})",
                 effective_config.server_addr,
-                if pin.is_some() { "set" } else { "none" },
+                if clean_pin.is_some() { "set" } else { "none" },
                 config.target_buffer_subframes,
                 config.dolby_effects,
             ),
@@ -1853,10 +1895,16 @@ impl ClientEngine {
         let mut last_bt_active = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
         #[cfg(target_os = "android")]
         let mut last_aaudio_open_attempt: Option<Instant> = None;
+        #[cfg(target_os = "android")]
+        let mut aaudio_xrun_base: u32 = 0;
         let mut window = LossWindow::default();
         // Auto-adaptive jitter cushion: 3.0 (7.5ms) on 5GHz, auto-expands up to 14.0 (35.0ms) on 2.4GHz!
         let configured_floor = configured_wifi_floor(config.target_buffer_subframes);
-        let mut initial_wifi_floor = configured_floor;
+        let mut initial_wifi_floor = if telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0 {
+            configured_floor.max(8.0)
+        } else {
+            configured_floor
+        };
         let mut adaptive_wifi_subframes = initial_wifi_floor;
         let mut last_pkt_subframe_count: u8 = 1;
         let mut smaller_pkt_run: u8 = 0;
@@ -1984,20 +2032,48 @@ impl ClientEngine {
                 let recent_open = last_aaudio_open_attempt
                     .map(|attempt| attempt.elapsed() < Duration::from_millis(300))
                     .unwrap_or(false);
-                // Defer a route-only reopen until the 300 ms debounce window
-                // elapses rather than overwriting `last_bt_active`, so genuine
-                // BT connect/disconnect transitions arriving shortly after
-                // stream open are never silently swallowed.
-                let reopen = hard_reason || (route_change && !recent_open);
+                // While Dolby is ON, AAudio is already on the shared normal
+                // mixer; skip redundant BT route-only reopens and keep
+                // `last_bt_active` synced so toggling Dolby OFF later does not
+                // see a stale transition.
+                if route_change && want_dolby && !hard_reason {
+                    last_bt_active = bt_active;
+                }
+                let is_exclusive = aaudio_guard
+                    .as_ref()
+                    .map(|g| g.is_exclusive())
+                    .unwrap_or(false);
+                let reclaim_pending = telemetry.reclaim_exclusive_mmap.load(Ordering::Acquire);
+                if reclaim_pending && (want_dolby || bt_active || is_exclusive) {
+                    telemetry
+                        .reclaim_exclusive_mmap
+                        .store(false, Ordering::Release);
+                }
+                let (bt_route_reopen, exclusive_reclaim) = should_reopen_aaudio_soft(
+                    want_dolby,
+                    bt_active,
+                    route_change && !want_dolby,
+                    reclaim_pending,
+                    is_exclusive,
+                    recent_open,
+                );
+                let reopen = hard_reason || bt_route_reopen || exclusive_reclaim;
                 if reopen {
+                    if exclusive_reclaim || hard_reason {
+                        telemetry
+                            .reclaim_exclusive_mmap
+                            .store(false, Ordering::Release);
+                    }
                     // Edge-triggered: reopen is rare, so the one formatted log
                     // line here never touches the 2.5 ms audio hot path.
                     let reason = if disconnected {
                         "disconnected"
                     } else if dolby_changed {
                         "dolby-toggle"
-                    } else if route_change {
+                    } else if bt_route_reopen {
                         "bt-route"
+                    } else if exclusive_reclaim {
+                        "exclusive-reclaim"
                     } else if retry_due {
                         "no-stream-retry"
                     } else {
@@ -2021,6 +2097,9 @@ impl ClientEngine {
                     // running: two consumers race on the SPSC decoupler, and
                     // the old stream keeps the device busy during an
                     // exclusive-mode reopen.
+                    if let Some(prev_guard) = aaudio_guard.as_ref() {
+                        aaudio_xrun_base = aaudio_xrun_base.saturating_add(prev_guard.xrun_count());
+                    }
                     *aaudio_guard = None;
                     // Flush stale old-rate samples while quiescent (no consumer
                     // running) so 44.1 kHz <-> 48 kHz <-> 96 kHz transitions
@@ -2066,7 +2145,7 @@ impl ClientEngine {
                 if let Some(guard) = aaudio_guard.as_mut() {
                     telemetry
                         .aaudio_xrun_count
-                        .store(guard.xrun_count(), Ordering::Relaxed);
+                        .store(aaudio_xrun_base.saturating_add(guard.xrun_count()), Ordering::Relaxed);
                     // Low-latency streams start at 2x burst; grow by one burst
                     // on a fresh XRun up to 4x/effective capacity.
                     guard.tune_buffer_on_xrun();
@@ -2262,6 +2341,9 @@ impl ClientEngine {
                 &mut scan_shield_subframes,
             )
             .max(initial_wifi_floor);
+            // Immediately shed excess cushion when BT disconnects or the 25 s
+            // Scan-Burst Shield expires, rather than lingering above the new cap.
+            adaptive_wifi_subframes = adaptive_wifi_subframes.min(adaptive_ceiling);
 
             let mut packets_drained = 0u8;
             // Only the first audio packet of a drain pass feeds the RFC 3550
@@ -5615,6 +5697,62 @@ mod tests {
         };
         assert_eq!(streak2, 2);
     }
+    #[test]
+    fn test_should_reopen_aaudio_soft_dolby_skip_and_exclusive_reclaim() {
+        // Dolby ON skips redundant BT route-only reopen.
+        assert_eq!(
+            should_reopen_aaudio_soft(true, true, true, false, false, false),
+            (false, false)
+        );
+        // Dolby OFF still reopens on BT route flip outside debounce.
+        assert_eq!(
+            should_reopen_aaudio_soft(false, true, true, false, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            should_reopen_aaudio_soft(false, true, true, false, false, true),
+            (false, false)
+        );
+        // Exclusive reclaim fires only when !dolby && !bt && !is_exclusive && !recent_open.
+        assert_eq!(
+            should_reopen_aaudio_soft(false, false, false, true, false, false),
+            (false, true)
+        );
+        assert_eq!(
+            should_reopen_aaudio_soft(false, false, false, true, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            should_reopen_aaudio_soft(false, true, false, true, false, false),
+            (false, false)
+        );
+        assert_eq!(
+            should_reopen_aaudio_soft(true, false, false, true, false, false),
+            (false, false)
+        );
+    }
+
+    /// p2 Commit 4 §5: BT delay must be seeded before the RX thread spawns.
+    #[test]
+    fn test_connect_with_pin_and_bt_delay_seeds_downstream_and_cushion() {
+        let mut client = ClientEngine::connect_with_pin_and_bt_delay(
+            ClientConfig {
+                server_addr: SocketAddr::from(([127, 0, 0, 1], 65500)),
+                target_buffer_subframes: 4.0,
+                preamp_gain_db: 0.0,
+                dolby_effects: false,
+            },
+            None,
+            185,
+        )
+        .expect("connect client with seeded BT delay");
+        assert_eq!(
+            client.telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed),
+            185
+        );
+        assert!(client.telemetry.adaptive_buffer_us.load(Ordering::Relaxed) >= 20_000);
+        client.stop();
+    }
 }
 
 /// Direct Zero-Dependency Android NDK `libaaudio.so` Hardware MMAP Binding
@@ -5928,11 +6066,18 @@ pub mod android_aaudio {
         /// True when the HAL granted `PERFORMANCE_MODE_NONE` (normal mixer).
         /// The tuner deliberately leaves that path at its double-buffered size.
         normal_mixer: bool,
+        /// Sharing mode actually granted by AAudio (`0` = EXCLUSIVE, `1` = SHARED).
+        granted_sharing_mode: i32,
     }
 
     unsafe impl Send for AAudioOutputGuard {}
 
     impl AAudioOutputGuard {
+        #[inline]
+        pub fn is_exclusive(&self) -> bool {
+            self.granted_sharing_mode == AAUDIO_SHARING_MODE_EXCLUSIVE
+        }
+
         #[inline]
         pub fn needs_reopen(&self) -> bool {
             if self.ctx_ptr.is_null() {
@@ -6211,6 +6356,7 @@ pub mod android_aaudio {
                 // when AAudio really put us on PERFORMANCE_MODE_NONE.
                 let granted_normal_mixer =
                     AAudioStream_getPerformanceMode(stream) == AAUDIO_PERFORMANCE_MODE_NONE;
+                let granted_sharing_mode = AAudioStream_getSharingMode(stream);
                 if let Some(target_frames) =
                     aaudio_buffer_frames_for_profile(raw_burst, cap_for_burst, granted_normal_mixer)
                 {
@@ -6251,7 +6397,7 @@ pub mod android_aaudio {
                         raw_burst,
                         AAudioStream_getBufferSizeInFrames(stream),
                         cap_for_burst,
-                        AAudioStream_getSharingMode(stream),
+                        granted_sharing_mode,
                         AAudioStream_getPerformanceMode(stream),
                         match mmap_used {
                             Some(true) => "yes",
@@ -6271,6 +6417,7 @@ pub mod android_aaudio {
                     burst_frames: raw_burst,
                     max_auto_buf_frames,
                     normal_mixer: granted_normal_mixer,
+                    granted_sharing_mode,
                 })
             }
         }
