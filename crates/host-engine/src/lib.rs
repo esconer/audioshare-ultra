@@ -78,6 +78,9 @@ const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(500);
 /// creation/encode failure. One attempt per 2 s instead of one per 2.5 ms TX
 /// tick (200 Hz) keeps recovery bounded while still healing transient errors.
 const OPUS_ENCODER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Grace window during which a newcomer joining an already-active multi-peer
+/// session cannot override the host's quality profile or target bitrate.
+const JOIN_PROFILE_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
 /// Sustained spotless lossless operation required before SmartAuto promotes
 /// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
 /// (~2.8-4.5+ Mbps) on Wi-Fi links.
@@ -323,6 +326,13 @@ impl OpusEncoderRetry {
         self.failed = false;
         self.next_attempt_at = Instant::now();
     }
+}
+
+/// True when a remote quality/bitrate command from a peer is outside any
+/// newcomer join-grace window.
+#[inline]
+fn should_apply_remote_profile_cmd(grace_until: Option<Instant>, now: Instant) -> bool {
+    grace_until.map(|until| now >= until).unwrap_or(true)
 }
 
 /// Advance a warm Opus encoder with one live subframe while Smart Auto is in
@@ -1629,6 +1639,9 @@ pub struct HostTelemetry {
     /// A large value points at an OS audio-stack stall (BT route change, device
     /// sleep, a wedged loopback capture) rather than a network problem.
     pub capture_cb_max_gap_ms: AtomicU16,
+    /// Count of capture-callback gaps strictly exceeding 20 ms after the
+    /// initial 500 ms stream warmup (or post-rebind warmup).
+    pub capture_cb_gaps_over_20ms: AtomicU64,
     /// Failed `send_to` calls on the real-time TX socket. The socket is
     /// non-blocking, so without this counter a saturated link drops silently.
     pub tx_send_errors: AtomicU64,
@@ -1670,6 +1683,7 @@ impl Default for HostTelemetry {
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
             capture_cb_max_gap_ms: AtomicU16::new(0),
+            capture_cb_gaps_over_20ms: AtomicU64::new(0),
             tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
@@ -1696,7 +1710,7 @@ impl HostTelemetry {
             "Host: profile={:?} codec={} opus={} bitrate={}kbps \
              pkt_interval={:.2}ms subframes={} dtx={} smart_dtx={} \
              packets_sent={} bytes_sent={} send_err={} \
-             cap_buf={:.2}ms cap_max_gap={}ms rebinds={} rej_hs={}",
+             cap_buf={:.2}ms cap_max_gap={}ms cap_gaps_gt20ms={} rebinds={} rej_hs={}",
             profile,
             codec,
             self.prefer_opus.load(Ordering::Relaxed),
@@ -1712,6 +1726,7 @@ impl HostTelemetry {
             self.tx_send_errors.load(Ordering::Relaxed),
             self.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0,
             self.capture_cb_max_gap_ms.load(Ordering::Relaxed),
+            self.capture_cb_gaps_over_20ms.load(Ordering::Relaxed),
             self.hotplug_rebinds.load(Ordering::Relaxed),
             self.rejected_handshakes.load(Ordering::Relaxed),
         )
@@ -1983,6 +1998,7 @@ impl HostEngine {
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
             capture_cb_max_gap_ms: AtomicU16::new(0),
+            capture_cb_gaps_over_20ms: AtomicU64::new(0),
             tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
@@ -3184,11 +3200,15 @@ impl HostEngine {
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
+        // Suppresses connect-time quality/bitrate overrides from legacy APKs
+        // joining a session that already has another active receiver.
+        let mut join_override_grace: HashMap<IpAddr, Instant> = HashMap::new();
         // Capture-callback gap instrumentation. Anchors are reset when the
         // capture source changes, so a rebind's fresh heartbeat is never
         // compared against the old stream's epoch.
         let mut last_observed_cb_ms: u64 = 0;
         let mut last_observed_rebinds: u16 = 0;
+        let mut capture_warmup_since = start_instant;
         // Edge-triggered TX logs: only write when the framing actually moves.
         let mut last_logged_codec_mode = telemetry.active_codec_mode.load(Ordering::Relaxed);
         let mut last_logged_subframes = telemetry.tx_subframes_per_packet.load(Ordering::Relaxed);
@@ -3365,18 +3385,31 @@ impl HostEngine {
             // producer, so both reset the anchor rather than reporting a
             // meaningless spike.
             let observed_rebinds = telemetry.hotplug_rebinds.load(Ordering::Relaxed);
-            if use_test_tone || observed_rebinds != last_observed_rebinds {
+            let rebind = observed_rebinds != last_observed_rebinds;
+            if use_test_tone || rebind || telemetry.dtx_silent_mode.load(Ordering::Relaxed) {
                 last_observed_cb_ms = 0;
+                // DTX silence re-anchors only the callback epoch. The warmup
+                // epoch survives so resumed audio measures gaps immediately.
+                if use_test_tone || rebind {
+                    capture_warmup_since = tick_now;
+                }
                 last_observed_rebinds = observed_rebinds;
             } else {
                 let cb_ms = capture_heartbeat_ms.load(Ordering::Relaxed);
                 if cb_ms > last_observed_cb_ms {
-                    if last_observed_cb_ms > 0 {
+                    if last_observed_cb_ms > 0
+                        && capture_warmup_since.elapsed() >= Duration::from_millis(500)
+                    {
                         let gap = cb_ms - last_observed_cb_ms;
                         telemetry.capture_cb_max_gap_ms.fetch_max(
                             gap.min(u16::MAX as u64) as u16,
                             Ordering::Relaxed,
                         );
+                        if gap > 20 {
+                            telemetry
+                                .capture_cb_gaps_over_20ms
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     last_observed_cb_ms = cb_ms;
                 }
@@ -3418,6 +3451,8 @@ impl HostEngine {
                         continue;
                     }
                     let newly_joined = !map.contains_key(&src_addr);
+                    let had_other_active = newly_joined
+                        && map.values().any(|c| !c.muted && c.addr != src_addr);
                     // Only query OS interfaces when inserting a genuinely new
                     // client (never on every 500 ms heartbeat in the RT loop!).
                     let is_usb = if newly_joined {
@@ -3453,6 +3488,12 @@ impl HostEngine {
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
                     drop(map);
                     if newly_joined {
+                        if had_other_active {
+                            join_override_grace.insert(
+                                src_addr.ip(),
+                                Instant::now() + JOIN_PROFILE_OVERRIDE_GRACE,
+                            );
+                        }
                         audioshare_protocol::diagnostics::info(
                             "host-clients",
                             format!(
@@ -3547,9 +3588,17 @@ impl HostEngine {
                                 continue;
                             }
                             let is_usb = is_usb_subnet_ip(src_addr.ip());
+                            let had_other_active =
+                                map.values().any(|c| !c.muted && c.addr != src_addr);
                             newly_joined = true;
                             newly_joined_usb = is_usb;
                             allow_remote_commands = true;
+                            if had_other_active {
+                                join_override_grace.insert(
+                                    src_addr.ip(),
+                                    Instant::now() + JOIN_PROFILE_OVERRIDE_GRACE,
+                                );
+                            }
                             map.insert(
                                 src_addr,
                                 ConnectedClient {
@@ -3629,21 +3678,27 @@ impl HostEngine {
                         }
 
                         // Remote quality-mode (1..=5) and bitrate (30..=34) selection.
-                        if (1..=5).contains(&fb.requested_mode) {
-                            telemetry
-                                .quality_profile
-                                .store(fb.requested_mode - 1, Ordering::Relaxed);
-                        } else {
-                            let kbps = match fb.requested_mode {
-                                30 => Some(96u16),
-                                31 => Some(160),
-                                32 => Some(256),
-                                33 => Some(320),
-                                34 => Some(510),
-                                _ => None,
-                            };
-                            if let Some(kbps) = kbps {
-                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                        let cmd_now = Instant::now();
+                        if should_apply_remote_profile_cmd(
+                            join_override_grace.get(&src_addr.ip()).copied(),
+                            cmd_now,
+                        ) {
+                            if (1..=5).contains(&fb.requested_mode) {
+                                telemetry
+                                    .quality_profile
+                                    .store(fb.requested_mode - 1, Ordering::Relaxed);
+                            } else {
+                                let kbps = match fb.requested_mode {
+                                    30 => Some(96u16),
+                                    31 => Some(160),
+                                    32 => Some(256),
+                                    33 => Some(320),
+                                    34 => Some(510),
+                                    _ => None,
+                                };
+                                if let Some(kbps) = kbps {
+                                    telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -3669,6 +3724,7 @@ impl HostEngine {
             // 2b. Expire clients that stopped sending HELLO/feedback, and refresh lock-free cached_targets
             if last_client_sweep.elapsed() >= Duration::from_secs(1) {
                 last_client_sweep = Instant::now();
+                join_override_grace.retain(|_, until| *until > last_client_sweep);
                 if let Ok(mut map) = clients.try_lock() {
                     let before = map.len();
                     map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(10));
@@ -4608,16 +4664,19 @@ mod tests {
         let t = HostTelemetry::new();
         let baseline = t.diagnostics_summary();
         assert!(baseline.contains("cap_max_gap=0ms"), "{baseline}");
+        assert!(baseline.contains("cap_gaps_gt20ms=0"), "{baseline}");
         assert!(baseline.contains("send_err=0 "), "{baseline}");
         assert!(baseline.contains("profile=SmartAuto"), "{baseline}");
         assert!(baseline.contains("codec=Lossless LPC"), "{baseline}");
 
         t.capture_cb_max_gap_ms.store(37, Ordering::Relaxed);
+        t.capture_cb_gaps_over_20ms.store(3, Ordering::Relaxed);
         t.tx_send_errors.store(9, Ordering::Relaxed);
         t.hotplug_rebinds.store(2, Ordering::Relaxed);
         t.rejected_handshakes.store(4, Ordering::Relaxed);
         let summary = t.diagnostics_summary();
         assert!(summary.contains("cap_max_gap=37ms"), "{summary}");
+        assert!(summary.contains("cap_gaps_gt20ms=3"), "{summary}");
         assert!(summary.contains("send_err=9 "), "{summary}");
         assert!(summary.contains("rebinds=2"), "{summary}");
         assert!(summary.contains("rej_hs=4"), "{summary}");
@@ -6692,5 +6751,76 @@ mod tests {
             summary.contains("bitrate=128kbps"),
             "diagnostics must print the effective TX bitrate, not the raw selection: {summary}"
         );
+    }
+
+    #[test]
+    fn test_joining_second_client_does_not_override_host_profile_during_grace() {
+        use audioshare_protocol::crypto::AEAD_TAG_LEN;
+        use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
+
+        let t = Instant::now();
+        assert!(should_apply_remote_profile_cmd(None, t));
+        assert!(!should_apply_remote_profile_cmd(
+            Some(t + Duration::from_millis(500)),
+            t,
+        ));
+        assert!(should_apply_remote_profile_cmd(Some(t), t));
+
+        // Live TX loop: Peer A is already connected on LowLatencyCompressed;
+        // Peer B joining immediately with SmartAuto (mode 1) must not flip it.
+        let (mut engine, port) = start_test_host();
+        engine.telemetry.quality_profile.store(
+            QualityProfile::LowLatencyCompressed as u8,
+            Ordering::Relaxed,
+        );
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        let peer_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let send_fb = |sock: &UdpSocket, seq: u32, mode: u8| {
+            let mut buf = [0u8; CONTROL_FEEDBACK_LEN];
+            ClientFeedbackPacket {
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                client_volume: 100,
+                requested_mode: mode,
+                hardware_delay_ms: 0,
+                feedback_seq: seq,
+                auth_tag: [0u8; AEAD_TAG_LEN],
+            }
+            .encode_signed(None, &mut buf);
+            sock.send_to(&buf, dest).unwrap();
+        };
+
+        send_fb(&peer_a, 1, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && engine.telemetry.active_clients_count.load(Ordering::Relaxed) < 1
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.telemetry.active_clients_count.load(Ordering::Relaxed), 1);
+
+        // Peer B joins with requested_mode = 1 (SmartAuto) + bitrate 30 (96k).
+        send_fb(&peer_b, 1, 1);
+        send_fb(&peer_b, 2, 30);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && engine.telemetry.active_clients_count.load(Ordering::Relaxed) < 2
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::LowLatencyCompressed as u8,
+            "newcomer joining an active session must not override host profile"
+        );
+        assert_eq!(
+            engine.telemetry.target_bitrate_kbps.load(Ordering::Relaxed),
+            256,
+            "newcomer joining an active session must not override host bitrate"
+        );
+        engine.stop();
     }
 }
