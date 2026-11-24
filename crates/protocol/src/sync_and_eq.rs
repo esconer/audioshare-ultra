@@ -724,8 +724,8 @@ impl LatencySonar {
     #[inline]
     pub fn detect_chirp_return(stereo_subframe: &[f32; 240]) -> bool {
         let mut zero_crossings = 0u32;
-        let mut max_peak = 0.0f32;
         let mut prev = stereo_subframe[0];
+        let mut max_peak = prev.abs();
         for i in 1..120 {
             let cur = stereo_subframe[i * 2];
             if cur.abs() > max_peak {
@@ -741,7 +741,7 @@ impl LatencySonar {
         // half then has 12-22 crossings, so the old >=20 threshold missed
         // most split returns. Keep a peak floor so low-level noise cannot
         // trigger the measurement.
-        max_peak > 0.12 && zero_crossings >= 12
+        max_peak > 0.12 && (12..=48).contains(&zero_crossings)
     }
 }
 
@@ -1342,6 +1342,24 @@ mod tests {
             tone[i * 2 + 1] = v;
         }
         assert!(!LatencySonar::detect_chirp_return(&tone));
+    }
+
+    #[test]
+    fn test_latency_sonar_rejects_nyquist_click() {
+        // A 16 kHz (Nyquist) alternating click has 119 zero crossings but no
+        // 3.5-7.0 kHz chirp structure; it must not false-trigger the sonar.
+        let mut click = [0.0f32; 240];
+        for i in 0..120 {
+            let v = if i % 2 == 0 { 0.8 } else { -0.8 };
+            click[i * 2] = v;
+            click[i * 2 + 1] = v;
+        }
+        assert!(!LatencySonar::detect_chirp_return(&click));
+
+        // A genuine chirp must still be detected after adding the upper bound.
+        let mut chirp = [0.0f32; 240];
+        LatencySonar::inject_chirp(&mut chirp);
+        assert!(LatencySonar::detect_chirp_return(&chirp));
     }
 
     #[test]

@@ -552,11 +552,7 @@ impl BurstDecouplerRing {
         let r = self.read_idx.0.load(Ordering::Acquire);
         let w = self.write_idx.0.load(Ordering::Acquire);
         let diff = w.wrapping_sub(r);
-        if diff > FIFO_CAPACITY {
-            0
-        } else {
-            diff
-        }
+        diff.min(FIFO_CAPACITY)
     }
 
     /// Total interleaved samples the ring can hold. Callers that translate a
@@ -582,7 +578,7 @@ impl BurstDecouplerRing {
     pub fn push_samples(&self, samples: &[f32]) -> usize {
         let w = self.write_idx.0.load(Ordering::Relaxed);
         let r = self.read_idx.0.load(Ordering::Acquire);
-        let free = FIFO_CAPACITY - w.wrapping_sub(r);
+        let free = FIFO_CAPACITY.saturating_sub(w.wrapping_sub(r));
         // The ring is stereo-interleaved. An odd write count would shift every
         // subsequent Left/Right pair by one sample, so always write whole frames.
         let to_write = samples.len().min(free) & !1;
@@ -844,13 +840,27 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
     for i in 0..frames {
         let src = &in_interleaved[i * channels..(i + 1) * channels];
         let (l, r) = match channels {
+            0 => (0.0, 0.0),
             1 => (src[0], src[0]),
             2 => (src[0], src[1]),
+            3 => {
+                // 3.0 / 2.1: FL(0), FR(1), FC/LFE(2)
+                let c = src[2] * CENTER_MIX;
+                ((src[0] + c) * HEADROOM, (src[1] + c) * HEADROOM)
+            }
             4 => {
                 // Quad: FL, FR, BL, BR
                 (
                     (src[0] + SURROUND_MIX * src[2]) * HEADROOM,
                     (src[1] + SURROUND_MIX * src[3]) * HEADROOM,
+                )
+            }
+            5 => {
+                // 5.0: FL(0), FR(1), FC(2), BL(3), BR(4)
+                let c = src[2] * CENTER_MIX;
+                (
+                    (src[0] + c + SURROUND_MIX * src[3]) * HEADROOM,
+                    (src[1] + c + SURROUND_MIX * src[4]) * HEADROOM,
                 )
             }
             6 => {
@@ -861,15 +871,23 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
                     (src[1] + c + SURROUND_MIX * src[5]) * HEADROOM,
                 )
             }
-            8 => {
-                // 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
+            7 => {
+                // 6.1 / 7.0: preserve Center dialogue (src[2]) and side/surround pair
+                let c = src[2] * CENTER_MIX;
+                (
+                    (src[0] + c + SURROUND_MIX * src[5]) * HEADROOM,
+                    (src[1] + c + SURROUND_MIX * src[6]) * HEADROOM,
+                )
+            }
+            8.. => {
+                // 7.1+ (7.1, Windows Spatial 7.1.2/7.1.4, 16-ch virtual cables):
+                // FL(0), FR(1), FC(2), LFE(3), BL(4), BR(5), SL(6), SR(7)
                 let c = src[2] * CENTER_MIX;
                 (
                     (src[0] + c + SURROUND_MIX * (src[4] + src[6])) * HEADROOM,
                     (src[1] + c + SURROUND_MIX * (src[5] + src[7])) * HEADROOM,
                 )
             }
-            _ => (src[0], *src.get(1).unwrap_or(&src[0])),
         };
         // Keep non-finite capture samples out of the resampler history and the
         // downstream limiter; one NaN would otherwise survive every later
@@ -952,6 +970,7 @@ pub fn push_mono_mic_chunk(
             stereo[i * 2 + 1] = sample;
         }
 
+        resampler.sanitize_phase_and_ratio();
         let phase_before = resampler.phase;
         let produced = resampler.process(&stereo[..frames * 2], out_scratch);
         if produced > 0 {
@@ -1470,6 +1489,29 @@ mod tests {
     }
 
     #[test]
+    fn test_downmix_to_stereo_preserves_center_dialogue_on_odd_and_spatial_layouts() {
+        // Center-only dialogue (channel 2 = 0.8) must land equally in L & R at
+        // 0.8 * (1/sqrt(2)) * (1/sqrt(2)) = 0.4 on 3, 5, 7, 10 (7.1.2), 12 (7.1.4), and 16 ch.
+        for channels in [3usize, 5, 7, 10, 12, 16] {
+            let mut input = vec![0.0f32; channels * 2];
+            input[2] = 0.8;
+            input[channels + 2] = -0.8;
+            let mut out = [0.0f32; 4];
+            downmix_to_stereo(&input, channels, &mut out);
+            assert!(
+                (out[0] - 0.4).abs() < 1e-5 && (out[1] - 0.4).abs() < 1e-5,
+                "channels={channels} dropped Center dialogue: {:?}",
+                out
+            );
+            assert!(
+                (out[2] + 0.4).abs() < 1e-5 && (out[3] + 0.4).abs() < 1e-5,
+                "channels={channels} frame 1 mismatch: {:?}",
+                out
+            );
+        }
+    }
+
+    #[test]
     fn test_soft_limit_post_resample_sanitizes_non_finite() {
         let mut s = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5];
         soft_limit_post_resample(&mut s);
@@ -1676,6 +1718,23 @@ mod tests {
         // A constant mono level must survive the loop as a constant stereo DC.
         let tail = &out[out.len().saturating_sub(200)..];
         assert!(tail.iter().all(|s| (s - 0.25).abs() < 1e-4));
+    }
+
+    #[test]
+    fn test_push_mono_mic_chunk_recovers_from_nan_phase() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(16_000, 48_000);
+        resampler.phase = f64::NAN;
+        let mono = vec![0.25f32; 256];
+        let mut scratch = [0.0f32; 128];
+        // With an un-sanitized phase_before, `NaN as usize == 0` forces
+        // `consumed == 0` on every retry and this call never returns.
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, true, &mut scratch);
+        assert!(resampler.phase.is_finite());
+        let out = drain_ring(&ring);
+        assert!(!out.is_empty(), "resampler must have emitted frames");
+        assert!(out.iter().all(|s| s.is_finite()));
     }
 
     #[test]
