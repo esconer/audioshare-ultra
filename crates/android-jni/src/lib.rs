@@ -32,6 +32,7 @@ use audioshare_protocol::{MAX_SAFE_UDP_PAYLOAD, SUBFRAME_STEREO_SAMPLES};
 static GLOBAL_ANDROID_CLIENT: RwLock<Option<ClientEngine>> = RwLock::new(None);
 static GLOBAL_PHONE_MIC_TX: RwLock<Option<PhoneMicTransmitter>> = RwLock::new(None);
 static GLOBAL_SCANNER: OnceLock<DiscoveryScanner> = OnceLock::new();
+static CRASH_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 /// User-selected Party codec profile (persisted by Android UI):
 /// 0 = Opus RLD (5 ms, default stable), 1 = Studio Lossless 16-bit,
 /// 2 = Max Stability Opus (10 ms), 3 = Pure-Rust VBR (0 ms).
@@ -151,6 +152,51 @@ const PARTY_SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// Hard cap on distinct Party listener IPs. An unbounded unicast fan-out from a
 /// phone host saturates its 2.4 GHz TX queue; 16 is the tested ceiling.
 const MAX_PARTY_PEERS: usize = 16;
+/// Minimum interval between Party Opus encoder recreation attempts after a
+/// creation or encode failure (matches `host-engine`'s 2 s bounded backoff).
+const PARTY_OPUS_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+struct PartyOpusRetry {
+    failed: bool,
+    next_attempt_at: Instant,
+}
+
+impl PartyOpusRetry {
+    fn new(now: Instant) -> Self {
+        Self {
+            failed: false,
+            next_attempt_at: now,
+        }
+    }
+
+    #[inline]
+    fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    #[inline]
+    fn retry_due(&self, now: Instant) -> bool {
+        self.failed && now >= self.next_attempt_at
+    }
+
+    fn take_retry(&mut self, now: Instant) {
+        if self.retry_due(now) {
+            self.failed = false;
+            self.next_attempt_at = now + PARTY_OPUS_RETRY_INTERVAL;
+        }
+    }
+
+    fn note_failure(&mut self, now: Instant) {
+        self.failed = true;
+        self.next_attempt_at = now + PARTY_OPUS_RETRY_INTERVAL;
+    }
+
+    fn clear(&mut self) {
+        self.failed = false;
+        self.next_attempt_at = Instant::now();
+    }
+}
 
 /// Resolve the user-locked Party transmission parameters:
 /// `(wire_codec, prefer_opus, subframes_per_packet, bitrate_kbps)`.
@@ -475,6 +521,14 @@ fn expire_party_peers(
     static_targets: &[SocketAddr],
     now: Instant,
 ) {
+    for (addr, state) in peers.iter_mut() {
+        if static_targets.contains(addr)
+            && now.saturating_duration_since(state.last_seen) >= PARTY_PEER_TIMEOUT
+        {
+            state.delay_ms = 0;
+            state.fec_permille = 0;
+        }
+    }
     peers.retain(|addr, state| {
         static_targets.contains(addr)
             || now.saturating_duration_since(state.last_seen) < PARTY_PEER_TIMEOUT
@@ -633,9 +687,10 @@ impl PhoneMicTransmitter {
                     audioshare_protocol::sync_and_eq::NoiseShapedQuantizer::new();
                 // Party mode upgrades its compressed fallback to Opus RLD when
                 // the encoder is available. Hardware-mic mode never compresses,
-                // so skip the encoder allocation there. `opus_available` goes
-                // false permanently if creation or encoding fails.
-                let mut opus_available = false;
+                // so skip the encoder allocation there. Transient failures retry
+                // at most once per `PARTY_OPUS_RETRY_INTERVAL` instead of latching
+                // off for the rest of the cast.
+                let mut opus_retry = PartyOpusRetry::new(start);
                 let mut opus_encoder = if use_hardware_mic {
                     None
                 } else {
@@ -645,7 +700,9 @@ impl PhoneMicTransmitter {
                             .load(Ordering::Relaxed)
                             .clamp(64, 320),
                     );
-                    opus_available = encoder.is_some();
+                    if encoder.is_none() {
+                        opus_retry.note_failure(start);
+                    }
                     encoder
                 };
                 // Retain the previous live subframe so a manual user switch
@@ -982,20 +1039,26 @@ impl PhoneMicTransmitter {
                         if !dtx {
                             if !want_opus {
                                 opus_encoder = None;
+                                opus_retry.clear();
                                 // Leaving Opus invalidates the exact-Opus RED
                                 // history; ADPCM FEC takes over again.
                                 opus_red.clear();
-                            } else if opus_encoder.is_none() && opus_available {
-                                opus_encoder = OpusStreamEncoder::new(target_kbps);
-                                opus_available = opus_encoder.is_some();
-                                if let Some(enc_opus) = opus_encoder.as_mut() {
-                                    if has_prev_subframe {
-                                        let mut discard = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
-                                        let _ = enc_opus.encode_subframe_f32(
-                                            &prev_f32_subframe,
-                                            target_kbps,
-                                            &mut discard,
-                                        );
+                            } else if opus_encoder.is_none() {
+                                let retry_now = Instant::now();
+                                if !opus_retry.is_failed() || opus_retry.retry_due(retry_now) {
+                                    opus_retry.take_retry(retry_now);
+                                    opus_encoder = OpusStreamEncoder::new(target_kbps);
+                                    if opus_encoder.is_none() {
+                                        opus_retry.note_failure(retry_now);
+                                    } else if let Some(enc_opus) = opus_encoder.as_mut() {
+                                        if has_prev_subframe {
+                                            let mut discard = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+                                            let _ = enc_opus.encode_subframe_f32(
+                                                &prev_f32_subframe,
+                                                target_kbps,
+                                                &mut discard,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1019,10 +1082,10 @@ impl PhoneMicTransmitter {
                                         )
                                     });
                                     let Some(enc_len) = encoded else {
-                                        // Opus failed: drop it for the rest of the
-                                        // stream and rebuild this packet as VBR.
+                                        // Opus failed: back off for 2 s and rebuild this
+                                        // packet as VBR until the bounded retry succeeds.
                                         opus_encoder = None;
-                                        opus_available = false;
+                                        opus_retry.note_failure(Instant::now());
                                         opus_primary = false;
                                         opus_sf_count = 0;
                                         opus_red.clear();
@@ -1271,6 +1334,19 @@ impl Drop for PhoneMicTransmitter {
     }
 }
 
+/// Install the diagnostics crash hook once per Android process so a release
+/// `panic = "abort"` writes the panic location and last 128 diagnostic events
+/// to `crash_log_path` before termination.
+pub fn android_install_crash_hook(crash_log_path: &str) {
+    let trimmed = crash_log_path.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    CRASH_HOOK_INSTALLED.get_or_init(|| {
+        diagnostics::install_crash_hook(std::path::PathBuf::from(trimmed));
+    });
+}
+
 pub fn android_start_stream(
     host_ip_port: &str,
     is_usb: bool,
@@ -1307,20 +1383,14 @@ pub fn android_start_stream(
         dolby_effects,
     };
 
-    let client = ClientEngine::connect_with_pin(cfg, pin).map_err(|e| {
+    let initial_bt_delay = LAST_REPORTED_BT_DELAY_MS.load(Ordering::Relaxed);
+    let client = ClientEngine::connect_with_pin_and_bt_delay(cfg, pin, initial_bt_delay).map_err(|e| {
         diagnostics::error(
             "session-start",
             format!("connect failed to {}:{} ({})", addr.ip(), addr.port(), e),
         );
         e
     })?;
-    let initial_bt_delay = LAST_REPORTED_BT_DELAY_MS.load(Ordering::Relaxed);
-    if initial_bt_delay > 0 {
-        client
-            .telemetry
-            .downstream_bt_delay_ms
-            .store(initial_bt_delay, Ordering::Relaxed);
-    }
     // Log the parsed host/port, never the raw input or PIN: the PIN is a
     // separate argument and must not end up in a pasteable diagnostics bundle.
     diagnostics::info(
@@ -1396,7 +1466,25 @@ pub fn android_set_gain_db(gain_db: f32) {
         client
             .telemetry
             .preamp_gain_db_tenths
-            .store(db_to_tenths(gain_db, -12.0, 24.0), Ordering::Relaxed);
+            // Allow down to -96 dB so AudioEngineService mute (-96 dB on
+            // headphone unplug, phone calls, and Mute button) reaches
+            // TruePeakLimiter's <= -60 dB digital silence and client_vol = 0%.
+            .store(db_to_tenths(gain_db, -96.0, 24.0), Ordering::Relaxed);
+    }
+}
+
+/// Ask the client RX loop to drop a shared AAudio stream and reopen it in
+/// Exclusive MMAP mode (one-shot, cleared by the loop once serviced).
+pub fn android_request_exclusive_mmap_reclaim() {
+    if let Some(client) = GLOBAL_ANDROID_CLIENT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        client
+            .telemetry
+            .reclaim_exclusive_mmap
+            .store(true, Ordering::Release);
     }
 }
 
@@ -1908,12 +1996,64 @@ pub mod android_native {
             _ => diagnostics::error(&component, &message),
         }
     }
+
+    /// Ask the client to drop its shared AAudio stream and reopen it in
+    /// Exclusive MMAP mode (one-shot, consumed by the RX loop on focus regain).
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeRequestExclusiveMmapReclaim(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        android_request_exclusive_mmap_reclaim();
+    }
+
+    /// Install the native panic hook once per process. Mirrors
+    /// `AudioEngineService.nativeInstallCrashHook(crashLogPath)`.
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeInstallCrashHook(
+        mut env: JNIEnv,
+        _class: JClass,
+        crash_log_path: JString,
+    ) {
+        let path = match env.get_string(&crash_log_path) {
+            Ok(s) => s.to_string_lossy().into_owned(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return;
+            }
+        };
+        android_install_crash_hook(&path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use audioshare_protocol::wire::pack_datagram;
+
+    #[test]
+    fn test_party_opus_retry_backoff_is_bounded() {
+        let base = Instant::now();
+        let mut retry = PartyOpusRetry::new(base);
+        assert!(!retry.is_failed());
+        retry.note_failure(base);
+        assert!(retry.is_failed());
+        assert!(!retry.retry_due(base + Duration::from_millis(1_999)));
+        assert!(retry.retry_due(base + Duration::from_secs(2)));
+        retry.take_retry(base + Duration::from_secs(2));
+        assert!(!retry.is_failed());
+        retry.note_failure(base + Duration::from_secs(2));
+        retry.clear();
+        assert!(!retry.is_failed());
+    }
+
+    #[test]
+    fn test_db_to_tenths_preserves_service_mute_and_duck_range() {
+        assert_eq!(db_to_tenths(-96.0, -96.0, 24.0), -960);
+        assert_eq!(db_to_tenths(-18.0, -96.0, 24.0), -180);
+        assert_eq!(db_to_tenths(-120.0, -96.0, 24.0), -960);
+        assert_eq!(db_to_tenths(30.0, -96.0, 24.0), 240);
+    }
 
     #[test]
     fn test_parse_target_endpoints_party_mode() {
@@ -2064,11 +2204,19 @@ mod tests {
             "a duplicate authenticated sequence is a replay"
         );
 
+        // A static PC target that stopped reporting feedback keeps its socket
+        // but must shed stale group-sync delay after the 10 s peer timeout.
+        if let Some(state) = peers.get_mut(&pc) {
+            state.delay_ms = 120;
+            state.fec_permille = 80;
+        }
         expire_party_peers(&mut peers, &static_targets, now + Duration::from_secs(11));
         assert!(
             peers.contains_key(&pc),
             "configured PC endpoints never expire"
         );
+        assert_eq!(peers[&pc].delay_ms, 0, "stale static delay must reset");
+        assert_eq!(peers[&pc].fec_permille, 0, "stale static FEC must reset");
         assert!(
             !peers.contains_key(&phone_new),
             "a silent dynamic peer must expire"
