@@ -9,7 +9,7 @@
 
 AudioShare Ultra is a real-time wireless and wired audio bridge written in Rust. Turn any Android phone (or secondary PC) into a **low-latency wireless speaker** or **PC microphone** over Wi-Fi, USB ADB, or USB tethering—with no accounts, no ads, and no kernel drivers required.
 
-> Inspired by the original `audio-share` project, AudioShare Ultra is an independent Rust reimplementation built for deterministic low latency, 2.4 GHz Wi-Fi scan resilience, studio lossless audio, and cross-platform reliability.
+> Inspired by the original [audio-share](https://github.com/mkckr0/audio-share) project, AudioShare Ultra is an independent Rust reimplementation built for deterministic low latency, 2.4 GHz Wi-Fi scan resilience, studio lossless audio, and cross-platform reliability.
 
 <!-- Add a side-by-side screenshot of Desktop GUI + Android App here -->
 <!-- ![AudioShare Ultra Desktop and Android](docs/screenshots/hero.png) -->
