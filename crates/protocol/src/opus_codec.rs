@@ -264,10 +264,10 @@ impl OpusStreamEncoder {
         inner.complexity = OPUS_COMPLEXITY;
         inner.bitrate_bps =
             i32::from(initial_kbps.clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS)) * 1000;
-        // Constrained VBR keeps packet sizes close to the selected target,
-        // which matters on congested 2.4 GHz links. CELT-only RLD frames do
-        // not use SILK's hybrid redundancy either.
-        inner.set_vbr_constraint(true);
+        // Unconstrained VBR lets 2.5 ms CELT frames spend reservoir bits on
+        // sudden quiet->loud transient attacks; MAX_OPUS_PACKET_BYTES and
+        // OpusRedHistory per-half splitting still cap every wire datagram.
+        inner.set_vbr_constraint(false);
         inner.set_dtx(false);
 
         Some(Self {

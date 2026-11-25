@@ -2353,6 +2353,11 @@ mod tests {
 
         let mut encoder =
             OpusStreamEncoder::new(PARTY_VBR_BITRATE_KBPS).expect("create Opus encoder");
+        // Warm up unconstrained VBR bit reservoir past the cold-start frame 0 burst.
+        let mut warmup_buf = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        for _ in 0..8 {
+            let _ = encoder.encode_subframe(&pcm, PARTY_VBR_BITRATE_KBPS, &mut warmup_buf);
+        }
         let mut opus_bundle = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES * 2 + 4];
         let mut cursor = 0usize;
         for _ in 0..2 {

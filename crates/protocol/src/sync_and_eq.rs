@@ -1,5 +1,16 @@
 //! Microsecond Group Sync, Spatial Channel Routing, Audiophile Bauer Crossfeed & Studio EQ.
 
+/// Clamp finite samples to `[-1.0e6, 1.0e6]` and replace NaN/Inf with `0.0`
+/// so extreme driver glitches cannot overflow filter state to `Inf`/`NaN`.
+#[inline(always)]
+fn sanitize_audio_sample(s: f32) -> f32 {
+    if s.is_finite() {
+        s.clamp(-1.0e6, 1.0e6)
+    } else {
+        0.0
+    }
+}
+
 /// 1. Spatial Channel Role for Multi-Phone Stereo Pairing & 5.1/7.1 Rear Surround
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,8 +202,8 @@ impl BauerCrossfeedFilter {
         const RAMP_STEP: f32 = 1.0 / 384.0; // ~8 ms smooth ramp @ 48 kHz
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_l = sanitize_audio_sample(frame[0]) + ANTI_DENORMAL;
+            let in_r = sanitize_audio_sample(frame[1]) + ANTI_DENORMAL;
 
             // Low-pass filter current samples (head shadow simulation)
             self.lp_l += ALPHA_700HZ * (in_l - self.lp_l);
@@ -460,12 +471,12 @@ impl StereoBiquad {
                 self.a2 += COEFF_SLEW * (self.tgt_a2 - self.a2);
             }
 
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_l = sanitize_audio_sample(frame[0]) + ANTI_DENORMAL;
             let out_l = self.b0 * in_l + self.z1_l;
             self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
             self.z2_l = self.b2 * in_l - self.a2 * out_l;
 
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_r = sanitize_audio_sample(frame[1]) + ANTI_DENORMAL;
             let out_r = self.b0 * in_r + self.z1_r;
             self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
             self.z2_r = self.b2 * in_r - self.a2 * out_r;
@@ -496,7 +507,9 @@ impl StereoBiquad {
                 + (self.b2 - self.tgt_b2).abs()
                 + (self.a1 - self.tgt_a1).abs()
                 + (self.a2 - self.tgt_a2).abs();
-            if err < 1.0e-5 {
+            // 5.0e-5 clears the f32 ULP stall floor (~1.1e-5 across 5 coeffs
+            // when |b1|, |a1| ~= 2.0 on the 90 Hz bass band) with <0.0005 dB delta.
+            if err < 5.0e-5 {
                 self.b0 = self.tgt_b0;
                 self.b1 = self.tgt_b1;
                 self.b2 = self.tgt_b2;
@@ -647,8 +660,8 @@ impl NightModeCompressor {
             return;
         }
         for frame in stereo.chunks_exact_mut(2) {
-            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
-            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            let l = sanitize_audio_sample(frame[0]);
+            let r = sanitize_audio_sample(frame[1]);
             self.gain_env += 0.008 * (1.0 - self.gain_env);
             frame[0] = (l * self.gain_env).clamp(-0.98, 0.98);
             frame[1] = (r * self.gain_env).clamp(-0.98, 0.98);
@@ -662,17 +675,16 @@ impl NightModeCompressor {
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
         for frame in stereo.chunks_exact_mut(2) {
-            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
-            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            let l = sanitize_audio_sample(frame[0]);
+            let r = sanitize_audio_sample(frame[1]);
             let peak = l.abs().max(r.abs()) + 1.0e-25;
 
-            // 1.5 ms attack, 100 ms release. The old 93 us attack / 26 ms
-            // release tracked 60-200 Hz waveform cycles and modulated their
-            // gain, adding harmonics.
+            // 1.5 ms attack, ~74 ms release: preserves <2% 100 Hz bass THD
+            // while recovering faster so whispers after loud hits stay audible.
             if peak > self.env {
                 self.env += 0.014 * (peak - self.env);
             } else {
-                self.env += 0.0002 * (peak - self.env);
+                self.env += 0.00028 * (peak - self.env);
             }
 
             // Feed-forward peak: a transient on top of a quiet envelope must
@@ -687,9 +699,14 @@ impl NightModeCompressor {
             let coeff = if target_gain < self.gain_env {
                 0.5
             } else {
-                0.001
+                0.0018
             };
             self.gain_env += coeff * (target_gain - self.gain_env);
+            // Prevent a whisper-boosted gain_env (up to 3.5x) from hard-clipping
+            // a sudden loud onset against the +/-0.84 ceiling on sample 0.
+            if peak * self.gain_env > 0.82 {
+                self.gain_env = 0.82 / peak;
+            }
 
             frame[0] = (l * self.gain_env).clamp(-0.84, 0.84);
             frame[1] = (r * self.gain_env).clamp(-0.84, 0.84);
@@ -868,10 +885,16 @@ impl MicRumbleAndNoiseGate {
         const GATE_THRESH: f32 = 0.0056; // -45 dBFS noise gate threshold
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + 1.0e-25;
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + 1.0e-25;
-            let hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
-            let hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
+            let in_l = sanitize_audio_sample(frame[0]);
+            let in_r = sanitize_audio_sample(frame[1]);
+            let mut hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
+            let mut hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
+            if hp_l.abs() < 1.0e-15 {
+                hp_l = 0.0;
+            }
+            if hp_r.abs() < 1.0e-15 {
+                hp_r = 0.0;
+            }
             self.hp_x1_l = in_l;
             self.hp_y1_l = hp_l;
             self.hp_x1_r = in_r;
@@ -883,6 +906,9 @@ impl MicRumbleAndNoiseGate {
             // pauses instead of gating each syllable and pumping the noise floor.
             let coeff = if peak > self.gate_env { 0.25 } else { 0.00025 };
             self.gate_env += coeff * (peak - self.gate_env);
+            if self.gate_env < 1.0e-15 {
+                self.gate_env = 0.0;
+            }
 
             let gate_gain = (self.gate_env / GATE_THRESH).clamp(0.05, 1.0);
             frame[0] = hp_l * gate_gain;
@@ -1722,6 +1748,64 @@ mod tests {
         assert_eq!(
             build_qr_connect_uri("fe80::1", 65530, Some("4829")),
             "asultra://connect?host=[fe80::1]:65530&pin=4829"
+        );
+    }
+
+    #[test]
+    fn test_all_upstream_dsp_filters_survive_huge_finite_glitch() {
+        let mut eq = StudioEqualizer::new();
+        eq.update_if_changed(60, 0, 0); // engage +6 dB bass first
+        for _ in 0..240 {
+            let mut frame = [0.25f32, -0.25];
+            eq.process(&mut frame);
+        }
+        eq.update_if_changed(120, 0, 0); // +12 dB -> slewing = true
+        assert!(eq.bass.slewing, "test must start from an active coefficient slew");
+        let mut xfeed = BauerCrossfeedFilter::new();
+        let mut night = NightModeCompressor::new();
+        let mut mic = MicRumbleAndNoiseGate::new();
+
+        // Test both the spec vector (1.0e38) and the true biquad overflow trigger (f32::MAX).
+        for &glitch in &[1.0e38f32, f32::MAX] {
+            let mut buf = [glitch, -glitch, 0.25, -0.25];
+            eq.process(&mut buf);
+            xfeed.process_in_place(&mut buf);
+            night.process_in_place(&mut buf);
+            mic.process_in_place(&mut buf);
+            assert!(buf.iter().all(|s| s.is_finite()), "glitch produced NaN/Inf");
+        }
+
+        // 2000 normal frames settle the 5.0e-5 coefficient snap and filter states.
+        let mut frame = [0.25f32, -0.25];
+        for _ in 0..2000 {
+            eq.process(&mut frame);
+            xfeed.process_in_place(&mut frame);
+            night.process_in_place(&mut frame);
+            mic.process_in_place(&mut frame);
+        }
+        assert!(
+            frame.iter().all(|s| s.is_finite() && s.abs() > 0.01),
+            "DSP chain stayed muted after a huge finite glitch: {:?}",
+            frame
+        );
+        assert!(
+            !eq.bass.slewing,
+            "90 Hz bass coefficient slew must settle at the 5.0e-5 threshold"
+        );
+
+        // Verify Night Mode whisper -> loud onset does not hard-clip at +/-0.84.
+        let mut onset_night = NightModeCompressor::new();
+        for _ in 0..2000 {
+            let mut whisper = [0.01f32, 0.01];
+            onset_night.process_in_place(&mut whisper);
+        }
+        assert!(onset_night.gain_env > 2.5);
+        let mut loud = [0.6f32, -0.6];
+        onset_night.process_in_place(&mut loud);
+        assert!(
+            loud[0].abs() <= 0.82 + 1.0e-5 && loud[1].abs() <= 0.82 + 1.0e-5,
+            "whisper-boosted Night Mode onset clipped past 0.82 soft cap: {:?}",
+            loud
         );
     }
 }

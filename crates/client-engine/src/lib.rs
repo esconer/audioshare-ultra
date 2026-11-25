@@ -4774,6 +4774,12 @@ mod tests {
             pcm[i * 2 + 1] = ((t * 554.37 * std::f32::consts::TAU).sin() * 8000.0) as i16;
         }
 
+        // Warm up unconstrained VBR bit reservoir so 4 subframes fit inside one 255 B RED blob.
+        let mut warmup_buf = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        for _ in 0..8 {
+            let _ = enc.encode_subframe(&pcm, 128, &mut warmup_buf);
+        }
+
         let mut payloads = [[0u8; MAX_OPUS_SUBFRAME_BYTES]; SF_PER_PKT * 2];
         let mut lens = [0usize; SF_PER_PKT * 2];
         for (buf, len) in payloads.iter_mut().zip(lens.iter_mut()) {

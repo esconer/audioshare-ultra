@@ -725,7 +725,13 @@ impl TruePeakLimiter {
         const RELEASE: f32 = 0.0005;
 
         for frame in stereo_samples.chunks_exact_mut(2) {
-            self.current_gain_linear += 0.01 * (self.target_gain_linear - self.current_gain_linear);
+            let gain_diff = self.target_gain_linear - self.current_gain_linear;
+            if gain_diff.abs() <= 1.0e-5 {
+                // Snap past f32 ULP stall (exact 1.0 unity / exact 0.0 mute, no subnormals).
+                self.current_gain_linear = self.target_gain_linear;
+            } else {
+                self.current_gain_linear += 0.01 * gain_diff;
+            }
             // A non-finite or astronomically huge capture sample (driver glitch,
             // decoder damage) must not propagate NaN/Inf into the ring, DAC, or
             // envelope follower (finite > 2e37 * 15.85 would overflow to Inf and
@@ -748,6 +754,9 @@ impl TruePeakLimiter {
                 self.envelope += ATTACK * (peak - self.envelope);
             } else {
                 self.envelope += RELEASE * (peak - self.envelope);
+                if self.envelope < 1.0e-15 {
+                    self.envelope = 0.0;
+                }
             }
 
             // At unity gain the limiter must be bit-transparent below the
@@ -830,6 +839,8 @@ pub fn inject_bluetooth_keepalive_dither(out: &mut [f32], rng_state: &mut u32) {
 pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &mut [f32]) {
     const CENTER_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2; // -3.0 dB (0.7071)
     const SURROUND_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const SURROUND_71_MIX: f32 = 0.5;
+    const BACK_CENTER_MIX: f32 = 0.5;
     // Equal-power headroom for the stereo bus
     const HEADROOM: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -872,11 +883,12 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
                 )
             }
             7 => {
-                // 6.1 / 7.0: preserve Center dialogue (src[2]) and side/surround pair
+                // 6.1 / 7.0: preserve Center dialogue (src[2]), Back Center (src[4]), and side/surround pair
                 let c = src[2] * CENTER_MIX;
+                let bc = src[4] * BACK_CENTER_MIX;
                 (
-                    (src[0] + c + SURROUND_MIX * src[5]) * HEADROOM,
-                    (src[1] + c + SURROUND_MIX * src[6]) * HEADROOM,
+                    (src[0] + c + bc + SURROUND_71_MIX * src[5]) * HEADROOM,
+                    (src[1] + c + bc + SURROUND_71_MIX * src[6]) * HEADROOM,
                 )
             }
             8.. => {
@@ -884,16 +896,35 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
                 // FL(0), FR(1), FC(2), LFE(3), BL(4), BR(5), SL(6), SR(7)
                 let c = src[2] * CENTER_MIX;
                 (
-                    (src[0] + c + SURROUND_MIX * (src[4] + src[6])) * HEADROOM,
-                    (src[1] + c + SURROUND_MIX * (src[5] + src[7])) * HEADROOM,
+                    (src[0] + c + SURROUND_71_MIX * (src[4] + src[6])) * HEADROOM,
+                    (src[1] + c + SURROUND_71_MIX * (src[5] + src[7])) * HEADROOM,
                 )
             }
         };
         // Keep non-finite capture samples out of the resampler history and the
         // downstream limiter; one NaN would otherwise survive every later
         // interpolation stage.
-        out_stereo[i * 2] = if l.is_finite() { l } else { 0.0 };
-        out_stereo[i * 2 + 1] = if r.is_finite() { r } else { 0.0 };
+        let mut out_l = if l.is_finite() { l } else { 0.0 };
+        let mut out_r = if r.is_finite() { r } else { 0.0 };
+        if channels >= 3 {
+            // Transparent multi-channel soft-limiter prevents 5.1/7.1 downmix
+            // peaks from hard-clipping in 16/24-bit host quantizers while
+            // staying bit-exact <= 0.92 and untouched for mono/stereo.
+            const KNEE: f32 = 0.92;
+            const OVER_HEADROOM: f32 = 0.075; // asymptotic ceiling = 0.995
+            let al = out_l.abs();
+            if al > KNEE {
+                let over = al - KNEE;
+                out_l = (KNEE + OVER_HEADROOM * (over / (over + OVER_HEADROOM))).copysign(out_l);
+            }
+            let ar = out_r.abs();
+            if ar > KNEE {
+                let over = ar - KNEE;
+                out_r = (KNEE + OVER_HEADROOM * (over / (over + OVER_HEADROOM))).copysign(out_r);
+            }
+        }
+        out_stereo[i * 2] = out_l;
+        out_stereo[i * 2 + 1] = out_r;
     }
 }
 
@@ -1891,5 +1922,85 @@ mod tests {
         let n = resampler.process(&bad_in, &mut out);
         assert!(n > 0);
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_true_peak_limiter_converges_to_exact_unity_and_flushes_denormals() {
+        let mut limiter = TruePeakLimiter::new(12.0);
+        // Establish a real (non-zero) envelope before returning to 0 dB.
+        for _ in 0..2000 {
+            let mut frame = [0.25f32, -0.25];
+            limiter.process_in_place(&mut frame);
+        }
+        limiter.set_gain_db(0.0);
+        for _ in 0..2000 {
+            let mut frame = [0.25f32, -0.25];
+            limiter.process_in_place(&mut frame);
+        }
+        // Without the 1.0e-5 snap the f32 ULP step stalls at ~1.000006.
+        assert_eq!(
+            limiter.current_gain_linear, 1.0,
+            "0 dB pre-amp must converge to exact unity"
+        );
+
+        limiter.set_gain_db(-96.0);
+        for _ in 0..2000 {
+            let mut frame = [0.0f32, 0.0];
+            limiter.process_in_place(&mut frame);
+        }
+        assert_eq!(
+            limiter.current_gain_linear, 0.0,
+            "mute must snap to exact 0.0, not a subnormal tail"
+        );
+        // RELEASE = 0.0005 needs ~69k samples to decay from ~1.0 below 1.0e-15.
+        for _ in 0..100_000 {
+            let mut frame = [0.0f32, 0.0];
+            limiter.process_in_place(&mut frame);
+        }
+        assert_eq!(
+            limiter.envelope, 0.0,
+            "envelope must not decay into denormals"
+        );
+        // Deterministic subnormal injection proves the flush branch directly.
+        limiter.envelope = 1.0e-16;
+        let mut frame = [0.0f32, 0.0];
+        limiter.process_in_place(&mut frame);
+        assert_eq!(limiter.envelope, 0.0);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_71_bounds_peaks_and_preserves_61_back_center() {
+        // 1. Worst-case coherent full-scale 7.1 input must be bounded below 0.995
+        //    by the multi-channel soft limiter instead of exceeding 1.0.
+        let full_71 = [1.0f32; 8];
+        let mut out_71 = [0.0f32; 2];
+        downmix_to_stereo(&full_71, 8, &mut out_71);
+        assert!(out_71.iter().all(|s| s.is_finite() && *s > 0.92 && *s < 0.995));
+
+        // 2. 7.1 combined Back + Side surround power (SURROUND_71_MIX = 0.5)
+        //    must match a single front channel instead of drowning Center by +6 dB.
+        let surround_only_71 = [0.0f32, 0.0, 0.0, 0.0, 0.8, 0.8, 0.8, 0.8];
+        let front_only_71 = [0.8f32, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut out_surr = [0.0f32; 2];
+        let mut out_front = [0.0f32; 2];
+        downmix_to_stereo(&surround_only_71, 8, &mut out_surr);
+        downmix_to_stereo(&front_only_71, 8, &mut out_front);
+        assert!((out_surr[0] - out_front[0]).abs() < 1.0e-6);
+        assert!((out_surr[1] - out_front[1]).abs() < 1.0e-6);
+
+        // 3. 6.1 Back Center (src[4]) must land equally in L & R at 0.5 * HEADROOM,
+        //    and side surrounds (src[5], src[6]) use SURROUND_71_MIX (0.5).
+        let back_center_61 = [0.0f32, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0];
+        let mut out_61 = [0.0f32; 2];
+        downmix_to_stereo(&back_center_61, 7, &mut out_61);
+        let expected_bc = 0.8 * 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out_61[0] - expected_bc).abs() < 1.0e-6);
+        assert!((out_61[1] - expected_bc).abs() < 1.0e-6);
+
+        // 4. Stereo (channels <= 2) must remain bit-exact untouched even > 0.92.
+        let hot_stereo = [1.5f32, -1.5];
+        let mut out_stereo = [0.0f32; 2];
+        downmix_to_stereo(&hot_stereo, 2, &mut out_stereo);
+        assert_eq!(out_stereo, hot_stereo);
     }
 }

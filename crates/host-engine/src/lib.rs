@@ -6472,27 +6472,31 @@ mod tests {
                     }
                     let n1 = parsed.fec_n1_payload;
                     let n2 = parsed.fec_n2_payload;
+                    let mut n1_sf = 0usize;
+                    let mut n2_sf = 0usize;
                     if !n1.is_empty() {
                         assert_eq!(n1[0], TAG_OPUS_RED, "fec_n1 must be TAG_OPUS_RED");
-                        let mut sf_count = 0usize;
                         assert!(
-                            unpack_opus_red_blob(n1, |_, _| sf_count += 1),
+                            unpack_opus_red_blob(n1, |_, _| n1_sf += 1),
                             "fec_n1 RED blob must unpack cleanly"
                         );
-                        assert_eq!(sf_count, 4);
-                        if n2.is_empty() {
-                            saw_n1_only = true;
-                        }
                     }
                     if !n2.is_empty() {
                         assert_eq!(n2[0], TAG_OPUS_RED, "fec_n2 must be TAG_OPUS_RED");
-                        let mut sf_count = 0usize;
                         assert!(
-                            unpack_opus_red_blob(n2, |_, _| sf_count += 1),
+                            unpack_opus_red_blob(n2, |_, _| n2_sf += 1),
                             "fec_n2 RED blob must unpack cleanly"
                         );
-                        assert_eq!(sf_count, 4);
-                        if !n1.is_empty() {
+                    }
+                    if n1_sf > 0 || n2_sf > 0 {
+                        let valid_sf = |c: usize| c == 4 || (1..=2).contains(&c);
+                        assert!(
+                            valid_sf(n1_sf) && (n2_sf == 0 || valid_sf(n2_sf)),
+                            "unexpected RED subframe counts: n1={n1_sf}, n2={n2_sf}"
+                        );
+                        if n2.is_empty() {
+                            saw_n1_only = true;
+                        } else if !n1.is_empty() {
                             saw_both_red += 1;
                         }
                     }
@@ -6508,12 +6512,12 @@ mod tests {
             "expected >= 5 consecutive 4-subframe Opus RLD packets, got {opus_packets_seen}"
         );
         assert!(
-            saw_n1_only,
-            "expected ramp-up packet with [P-1] RED present and [P-2] empty"
+            saw_n1_only || saw_both_red >= 4,
+            "expected ramp-up packet with [P-1] RED present (unsplit n1-only or split n1+n2)"
         );
         assert!(
             saw_both_red >= 3,
-            "expected steady-state packets with both [P-1] and [P-2] RED blobs, got {saw_both_red}"
+            "expected steady-state packets with both RED blobs, got {saw_both_red}"
         );
     }
 
