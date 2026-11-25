@@ -108,6 +108,21 @@ fn bt_coex_floor_for_link(configured_floor: f32, bt_coex_active: bool) -> f32 {
     }
 }
 
+/// Extra post-drain HAL headroom in subframes above `hal_burst_sf`.
+///
+/// Large bursts (`>= 15 ms` such as 20 ms BT A2DP and 26.7 ms Dolby) drain
+/// 8-10.7 sf per callback, so `+7.0 sf` (`17.5 ms`) keeps the ring safely
+/// above the `5.0 ms` PLC watermark across Linux `8-12 ms` PipeWire quanta
+/// plus USB scheduling jitter. Smaller wired DAC bursts keep `+5.0 sf`.
+#[inline]
+fn hal_burst_margin_subframes(hal_burst_sf: f32) -> f32 {
+    if hal_burst_sf >= 6.0 {
+        7.0
+    } else {
+        5.0
+    }
+}
+
 /// Fast-attack cushion expansion for single-packet Wi-Fi stalls (signal-bar
 /// drops, 802.11 MCS rate shifts, and AP recovery bursts).
 ///
@@ -171,22 +186,17 @@ fn should_hold_missing_slot(
 
 /// Client playhead advance rule on `STATUS_EMPTY`:
 /// - Advance past a genuine packet-loss hole (`latest_rx_seq >= next_play_seq`).
-/// - Advance 1:1 on short live-edge dips (`consecutive_empty_ticks < 2`) so
-///   momentary jitter never duplicates 2.5 ms of WSOLA audio before the real
-///   frame or injects phantom backlog into the PI clock loop.
-/// - Hold at the live edge once a sustained stall (`>= 2` ticks / 5 ms) is
-///   underway so AP-buffered Wi-Fi bursts refill `burst_fifo` cleanly instead
-///   of being discarded as `late_subframes_dropped`.
+/// - Always hold at the live edge (`latest_rx_seq < next_play_seq`) so
+///   momentarily delayed packets are NEVER discarded as `late_subframes_dropped`
+///   (which previously subtracted 2.5 ms per dip and trapped 20 ms A2DP bursts
+///   in a self-sustaining Ghost Cushion loop).
 #[inline]
 fn should_advance_client_playhead(
     status: u32,
     latest_rx_seq: u16,
     next_play_seq: u16,
-    consecutive_empty_ticks: u16,
 ) -> bool {
-    status != STATUS_EMPTY
-        || (latest_rx_seq.wrapping_sub(next_play_seq) as i16) >= 0
-        || consecutive_empty_ticks < 2
+    status != STATUS_EMPTY || (latest_rx_seq.wrapping_sub(next_play_seq) as i16) >= 0
 }
 
 /// Gaming hard-lock never adds group-sync delay. The target must stay above
@@ -1470,12 +1480,10 @@ impl ClientEngine {
         let running = Arc::new(AtomicBool::new(true));
         // Mirror the RX loop's initial cushion so the debug view has sensible
         // values before the first packet arrives.
+        let usb_link = is_usb_link(config.target_buffer_subframes);
         let configured_floor = configured_wifi_floor(config.target_buffer_subframes);
-        let initial_floor_subframes = if initial_bt_delay_ms > 0 {
-            configured_floor.max(8.0)
-        } else {
-            configured_floor
-        };
+        let initial_floor_subframes =
+            bt_coex_floor_for_link(configured_floor, !usb_link && initial_bt_delay_ms > 0);
         let initial_target_subframes = (initial_floor_subframes.ceil() as u32).clamp(4, 12);
         let telemetry = Arc::new(ClientTelemetry {
             packets_received: AtomicU64::new(0),
@@ -2356,7 +2364,7 @@ impl ClientEngine {
                 } else {
                     adaptive_wifi_subframes
                 })
-                .max(last_hal_burst_sf + 5.0);
+                .max(last_hal_burst_sf + hal_burst_margin_subframes(last_hal_burst_sf));
                 let base_fifo_for_fb = fifo_target_subframes(base_target_for_fb);
                 let effective_hw_delay_ms = effective_unaligned_delay_ms(
                     base_fifo_for_fb,
@@ -3052,12 +3060,13 @@ impl ClientEngine {
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
+            let hal_margin_sf = hal_burst_margin_subframes(hal_burst_sf);
             let base_target = (if gaming_lock {
                 gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
             } else {
                 adaptive_wifi_subframes
             })
-            .max(hal_burst_sf + 5.0);
+            .max(hal_burst_sf + hal_margin_sf);
             let base_fifo_subframes = fifo_target_subframes(base_target);
             let my_downstream_delay_ms = telemetry
                 .downstream_bt_delay_ms
@@ -3182,13 +3191,13 @@ impl ClientEngine {
             let fifo_capacity = burst_fifo
                 .capacity_samples()
                 .saturating_sub(one_subframe_samples.saturating_add(16).max(2));
-            // Keep at least 5 subframes (12.5 ms = 1200 samples @ 48 kHz) above
-            // one HAL burst so draining a 1280-frame Dolby or 960-frame BT
-            // burst still leaves >= 11-12 ms Linux PipeWire capture margin
-            // instead of tripping emergency WSOLA PLC.
+            // Keep at least `hal_margin_sf` (`7.0 sf` = 17.5 ms on BT/Dolby,
+            // `5.0 sf` = 12.5 ms on wired low-latency) above one HAL burst so
+            // draining a burst still leaves comfortable capture margin above the
+            // emergency WSOLA PLC watermark.
             let fifo_watermark = resampler
                 .subframes_to_samples(target_fifo_subframes)
-                .max(hal_burst_samples + one_subframe_samples * 5)
+                .max(hal_burst_samples + one_subframe_samples * (hal_margin_sf as usize))
                 .min(fifo_capacity);
             // Keep emergency PLC watermark >= one normal wired HAL burst
             // (capped at 2 subframes = 5.0 ms) during healthy playback so huge
@@ -3335,12 +3344,7 @@ impl ClientEngine {
                 } else if sequencer.is_slot_missing(next_play_seq)
                     && last_played_codec_mode == Some(CodecMode::OpusRld)
                     && opus_decoder.is_some()
-                    && should_advance_client_playhead(
-                        STATUS_EMPTY,
-                        latest_rx_seq,
-                        next_play_seq,
-                        consecutive_empty_ticks,
-                    )
+                    && should_advance_client_playhead(STATUS_EMPTY, latest_rx_seq, next_play_seq)
                 {
                     // Phase-locked CELT PLC right at the playhead ONLY for real
                     // packet-loss holes behind `latest_rx_seq`. At the live edge
@@ -3368,7 +3372,7 @@ impl ClientEngine {
 
                 match status {
                     STATUS_PRIMARY_LOSSLESS => {
-                        if consecutive_empty_ticks >= 4 {
+                        if consecutive_empty_ticks > 0 {
                             resampler.reset_clock_window();
                         }
                         next_play_seq = next_play_seq.wrapping_add(1);
@@ -3403,7 +3407,7 @@ impl ClientEngine {
                         }
                     }
                     STATUS_HEALED_BY_FEC => {
-                        if consecutive_empty_ticks >= 4 {
+                        if consecutive_empty_ticks > 0 {
                             resampler.reset_clock_window();
                         }
                         next_play_seq = next_play_seq.wrapping_add(1);
@@ -3424,14 +3428,13 @@ impl ClientEngine {
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
-                        // Advance past a real packet-loss hole (`latest >= next`)
-                        // or short <5 ms dips; hold at the live edge after >=2
-                        // ticks so AP bursts are not discarded as late.
+                        // Advance past a real packet-loss hole (`latest >= next`),
+                        // and hold at the live edge so arriving packets are not
+                        // discarded as `late_subframes_dropped`.
                         if should_advance_client_playhead(
                             STATUS_EMPTY,
                             latest_rx_seq,
                             next_play_seq,
-                            consecutive_empty_ticks,
                         ) {
                             next_play_seq = next_play_seq.wrapping_add(1);
                         }
@@ -5988,29 +5991,24 @@ mod tests {
 
     #[test]
     fn test_live_edge_plc_holds_playhead_so_resuming_packets_are_not_dropped() {
-        // Short <5 ms live-edge dips advance 1:1 to avoid duplicate WSOLA pitch flickers.
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 100, 101, 0));
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 100, 101, 1));
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 65535, 0, 1));
-        // Sustained live-edge stall (>=2 ticks / 5 ms): hold playhead so AP burst refills FIFO.
-        assert!(!should_advance_client_playhead(STATUS_EMPTY, 100, 101, 2));
-        assert!(!should_advance_client_playhead(STATUS_EMPTY, 65535, 0, 10));
+        // Live-edge hold: `latest_rx_seq < next_play_seq` holds playhead so
+        // delayed packets are never discarded as `late_subframes_dropped`.
+        assert!(!should_advance_client_playhead(STATUS_EMPTY, 100, 101));
+        assert!(!should_advance_client_playhead(STATUS_EMPTY, 65535, 0));
         // Packet-loss hole: newer packet already buffered -> always advance past hole.
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 101, 101, 5));
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 105, 101, 5));
-        assert!(should_advance_client_playhead(STATUS_EMPTY, 2, 65535, 5));
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 101, 101));
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 105, 101));
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 2, 65535));
         // Real / FEC frames always advance.
         assert!(should_advance_client_playhead(
             STATUS_PRIMARY_LOSSLESS,
             90,
             101,
-            5
         ));
         assert!(should_advance_client_playhead(
             STATUS_HEALED_BY_FEC,
             90,
             101,
-            5
         ));
     }
 
@@ -6034,6 +6032,35 @@ mod tests {
         );
         assert!(client.telemetry.adaptive_buffer_us.load(Ordering::Relaxed) >= 20_000);
         client.stop();
+
+        // Wired USB bypasses the 8.0 sf Wi-Fi+BT coexistence floor while
+        // still seeding `downstream_bt_delay_ms` for host lip-sync.
+        let mut usb_client = ClientEngine::connect_with_pin_and_bt_delay(
+            ClientConfig {
+                server_addr: SocketAddr::from(([127, 0, 0, 1], 65500)),
+                target_buffer_subframes: 2.0,
+                preamp_gain_db: 0.0,
+                dolby_effects: false,
+            },
+            None,
+            185,
+        )
+        .expect("connect USB client with seeded BT delay");
+        assert_eq!(
+            usb_client
+                .telemetry
+                .downstream_bt_delay_ms
+                .load(Ordering::Relaxed),
+            185
+        );
+        assert_eq!(
+            usb_client
+                .telemetry
+                .adaptive_buffer_us
+                .load(Ordering::Relaxed),
+            15_000
+        );
+        usb_client.stop();
     }
 }
 

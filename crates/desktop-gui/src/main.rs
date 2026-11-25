@@ -2116,7 +2116,16 @@ impl AudioShareApp {
                     bt_delay, total_lipsync
                 );
                 let _ = total_lipsync;
-                uw::status_pill(ui, &bt_pill_text, p.warn_bg, p.warn_fg);
+                ui.horizontal_wrapped(|ui| {
+                    uw::status_pill(ui, &bt_pill_text, p.warn_bg, p.warn_fg);
+                    #[cfg(target_os = "linux")]
+                    if !self.auto_bt_video_lipsync
+                        && ui.small_button("Enable Video Lip-Sync").clicked()
+                    {
+                        self.auto_bt_video_lipsync = true;
+                        self.save_persistent_config();
+                    }
+                });
             }
 
             #[cfg(target_os = "windows")]

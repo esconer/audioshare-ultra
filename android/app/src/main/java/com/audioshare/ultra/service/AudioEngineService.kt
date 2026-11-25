@@ -388,10 +388,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             // request must match the AAudio stream profile. Re-requesting
             // also abandons the stale attributes from the previous mode.
             requestAudioFocus(dolbyEffects)
-            // The routed device query follows the focus attributes, so the
-            // Bluetooth report must be refreshed after the mode change.
-            reportBluetoothRoute()
+            // Reopen the AAudio stream BEFORE querying `reportBluetoothRoute()`
+            // and refresh once more after Android's HAL settles (400 ms) so
+            // `bluetooth_delay_ms` does not stay stuck on Samsung's 290 ms
+            // normal-mixer Dolby delay after toggling Dolby OFF.
             applyDspFromPrefs()
+            reportBluetoothRoute()
+            mainHandler.postDelayed({
+                if (!serviceDestroyed && isStreaming) reportBluetoothRoute()
+            }, 400L)
             if (foregroundStarted) {
                 startForegroundNotification(currentHostAddr, currentIsUsb)
             }
