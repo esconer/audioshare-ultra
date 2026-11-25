@@ -84,7 +84,7 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
     if target_buffer_subframes <= 2.5 {
         4.0 // Minimum 4 subframes (10.0ms) for USB so OS capture chunks never underrun
     } else {
-        target_buffer_subframes.max(6.0) // 15.0ms baseline on Wi-Fi cuts steady latency but still absorbs minor 802.11 retries
+        target_buffer_subframes.max(5.0) // 12.5ms baseline on clean non-BT Wi-Fi (BT keeps 8.0 via bt_coex_floor)
     }
 }
 
@@ -94,7 +94,7 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
 /// Standard RFC 3550 EWMA (1/16 gain) barely moves on an isolated 35-80 ms
 /// signal drop, leaving the cushion too small when the AP dumps the queued
 /// recovery burst right afterwards (which tripped `trim_post_stall_backlog`
-/// and skipped live audio). Expanding immediately on any >=12 ms stall lets
+/// and skipped live audio). Expanding immediately on any >=18 ms stall lets
 /// the recovery burst land cleanly inside the buffer with zero crack.
 /// A stall of `D` ms drains `D` ms of audio from the buffer while the sender
 /// keeps transmitting, so the recovery burst is covered by a TOTAL cushion of
@@ -104,7 +104,7 @@ fn configured_wifi_floor(target_buffer_subframes: f32) -> f32 {
 /// lag after every connect or signal dip).
 #[inline]
 fn spike_cushion_subframes(initial_floor: f32, raw_transit_delta_us: f32, ceiling: f32) -> f32 {
-    if raw_transit_delta_us < 12_000.0 {
+    if raw_transit_delta_us < 18_000.0 {
         return initial_floor;
     }
     let needed_sf = raw_transit_delta_us.min(100_000.0) / 2500.0 + 1.0;
@@ -117,7 +117,7 @@ fn spike_cushion_subframes(initial_floor: f32, raw_transit_delta_us: f32, ceilin
 /// return to 2.5/5 ms framing after a SmartAuto excursion into 10 ms mode.
 #[inline]
 fn wifi_floor_for_packet(configured_floor: f32, subframe_count: u8) -> f32 {
-    configured_floor.max((subframe_count.max(1) as f32) * 2.5 + 1.0)
+    configured_floor.max((subframe_count.max(1) as f32) * 2.0 + 1.0)
 }
 
 /// How far the playhead may trail the newest received subframe while the
@@ -147,6 +147,16 @@ fn should_hold_missing_slot(
     in_flight_wait: i16,
 ) -> bool {
     slot_missing && fifo_samples >= plc_emergency_watermark && missing_delta < in_flight_wait
+}
+
+/// Client playhead advance rule on `STATUS_EMPTY`:
+/// - Advance past a genuine packet-loss hole (`latest_rx_seq >= next_play_seq`).
+/// - Hold at the live edge (`latest_rx_seq < next_play_seq`) so AP-buffered
+///   Wi-Fi bursts are NOT discarded as `late_subframes_dropped` and instead
+///   immediately refill `burst_fifo` up to the expanded `target_buffer_ms`.
+#[inline]
+fn should_advance_client_playhead(status: u32, latest_rx_seq: u16, next_play_seq: u16) -> bool {
+    status != STATUS_EMPTY || (latest_rx_seq.wrapping_sub(next_play_seq) as i16) >= 0
 }
 
 /// Gaming hard-lock never adds group-sync delay. The target must stay above
@@ -223,7 +233,13 @@ fn detect_playhead_codec_switch(
     let Some(cur) = cur_slot_mode else {
         return false;
     };
-    let switched = matches!(*last_played, Some(prev) if prev != cur);
+    // Only crossing the OpusRld 2.5 ms lookahead boundary shifts phase.
+    // Lossless, RawPcm16, VBR, and ADPCM FEC all share 0.0 ms lookahead, so
+    // an FEC heal on a Lossless stream must not trigger a 48-frame DC splice.
+    let switched = matches!(
+        *last_played,
+        Some(prev) if (prev == CodecMode::OpusRld) != (cur == CodecMode::OpusRld)
+    );
     *last_played = Some(cur);
     switched
 }
@@ -913,7 +929,10 @@ fn should_reopen_aaudio_soft(
     is_exclusive: bool,
     recent_open: bool,
 ) -> (bool, bool) {
-    let bt_route_reopen = route_change && !want_dolby && !recent_open;
+    // Leaving BT for speaker/wired needs no route-only reopen if a prior HAL
+    // disconnect already reopened the stream in Exclusive MMAP.
+    let bt_route_reopen =
+        route_change && !want_dolby && !recent_open && (bt_active || !is_exclusive);
     let exclusive_reclaim =
         reclaim_requested && !want_dolby && !bt_active && !is_exclusive && !recent_open;
     (bt_route_reopen, exclusive_reclaim)
@@ -1922,7 +1941,7 @@ impl ClientEngine {
         let mut scan_shield_subframes: f32 = 0.0;
         let mut smoothed_host_vol: f32 = 1.0;
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
-        let mut last_large_burst_extra_sf: f32 = 0.0;
+        let mut last_hal_burst_sf: f32 = 2.0;
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
         let mut prev_tx_us: u32 = 0;
@@ -1982,7 +2001,6 @@ impl ClientEngine {
                         .map(|t| t.elapsed() >= Duration::from_millis(500))
                         .unwrap_or(true);
                 if failed || retry_due {
-                    last_desktop_open_attempt = Some(Instant::now());
                     *desktop_stream = None;
                     // Discard old-rate samples now that no consumer is active
                     // so a sample-rate switch (e.g. 48 kHz <-> 44.1/96 kHz)
@@ -1999,6 +2017,28 @@ impl ClientEngine {
                         resampler.set_output_sample_rate(rate);
                         *desktop_stream =
                             Some((stream, rate, err, observed_frames, ring_underruns));
+                    }
+                    last_desktop_open_attempt = Some(Instant::now());
+                    // Do not feed the blocking CPAL open duration into jitter/spike
+                    // estimators, and re-anchor on the live edge after mid-stream reopen.
+                    prev_rx_us = None;
+                    if stream_initialized {
+                        stream_initialized = false;
+                        sequencer.reset();
+                        opus_decoder = None;
+                        consecutive_empty_ticks = 0;
+                        backwards_resync_candidate = None;
+                        last_played_codec_mode = None;
+                        slot_codec_mode.fill(None);
+                        for slot in &mut opus_ring {
+                            slot.seq = None;
+                            slot.from_red = false;
+                        }
+                        for _ in 0..512 {
+                            if socket.recv_from(&mut recv_buf).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -2033,16 +2073,17 @@ impl ClientEngine {
                     .map(|attempt| attempt.elapsed() < Duration::from_millis(300))
                     .unwrap_or(false);
                 // While Dolby is ON, AAudio is already on the shared normal
-                // mixer; skip redundant BT route-only reopens and keep
-                // `last_bt_active` synced so toggling Dolby OFF later does not
-                // see a stale transition.
-                if route_change && want_dolby && !hard_reason {
-                    last_bt_active = bt_active;
-                }
+                // mixer, and when leaving BT for speaker/wired while already on
+                // Exclusive MMAP, skip redundant BT route-only reopens and keep
+                // `last_bt_active` synced so later transitions stay clean.
                 let is_exclusive = aaudio_guard
                     .as_ref()
                     .map(|g| g.is_exclusive())
                     .unwrap_or(false);
+                let skip_bt_route = want_dolby || (!bt_active && is_exclusive);
+                if route_change && skip_bt_route && !hard_reason {
+                    last_bt_active = bt_active;
+                }
                 let reclaim_pending = telemetry.reclaim_exclusive_mmap.load(Ordering::Acquire);
                 if reclaim_pending && (want_dolby || bt_active || is_exclusive) {
                     telemetry
@@ -2052,7 +2093,7 @@ impl ClientEngine {
                 let (bt_route_reopen, exclusive_reclaim) = should_reopen_aaudio_soft(
                     want_dolby,
                     bt_active,
-                    route_change && !want_dolby,
+                    route_change && !skip_bt_route,
                     reclaim_pending,
                     is_exclusive,
                     recent_open,
@@ -2114,8 +2155,34 @@ impl ClientEngine {
                         Arc::clone(&burst_fifo),
                         want_dolby,
                     );
+                    // Re-anchor debounce AFTER the blocking HAL open completes so a
+                    // 300+ ms open cannot expire its own 300 ms debounce window.
+                    last_aaudio_open_attempt = Some(Instant::now());
                     if let Some(guard) = aaudio_guard.as_ref() {
                         resampler.set_output_sample_rate(guard.sample_rate());
+                    }
+                    // AAudio open can block 150-370 ms on Android HALs. Clear the
+                    // jitter reference so that open latency never triggers a false
+                    // spike cushion, and on mid-stream reopens drain stale pre-open
+                    // datagrams so playback resumes cleanly on the live edge.
+                    prev_rx_us = None;
+                    if stream_initialized {
+                        stream_initialized = false;
+                        sequencer.reset();
+                        opus_decoder = None;
+                        consecutive_empty_ticks = 0;
+                        backwards_resync_candidate = None;
+                        last_played_codec_mode = None;
+                        slot_codec_mode.fill(None);
+                        for slot in &mut opus_ring {
+                            slot.seq = None;
+                            slot.from_red = false;
+                        }
+                        for _ in 0..512 {
+                            if socket.recv_from(&mut recv_buf).is_err() {
+                                break;
+                            }
+                        }
                     }
                     // The previous route's measurement is no longer valid.
                     // Trigger an immediate feedback report so the host clears
@@ -2209,7 +2276,7 @@ impl ClientEngine {
                     // periodic sawtooth underrun crackles on fluctuating Wi-Fi.
                     let now_fb = Instant::now();
                     if closed > ADAPTIVE_DECAY_MAX_FEC_PERMILLE {
-                        cushion_hold_until = now_fb + Duration::from_secs(8);
+                        cushion_hold_until = now_fb + Duration::from_secs(6);
                     } else if now_fb >= cushion_hold_until {
                         adaptive_wifi_subframes = decay_adaptive_cushion(
                             adaptive_wifi_subframes,
@@ -2253,7 +2320,8 @@ impl ClientEngine {
                     gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
                 } else {
                     adaptive_wifi_subframes
-                }) + last_large_burst_extra_sf;
+                })
+                .max(last_hal_burst_sf + 2.0);
                 let base_fifo_for_fb = fifo_target_subframes(base_target_for_fb);
                 let effective_hw_delay_ms = effective_unaligned_delay_ms(
                     base_fifo_for_fb,
@@ -2408,10 +2476,11 @@ impl ClientEngine {
                             telemetry.buffered_audio_us.store(0, Ordering::Relaxed);
                             telemetry.client_vu_peak_pct.store(0, Ordering::Relaxed);
                             // DTX means the burst is over: drop any expanded
-                            // scan shield and return the cushion to baseline.
+                            // scan shield, while keeping the learned Wi-Fi
+                            // cushion across pauses so resuming audio never
+                            // starves on the first jitter bump.
                             scan_shield_until = None;
                             scan_shield_subframes = 0.0;
-                            adaptive_wifi_subframes = initial_wifi_floor;
                             prebuffer_ready = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
                             next_play_seq = base_seq;
@@ -2509,6 +2578,34 @@ impl ClientEngine {
                             }
                         } else {
                             backwards_resync_candidate = None;
+                        }
+                        // Recovering from a live-edge Wi-Fi stall where packets
+                        // `next_play_seq..base_seq` were genuinely dropped on the
+                        // air (not buffered by the AP): jump straight to `base_seq`
+                        // instead of walking the empty hole at 1 PLC per 2.5 ms,
+                        // and fast-refill the cushion if the blackout lasted >=40 ms.
+                        if !was_dtx
+                            && consecutive_empty_ticks >= 4
+                            && (latest_rx_seq.wrapping_sub(next_play_seq) as i16) < 0
+                            && seq_delta > 0
+                            && seq_delta <= resync_ahead
+                        {
+                            next_play_seq = base_seq;
+                            latest_rx_seq = base_seq;
+                            sequencer.reset();
+                            opus_decoder = None;
+                            last_played_codec_mode = None;
+                            slot_codec_mode.fill(None);
+                            for slot in &mut opus_ring {
+                                slot.seq = None;
+                                slot.from_red = false;
+                            }
+                            if consecutive_empty_ticks >= 16 {
+                                prebuffer_ready = false;
+                                telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            }
+                            consecutive_empty_ticks = 0;
+                            last_plc_emit = None;
                         }
                         if was_dtx || seq_delta > resync_ahead || trigger_backwards_resync {
                             if !was_dtx {
@@ -2621,7 +2718,7 @@ impl ClientEngine {
                                 wifi_ceiling,
                             );
                             if spike_floor > adaptive_wifi_subframes + 0.1 {
-                                cushion_hold_until = now_rx + Duration::from_secs(6);
+                                cushion_hold_until = now_rx + Duration::from_secs(3);
                             }
                             adaptive_wifi_subframes = adaptive_wifi_subframes
                                 .max(proactive_floor)
@@ -2915,11 +3012,10 @@ impl ClientEngine {
             {
                 sequencer.arm_fade_in();
                 adaptive_wifi_subframes = (adaptive_wifi_subframes + 2.0).min(adaptive_ceiling);
-                cushion_hold_until = Instant::now() + Duration::from_secs(8);
+                cushion_hold_until = Instant::now() + Duration::from_secs(6);
             }
             let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
-            let large_burst_extra_sf = (hal_burst_sf - 2.0).max(0.0);
-            last_large_burst_extra_sf = large_burst_extra_sf;
+            last_hal_burst_sf = hal_burst_sf;
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
@@ -2927,7 +3023,8 @@ impl ClientEngine {
                 gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
             } else {
                 adaptive_wifi_subframes
-            }) + large_burst_extra_sf;
+            })
+            .max(hal_burst_sf + 2.0);
             let base_fifo_subframes = fifo_target_subframes(base_target);
             let my_downstream_delay_ms = telemetry
                 .downstream_bt_delay_ms
@@ -2964,7 +3061,11 @@ impl ClientEngine {
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
-                    sequencer.arm_fade_in();
+                    if burst_fifo.available_samples() == 0 {
+                        sequencer.arm_fade_in();
+                    } else {
+                        sequencer.arm_declick();
+                    }
                 }
 
                 // If Group Sync requires a deeper cushion (e.g. wired client aligning to
@@ -3074,6 +3175,43 @@ impl ClientEngine {
             last_fifo_watermark = fifo_watermark;
             last_plc_watermark = plc_emergency_watermark;
 
+            // Trim any AP-flushed recovery burst BEFORE popping the first
+            // subframe so we never play a single 2.5 ms blip of 200 ms-old
+            // audio and immediately refill `burst_fifo` from the live edge.
+            if stream_initialized
+                && prebuffer_ready
+                && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
+            {
+                let fifo_sf = resampler.samples_to_subframes(burst_fifo.available_samples());
+                let mut net_sf = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq)
+                    as i16)
+                    .max(0) as f32;
+                let old_play_seq = next_play_seq;
+                if trim_post_stall_backlog(
+                    latest_rx_seq,
+                    &mut next_play_seq,
+                    &mut net_sf,
+                    fifo_sf,
+                    target_buf.max(resampler.samples_to_subframes(fifo_watermark)),
+                    last_pkt_subframe_count,
+                ) {
+                    let mut s = old_play_seq;
+                    while s != next_play_seq {
+                        sequencer.clear_slot(s);
+                        let idx = (s as usize) & (RING_SLOTS - 1);
+                        if opus_ring[idx].seq == Some(s) {
+                            opus_ring[idx].seq = None;
+                            opus_ring[idx].from_red = false;
+                        }
+                        if matches!(slot_codec_mode[idx], Some((seq_tag, _)) if seq_tag == s) {
+                            slot_codec_mode[idx] = None;
+                        }
+                        s = s.wrapping_add(1);
+                    }
+                    sequencer.arm_declick();
+                }
+            }
+
             while stream_initialized
                 && prebuffer_ready
                 && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
@@ -3164,9 +3302,12 @@ impl ClientEngine {
                 } else if sequencer.is_slot_missing(next_play_seq)
                     && last_played_codec_mode == Some(CodecMode::OpusRld)
                     && opus_decoder.is_some()
+                    && should_advance_client_playhead(STATUS_EMPTY, latest_rx_seq, next_play_seq)
                 {
-                    // Phase-locked CELT PLC right at the playhead instead of
-                    // falling back to WSOLA (timbre jump on Opus streams).
+                    // Phase-locked CELT PLC right at the playhead ONLY for real
+                    // packet-loss holes behind `latest_rx_seq`. At the live edge
+                    // calling `decode_plc` advances `last_seq` and locks out the
+                    // resuming real Opus frame.
                     if opus_decoder
                         .as_mut()
                         .map(|d| d.decode_plc(next_play_seq, &mut raw_subframe))
@@ -3206,7 +3347,7 @@ impl ClientEngine {
                             if consecutive_fec_heals >= 2 || elevated_loss {
                                 adaptive_wifi_subframes =
                                     (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
-                                cushion_hold_until = Instant::now() + Duration::from_secs(8);
+                                cushion_hold_until = Instant::now() + Duration::from_secs(6);
                             } else {
                                 adaptive_wifi_subframes =
                                     (adaptive_wifi_subframes + 0.15).min(adaptive_ceiling);
@@ -3231,7 +3372,7 @@ impl ClientEngine {
                         if consecutive_fec_heals >= 2 || elevated_loss {
                             adaptive_wifi_subframes =
                                 (adaptive_wifi_subframes + 0.45).min(adaptive_ceiling);
-                            cushion_hold_until = Instant::now() + Duration::from_secs(8);
+                            cushion_hold_until = Instant::now() + Duration::from_secs(6);
                         } else {
                             adaptive_wifi_subframes =
                                 (adaptive_wifi_subframes + 0.15).min(adaptive_ceiling);
@@ -3239,15 +3380,16 @@ impl ClientEngine {
                         telemetry.fec_healed_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     STATUS_EMPTY => {
-                        // `pop_next` has already synthesized one PLC subframe
-                        // for this playhead and rendered it into the decoupler.
-                        // Holding the playhead here would play a late primary
-                        // packet a second time (comb filtering plus permanent
-                        // +2.5 ms queue inflation), so advance exactly one
-                        // slot. The late packet then fails the
-                        // `s < next_play_seq` test and is dropped, which is the
-                        // right tradeoff once its slot has been concealed.
-                        next_play_seq = next_play_seq.wrapping_add(1);
+                        // Advance past a real packet-loss hole (`latest >= next`);
+                        // hold at the live edge (`latest < next`) so resuming
+                        // audio never gets discarded as late in a lockstep loop.
+                        if should_advance_client_playhead(
+                            STATUS_EMPTY,
+                            latest_rx_seq,
+                            next_play_seq,
+                        ) {
+                            next_play_seq = next_play_seq.wrapping_add(1);
+                        }
                         consecutive_empty_ticks = consecutive_empty_ticks.saturating_add(1);
                         // Start the real-time pacing window for the next slot.
                         last_plc_emit = Some(Instant::now());
@@ -3262,7 +3404,7 @@ impl ClientEngine {
                         // +1.0 subframe, clamped to the route-aware ceiling.
                         let bt_now = telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
                         let now_empty = Instant::now();
-                        cushion_hold_until = now_empty + Duration::from_secs(6);
+                        cushion_hold_until = now_empty + Duration::from_secs(4);
                         let shield_armed = update_scan_shield(
                             bt_now,
                             last_pkt_subframe_count,
@@ -3348,9 +3490,12 @@ impl ClientEngine {
                 role_blender.process_in_place(role, &mut raw_subframe);
 
                 // 3. Apply Audiophile Bauer Headphone Crossfeed with smooth wet/dry ramp
+                // (bypass on non-Stereo speaker roles so headphone crossfeed
+                // never bleeds opposite channels into Mono/Center/Surround).
                 crossfeed.process_with_enable(
                     &mut raw_subframe,
-                    telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed),
+                    role == audioshare_protocol::sync_and_eq::ChannelRole::Stereo
+                        && telemetry.enable_binaural_crossfeed.load(Ordering::Relaxed),
                 );
 
                 // 3b. Apply Night-Mode Upward Whisper Compressor with smooth bypass release
@@ -4069,11 +4214,11 @@ mod tests {
         let configured = configured_wifi_floor(0.0);
         assert_eq!(configured, 4.0);
         assert_eq!(wifi_floor_for_packet(configured, 1), 4.0);
-        assert_eq!(wifi_floor_for_packet(configured, 2), 6.0);
-        assert_eq!(wifi_floor_for_packet(configured, 4), 11.0);
+        assert_eq!(wifi_floor_for_packet(configured, 2), 5.0);
+        assert_eq!(wifi_floor_for_packet(configured, 4), 9.0);
         // Returning to 5 ms or 2.5 ms framing lowers the floor immediately
         // instead of leaving it ratcheted at 27.5 ms for the session.
-        assert_eq!(wifi_floor_for_packet(configured, 2), 6.0);
+        assert_eq!(wifi_floor_for_packet(configured, 2), 5.0);
         assert_eq!(wifi_floor_for_packet(configured, 1), 4.0);
 
         // A 2.4 GHz profile keeps its configured floor for small packets but
@@ -4082,13 +4227,13 @@ mod tests {
         assert_eq!(configured, 8.0);
         assert_eq!(wifi_floor_for_packet(configured, 1), 8.0);
         assert_eq!(wifi_floor_for_packet(configured, 2), 8.0);
-        assert_eq!(wifi_floor_for_packet(configured, 4), 11.0);
+        assert_eq!(wifi_floor_for_packet(configured, 4), 9.0);
     }
 
     #[test]
     fn test_non_bt_wifi_floor_ceiling_and_bt_preservation() {
-        // Wi-Fi (3.5 configured subframes) now starts at 6 sf = 15 ms.
-        assert_eq!(configured_wifi_floor(3.5), 6.0);
+        // Wi-Fi (3.5 configured subframes) now starts at 5 sf = 12.5 ms.
+        assert_eq!(configured_wifi_floor(3.5), 5.0);
         // USB / 2.5 ms framing keeps the 4 sf = 10 ms floor.
         assert_eq!(configured_wifi_floor(2.5), 4.0);
 
@@ -5622,6 +5767,17 @@ mod tests {
             Some(CodecMode::StudioLosslessLpc)
         ));
         assert_eq!(last_played, Some(CodecMode::StudioLosslessLpc));
+
+        // Zero-lookahead FEC/VBR transitions inside a Lossless stream must NOT
+        // arm the 48-frame DC-hold declick splice.
+        assert!(!detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::CompressedLowDelay)
+        ));
+        assert!(!detect_playhead_codec_switch(
+            &mut last_played,
+            Some(CodecMode::StudioLosslessLpc)
+        ));
     }
 
     #[cfg(not(target_os = "android"))]
@@ -5736,6 +5892,31 @@ mod tests {
             should_reopen_aaudio_soft(true, false, false, true, false, false),
             (false, false)
         );
+        // Leaving BT when the disconnect reopen already granted Exclusive MMAP
+        // must not trigger a redundant second reopen.
+        assert_eq!(
+            should_reopen_aaudio_soft(false, false, true, false, true, false),
+            (false, false)
+        );
+        // Leaving BT while still stuck in shared mode still reopens to claim Exclusive.
+        assert_eq!(
+            should_reopen_aaudio_soft(false, false, true, false, false, false),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn test_live_edge_plc_holds_playhead_so_resuming_packets_are_not_dropped() {
+        // Live edge: latest_rx_seq (100) < next_play_seq (101) -> hold playhead.
+        assert!(!should_advance_client_playhead(STATUS_EMPTY, 100, 101));
+        assert!(!should_advance_client_playhead(STATUS_EMPTY, 65535, 0));
+        // Packet-loss hole: newer packet already buffered -> advance past hole.
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 101, 101));
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 105, 101));
+        assert!(should_advance_client_playhead(STATUS_EMPTY, 2, 65535));
+        // Real / FEC frames always advance.
+        assert!(should_advance_client_playhead(STATUS_PRIMARY_LOSSLESS, 90, 101));
+        assert!(should_advance_client_playhead(STATUS_HEALED_BY_FEC, 90, 101));
     }
 
     /// p2 Commit 4 §5: BT delay must be seeded before the RX thread spawns.
@@ -6574,25 +6755,38 @@ pub mod android_aaudio {
                     AAUDIO_SHARING_MODE_EXCLUSIVE,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                     AAUDIO_FORMAT_PCM_FLOAT,
+                    SAMPLE_RATE as i32,
                 ),
                 (
                     AAUDIO_SHARING_MODE_SHARED,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                     AAUDIO_FORMAT_PCM_FLOAT,
+                    SAMPLE_RATE as i32,
                 ),
                 (
                     AAUDIO_SHARING_MODE_SHARED,
                     AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
                     AAUDIO_FORMAT_PCM_I16,
+                    SAMPLE_RATE as i32,
                 ),
                 (
                     AAUDIO_SHARING_MODE_SHARED,
                     AAUDIO_PERFORMANCE_MODE_NONE,
                     AAUDIO_FORMAT_PCM_I16,
+                    SAMPLE_RATE as i32,
+                ),
+                // Last resort for 16 kHz BT HFP / 44.1 kHz-only capture HALs that
+                // reject explicit 48 kHz; `open_internal` resamples the granted rate.
+                (
+                    AAUDIO_SHARING_MODE_SHARED,
+                    AAUDIO_PERFORMANCE_MODE_NONE,
+                    AAUDIO_FORMAT_PCM_I16,
+                    AAUDIO_UNSPECIFIED,
                 ),
             ];
-            for (sharing, perf, fmt) in attempts {
-                if let Some(guard) = Self::open_internal(Arc::clone(&fifo), sharing, perf, fmt) {
+            for (sharing, perf, fmt, rate) in attempts {
+                if let Some(guard) = Self::open_internal(Arc::clone(&fifo), sharing, perf, fmt, rate)
+                {
                     return Some(guard);
                 }
             }
@@ -6608,6 +6802,7 @@ pub mod android_aaudio {
             sharing_mode: i32,
             perf_mode: i32,
             format: i32,
+            requested_rate: i32,
         ) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
@@ -6630,7 +6825,7 @@ pub mod android_aaudio {
                 AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
                 AAudioStreamBuilder_setPerformanceMode(builder, perf_mode);
                 AAudioStreamBuilder_setSharingMode(builder, sharing_mode);
-                AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE as i32);
+                AAudioStreamBuilder_setSampleRate(builder, requested_rate);
                 AAudioStreamBuilder_setChannelCount(builder, 1);
                 AAudioStreamBuilder_setFormat(builder, format);
                 AAudioStreamBuilder_setDataCallback(
