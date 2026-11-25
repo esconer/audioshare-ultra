@@ -144,7 +144,9 @@ const LEGACY_RNDIS_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 129);
 const PARTY_PEER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const PARTY_VBR_BITRATE_KBPS: u16 = 256;
-const PARTY_DTX_SILENT_SUBFRAMES: u32 = 200;
+/// Holdoff before Party Mode DTX suspends Opus (1200 x 2.5 ms = 3.0 s) so
+/// natural dialogue/music gaps never chop whispers or cold-start CELT.
+const PARTY_DTX_SILENT_SUBFRAMES: u32 = 1200;
 const PARTY_DTX_HEARTBEAT_INTERVAL: u16 = 80;
 /// Periodic AEAD session salt rotation interval so >71-minute encrypted Party
 /// casts never wrap the 32-bit `tx_timestamp_us` nonce on the same salt.
@@ -990,7 +992,7 @@ impl PhoneMicTransmitter {
 
                         seq = seq.wrapping_add(subframes_per_pkt as u16);
 
-                        // After 500 ms of silence, keep only a 200 ms
+                        // After 3.0 s of silence, keep only a 200 ms
                         // heartbeat. Evaluate DTX before touching the encoder
                         // or encoding any payload, so silence cycles never
                         // allocate an Opus encoder or run LPC/VBR + ADPCM FEC.
@@ -1627,14 +1629,20 @@ pub mod android_native {
         pin: JString,
         dolby_effects: jboolean,
     ) -> jboolean {
-        let Ok(addr_str) = env.get_string(&host_addr) else {
-            return 0;
+        let addr_rust: String = match env.get_string(&host_addr) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return 0;
+            }
         };
-        let addr_rust: String = addr_str.into();
-        let pin_rust: String = env
-            .get_string(&pin)
-            .map(|value| value.into())
-            .unwrap_or_default();
+        let pin_rust: String = match env.get_string(&pin) {
+            Ok(value) => value.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                String::new()
+            }
+        };
         let pin_trimmed = pin_rust.trim();
         let pin_opt = if pin_trimmed.is_empty() {
             None
@@ -1767,14 +1775,20 @@ pub mod android_native {
         use_hardware_mic: jboolean,
         pin: JString,
     ) -> jboolean {
-        let Ok(ip_str) = env.get_string(&host_ip) else {
-            return 0;
+        let ip_rust: String = match env.get_string(&host_ip) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                return 0;
+            }
         };
-        let ip_rust: String = ip_str.into();
-        let pin_rust: String = env
-            .get_string(&pin)
-            .map(|v| v.into())
-            .unwrap_or_default();
+        let pin_rust: String = match env.get_string(&pin) {
+            Ok(v) => v.into(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                String::new()
+            }
+        };
         let pin_trimmed = pin_rust.trim();
         let pin_opt = if pin_trimmed.is_empty() {
             None
@@ -2294,7 +2308,9 @@ mod tests {
 
     #[test]
     fn test_party_dtx_threshold_and_heartbeat_cadence() {
+        assert_eq!(PARTY_DTX_SILENT_SUBFRAMES, 1200);
         assert!(!party_dtx_active(false, 10_000));
+        assert!(!party_dtx_active(true, 201));
         assert!(!party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES));
         assert!(party_dtx_active(true, PARTY_DTX_SILENT_SUBFRAMES + 1));
 
