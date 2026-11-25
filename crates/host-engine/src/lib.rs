@@ -61,19 +61,24 @@ const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
 /// rung. Exact [P-1]/[P-2] Opus RED still fits at the floors below, so the
 /// stability ladder keeps audio continuous without the audible 64 kbps floor.
 const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
-/// Smart Auto's compressed Opus floor. Four 2.5 ms subframes at 128 kbps pack
-/// into ~172 B (4 B RED header + 4 x (1 B length + 41 B tagged Opus payload))
-/// inside the 255 B `OpusRedHistory` slot, leaving ~83 B of headroom.
-const SMART_AUTO_OPUS_FLOOR_KBPS: u16 = 128;
+/// Smart Auto's compressed Opus floor. Four 2.5 ms subframes at 160 kbps pack
+/// into ~212 B (4 B RED header + 4 x (1 B length + 51 B tagged Opus payload))
+/// inside the 255 B `OpusRedHistory` slot, leaving ~43 B of headroom while
+/// preserving clean 2.5 ms CELT transient resolution.
+const SMART_AUTO_OPUS_FLOOR_KBPS: u16 = 160;
+/// Quiet duration before Smart DTX tears down the encoder and parks clients
+/// (1200 x 2.5 ms = 3.0 s) so natural movie/dialogue pauses never chop whispers.
+const SMART_DTX_SILENT_SUBFRAMES: u32 = 1200;
 /// Floor for the explicit 2.4 GHz stability profile under severe loss.
 const MAX_STABILITY_OPUS_FLOOR_KBPS: u16 = 96;
 /// Consecutive ~500 ms feedback windows above
 /// [`SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE`] required before Smart Auto may
 /// escalate from 5 ms (2 sf) to 10 ms (4 sf) framing.
 const SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS: u8 = 2;
-/// Feedback heartbeats arrive at roughly this cadence; several clients
-/// reporting inside one such window count as a single observation.
-const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(500);
+/// Minimum spacing between distinct ~500 ms feedback observations. 350 ms
+/// collapses multi-client bursts inside one window without dropping a single
+/// client's 500 ms heartbeat that arrives a few ms early due to Wi-Fi jitter.
+const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(350);
 /// Minimum interval between Opus encoder recreation attempts after a genuine
 /// creation/encode failure. One attempt per 2 s instead of one per 2.5 ms TX
 /// tick (200 Hz) keeps recovery bounded while still healing transient errors.
@@ -266,6 +271,15 @@ impl HighLossWindowGate {
             self.armed = false;
         }
         self.armed
+    }
+
+    /// Disarm once the paced governor decays below the high-loss tier without
+    /// counting stale per-client loss reports as a fresh consecutive window.
+    fn sync_governor(&mut self, governed_loss_permille: u16) {
+        if governed_loss_permille <= SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+            self.armed = false;
+            self.consecutive_windows = 0;
+        }
     }
 
     #[inline]
@@ -526,8 +540,8 @@ fn select_tx_profile(
                 // Pure selector: 4 sf is the *candidate* framing. The live TX
                 // loop additionally requires two consecutive high-loss windows
                 // before actually using it (HighLossWindowGate). The bitrate
-                // never goes below 128 kbps: four 2.5 ms Opus subframes plus
-                // exact [P-1]/[P-2] RED are ~172 B inside the 255 B slot.
+                // never goes below 160 kbps: four 2.5 ms Opus subframes plus
+                // exact [P-1]/[P-2] RED are ~212 B inside the 255 B slot.
                 (
                     CodecMode::CompressedLowDelay,
                     if gaming_lock { 2 } else { 4 },
@@ -537,10 +551,11 @@ fn select_tx_profile(
             } else if bt_active && any_wifi_client {
                 // Single-antenna Wi-Fi + A2DP link: stay on transparent Opus
                 // instead of probing 1+ Mbps lossless that A2DP re-encodes anyway.
+                // 256 kbps (2-sf RED ~168 B <= 255 B) prevents Opus->A2DP cascading grit.
                 (
                     CodecMode::CompressedLowDelay,
                     2,
-                    selected_kbps.clamp(96, 192),
+                    selected_kbps.clamp(160, 256),
                 )
             } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                 // Smooth intra-Opus bitrate scaling (zero codec switch, zero
@@ -2416,7 +2431,19 @@ impl HostEngine {
                             while watcher_running.load(Ordering::Relaxed)
                                 && watcher_active.load(Ordering::Relaxed)
                             {
-                                std::thread::sleep(Duration::from_secs(2));
+                                for _ in 0..40 {
+                                    if !watcher_running.load(Ordering::Relaxed)
+                                        || !watcher_active.load(Ordering::Relaxed)
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                if !watcher_running.load(Ordering::Relaxed)
+                                    || !watcher_active.load(Ordering::Relaxed)
+                                {
+                                    break;
+                                }
                                 if let Some(current) = query_default_monitor() {
                                     if current != last {
                                         last = current.clone();
@@ -2439,14 +2466,14 @@ impl HostEngine {
                     //    low latency. A non-blocking poll reader drains its
                     //    stdout so a silent sink cannot wedge the thread.
                     let child = Command::new("parec")
-                        .env("PIPEWIRE_LATENCY", "240/48000")
+                        .env("PIPEWIRE_LATENCY", "120/48000")
                         .args([
                             "--raw",
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=5",
-                            "--process-time-msec=3",
+                            "--latency-msec=3",
+                            "--process-time-msec=2",
                             &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())
@@ -3058,7 +3085,15 @@ impl HostEngine {
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
                     while watcher_running.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !watcher_running.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        if !watcher_running.load(Ordering::Relaxed) {
+                            break;
+                        }
                         if let Some(current) = cpal::default_host()
                             .default_output_device()
                             .and_then(|d| d.name().ok())
@@ -3095,7 +3130,11 @@ impl HostEngine {
                     start_instant,
                 ) {
                     Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
-                    Err(_) => {
+                    Err(err) => {
+                        app_routing::clear_windows_target_capture_pid();
+                        app_routing::set_windows_app_isolation_error(Some(format!(
+                            "App isolation (PID {bound_target_pid}) failed: {err} — fell back to Full System Audio"
+                        )));
                         bound_target_pid = 0;
                         Self::spawn_loopback_capture(
                             Arc::clone(&ring),
@@ -3200,6 +3239,9 @@ impl HostEngine {
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
+        let mut was_dtx_active = false;
+        let mut dtx_entry_confirm_pending = false;
+        let capture_idle_ms: u64 = if cfg!(target_os = "linux") { 40 } else { 80 };
         // Suppresses connect-time quality/bitrate overrides from legacy APKs
         // joining a session that already has another active receiver.
         let mut join_override_grace: HashMap<IpAddr, Instant> = HashMap::new();
@@ -3551,17 +3593,19 @@ impl HostEngine {
                             }
                             allow_remote_commands = !entry.muted;
                         } else {
-                            // Reject continuing heartbeats (`feedback_seq > 1`)
+                            // Reject continuing heartbeats (`feedback_seq > 8`)
                             // from recently kicked IPs during their 15 s
                             // cooldown so clicking Kick actually keeps an
                             // active client out instead of auto-rejoining in
                             // 500 ms. A deliberate fresh reconnect starts a new
-                            // `ClientEngine` at `feedback_seq == 1`, which is
-                            // admitted immediately and clears the cooldown.
+                            // `ClientEngine` at `feedback_seq == 1` (and retries
+                            // every 150 ms); accepting `seq <= 8` prevents one
+                            // lost UDP handshake packet on Wi-Fi from locking out
+                            // a valid reconnect behind the 15 s kick cooldown.
                             {
                                 let mut kicked =
                                     kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
-                                if fb.feedback_seq == 1 {
+                                if fb.feedback_seq <= 8 {
                                     kicked.remove(&src_addr.ip());
                                 } else if kicked
                                     .get(&src_addr.ip())
@@ -3761,7 +3805,7 @@ impl HostEngine {
                             .max()
                             .unwrap_or(0);
                         loss_governor.update(raw_worst, now_sweep);
-                        high_loss_gate.observe(raw_worst, loss_governor.value, now_sweep);
+                        high_loss_gate.sync_governor(loss_governor.value);
                     }
                     let raw_worst_for_promo = map
                         .values()
@@ -3818,11 +3862,6 @@ impl HostEngine {
                 any_wifi,
                 cached_all_usb,
             );
-            // Publish the bitrate actually driving the TX codec on every tick.
-            // Diagnostics reports this instead of the raw UI selection.
-            telemetry
-                .effective_bitrate_kbps
-                .store(tx_bitrate_kbps, Ordering::Relaxed);
             // Hysteresis lives in session state, not in the pure 8-arg
             // `select_tx_profile` helper used by unit tests: a single lossy
             // feedback window must not jump Smart Auto from 5 ms to 10 ms.
@@ -3831,7 +3870,15 @@ impl HostEngine {
                 && !high_loss_gate.allows_four_subframes()
             {
                 subframes_per_pkt = 2;
+                // Keep a 2-sf stream on the 2-sf intra-Opus rung (up to 224k,
+                // ~148 B RED) instead of stranding it at the 4-sf floor.
+                tx_bitrate_kbps = selected_kbps.clamp(SMART_AUTO_OPUS_FLOOR_KBPS, 224);
             }
+            // Publish the bitrate actually driving the TX codec on every tick.
+            // Diagnostics reports this instead of the raw UI selection.
+            telemetry
+                .effective_bitrate_kbps
+                .store(tx_bitrate_kbps, Ordering::Relaxed);
             let use_pcm24 = profile == QualityProfile::StudioLossless24Bit
                 || (profile == QualityProfile::SmartAuto
                     && dynamic_codec_mode == CodecMode::StudioLosslessLpc
@@ -3918,7 +3965,10 @@ impl HostEngine {
                 } else if avail < needed_samples {
                     let now_ms = start_instant.elapsed().as_millis() as u64;
                     let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last_cb) <= 80 {
+                    // Linux PipeWire delivers 2.5-5 ms chunks; fall back to silence
+                    // after 40 ms on track-change/suspend pauses instead of starving
+                    // the client for 80 ms. Windows keeps 80 ms for 10-22 ms WASAPI.
+                    if now_ms.saturating_sub(last_cb) <= capture_idle_ms {
                         capture_wakeup.wait_bounded(seen, Duration::from_micros(1500));
                         continue;
                     }
@@ -4036,7 +4086,7 @@ impl HostEngine {
             // encoder in the DTX branch below -- 200 allocations/sec of silence.
             let is_dtx_active = telemetry.enable_smart_dtx.load(Ordering::Relaxed)
                 && packet_is_silent
-                && silent_subframes > 200;
+                && silent_subframes > SMART_DTX_SILENT_SUBFRAMES;
             telemetry
                 .dtx_silent_mode
                 .store(is_dtx_active, Ordering::Relaxed);
@@ -4294,7 +4344,15 @@ impl HostEngine {
                 opus_encoder = None;
                 fec_hist_len = 0;
                 let heartbeat_now = Instant::now();
-                if dtx_heartbeat_due(last_dtx_heartbeat, heartbeat_now) {
+                // Force an immediate SilenceHeartbeat on DTX entry plus one
+                // confirmation heartbeat on the next tick so a single dropped
+                // Wi-Fi packet never leaves the client burning 200 ms of PLC.
+                let entering_dtx = !was_dtx_active;
+                let send_dtx = entering_dtx
+                    || dtx_entry_confirm_pending
+                    || dtx_heartbeat_due(last_dtx_heartbeat, heartbeat_now);
+                if send_dtx {
+                    dtx_entry_confirm_pending = entering_dtx;
                     last_dtx_heartbeat = heartbeat_now;
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
@@ -4336,7 +4394,10 @@ impl HostEngine {
                         &telemetry,
                     );
                 }
+                was_dtx_active = true;
             } else if has_targets {
+                was_dtx_active = false;
+                dtx_entry_confirm_pending = false;
                 let hdr = WireHeader {
                     mode: dynamic_codec_mode,
                     subframe_count: subframes_per_pkt as u8,
@@ -4427,6 +4488,12 @@ impl HostEngine {
                         // audio by sending one subframe per datagram, with the
                         // FEC history re-based to each new packet sequence.
                         for split_idx in 0..subframes_per_pkt {
+                            // Spread split 24-bit datagrams across 1 ms on Wi-Fi
+                            // so silence->music transitions never blast 20 us
+                            // microbursts into the 802.11 TX queue.
+                            if split_idx > 0 && !cached_all_usb {
+                                std::thread::sleep(Duration::from_micros(1_000));
+                            }
                             let (start, end) = subframe_ranges[split_idx];
                             let mut split_hdr = hdr;
                             split_hdr.subframe_count = 1;
@@ -4474,6 +4541,9 @@ impl HostEngine {
                         }
                     }
                 }
+            } else {
+                was_dtx_active = false;
+                dtx_entry_confirm_pending = false;
             }
 
             // Store the just-sent packet P as the new [P-1] for the next OpusRld
@@ -4523,7 +4593,7 @@ impl HostEngine {
             let capture_active = !use_test_tone
                 && (start_instant.elapsed().as_millis() as u64)
                     .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
-                    <= 80;
+                    <= capture_idle_ms;
             if capture_active {
                 if sent_any {
                     last_tx_instant = Instant::now();
@@ -5476,7 +5546,7 @@ mod tests {
         );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
 
-        // SmartAuto on Wi-Fi + BT stays compressed (192k, 2 sf) instead of probing lossless.
+        // SmartAuto on Wi-Fi + BT stays compressed (256k, 2 sf) instead of probing lossless.
         let (mode, sf, kbps) = select_tx_profile(
             QualityProfile::SmartAuto,
             2,
@@ -5487,7 +5557,7 @@ mod tests {
             true,
             false,
         );
-        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 192));
+        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 256));
 
         // Clean wired/speaker SmartAuto still stays lossless.
         let (mode, sf, _) = select_tx_profile(
@@ -6560,7 +6630,7 @@ mod tests {
             (CodecMode::CompressedLowDelay, 2, 510)
         );
         // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf
-        // -> 128k 4sf floor. There is no 64 kbps rung any more.
+        // (160k 4sf floor). There is no 64 kbps or 128 kbps rung any more.
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 0, false, false, true, false),
             (CodecMode::StudioLosslessLpc, 2, 510)
@@ -6579,11 +6649,11 @@ mod tests {
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 220, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 128)
+            (CodecMode::CompressedLowDelay, 4, 160)
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 320, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 128)
+            (CodecMode::CompressedLowDelay, 4, 160)
         );
     }
 
@@ -6604,7 +6674,7 @@ mod tests {
         );
         assert_eq!(mode, CodecMode::CompressedLowDelay);
         assert_eq!(sf, 4, "expected 10 ms (4 sf) framing at 350 permille");
-        assert!(kbps >= 128, "SmartAuto 350 permille selected {kbps} kbps (<128)");
+        assert!(kbps >= 160, "SmartAuto 350 permille selected {kbps} kbps (<160)");
         assert_ne!(kbps, 64);
         assert_ne!(kbps, 96);
     }
@@ -6715,6 +6785,24 @@ mod tests {
         assert!(!flapping.observe(0, 0, t + Duration::from_millis(500)));
         assert!(!flapping.observe(350, 350, t + Duration::from_millis(1_000)));
         assert!(!flapping.allows_four_subframes());
+
+        // Jittered 2nd report at +480 ms (just under 500 ms, >= 350 ms window)
+        // must be accepted and arm 4 sf.
+        let mut jittered = HighLossWindowGate::new();
+        assert!(!jittered.observe(350, 350, t));
+        assert!(jittered.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(jittered.allows_four_subframes());
+
+        // sync_governor(350) after a single spike must NOT arm 4 sf, while
+        // sync_governor(40) disarms an armed gate.
+        let mut synced = HighLossWindowGate::new();
+        assert!(!synced.observe(350, 350, t));
+        synced.sync_governor(350);
+        assert!(!synced.allows_four_subframes());
+        assert!(synced.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(synced.allows_four_subframes());
+        synced.sync_governor(40);
+        assert!(!synced.allows_four_subframes());
     }
 
     #[test]
