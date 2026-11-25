@@ -651,27 +651,24 @@ fn sink_inputs_on_sink(sink_name: &str) -> Vec<u32> {
 }
 
 #[cfg(target_os = "linux")]
-fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
+fn parse_linux_sink_inputs(text: &str, self_pid: u32) -> Vec<AudioAppEntry> {
     let mut apps = Vec::new();
-    let Ok(output) = crate::discovery_and_os::pactl_command().args(["list", "sink-inputs"]).output() else {
-        return apps;
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-
     let mut current_id: Option<u32> = None;
     let mut current_pid: u32 = 0;
     let mut current_name: Option<String> = None;
 
+    let mut push_entry = |id: Option<u32>, pid: u32, name: Option<String>| {
+        if let (Some(id), Some(name)) = (id, name) {
+            if pid == 0 || pid != self_pid {
+                apps.push(AudioAppEntry { id, pid, name });
+            }
+        }
+    };
+
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("Sink Input #") {
-            if let (Some(id), Some(name)) = (current_id.take(), current_name.take()) {
-                apps.push(AudioAppEntry {
-                    id,
-                    pid: current_pid,
-                    name,
-                });
-            }
+            push_entry(current_id.take(), current_pid, current_name.take());
             current_id = rest.parse::<u32>().ok();
             current_pid = 0;
         } else if let Some(rest) = trimmed.strip_prefix("application.name = ") {
@@ -681,14 +678,20 @@ fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
         }
     }
 
-    if let (Some(id), Some(name)) = (current_id, current_name) {
-        apps.push(AudioAppEntry {
-            id,
-            pid: current_pid,
-            name,
-        });
-    }
+    push_entry(current_id, current_pid, current_name);
     apps
+}
+
+#[cfg(target_os = "linux")]
+fn list_linux_pipewire_sink_inputs() -> Vec<AudioAppEntry> {
+    let Ok(output) = crate::discovery_and_os::pactl_command()
+        .args(["list", "sink-inputs"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_linux_sink_inputs(&text, std::process::id())
 }
 
 #[cfg(target_os = "windows")]
@@ -955,10 +958,16 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
             }
         }
 
-        let status = crate::discovery_and_os::pactl_command()
+        let status = match crate::discovery_and_os::pactl_command()
             .args(["move-sink-input", &app.id.to_string(), "AudioShare_Ultra"])
             .status()
-            .map_err(|e| format!("Failed to move sink-input: {}", e))?;
+        {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = restore_all_apps_to_default_sink();
+                return Err(format!("Failed to move sink-input: {}", e));
+            }
+        };
 
         if status.success() {
             // Only switch the capture source AFTER move-sink-input succeeded so
@@ -977,6 +986,9 @@ pub fn route_single_app_to_audioshare(app: &AudioAppEntry) -> Result<String, Str
                 app.name, app.pid
             ))
         } else {
+            // Previous isolated apps were already returned to @DEFAULT_SINK@ above;
+            // restore @DEFAULT_SOURCE@ so the host does not capture an empty null sink.
+            let _ = restore_all_apps_to_default_sink();
             Err("pactl move-sink-input returned non-zero".into())
         }
     }
@@ -1073,5 +1085,39 @@ mod tests {
     fn test_restore_all_apps_to_default_sink_runs_without_panic() {
         let res = restore_all_apps_to_default_sink();
         assert!(res.contains("Restored: Capturing Full System Audio"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_linux_sink_inputs_skips_self_pid() {
+        let pactl_out = "\
+Sink Input #11
+\tProperties:
+\t\tapplication.name = \"AudioShare Ultra\"
+\t\tapplication.process.id = \"4242\"
+Sink Input #12
+\tProperties:
+\t\tapplication.name = \"Firefox\"
+\t\tapplication.process.id = \"9001\"
+Sink Input #13
+\tProperties:
+\t\tapplication.name = \"System Effect\"
+";
+        let apps = parse_linux_sink_inputs(pactl_out, 4242);
+        assert_eq!(
+            apps,
+            vec![
+                AudioAppEntry {
+                    id: 12,
+                    pid: 9001,
+                    name: "Firefox".into(),
+                },
+                AudioAppEntry {
+                    id: 13,
+                    pid: 0,
+                    name: "System Effect".into(),
+                },
+            ]
+        );
     }
 }

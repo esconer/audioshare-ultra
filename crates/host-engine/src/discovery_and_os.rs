@@ -764,6 +764,19 @@ impl Drop for AdbUsbWatcher {
     }
 }
 
+/// Validate Windows Wi-Fi Direct SoftAP credentials before stopping any active
+/// hotspot or spawning PowerShell.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_windows_softap_credentials(ssid: &str, password: &str) -> Result<(), String> {
+    if ssid.trim().is_empty() {
+        return Err("Wi-Fi Direct SoftAP SSID cannot be empty".into());
+    }
+    if password.len() < 8 {
+        return Err("Wi-Fi Direct SoftAP password must be at least 8 characters".into());
+    }
+    Ok(())
+}
+
 /// 1-Hop Wi-Fi Direct / SoftAP Hotspot Controller (Bypasses congested or AP-isolated routers)
 pub struct DirectHotspotController;
 
@@ -796,6 +809,7 @@ impl DirectHotspotController {
 
         #[cfg(target_os = "windows")]
         {
+            validate_windows_softap_credentials(ssid, password)?;
             Self::stop_direct_hotspot();
             let safe_ssid = ssid.replace('\'', "''");
             let safe_pass = password.replace('\'', "''");
@@ -825,8 +839,9 @@ impl DirectHotspotController {
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
+            let encoded = encode_powershell_utf16le_base64(&script);
             let mut child = silent_command("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -959,7 +974,7 @@ pub fn is_windows_firewall_configured() -> bool {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$r = Get-NetFirewallRule -DisplayName 'AudioShare_Ultra_UDP' -ErrorAction SilentlyContinue | Select-Object -First 1; if ($null -ne $r -and $r.Enabled.ToString() -eq 'True' -and $r.Action.ToString() -eq 'Allow') { 'OK' }",
+                "if (Get-NetFirewallRule -DisplayName 'AudioShare_Ultra_UDP' -ErrorAction SilentlyContinue | Where-Object { $_.Enabled.ToString() -eq 'True' -and $_.Action.ToString() -eq 'Allow' } | Select-Object -First 1) { 'OK' }",
             ])
             .output()
         {
@@ -1958,6 +1973,22 @@ mod tests {
         assert_eq!(encode_powershell_utf16le_base64("hi"), "aABpAA==");
         // Non-ASCII: "é" (U+00E9) -> UTF-16LE `E9 00` -> base64.
         assert_eq!(encode_powershell_utf16le_base64("é"), "6QA=");
+    }
+
+    #[test]
+    fn test_windows_softap_credentials_validation() {
+        assert!(validate_windows_softap_credentials("", "audioshare88").is_err());
+        assert!(validate_windows_softap_credentials("   ", "audioshare88").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "short").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "1234567").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "audioshare88").is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_softap_start_rejects_invalid_credentials_without_powershell() {
+        assert!(DirectHotspotController::start_direct_5ghz_hotspot("", "audioshare88").is_err());
+        assert!(DirectHotspotController::start_direct_5ghz_hotspot("AudioShare_5G", "short").is_err());
     }
 
     #[test]
