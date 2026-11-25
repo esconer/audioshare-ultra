@@ -238,6 +238,8 @@ enum SettingsTab {
 /// thread never stalls on `pkexec`, `netsh`, `nmcli`, or `netsh wlan`.
 enum BgTaskResult {
     Firewall { msg: String, firewall_ok: bool },
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    FirewallProbe { firewall_ok: bool },
     HotspotStart {
         result: Result<String, String>,
     },
@@ -420,6 +422,18 @@ fn refreshed_qr_iface_index(interfaces: &[NetworkInterfaceInfo], selected: usize
     }
 }
 
+/// Resolve whether the desktop client should send a pairing PIN to the target
+/// host. Discovered open hosts (`use_pin = false`) must connect unencrypted
+/// even when this machine's own host PIN encryption is enabled.
+fn effective_client_pin(use_pin: bool, encryption_enabled: bool, pin: &str) -> Option<&str> {
+    let trimmed = pin.trim();
+    if use_pin && encryption_enabled && !trimmed.is_empty() {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
 impl AudioShareApp {
     /// Side-effect-free construction shared by `new()` and the config unit
     /// tests. Deliberately does **not** enumerate NICs, bind the discovery UDP
@@ -443,7 +457,7 @@ impl AudioShareApp {
             firewall_task_in_flight: false,
             hotspot_task_in_flight: false,
             #[cfg(target_os = "windows")]
-            windows_firewall_ok: false,
+            windows_firewall_ok: true,
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
@@ -519,7 +533,12 @@ impl AudioShareApp {
         app.scanner = Some(DiscoveryScanner::start());
         #[cfg(target_os = "windows")]
         {
-            app.windows_firewall_ok = is_windows_firewall_configured();
+            // Probe PowerShell/netsh off the UI thread so cold launch stays <50 ms.
+            let tx = app.bg_task_tx.clone();
+            std::thread::spawn(move || {
+                let firewall_ok = is_windows_firewall_configured();
+                let _ = tx.send(BgTaskResult::FirewallProbe { firewall_ok });
+            });
         }
         if Self::config_file_path().exists() {
             app.load_persistent_config();
@@ -881,7 +900,7 @@ impl AudioShareApp {
         }
     }
 
-    fn connect_client(&mut self, addr: SocketAddr) {
+    fn connect_client(&mut self, addr: SocketAddr, use_pin: bool) {
         if self.pin_dirty {
             self.apply_pin_now();
         }
@@ -899,11 +918,7 @@ impl AudioShareApp {
             preamp_gain_db: self.preamp_gain_db,
             dolby_effects: false,
         };
-        let pin_opt = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-            Some(self.pairing_pin.trim())
-        } else {
-            None
-        };
+        let pin_opt = effective_client_pin(use_pin, self.enable_pin_encryption, &self.pairing_pin);
         match ClientEngine::connect_with_pin(cfg, pin_opt) {
             Ok(engine) => {
                 self.sync_client_dsp_atomics(&engine);
@@ -1024,6 +1039,14 @@ impl AudioShareApp {
                     #[cfg(not(target_os = "windows"))]
                     let _ = firewall_ok;
                     self.show_toast(msg);
+                }
+                BgTaskResult::FirewallProbe { firewall_ok } => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.windows_firewall_ok = firewall_ok;
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = firewall_ok;
                 }
                 BgTaskResult::HotspotStart { result } => {
                     self.hotspot_task_in_flight = false;
@@ -1842,11 +1865,10 @@ impl AudioShareApp {
                             }
                             if ui.button("New PIN").clicked() {
                                 self.pairing_pin = Self::generate_initial_pairing_pin();
-                                if self.enable_pin_encryption {
-                                    self.apply_pin_now();
-                                } else {
-                                    self.pin_dirty = true;
-                                }
+                                // Clicking New PIN implies the user intends to use it;
+                                // enable and apply immediately so PC & Android never disagree.
+                                self.enable_pin_encryption = true;
+                                self.apply_pin_now();
                             }
                         });
                     }
@@ -2067,12 +2089,13 @@ impl AudioShareApp {
                 "Mute PC Speakers While Streaming (Virtual Speaker)",
                 "Routes PC audio exclusively to connected devices and restores speakers on disconnect",
                 &mut self.enable_virtual_speaker,
-            ) && self.host_engine.is_some()
-            {
-                let _ = self.os_guard.take();
-                self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
-                    self.enable_virtual_speaker,
-                ));
+            ) {
+                if self.host_engine.is_some() {
+                    let _ = self.os_guard.take();
+                    self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
+                        self.enable_virtual_speaker,
+                    ));
+                }
                 self.save_persistent_config();
             }
 
@@ -2987,7 +3010,7 @@ impl AudioShareApp {
                                 return;
                             }
                             self.usb_buffer_mode = host.is_usb;
-                            self.connect_client(host.addr);
+                            self.connect_client(host.addr, host.encrypted);
                         }
                     });
                 }
@@ -3029,7 +3052,7 @@ impl AudioShareApp {
                         match parsed {
                             Ok(addr) => {
                                 self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                                self.connect_client(addr);
+                                self.connect_client(addr, self.enable_pin_encryption);
                             }
                             Err(_) => {
                                 self.client_status_msg = format!(
@@ -3864,6 +3887,16 @@ phone_rx_mode=1
         assert_eq!(effective_pin(true, ""), None);
         assert_eq!(effective_pin(false, "1234"), None);
         assert_eq!(effective_pin(false, ""), None);
+    }
+
+    #[test]
+    fn test_effective_client_pin_respects_open_host_flag() {
+        // Discovered open host (use_pin = false) ignores local host PIN encryption.
+        assert_eq!(effective_client_pin(false, true, "482910"), None);
+        // Encrypted host or manual IP with encryption ON uses trimmed PIN.
+        assert_eq!(effective_client_pin(true, true, " 482910 "), Some("482910"));
+        assert_eq!(effective_client_pin(true, false, "482910"), None);
+        assert_eq!(effective_client_pin(true, true, "   "), None);
     }
 
     fn icon_pixel(icon: &egui::IconData, x: usize, y: usize) -> [u8; 4] {

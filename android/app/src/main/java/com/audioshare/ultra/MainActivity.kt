@@ -51,6 +51,12 @@ class MainActivity : ComponentActivity() {
         )
         super.onCreate(savedInstanceState)
 
+        // Install the native panic hook before onStart() touches JNI (scanner).
+        runCatching {
+            val crashPath = java.io.File(filesDir, "audioshare-ultra-crash.log").absolutePath
+            AudioEngineService.nativeInstallCrashHook(crashPath)
+        }
+
         // Hardware volume rocker always adjusts media volume, even before a
         // native stream has opened an AAudio stream of its own.
         volumeControlStream = android.media.AudioManager.STREAM_MUSIC

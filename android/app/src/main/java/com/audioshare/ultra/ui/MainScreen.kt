@@ -61,6 +61,10 @@ private fun codecModeName(mode: Long): String = when (mode.toInt()) {
     else -> "Unknown"
 }
 
+private fun sendServiceAction(context: Context, intent: Intent) {
+    runCatching { context.startService(intent) }
+}
+
 /**
  * Telemetry-heavy hero. All 16 Hz snapshot reads are confined to this leaf
  * (and the two other telemetry leaves), keeping them out of the Connect/EQ/
@@ -732,7 +736,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         // adjusted the preamp while muted, so touching EQ/switches never
         // accidentally unmutes a muted stream.
         if (updatePreamp && isConnected && AudioEngineService.isLocallyMutedState) {
-            context.startService(
+            sendServiceAction(
+                context,
                 Intent(context, AudioEngineService::class.java).apply {
                     action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
                 }
@@ -750,7 +755,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 action = "ACTION_SET_DOLBY"
                 putExtra("DOLBY_ENABLED", enabled)
             }
-            context.startService(intent)
+            sendServiceAction(context, intent)
         }
     }
 
@@ -814,6 +819,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         awaitingConnectResult = true
                         connectAttemptId += 1
                         lastHandledAuthFailures = 0L
+                        telemetry = TelemetrySnapshot()
                         showPinMismatchDialog = false
                     }
                 }
@@ -850,6 +856,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         awaitingConnectResult = true
         connectAttemptId += 1
         lastHandledAuthFailures = 0L
+        telemetry = TelemetrySnapshot()
         showPinMismatchDialog = false
         prefs.edit().putString("last_host_addr", addr).apply()
         HostPinStore.savePin(prefs, addr, cleanPin)
@@ -1049,11 +1056,18 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 if (isConnected && !AudioEngineService.isStreaming) {
                     isConnected = false
                 }
+                val pollAttempt = connectAttemptId
                 val (raw, nativeAuthFailures) = withContext(Dispatchers.IO) {
                     val stats = AudioEngineService.nativeGetTelemetry()
                     val authFails = runCatching { AudioEngineService.nativeGetAuthFailures() }
                         .getOrDefault(stats.getOrElse(5) { 0L })
                     stats to authFails
+                }
+                // Drop results sampled from the outgoing ClientEngine while a
+                // reconnect / corrected-PIN swap was in flight.
+                if (pollAttempt != connectAttemptId || awaitingConnectResult) {
+                    delay(60)
+                    continue
                 }
                 vm.updateTelemetry(raw)
 
@@ -1183,7 +1197,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val i = Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
                             }
-                            context.startService(i)
+                            sendServiceAction(context, i)
                         }) {
                             Text("Unmute")
                         }
@@ -1319,7 +1333,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 val intent = Intent(context, AudioEngineService::class.java).apply {
                                     action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
                                 }
-                                context.startService(intent)
+                                sendServiceAction(context, intent)
                                 isConnected = false
                             } else {
                                 // Primary connect: omit IS_USB so the service
@@ -1446,7 +1460,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     },
                     onBtOverrideFinished = {
                         prefs.edit().putInt("bt_delay_override_ms", btDelayOverrideMs).apply()
-                        context.startService(
+                        sendServiceAction(
+                            context,
                             Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
@@ -1455,7 +1470,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     onBtAuto = {
                         btDelayOverrideMs = 0
                         prefs.edit().putInt("bt_delay_override_ms", 0).apply()
-                        context.startService(
+                        sendServiceAction(
+                            context,
                             Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
@@ -1472,6 +1488,26 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             } // End Tab 0
 
             if (selectedTab == 1) {
+                fun selectHostQualityMode(mode: Int, mediaCmd: Int) {
+                    if (!isConnected) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Connect to a host to control host mode")
+                        }
+                        return
+                    }
+                    qualityMode = mode
+                    prefs.edit().putInt("quality_mode", mode).apply()
+                    AudioEngineService.nativeSendMediaCommand(mediaCmd)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SectionEyebrow("Host Stream Profile")
+                    if (!isConnected) StatusBadge("Connect to control host")
+                }
                 // 4 intent-driven host quality cards, surfaced directly on the tab.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1482,11 +1518,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Lossless / Opus",
                         badge = "Default",
                         selected = qualityMode == 0,
-                        onClick = {
-                            qualityMode = 0
-                            prefs.edit().putInt("quality_mode", 0).apply()
-                            AudioEngineService.nativeSendMediaCommand(1)
-                        },
+                        onClick = { selectHostQualityMode(0, 1) },
                         modifier = Modifier.weight(1f)
                     )
                     ModePresetCard(
@@ -1495,10 +1527,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         badge = if (qualityMode == 4) "24-Bit" else "16-Bit",
                         selected = qualityMode == 1 || qualityMode == 4,
                         onClick = {
-                            if (qualityMode != 1 && qualityMode != 4) {
-                                qualityMode = 1
-                                prefs.edit().putInt("quality_mode", 1).apply()
-                                AudioEngineService.nativeSendMediaCommand(2)
+                            if (!isConnected || (qualityMode != 1 && qualityMode != 4)) {
+                                selectHostQualityMode(1, 2)
                             }
                         },
                         modifier = Modifier.weight(1f)
@@ -1513,11 +1543,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Best for 2.4G / BT",
                         badge = "Opus ${compressedBitrateKbps}k",
                         selected = qualityMode == 2,
-                        onClick = {
-                            qualityMode = 2
-                            prefs.edit().putInt("quality_mode", 2).apply()
-                            AudioEngineService.nativeSendMediaCommand(3)
-                        },
+                        onClick = { selectHostQualityMode(2, 3) },
                         modifier = Modifier.weight(1f)
                     )
                     ModePresetCard(
@@ -1525,11 +1551,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Through walls",
                         badge = "10 ms",
                         selected = qualityMode == 3,
-                        onClick = {
-                            qualityMode = 3
-                            prefs.edit().putInt("quality_mode", 3).apply()
-                            AudioEngineService.nativeSendMediaCommand(4)
-                        },
+                        onClick = { selectHostQualityMode(3, 4) },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -1661,7 +1683,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     StudioCard {
                         StudioFaderRow(
                             title = "Sub-Bass",
-                            freqLabel = "80 Hz",
+                            freqLabel = "90 Hz",
                             value = bassDb,
                             valueRange = -12.0f..12.0f,
                             onValueChange = {
@@ -1763,11 +1785,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             ).forEach { (idx, label) ->
                                 FilterChip(
                                     selected = qualityMode == idx,
-                                    onClick = {
-                                        qualityMode = idx
-                                        prefs.edit().putInt("quality_mode", idx).apply()
-                                        AudioEngineService.nativeSendMediaCommand(idx + 1)
-                                    },
+                                    onClick = { selectHostQualityMode(idx, idx + 1) },
                                     label = { Text(label) }
                                 )
                             }
@@ -1796,9 +1814,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     FilterChip(
                                         selected = effectiveBitrate == kbps,
                                         onClick = {
-                                            compressedBitrateKbps = kbps
-                                            prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
-                                            AudioEngineService.nativeSendMediaCommand(30 + idx)
+                                            if (!isConnected) {
+                                                scope.launch {
+                                                    snackbarHostState.showSnackbar("Connect to a host to control host mode")
+                                                }
+                                            } else {
+                                                compressedBitrateKbps = kbps
+                                                prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
+                                                AudioEngineService.nativeSendMediaCommand(30 + idx)
+                                            }
                                         },
                                         label = { Text("$kbps kbps") }
                                     )
@@ -1852,7 +1876,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_STOP_PARTY_CAST
                                     }
-                                    context.startService(stopIntent)
+                                    sendServiceAction(context, stopIntent)
                                 }
                             }
                         )
@@ -1865,7 +1889,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 muteHostSpeakerInParty = mute
                                 prefs.edit().putBoolean("party_mute_local", mute).apply()
                                 if (castPhoneInternalAudio) {
-                                    context.startService(
+                                    sendServiceAction(
+                                        context,
                                         Intent(context, AudioEngineService::class.java).apply {
                                             action = AudioEngineService.ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE
                                             putExtra("MUTE_LOCAL", mute)
@@ -1985,7 +2010,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                     action = AudioEngineService.ACTION_STOP_PHONE_MIC
                                 }
-                                context.startService(stopIntent)
+                                sendServiceAction(context, stopIntent)
                             } else {
                                 // If the user hasn't picked a PC yet and is still
                                 // on the legacy RNDIS default, auto-pick the first
@@ -2036,7 +2061,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     val toggleIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_TOGGLE_MIC_MUTE
                                     }
-                                    context.startService(toggleIntent)
+                                    sendServiceAction(context, toggleIntent)
                                 }) {
                                     Text(if (micMuted) "Unmute Mic" else "Mute Mic")
                                 }
@@ -2105,14 +2130,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 else -> sleepTimerMinutes > 30
                             },
                             onClick = {
-                                runCatching {
-                                    context.startService(
-                                        Intent(context, AudioEngineService::class.java).apply {
-                                            action = AudioEngineService.ACTION_SET_SLEEP_TIMER
-                                            putExtra("MINUTES", mins)
-                                        }
-                                    )
-                                }
+                                sendServiceAction(
+                                    context,
+                                    Intent(context, AudioEngineService::class.java).apply {
+                                        action = AudioEngineService.ACTION_SET_SLEEP_TIMER
+                                        putExtra("MINUTES", mins)
+                                    }
+                                )
                             },
                             label = { Text(lbl) }
                         )
