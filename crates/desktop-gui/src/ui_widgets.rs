@@ -33,9 +33,9 @@ impl Palette {
             Self {
                 // Tonal layering: soft 8% white hairline rims instead of
                 // heavy blue-gray outlines (calm, borderless studio look).
-                card_fill: egui::Color32::from_rgb(16, 22, 36),
+                card_fill: egui::Color32::from_rgb(14, 20, 32),
                 card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20),
-                inner_fill: egui::Color32::from_rgb(10, 14, 23),
+                inner_fill: egui::Color32::from_rgb(8, 12, 20),
                 inner_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
                 muted_text: egui::Color32::from_rgb(139, 154, 181),
                 accent: egui::Color32::from_rgb(37, 99, 235),
@@ -245,7 +245,21 @@ pub fn studio_card<R>(
         .inner_margin(egui::Margin::same(18))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            add_contents(ui)
+            let r = add_contents(ui);
+            if dark_mode {
+                let rect = ui.max_rect();
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(rect.left() + 12.0, rect.top() - 17.5),
+                        egui::pos2(rect.right() - 12.0, rect.top() - 17.5),
+                    ],
+                    egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                    ),
+                );
+            }
+            r
         })
 }
 
@@ -565,31 +579,53 @@ pub fn drawer_header(
     }
 }
 
-/// 24-segment studio LED VU meter with a decaying white peak-hold indicator.
-pub fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8, peak_hold_pct: f32) {
-    let segments = 24usize;
-    let desired = egui::vec2(216.0, 16.0);
-    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        egui::CornerRadius::same(4),
-        egui::Color32::from_rgb(10, 13, 20),
-    );
-
-    let gap = 2.0f32;
-    let seg_w = (rect.width() - gap * (segments as f32 + 1.0)) / (segments as f32);
-    let active_segs = ((vu_pct as usize) * segments).div_ceil(100);
+fn vu_segment_counts(vu_pct: u8, peak_hold_pct: f32, segments: usize) -> (usize, Option<usize>) {
+    let clamped_vu = (vu_pct as usize).min(100);
+    let active_segs = (clamped_vu * segments).div_ceil(100).min(segments);
     let hold_seg = if peak_hold_pct > 2.0 {
+        let clamped_peak = peak_hold_pct.clamp(0.0, 100.0) as usize;
         Some(
-            (((peak_hold_pct as usize) * segments)
-                .div_ceil(100))
-            .saturating_sub(1)
-            .min(segments - 1),
+            (clamped_peak * segments)
+                .div_ceil(100)
+                .saturating_sub(1)
+                .min(segments - 1),
         )
     } else {
         None
     };
+    (active_segs, hold_seg)
+}
+
+fn quantize_fader_db(t: f32, min: f32, max: f32) -> f32 {
+    let span = (max - min).max(1e-4);
+    (((min + t.clamp(0.0, 1.0) * span) * 2.0).round() * 0.5).clamp(min, max)
+}
+
+/// 32-segment precision studio LED VU meter with glow bloom, peak-hold LED, and dB scale.
+pub fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8, peak_hold_pct: f32) {
+    let segments = 32usize;
+    let width = (ui.available_width() - 48.0).clamp(180.0, 280.0);
+    let (full_rect, _) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::hover());
+    let rect = egui::Rect::from_min_size(full_rect.min, egui::vec2(width, 16.0));
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Color32::from_rgb(7, 10, 17),
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    let gap = 2.0f32;
+    let seg_w = (rect.width() - gap * (segments as f32 + 1.0)) / (segments as f32);
+    let (active_segs, hold_seg) = vu_segment_counts(vu_pct, peak_hold_pct, segments);
 
     for i in 0..segments {
         let x = rect.left() + gap + (i as f32) * (seg_w + gap);
@@ -600,17 +636,48 @@ pub fn draw_led_vu_meter(ui: &mut egui::Ui, vu_pct: u8, peak_hold_pct: f32) {
         let color = if hold_seg == Some(i) && i >= active_segs {
             egui::Color32::from_rgb(241, 245, 249) // Crisp peak-hold LED
         } else if i < active_segs {
-            if i >= 21 {
+            if i >= 28 {
                 egui::Color32::from_rgb(239, 68, 68)
-            } else if i >= 16 {
+            } else if i >= 22 {
                 egui::Color32::from_rgb(245, 158, 11)
             } else {
                 egui::Color32::from_rgb(16, 185, 129)
             }
         } else {
-            egui::Color32::from_rgb(26, 33, 46)
+            egui::Color32::from_rgb(22, 30, 44)
         };
+        if i < active_segs {
+            painter.rect_filled(
+                seg_rect.expand(1.0),
+                egui::CornerRadius::same(2),
+                color.linear_multiply(0.28),
+            );
+        }
         painter.rect_filled(seg_rect, egui::CornerRadius::same(2), color);
+    }
+    let tick_y = rect.bottom() + 2.0;
+    let tick_col = egui::Color32::from_rgb(100, 116, 139);
+    for (frac, label) in [
+        (0.0f32, "-48"),
+        (0.33, "-24"),
+        (0.62, "-12"),
+        (0.82, "-6"),
+        (1.0, "0dB"),
+    ] {
+        let align = if frac <= 0.01 {
+            egui::Align2::LEFT_TOP
+        } else if frac >= 0.99 {
+            egui::Align2::RIGHT_TOP
+        } else {
+            egui::Align2::CENTER_TOP
+        };
+        painter.text(
+            egui::pos2(rect.left() + frac * rect.width(), tick_y),
+            align,
+            label,
+            egui::FontId::monospace(8.5),
+            tick_col,
+        );
     }
 }
 
@@ -671,13 +738,81 @@ pub fn studio_fader_row(
                 }
             });
         });
-        ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(140.0);
-        if ui
-            .add(egui::Slider::new(value, range).show_value(false).trailing_fill(true))
-            .changed()
-        {
+        let min = *range.start();
+        let max = *range.end();
+        let span = (max - min).max(1e-4);
+        let track_w = ui.available_width().max(140.0);
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(track_w, 20.0), egui::Sense::click_and_drag());
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((pos.x - (rect.left() + 8.0)) / (rect.width() - 16.0).max(1.0))
+                    .clamp(0.0, 1.0);
+                let next = quantize_fader_db(t, min, max);
+                if (next - *value).abs() > 1e-4 {
+                    *value = next;
+                    changed = true;
+                }
+            }
+        }
+        if resp.double_clicked() && min <= 0.0 && max >= 0.0 {
+            *value = 0.0;
             changed = true;
         }
+        let painter = ui.painter();
+        let rail = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.center().y - 2.5),
+            egui::pos2(rect.right() - 8.0, rect.center().y + 2.5),
+        );
+        painter.rect_filled(
+            rail,
+            egui::CornerRadius::same(3),
+            if dark_mode {
+                egui::Color32::from_rgb(20, 27, 40)
+            } else {
+                egui::Color32::from_rgb(218, 226, 238)
+            },
+        );
+        let zero_t = ((0.0 - min) / span).clamp(0.0, 1.0);
+        let val_t = ((*value - min) / span).clamp(0.0, 1.0);
+        let zero_x = rail.left() + zero_t * rail.width();
+        let val_x = rail.left() + val_t * rail.width();
+        let fill = egui::Rect::from_min_max(
+            egui::pos2(zero_x.min(val_x), rail.top()),
+            egui::pos2(zero_x.max(val_x), rail.bottom()),
+        );
+        painter.rect_filled(
+            fill,
+            egui::CornerRadius::same(3),
+            egui::Color32::from_rgb(59, 130, 246),
+        );
+        // Center 0 dB hairline detent
+        if min < 0.0 && max > 0.0 {
+            painter.line_segment(
+                [
+                    egui::pos2(zero_x, rail.top() - 3.0),
+                    egui::pos2(zero_x, rail.bottom() + 3.0),
+                ],
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(100, 116, 139)),
+            );
+        }
+        let knob_r = if resp.hovered() || resp.dragged() {
+            7.5
+        } else {
+            6.5
+        };
+        let knob_center = egui::pos2(val_x, rect.center().y);
+        painter.circle_filled(
+            knob_center,
+            knob_r + 2.0,
+            egui::Color32::from_rgba_unmultiplied(59, 130, 246, 45),
+        );
+        painter.circle_filled(knob_center, knob_r, egui::Color32::from_rgb(241, 245, 249));
+        painter.circle_stroke(
+            knob_center,
+            knob_r,
+            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(37, 99, 235)),
+        );
     });
     ui.add_space(2.0);
     changed
@@ -799,5 +934,34 @@ pub fn draw_qr_code(ui: &mut egui::Ui, uri: &str, cache: &mut QrTextureCache) {
         const MODULE_PX: f32 = 5.0;
         let size = tex.size_vec2() * MODULE_PX;
         ui.image((tex.id(), size));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dark_palette_obsidian_surfaces() {
+        let p = Palette::for_mode(true);
+        assert_eq!(p.card_fill, egui::Color32::from_rgb(14, 20, 32));
+        assert_eq!(p.inner_fill, egui::Color32::from_rgb(8, 12, 20));
+    }
+
+    #[test]
+    fn test_vu_segment_counts_32_seg_bounds_and_peak_hold() {
+        assert_eq!(vu_segment_counts(0, 0.0, 32), (0, None));
+        assert_eq!(vu_segment_counts(50, 75.0, 32), (16, Some(23)));
+        assert_eq!(vu_segment_counts(100, 120.0, 32), (32, Some(31)));
+        assert_eq!(vu_segment_counts(200, -5.0, 32), (32, None));
+    }
+
+    #[test]
+    fn test_quantize_fader_db_half_db_steps_and_clamp() {
+        assert!((quantize_fader_db(0.0, -12.0, 12.0) - (-12.0)).abs() < 1e-6);
+        assert!((quantize_fader_db(0.5, -12.0, 12.0) - 0.0).abs() < 1e-6);
+        assert!((quantize_fader_db(0.51, -12.0, 12.0) - 0.0).abs() < 1e-6);
+        assert!((quantize_fader_db(0.525, -12.0, 12.0) - 0.5).abs() < 1e-6);
+        assert!((quantize_fader_db(1.2, -12.0, 24.0) - 24.0).abs() < 1e-6);
     }
 }

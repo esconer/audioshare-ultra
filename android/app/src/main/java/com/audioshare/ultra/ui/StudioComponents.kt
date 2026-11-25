@@ -30,21 +30,31 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.sin
 
 /** Studio palette: calm tonal layering instead of heavy 1dp blue-gray outlines. */
 object StudioColors {
-    val Canvas = Color(0xFF070A10)
-    val CardBg = Color(0xFF101624)
+    val Canvas = Color(0xFF06090F)
+    val CardBg = Color(0xFF0E1420)
+    val CardTop = Color(0xFF131B2B)
     val CardBorder = Color(0x18FFFFFF) // 9% white hairline
-    val TileBg = Color(0xFF0A0E17)
+    val TileBg = Color(0xFF080C14)
     val TileBorder = Color(0x12FFFFFF)
+    val HairlineTop = Color(0x26FFFFFF)
+    val HairlineBottom = Color(0x08FFFFFF)
     val Accent = Color(0xFF4F8BFF)
     val AccentDeep = Color(0xFF162847)
     val AccentSoft = Color(0xFF93C5FD)
@@ -77,11 +87,20 @@ fun StudioCard(
     borderColor: Color = StudioColors.CardBorder,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(22.dp),
-        color = StudioColors.CardBg,
-        border = BorderStroke(1.dp, borderColor)
+    val shape = RoundedCornerShape(20.dp)
+    val rimBrush = if (borderColor == StudioColors.CardBorder) {
+        Brush.verticalGradient(listOf(StudioColors.HairlineTop, StudioColors.HairlineBottom))
+    } else {
+        Brush.verticalGradient(listOf(borderColor, borderColor.copy(alpha = 0.25f)))
+    }
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(
+                Brush.verticalGradient(listOf(StudioColors.CardTop, StudioColors.CardBg))
+            )
+            .border(1.dp, rimBrush, shape)
     ) {
         Column(
             modifier = Modifier.padding(18.dp),
@@ -112,19 +131,29 @@ fun HeroAudioStage(
         modifier = modifier
             .fillMaxWidth()
             .clip(shape)
-            .background(StudioColors.CardBg)
+            .background(
+                Brush.verticalGradient(listOf(Color(0xFF121A2A), Color(0xFF0B101B)))
+            )
             .drawBehind {
                 drawRect(
                     brush = Brush.radialGradient(
                         colors = listOf(
-                            glowColor.copy(alpha = 0.14f + 0.14f * smoothEnergy),
+                            glowColor.copy(alpha = 0.16f + 0.18f * smoothEnergy),
+                            glowColor.copy(alpha = 0.04f),
                             Color.Transparent
                         ),
-                        radius = 520f
+                        center = Offset(size.width * 0.22f, size.height * 0.18f),
+                        radius = (size.width * 0.85f).coerceAtLeast(1f)
                     )
                 )
             }
-            .border(1.dp, glowColor.copy(alpha = 0.24f), shape)
+            .border(
+                1.dp,
+                Brush.verticalGradient(
+                    listOf(glowColor.copy(alpha = 0.40f), StudioColors.HairlineBottom)
+                ),
+                shape
+            )
     ) {
         Column(
             modifier = Modifier.padding(20.dp),
@@ -134,39 +163,151 @@ fun HeroAudioStage(
     }
 }
 
-/** Fluid 60 FPS spring-smoothed symmetric audio-level bar visualizer. */
+/** Precision studio LED bar visualizer with calibrated headroom zones and scale. */
 @Composable
 fun FluidAudioVisualizer(vuPct: Int, isLive: Boolean, modifier: Modifier = Modifier) {
     val smoothLevel by animateFloatAsState(
-        targetValue = if (isLive) (vuPct / 100f).coerceIn(0.04f, 1f) else 0.04f,
+        targetValue = if (isLive) (vuPct / 100f).coerceIn(0.02f, 1f) else 0.0f,
         animationSpec = spring(dampingRatio = 0.72f, stiffness = Spring.StiffnessMedium),
         label = "vuSmooth"
     )
-    Canvas(
+    Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(StudioColors.TileBg)
+                .border(1.dp, StudioColors.TileBorder, RoundedCornerShape(10.dp))
+                .padding(horizontal = 8.dp, vertical = 7.dp)
+        ) {
+            Canvas(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(22.dp)
+            ) {
+                val segments = 32
+                val gap = 3.dp.toPx()
+                val segW = ((size.width - gap * (segments - 1)) / segments).coerceAtLeast(2f)
+                val active = (smoothLevel * segments).toInt().coerceIn(0, segments)
+                val midY = size.height / 2f
+                for (i in 0 until segments) {
+                    val lit = isLive && i < active
+                    val frac = i.toFloat() / (segments - 1).coerceAtLeast(1)
+                    val wave = if (lit) 0.78f + 0.22f * sin(i * 0.7f + smoothLevel * 8f) else 0.55f
+                    val segH = (size.height * wave).coerceAtLeast(6.dp.toPx())
+                    val color = when {
+                        !lit -> Color(0xFF182234)
+                        frac >= 0.88f -> Color(0xFFEF4444)
+                        frac >= 0.70f -> Color(0xFFF59E0B)
+                        else -> Color(0xFF10B981)
+                    }
+                    drawRoundRect(
+                        color = color,
+                        topLeft = Offset(i * (segW + gap), midY - segH / 2f),
+                        size = Size(segW, segH),
+                        cornerRadius = CornerRadius(segW / 2f, segW / 2f)
+                    )
+                }
+            }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            listOf("-48", "-24", "-12", "-6", "0 dB").forEach { tick ->
+                Text(
+                    text = tick,
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                    fontFamily = FontFamily.Monospace,
+                    color = StudioColors.Muted.copy(alpha = 0.7f)
+                )
+            }
+        }
+    }
+}
+
+/** Live log-frequency 3-band parametric EQ response preview (90 Hz / 2.5 kHz / 10 kHz). */
+@Composable
+fun ParametricEqCurveCanvas(
+    bassDb: Float,
+    vocalDb: Float,
+    trebleDb: Float,
+    modifier: Modifier = Modifier
+) {
+    val shape = RoundedCornerShape(12.dp)
+    Box(
         modifier = modifier
             .fillMaxWidth()
-            .height(28.dp)
+            .height(74.dp)
+            .clip(shape)
+            .background(StudioColors.TileBg)
+            .border(1.dp, StudioColors.TileBorder, shape)
+            .padding(horizontal = 8.dp, vertical = 6.dp)
     ) {
-        val bars = 28
-        val gap = 4.dp.toPx()
-        val barW = ((size.width - gap * (bars - 1)) / bars).coerceAtLeast(2f)
-        val center = (bars - 1) / 2f
-        for (i in 0 until bars) {
-            val dist = abs(i - center) / center // 0 at center, 1 at edges
-            val envelope = (1f - dist * dist * 0.75f).coerceIn(0.18f, 1f)
-            val ripple = 0.85f + 0.15f * sin(i * 1.3f + smoothLevel * 9f)
-            val h = (size.height * smoothLevel * envelope * ripple).coerceAtLeast(4.dp.toPx())
-            val y = (size.height - h) / 2f
-            val color = when {
-                !isLive -> Color(0xFF1F2A3E)
-                smoothLevel > 0.88f && dist < 0.35f -> Color(0xFFF59E0B)
-                else -> Color(0xFF34D399).copy(alpha = 0.45f + 0.55f * envelope)
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val midY = size.height / 2f
+            val gridColor = Color(0xFF1E293B)
+            drawLine(gridColor, Offset(0f, midY), Offset(size.width, midY), strokeWidth = 1.dp.toPx())
+            drawLine(
+                gridColor.copy(alpha = 0.55f),
+                Offset(0f, size.height * 0.25f),
+                Offset(size.width, size.height * 0.25f),
+                strokeWidth = 0.75.dp.toPx()
+            )
+            drawLine(
+                gridColor.copy(alpha = 0.55f),
+                Offset(0f, size.height * 0.75f),
+                Offset(size.width, size.height * 0.75f),
+                strokeWidth = 0.75.dp.toPx()
+            )
+
+            val logMin = ln(20f)
+            val logMax = ln(20000f)
+            val log90 = ln(90f)
+            val log2500 = ln(2500f)
+            val log10k = ln(10000f)
+
+            fun gainAtLogFreq(lf: Float): Float {
+                val d1 = (lf - log90) / 0.85f
+                val d2 = (lf - log2500) / 0.75f
+                val d3 = (lf - log10k) / 0.85f
+                return (bassDb * exp(-d1 * d1) + vocalDb * exp(-d2 * d2) + trebleDb * exp(-d3 * d3))
+                    .coerceIn(-12f, 12f)
             }
-            drawRoundRect(
-                color = color,
-                topLeft = Offset(i * (barW + gap), y),
-                size = Size(barW, h),
-                cornerRadius = CornerRadius(barW / 2f, barW / 2f)
+
+            val steps = 64
+            val strokePath = Path()
+            val fillPath = Path()
+            for (i in 0..steps) {
+                val frac = i.toFloat() / steps
+                val x = frac * size.width
+                val lf = logMin + frac * (logMax - logMin)
+                val db = gainAtLogFreq(lf)
+                val y = midY - (db / 12f) * (size.height * 0.42f)
+                if (i == 0) {
+                    strokePath.moveTo(x, y)
+                    fillPath.moveTo(x, midY)
+                    fillPath.lineTo(x, y)
+                } else {
+                    strokePath.lineTo(x, y)
+                    fillPath.lineTo(x, y)
+                }
+            }
+            fillPath.lineTo(size.width, midY)
+            fillPath.close()
+
+            drawPath(
+                path = fillPath,
+                brush = Brush.verticalGradient(
+                    listOf(StudioColors.Accent.copy(alpha = 0.28f), Color.Transparent)
+                )
+            )
+            drawPath(
+                path = strokePath,
+                color = StudioColors.AccentSoft,
+                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
             )
         }
     }
@@ -251,9 +392,13 @@ fun ModePresetCard(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val haptic = LocalHapticFeedback.current
     Surface(
-        modifier = modifier.clickable { onClick() },
-        shape = RoundedCornerShape(12.dp),
+        modifier = modifier.clickable {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            onClick()
+        },
+        shape = RoundedCornerShape(14.dp),
         color = if (selected) Color(0xFF172544) else StudioColors.TileBg,
         border = BorderStroke(
             if (selected) 1.5.dp else 1.dp,
@@ -383,6 +528,7 @@ fun StudioFaderRow(
     onValueChange: (Float) -> Unit,
     onValueChangeFinished: (() -> Unit)? = null
 ) {
+    val haptic = LocalHapticFeedback.current
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -399,6 +545,7 @@ fun StudioFaderRow(
                 containerColor = if (boosted) StudioColors.AccentDeep else Color(0xFF1A2436),
                 contentColor = if (boosted) StudioColors.AccentSoft else StudioColors.Muted,
                 onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                     onValueChange(0f)
                     onValueChangeFinished?.invoke()
                 }

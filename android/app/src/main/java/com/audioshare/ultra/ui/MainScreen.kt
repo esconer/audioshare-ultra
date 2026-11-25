@@ -19,7 +19,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.rememberScrollState
@@ -79,7 +78,12 @@ private fun HeroStageSection(
     hostAddress: String,
     sleepRemainingMins: Int,
     gamingLock: Boolean,
-    latencyDebug: Boolean
+    latencyDebug: Boolean,
+    isLocallyMuted: Boolean,
+    onPrev: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onToggleMute: () -> Unit
 ) {
     val t = telemetry()
     val heroGlow = when {
@@ -161,29 +165,57 @@ private fun HeroStageSection(
         if (isConnected) {
             val vuNow = t.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
             FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
-        }
-        if (isConnected) {
+            val estMs = t.getOrElse(20) { 0L } / 10.0
+            val btMs = t.getOrElse(17) { 0L }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    .padding(top = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                StatusBadge("Pkts: ${t[0]}")
-                StatusBadge("FEC: ${t[2]}")
-                StatusBadge("Drift: ${t[4]} ppm")
-                if (groupDelay > 0) {
-                    StatusBadge("Sync: +${groupDelay}ms")
-                }
-                if (latencyDebug) {
-                    val estMs = t.getOrElse(20) { 0L } / 10.0
-                    val targetMs = t.getOrElse(14) { 0L } / 1000.0
-                    val bufferedMs = t.getOrElse(15) { 0L } / 1000.0
-                    StatusBadge(
-                        text = "Est ${"%.1f".format(estMs)}ms • FIFO ${"%.1f".format(bufferedMs)}/${"%.1f".format(targetMs)}ms",
-                        containerColor = Color(0xFF14532D),
-                        contentColor = Color(0xFF86EFAC)
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        text = "${"%.1f".format(estMs)} ms",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
+                    Text(
+                        text = buildString {
+                            append(if (btMs > 0) "BT A2DP ${btMs}ms" else "Est. Latency")
+                            if (groupDelay > 0) append(" • Sync +${groupDelay}ms")
+                            if (latencyDebug) append(" • Drift ${t[4]}ppm")
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudioColors.Muted
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    FilledTonalIconButton(onClick = onPrev, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.SkipPrevious, "Previous", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(onClick = onPlayPause, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.PlayArrow, "Play / Pause", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(onClick = onNext, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.SkipNext, "Next", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(
+                        onClick = onToggleMute,
+                        modifier = Modifier.size(36.dp),
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = if (isLocallyMuted) StudioColors.WarnBg else StudioColors.AccentDeep
+                        )
+                    ) {
+                        Icon(
+                            if (isLocallyMuted) Icons.Rounded.VolumeOff else Icons.Rounded.VolumeUp,
+                            if (isLocallyMuted) "Unmute" else "Mute",
+                            tint = if (isLocallyMuted) StudioColors.WarnFg else StudioColors.AccentSoft,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1174,7 +1206,16 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 hostAddress = hostAddress,
                 sleepRemainingMins = sleepTimerMinutes,
                 gamingLock = gamingLock,
-                latencyDebug = latencyDebug
+                latencyDebug = latencyDebug,
+                isLocallyMuted = isLocallyMuted,
+                onPrev = { AudioEngineService.nativeSendMediaCommand(12) },
+                onPlayPause = { AudioEngineService.nativeSendMediaCommand(10) },
+                onNext = { AudioEngineService.nativeSendMediaCommand(11) },
+                onToggleMute = {
+                    sendServiceAction(context, Intent(context, AudioEngineService::class.java).apply {
+                        action = "ACTION_TOGGLE_MUTE"
+                    })
+                }
             )
 
             // Surface local speaker mute in-app (e.g. after headphone unplug or
@@ -1681,6 +1722,11 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
                 AnimatedVisibility(visible = showEqDrawer) {
                     StudioCard {
+                        ParametricEqCurveCanvas(
+                            bassDb = bassDb,
+                            vocalDb = vocalDb,
+                            trebleDb = trebleDb
+                        )
                         StudioFaderRow(
                             title = "Sub-Bass",
                             freqLabel = "90 Hz",
