@@ -1760,9 +1760,24 @@ impl HostTelemetry {
             .load(Ordering::Relaxed)
             .max(bt);
         let packet_ms = (self.tx_packet_interval_us.load(Ordering::Relaxed) / 1000) as u16;
+        // Include Linux PipeWire/WASAPI capture buffering and Opus RLD encoder
+        // lookahead so the host's ProcessLatency offset covers the full
+        // capture-to-ear pipeline.
+        let cap_ms = ((self.capture_buffer_us.load(Ordering::Relaxed) / 1000) as u16).min(30);
+        let codec_ms = if self.active_codec_mode.load(Ordering::Relaxed)
+            == audioshare_protocol::wire::CodecMode::OpusRld as u8
+        {
+            3
+        } else {
+            0
+        };
         // `downstream` already includes BT delay + excess FIFO above the 10 ms
-        // base floor. Add the base floor and this packet's framing interval.
-        downstream.saturating_add(10).saturating_add(packet_ms)
+        // base floor. Add the base floor, framing, capture backlog, and codec lookahead.
+        downstream
+            .saturating_add(10)
+            .saturating_add(packet_ms)
+            .saturating_add(cap_ms)
+            .saturating_add(codec_ms)
     }
 }
 
@@ -4725,8 +4740,20 @@ mod tests {
         t.max_client_downstream_delay_ms
             .store(185, Ordering::Relaxed);
         t.tx_packet_interval_us.store(5_000, Ordering::Relaxed);
-        // 185 downstream + 10 ms base floor + 5 ms packetization.
+        // 185 downstream + 10 ms base floor + 5 ms packetization + 0 cap + 0 lossless.
         assert_eq!(t.video_lipsync_offset_ms(), 200);
+
+        t.capture_buffer_us.store(7_500, Ordering::Relaxed);
+        t.active_codec_mode.store(
+            audioshare_protocol::wire::CodecMode::OpusRld as u8,
+            Ordering::Relaxed,
+        );
+        // + 7 ms capture buffering + 3 ms Opus RLD lookahead.
+        assert_eq!(t.video_lipsync_offset_ms(), 210);
+
+        t.capture_buffer_us.store(50_000, Ordering::Relaxed);
+        // Capture contribution is capped at 30 ms.
+        assert_eq!(t.video_lipsync_offset_ms(), 233);
     }
 
     #[test]

@@ -229,6 +229,14 @@ impl ClockDriftResampler {
         }
     }
 
+    /// Clear the in-progress 500 ms error window after a stall/PLC event while
+    /// preserving the learned steady-state crystal offset (`integral_err`, `ratio`).
+    #[inline]
+    pub fn reset_clock_window(&mut self) {
+        self.err_sum_window = 0.0;
+        self.window_ticks = 0;
+    }
+
     /// Observe current queue depth every 2.5ms subframe.
     /// Uses a 200-subframe (500ms) error-relative windowed mean so periodic HAL
     /// bursts cancel out while tracking both positive and negative crystal drift.
@@ -245,8 +253,8 @@ impl ClockDriftResampler {
 
             // Hold the learned crystal offset inside the deadband rather than
             // decaying it (the old `*= 0.9` erased the offset every 500 ms).
-            // Anti-windup clamps per-window steps; +/-100.0 gives full
-            // +/-500 ppm steady-state integral authority for real crystals.
+            // Anti-windup clamps per-window steps; +/-80.0 gives +/-400 ppm
+            // steady-state integral authority for real crystals.
             if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
                 let step = err.clamp(-1.0, 1.0) * 0.6;
                 self.integral_err = (self.integral_err + step).clamp(-80.0, 80.0);

@@ -391,6 +391,30 @@ impl ZeroJitterSequencer {
         // ramp the attenuation from the previous frame's value to this
         // frame's target instead of applying a constant per-frame step.
         self.consecutive_plc_count += 1;
+        // Quiet fade-outs / between-song silence (<-48 dBFS): pitch autocorrelation
+        // on near-zero noise locks onto arbitrary short lags (e.g. 48 frames = 1 kHz)
+        // and produces metallic buzzing. Ramp cleanly to digital silence instead.
+        let recent_peak = self.history[(HISTORY_FRAMES - SUBFRAME_FRAMES) * 2..]
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        if recent_peak < 0.004 {
+            let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
+            let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+            for i in 0..SUBFRAME_FRAMES {
+                let w = if i < CROSSFADE_FRAMES {
+                    let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
+                    0.5 * (1.0 + (alpha * std::f32::consts::PI).cos())
+                } else {
+                    0.0
+                };
+                out[i * 2] = last_l * w;
+                out[i * 2 + 1] = last_r * w;
+            }
+            self.plc_recovery_tail.fill(0.0);
+            self.last_pop_was_fec = false;
+            self.append_to_history(out);
+            return STATUS_EMPTY;
+        }
         // `history` already holds the previously attenuated PLC frames, so a
         // compounding 0.90^k collapses volume quadratically (0.90^(k(k+1)/2)).
         // Apply a gentle single-step decay instead: frame 1 fades 1.0 -> 0.90,
@@ -784,6 +808,34 @@ mod tests {
         assert!(
             peak <= 0.95 + 1e-5,
             "convex declick overshot input peak: {peak}"
+        );
+    }
+
+    #[test]
+    fn test_wsola_plc_ramps_quiet_tails_to_silence() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut quiet_tail = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        // -60 dBFS (0.001) quiet fade-out / reverb tail.
+        for i in 0..SUBFRAME_FRAMES {
+            let v = ((i as f32) * std::f32::consts::TAU * 1000.0 / 48_000.0).sin() * 0.001;
+            quiet_tail[i * 2] = v;
+            quiet_tail[i * 2 + 1] = v;
+        }
+        for s in 0..3u16 {
+            assert!(seq.push_primary(s, &quiet_tail));
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+
+        let mut plc_out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(3, &mut plc_out), STATUS_EMPTY);
+        // After the 32-frame raised-cosine ramp, trailing samples must be exact digital zero
+        // with no 1 kHz pitch-loop oscillation.
+        assert!(
+            plc_out[CROSSFADE_FRAMES * 2..]
+                .iter()
+                .all(|&s| s == 0.0),
+            "quiet-tail PLC leaked non-zero audio after ramp"
         );
     }
 }

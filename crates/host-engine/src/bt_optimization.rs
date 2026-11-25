@@ -32,7 +32,7 @@ impl RemoteMediaCommand {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LinuxSinkInfo {
-    /// Numeric PipeWire node ID (`object.id`), required by `pw-cli s <id> Props`.
+    /// Numeric PipeWire node ID (`object.id`), required by `pw-cli s <id> ProcessLatency`.
     node_id: Option<String>,
     /// PulseAudio/PipeWire card index (`Card: N`), required by `pactl set-port-latency-offset`.
     card_idx: Option<String>,
@@ -155,10 +155,10 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
             }
         }
     }
-    let prop = format!("{{ latencyOffsetNsec = {} }}", offset_ns);
+    let prop = format!("{{ ns = {} }}", offset_ns);
     let us_str = offset_us.to_string();
     for sink in &targets {
-        // Apply EITHER native PipeWire node latency offset OR PulseAudio port
+        // Apply EITHER native PipeWire node ProcessLatency OR PulseAudio port
         // offset — never both sequentially, because PipeWire-Pulse exposes both
         // `object.id` and `Card`/`Active Port`, and applying both stacks them
         // into a 2x video lip-sync offset. On reset (`bt_delay_ms == 0`), clear
@@ -166,7 +166,7 @@ fn apply_linux_lipsync_now(bt_delay_ms: u16) {
         let mut pw_applied = false;
         if let Some(ref node_id) = sink.node_id {
             pw_applied = Command::new("pw-cli")
-                .args(["s", node_id, "Props", &prop])
+                .args(["s", node_id, "ProcessLatency", &prop])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);

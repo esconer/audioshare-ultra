@@ -283,7 +283,7 @@ private fun TelemetryDrawerSection(
 
             if (btEarbudsDetected) {
                 val activeBtMs = t.getOrElse(17) { 185L }
-                    .toInt().coerceIn(40, 350)
+                    .toInt().coerceIn(40, 450)
                 StatusBadge(
                     text = "Bluetooth Audio Active: Reporting +${activeBtMs}ms A/V Sync Offset to PC",
                     containerColor = Color(0xFF14532D),
@@ -302,9 +302,9 @@ private fun TelemetryDrawerSection(
                 }
                 Slider(
                     value = (if (btDelayOverrideMs == 0) activeBtMs else btDelayOverrideMs).toFloat(),
-                    onValueChange = { onBtOverrideChanged(it.toInt().coerceIn(40, 350)) },
+                    onValueChange = { onBtOverrideChanged(it.toInt().coerceIn(40, 450)) },
                     onValueChangeFinished = onBtOverrideFinished,
-                    valueRange = 40f..350f
+                    valueRange = 40f..450f
                 )
             }
 

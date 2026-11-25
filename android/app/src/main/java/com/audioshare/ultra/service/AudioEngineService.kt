@@ -816,7 +816,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         val reportedDelayMs = if (fallbackBtDelayMs > 0) {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val manualOverride = prefs.getInt("bt_delay_override_ms", 0)
-            if (manualOverride in 40..350) {
+            if (manualOverride in 40..450) {
                 // Live BT Lip-Sync Calibration slider value wins over the
                 // estimate for any active Bluetooth route (A2DP, BLE Audio, SCO).
                 manualOverride
@@ -827,7 +827,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     val m = am.javaClass.getMethod("getOutputLatency", Int::class.javaPrimitiveType)
                     (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
                 }.getOrDefault(0)
-                if (avdtpMs in 35..350) avdtpMs else 185
+                if (avdtpMs in 35..450) avdtpMs else 185
             } else {
                 fallbackBtDelayMs
             }
