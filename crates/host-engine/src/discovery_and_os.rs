@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "windows")]
 use std::io::BufRead;
 use std::io::{Read, Write};
@@ -391,6 +391,25 @@ impl Drop for DiscoveryScanner {
     }
 }
 
+/// Serial numbers that still need `adb reverse` on this poll.
+///
+/// A newly attached device is always armed immediately, even while another
+/// device is streaming, so multi-phone setups keep working. The periodic
+/// re-arm is only allowed when no ADB TCP session is active: running
+/// `adb reverse` every 10 s during playback injects control traffic into the
+/// same USB/ADB link that carries the audio tunnel.
+fn adb_reverse_targets<'a>(
+    serials: &'a [String],
+    armed: &HashSet<String>,
+    periodic: bool,
+) -> Vec<&'a str> {
+    serials
+        .iter()
+        .filter(|serial| periodic || !armed.contains(serial.as_str()))
+        .map(String::as_str)
+        .collect()
+}
+
 pub struct AdbUsbWatcher {
     running: Arc<AtomicBool>,
     pub usb_device_connected: Arc<AtomicBool>,
@@ -408,12 +427,16 @@ impl AdbUsbWatcher {
         // Shared across every accepted ADB reverse session so a flood of
         // connects cannot spawn unbounded reader/writer thread pairs.
         let active_sessions = Arc::new(AtomicUsize::new(0));
+        let watcher_sessions = Arc::clone(&active_sessions);
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-adb-watcher".into())
             .spawn(move || {
-                let mut was_connected = false;
                 let mut last_reverse: Option<Instant> = None;
+                // Serials whose reverse tunnel was armed since they attached.
+                // Cleared when `adb devices` goes empty (unplug/daemon restart)
+                // so a reattached device is armed immediately.
+                let mut armed_serials: HashSet<String> = HashSet::new();
                 while run_clone.load(Ordering::Relaxed) {
                     // Enumerate all attached ADB devices in the "device" state so
                     // `adb reverse` still succeeds when multiple phones or an
@@ -448,27 +471,34 @@ impl AdbUsbWatcher {
 
                     // `adb reverse` is not durable across a USB cable yank or
                     // an ADB daemon restart: the tunnel silently disappears
-                    // while `adb devices` still reports a device. Re-arm it
-                    // on the initial attach (fast path) and then every 10 s
-                    // for as long as the device stays attached.
+                    // while `adb devices` still reports a device. Re-arm on
+                    // initial attach, and periodically only while no session
+                    // is active so discovery never competes with a live
+                    // audio tunnel.
                     if has_device {
-                        let initial_attach = !was_connected;
-                        let periodic = last_reverse
-                            .map(|t| t.elapsed() >= Duration::from_secs(10))
-                            .unwrap_or(false);
-                        if initial_attach || periodic {
+                        // Skip the 10 s re-arm while a tunnel is live: the
+                        // forward is already working, and extra `adb reverse`
+                        // calls compete with the audio stream for USB/ADB.
+                        // New devices are still armed immediately below.
+                        let periodic = watcher_sessions.load(Ordering::Relaxed) == 0
+                            && last_reverse
+                                .map(|t| t.elapsed() >= Duration::from_secs(10))
+                                .unwrap_or(true);
+                        let targets = adb_reverse_targets(&serials, &armed_serials, periodic);
+                        if !targets.is_empty() {
                             let port_spec = format!("tcp:{}", port);
-                            for serial in &serials {
+                            for serial in targets {
                                 let _ = silent_command("adb")
                                     .args(["-s", serial, "reverse", &port_spec, &port_spec])
                                     .output();
+                                armed_serials.insert(serial.to_string());
                             }
                             last_reverse = Some(Instant::now());
                         }
                     } else {
+                        armed_serials.clear();
                         last_reverse = None;
                     }
-                    was_connected = has_device;
                     // Poll `run_clone` every 50 ms instead of blocking in an
                     // uninterruptible 2 s sleep so `AdbUsbWatcher::drop()`
                     // returns immediately without freezing the desktop GUI.
@@ -679,6 +709,10 @@ fn spawn_host_adb_tcp_session(
     if udp_rx.connect((Ipv4Addr::LOCALHOST, host_udp_port)).is_err() {
         return;
     }
+    // The bridge carries the same real-time audio as the direct UDP path.
+    // Without the 1 MB buffers + CS5/AC_VI marking, an ADB/USB scheduling
+    // stall can drop datagrams before the tunnel even sees them.
+    let _ = crate::configure_realtime_udp_socket(&udp_rx);
     let _ = udp_rx.set_read_timeout(Some(Duration::from_millis(200)));
     let Ok(udp_tx) = udp_rx.try_clone() else {
         return;
@@ -692,6 +726,7 @@ fn spawn_host_adb_tcp_session(
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-in".into())
         .spawn(move || {
+            let _rt_guard = crate::RealtimeThreadGuard::enter();
             let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
                 let Ok(raw_len) =
@@ -725,6 +760,7 @@ fn spawn_host_adb_tcp_session(
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-out".into())
         .spawn(move || {
+            let _rt_guard = crate::RealtimeThreadGuard::enter();
             let mut framed = [0u8; 2 + crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_out.load(Ordering::Relaxed) && run_out.load(Ordering::Relaxed) {
                 match udp_rx.recv(&mut framed[2..]) {
@@ -1966,6 +2002,29 @@ impl Drop for WindowsWlanMediaStreamingGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_adb_reverse_targets_arms_new_devices_while_streaming() {
+        let serials = vec!["phone-a".to_string(), "phone-b".to_string()];
+        let mut armed = HashSet::new();
+        armed.insert("phone-a".to_string());
+
+        // Periodic re-arm is suppressed while a tunnel is live, but a newly
+        // attached phone must still be armed immediately.
+        assert_eq!(
+            adb_reverse_targets(&serials, &armed, false),
+            vec!["phone-b"]
+        );
+
+        // With no active session, the periodic pass re-arms every device.
+        assert_eq!(
+            adb_reverse_targets(&serials, &armed, true),
+            vec!["phone-a", "phone-b"]
+        );
+
+        // Already-armed devices are skipped when the periodic pass is off.
+        assert!(adb_reverse_targets(&serials[..1], &armed, false).is_empty());
+    }
 
     #[test]
     fn test_encode_powershell_utf16le_base64() {

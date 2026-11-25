@@ -1277,6 +1277,11 @@ impl AdbTcpClientBridge {
         };
         let udp_base = UdpSocket::bind(SocketAddr::new(loopback_ip, 0)).ok()?;
         let local_udp_addr = udp_base.local_addr().ok()?;
+        // This socket relays the same real-time audio as the direct UDP path
+        // (the engine sends to `local_udp_addr` instead of the host). Give it
+        // the 1 MB buffers and CS5/AC_VI marking too, otherwise an ADB/USB
+        // scheduling stall can drop audio before it reaches the TCP tunnel.
+        let _ = configure_realtime_udp_socket(&udp_base);
         // A bounded read lets the supervisor join the per-session out thread
         // promptly on yank/shutdown instead of blocking forever in recv().
         let _ = udp_base.set_read_timeout(Some(Duration::from_millis(200)));
@@ -1354,6 +1359,7 @@ impl AdbTcpClientBridge {
                     let in_handle = std::thread::Builder::new()
                         .name("as-ultra-adb-cli-in".into())
                         .spawn(move || {
+                            let _rt_guard = RealtimeThreadGuard::enter();
                             let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
                             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed)
                             {
@@ -1390,6 +1396,7 @@ impl AdbTcpClientBridge {
                     let out_handle = std::thread::Builder::new()
                         .name("as-ultra-adb-cli-out".into())
                         .spawn(move || {
+                            let _rt_guard = RealtimeThreadGuard::enter();
                             let mut framed = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
                             while alive_out.load(Ordering::Relaxed) && run_out.load(Ordering::Relaxed)
                             {

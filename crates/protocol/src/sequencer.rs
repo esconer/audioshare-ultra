@@ -354,21 +354,21 @@ impl ZeroJitterSequencer {
                     // Disarm pending_declick so apply_boundary_ramps() below
                     // does not add the same step a second time.
                     self.pending_declick = false;
-                } else if self.last_pop_was_fec && cur_status != STATUS_HEALED_BY_FEC {
-                    // The previous subframe was an IMA-ADPCM FEC reconstruction.
-                    // Its timbre is close, but its accumulated quantization error
-                    // leaves the final sample offset from the bit-exact primary
-                    // frame that follows. Splice from that exact last sample for
-                    // 0.17 ms instead of applying the old unconditional codec
-                    // step, then let the primary frame take over unchanged.
+                } else if cur_status == STATUS_HEALED_BY_FEC || self.last_pop_was_fec {
+                    // A 124-byte IMA-ADPCM FEC frame stores Left sample 0 in
+                    // the same 16-bit word as the 7-bit step index, so it can
+                    // step by up to 127 LSB (~-48 dBFS) at every boundary:
+                    // primary -> FEC (entry), FEC -> FEC, and FEC -> primary
+                    // (exit). Splice all three from the exact previous output
+                    // sample for 0.17 ms. Convex blending cannot overshoot the
+                    // input peak, unlike the old additive delta ramp.
                     let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
                     let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
-                    let delta_l = last_l - out[0];
-                    let delta_r = last_r - out[1];
                     for i in 0..FEC_DECLICK_FRAMES {
-                        let w = 1.0 - (i as f32) / (FEC_DECLICK_FRAMES as f32);
-                        out[i * 2] += delta_l * w;
-                        out[i * 2 + 1] += delta_r * w;
+                        let alpha = (i as f32) / ((FEC_DECLICK_FRAMES - 1) as f32);
+                        let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
+                        out[i * 2] = last_l * w + out[i * 2] * (1.0 - w);
+                        out[i * 2 + 1] = last_r * w + out[i * 2 + 1] * (1.0 - w);
                     }
                     // This branch already applied the declick splice; clear
                     // the arm so apply_boundary_ramps() does not double it.
@@ -484,6 +484,33 @@ impl ZeroJitterSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fec_sine_frame(subframe_index: u16) -> [f32; SUBFRAME_STEREO_SAMPLES] {
+        let mut frame = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let n = subframe_index as usize * SUBFRAME_FRAMES + i;
+            let v = ((n as f32) * 2.0 * std::f32::consts::PI * 300.0 / 48_000.0).sin() * 0.5;
+            frame[i * 2] = v;
+            frame[i * 2 + 1] = v;
+        }
+        frame
+    }
+
+    fn fec_roundtrip(frame: &[f32; SUBFRAME_STEREO_SAMPLES]) -> [f32; SUBFRAME_STEREO_SAMPLES] {
+        use crate::lpc_lossless::{
+            decode_fec_subframe_to_f32, encode_fec_subframe, ADPCM_FEC_BYTES,
+        };
+
+        let mut pcm_i16 = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for (dst, &s) in pcm_i16.iter_mut().zip(frame.iter()) {
+            *dst = (s * 32767.0) as i16;
+        }
+        let mut fec_bytes = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm_i16, &mut fec_bytes);
+        let mut decoded = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec_bytes, &mut decoded));
+        decoded
+    }
 
     #[test]
     fn test_wsola_plc_and_smooth_recovery_crossfade() {
@@ -697,6 +724,95 @@ mod tests {
         assert_eq!(seq.pop_next(3, &mut out), STATUS_PRIMARY_LOSSLESS);
         assert_eq!(out[0], fourth[0]);
         assert_eq!(out[1], fourth[1]);
+    }
+
+    #[test]
+    fn test_primary_to_fec_entry_is_declicked() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        for s in 0..2u16 {
+            let frame = fec_sine_frame(s);
+            assert!(seq.push_primary(s, &frame));
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+        let last_l = out[SUBFRAME_STEREO_SAMPLES - 2];
+        let last_r = out[SUBFRAME_STEREO_SAMPLES - 1];
+
+        let third = fec_sine_frame(2);
+        let fec = fec_roundtrip(&third);
+        assert!(seq.try_heal_with_fec(2, &fec));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_HEALED_BY_FEC);
+
+        assert!(
+            (out[0] - last_l).abs() < 1e-6 && (out[1] - last_r).abs() < 1e-6,
+            "primary->FEC entry stepped from ({last_l}, {last_r}) to ({}, {})",
+            out[0],
+            out[1]
+        );
+        // The splice must end before the bit-exact FEC waveform resumes.
+        for i in FEC_DECLICK_FRAMES..SUBFRAME_FRAMES {
+            assert_eq!(out[i * 2], fec[i * 2], "entry splice leaked past frame {i}");
+            assert_eq!(out[i * 2 + 1], fec[i * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn test_fec_to_fec_boundary_is_declicked() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+
+        for s in 0..2u16 {
+            let frame = fec_sine_frame(s);
+            assert!(seq.push_primary(s, &frame));
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+
+        let second_fec = fec_roundtrip(&fec_sine_frame(2));
+        assert!(seq.try_heal_with_fec(2, &second_fec));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_HEALED_BY_FEC);
+        let last_l = out[SUBFRAME_STEREO_SAMPLES - 2];
+        let last_r = out[SUBFRAME_STEREO_SAMPLES - 1];
+
+        let third_fec = fec_roundtrip(&fec_sine_frame(3));
+        assert!(seq.try_heal_with_fec(3, &third_fec));
+        assert_eq!(seq.pop_next(3, &mut out), STATUS_HEALED_BY_FEC);
+        assert!(
+            (out[0] - last_l).abs() < 1e-6 && (out[1] - last_r).abs() < 1e-6,
+            "FEC->FEC boundary stepped from ({last_l}, {last_r}) to ({}, {})",
+            out[0],
+            out[1]
+        );
+    }
+
+    #[test]
+    fn test_fec_entry_splice_never_overshoots_full_scale_flip() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        let hi = [0.95f32; SUBFRAME_STEREO_SAMPLES];
+
+        for s in 0..2u16 {
+            assert!(seq.push_primary(s, &hi));
+            assert_eq!(seq.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+
+        // A 2 kHz full-scale flip immediately after +0.95: additive splicing
+        // would push the first samples toward +2.4 and slam the limiter.
+        let mut flip = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for i in 0..SUBFRAME_FRAMES {
+            let v = -((i as f32) * std::f32::consts::TAU * 2000.0 / 48_000.0).cos() * 0.95;
+            flip[i * 2] = v;
+            flip[i * 2 + 1] = v;
+        }
+        let fec = fec_roundtrip(&flip);
+        assert!(seq.try_heal_with_fec(2, &fec));
+        assert_eq!(seq.pop_next(2, &mut out), STATUS_HEALED_BY_FEC);
+
+        let peak = out.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            peak <= 1.0 + 1e-5,
+            "convex FEC entry splice overshot input peak: {peak}"
+        );
     }
 
     #[test]
