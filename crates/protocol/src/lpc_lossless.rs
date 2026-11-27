@@ -213,9 +213,8 @@ impl CvsdState {
     #[inline(always)]
     fn new() -> Self {
         Self {
-            // Start at a quiet-friendly step. A loud block grows the step within
-            // a few identical bits, while silence no longer starts at a
-            // -42 dBFS granular limit cycle.
+            // Start at 64 for fast initial slope tracking while decaying to a
+            // 2 LSB floor on silence.
             step: 64,
             history: 0b101,
         }
@@ -228,10 +227,9 @@ impl CvsdState {
             // Three identical bits in a row: slope overload, grow the step.
             self.step = (self.step + (self.step >> 2) + 1).min(16_384);
         } else {
-            // Leaky decay keeps granular noise under control. The floor is
-            // deliberately tiny (6 LSB, about -75 dBFS) instead of 32 LSB,
-            // which was an audible constant hiss during silence.
-            self.step = (self.step - (self.step >> 3)).max(6);
+            // Leaky decay down to a 2 LSB floor (-84 dBFS) keeps idle
+            // granular noise inaudible during digital silence.
+            self.step = (self.step - (self.step >> 3).max(1)).max(2);
         }
         self.step
     }
@@ -403,7 +401,8 @@ fn encode_vbr_subframe_layout(
 
                 // 2nd-order integrator predictor, seeded with a flat slope at
                 // sample 0 so the first synthesized sample does not overshoot.
-                let pred = (prev1 << 1) - prev2;
+                let delta = prev1 - prev2;
+                let pred = prev1 + delta - (delta / 64);
                 let bit = u8::from(s >= pred);
                 let step = cvsd.update_and_get_step(bit);
                 let dequant = if bit == 1 { step } else { -step };
@@ -525,6 +524,12 @@ fn encode_vbr_subframe_layout(
                     prev1 = (prev1 + dequant).clamp(-32_768, 32_767);
                 }
                 step = adapt_vbr_step(step, code, width, &mut prev_bit, min_step);
+                if onset_k > 0 && k >= onset_k && min_step > VBR_MIN_STEP {
+                    // Decay transient step floor back to VBR_MIN_STEP (~16-sample
+                    // time constant) so quiet tails after a sharp attack do not
+                    // stay noisy for the remainder of the 2.5 ms subframe.
+                    min_step = (min_step - (min_step >> 4).max(1)).max(VBR_MIN_STEP);
+                }
             }
         }
     }
@@ -599,7 +604,8 @@ pub fn decode_vbr_subframe_to_f32(
 
                 let step = cvsd.update_and_get_step(bit as u8);
                 let dequant = if bit == 1 { step } else { -step };
-                let pred = (prev1 << 1) - prev2;
+                let delta = prev1 - prev2;
+                let pred = prev1 + delta - (delta / 64);
                 let recon = (pred + dequant).clamp(-32_768, 32_767);
 
                 out_f32[i * 2 + ch] = (recon as f32) * (1.0 / 32_768.0);
@@ -655,6 +661,12 @@ pub fn decode_vbr_subframe_to_f32(
                     prev1 = recon;
                 }
                 step = adapt_vbr_step(step, code, width, &mut prev_bit, min_step);
+                if onset_k > 0 && k >= onset_k && min_step > VBR_MIN_STEP {
+                    // Decay transient step floor back to VBR_MIN_STEP (~16-sample
+                    // time constant) so quiet tails after a sharp attack do not
+                    // stay noisy for the remainder of the 2.5 ms subframe.
+                    min_step = (min_step - (min_step >> 4).max(1)).max(VBR_MIN_STEP);
+                }
             }
         }
     }
@@ -966,7 +978,8 @@ const IMA_STEP_TABLE: [i32; 89] = [
 /// every legacy payload while giving late-transient frames their own mode.
 const FEC_RIGHT_INDEX_MARKER_MAX: u8 = 0xD8;
 const FEC_TRANSIENT_MARKER_BASE: u8 = 0xD9;
-const FEC_TRANSIENT_BUCKETS: usize = 38;
+const FEC_TRANSIENT_MARKER_MAX: u8 = 0xFC;
+const FEC_TRANSIENT_BUCKETS: usize = 12;
 
 /// Map an onset sample to the bucket stored in the byte-4 marker.
 #[inline]
@@ -975,9 +988,11 @@ fn fec_onset_bucket(onset_k: usize) -> usize {
 }
 
 /// Recover the onset sample both encoder and decoder use for the deadzone.
+/// Floor division ensures `deadzone_until <= onset_k` so the onset sample is
+/// never suppressed by the lead-in deadzone.
 #[inline]
 fn fec_bucket_onset(bucket: usize) -> usize {
-    (bucket * SUBFRAME_FRAMES + FEC_TRANSIENT_BUCKETS / 2) / FEC_TRANSIENT_BUCKETS
+    (bucket * SUBFRAME_FRAMES) / FEC_TRANSIENT_BUCKETS
 }
 
 #[inline(always)]
@@ -1080,6 +1095,8 @@ pub fn encode_fec_subframe(
     let mut early_slope_r = 60i32;
     let mut full_slope_l = 60i32;
     let mut full_slope_r = 60i32;
+    let mut raw_slope_l = 0i32;
+    let mut raw_slope_r = 0i32;
     let mut first_active_k: Option<usize> = None;
     for i in 1..SUBFRAME_FRAMES {
         let d_l = (pcm_stereo[i * 2] as i32 - pcm_stereo[(i - 1) * 2] as i32).abs();
@@ -1091,6 +1108,8 @@ pub fn encode_fec_subframe(
         if first_active_k.is_none() && d_l.max(d_r) > ONSET_SLOPE_THRESHOLD {
             first_active_k = Some(i);
         }
+        raw_slope_l = raw_slope_l.max(d_l);
+        raw_slope_r = raw_slope_r.max(d_r);
         full_slope_l = full_slope_l.max(d_l);
         full_slope_r = full_slope_r.max(d_r);
     }
@@ -1100,11 +1119,10 @@ pub fn encode_fec_subframe(
             .position(|&s| s >= slope)
             .unwrap_or(IMA_STEP_TABLE.len() - 1) as i8
     };
-    // A late transient gets the full-frame maximum slope and a shared initial
-    // index. Sharing is safe because the zero deadzone holds both predictors
-    // still through the lead-in, and it frees byte 4 for the mode marker.
-    // Only a genuinely quiet lead-in benefits; a steady or DC-offset start
-    // already has a representative first-window step.
+    // A late transient gets the full-frame maximum slope and an active-channel
+    // mask packed into `0xD9..=0xFC` (12 onset buckets x 3 masks). A silent
+    // opposite channel keeps `init_idx = 0, min_idx = 0` so a hard-panned
+    // transient never leaks thousands of LSB into the quiet ear.
     let lead_in_is_silent = first_active_k.is_some_and(|onset_k| {
         (0..onset_k).all(|i| {
             pcm_stereo[i * 2].unsigned_abs() <= SILENT_LEAD_IN_PEAK_LSB as u16
@@ -1113,28 +1131,44 @@ pub fn encode_fec_subframe(
     });
     let transient_onset =
         first_active_k.filter(|&k| k >= ONSET_MIN_LATE_SAMPLE && lead_in_is_silent);
-    let (init_idx_l, init_idx_r, min_idx_l, min_idx_r, marker, deadzone_until) =
+    let (header_idx_l, init_idx_l, init_idx_r, min_idx_l, min_idx_r, marker, deadzone_until) =
         if let Some(onset_k) = transient_onset {
-            let shared = lookup_idx(full_slope_l.max(full_slope_r));
+            let l_active = raw_slope_l > ONSET_SLOPE_THRESHOLD
+                || (0..SUBFRAME_FRAMES)
+                    .any(|i| pcm_stereo[i * 2].unsigned_abs() > SILENT_LEAD_IN_PEAK_LSB as u16);
+            let r_active = raw_slope_r > ONSET_SLOPE_THRESHOLD
+                || (0..SUBFRAME_FRAMES).any(|i| {
+                    pcm_stereo[i * 2 + 1].unsigned_abs() > SILENT_LEAD_IN_PEAK_LSB as u16
+                });
+            let channel_mask: usize = match (l_active, r_active) {
+                (true, false) => 1,
+                (false, true) => 2,
+                _ => 3,
+            };
+            let active_slope = match channel_mask {
+                1 => full_slope_l,
+                2 => full_slope_r,
+                _ => full_slope_l.max(full_slope_r),
+            };
+            let shared = lookup_idx(active_slope);
             let floor = (shared - 8).max(0);
             let bucket = fec_onset_bucket(onset_k);
-            (
-                shared,
-                shared,
-                floor,
-                floor,
-                FEC_TRANSIENT_MARKER_BASE + bucket as u8,
-                fec_bucket_onset(bucket),
-            )
+            let marker = FEC_TRANSIENT_MARKER_BASE + (bucket * 3 + (channel_mask - 1)) as u8;
+            let (il, ir, ml, mr) = match channel_mask {
+                1 => (shared, 0, floor, 0),
+                2 => (0, shared, 0, floor),
+                _ => (shared, shared, floor, floor),
+            };
+            (shared, il, ir, ml, mr, marker, fec_bucket_onset(bucket))
         } else {
             let init_l = lookup_idx(early_slope_l);
             let init_r = lookup_idx(early_slope_r);
-            (init_l, init_r, 0, 0, 0x80 | (init_r as u8 & 0x7F), 0)
+            (init_l, init_l, init_r, 0, 0, 0x80 | (init_r as u8 & 0x7F), 0)
         };
     let mut idx_l = init_idx_l;
     let mut idx_r = init_idx_r;
 
-    let l_tagged = (pcm_stereo[0] & !0x007F) | ((init_idx_l as i16) & 0x007F);
+    let l_tagged = (pcm_stereo[0] & !0x007F) | ((header_idx_l as i16) & 0x007F);
     out[0..2].copy_from_slice(&l_tagged.to_le_bytes());
     out[2..4].copy_from_slice(&pcm_stereo[1].to_le_bytes());
     pred_l = l_tagged as i32;
@@ -1174,29 +1208,31 @@ pub fn decode_fec_subframe_to_f32(
         return false;
     }
     let l_tagged = i16::from_le_bytes([fec_bytes[0], fec_bytes[1]]);
-    let init_idx_l = ((l_tagged & 0x007F) as i8).clamp(0, 88);
+    let header_idx_l = ((l_tagged & 0x007F) as i8).clamp(0, 88);
     let marker = fec_bytes[4];
-    let transient = (FEC_TRANSIENT_MARKER_BASE..=0xFE).contains(&marker);
-    let (init_idx_r, min_idx_l, min_idx_r, deadzone_until) = if transient {
-        // One shared transient-sized index; the mode marker occupies the byte
-        // that otherwise carries the independent right index.
-        let floor = (init_idx_l - 8).max(0);
-        (
-            init_idx_l,
-            floor,
-            floor,
-            fec_bucket_onset((marker - FEC_TRANSIENT_MARKER_BASE) as usize),
-        )
-    } else if marker > FEC_RIGHT_INDEX_MARKER_MAX {
-        // 0xFF is reserved; decode it as a plain nb16 frame.
-        (init_idx_l, 0, 0, 0)
-    } else if (marker & 0x80) != 0 {
-        let init_idx_r = ((marker & 0x7F) as i8).clamp(0, 88);
-        (init_idx_r, 0, 0, 0)
-    } else {
-        // Pre-nb16 frames leave byte 4 zero and share the left index.
-        (init_idx_l, 0, 0, 0)
-    };
+    let (init_idx_l, init_idx_r, min_idx_l, min_idx_r, deadzone_until) =
+        if (FEC_TRANSIENT_MARKER_BASE..=FEC_TRANSIENT_MARKER_MAX).contains(&marker) {
+            let code = (marker - FEC_TRANSIENT_MARKER_BASE) as usize;
+            let bucket = code / 3;
+            let channel_mask = (code % 3) + 1;
+            let shared = header_idx_l;
+            let floor = (shared - 8).max(0);
+            let dz = fec_bucket_onset(bucket);
+            match channel_mask {
+                1 => (shared, 0, floor, 0, dz),
+                2 => (0, shared, 0, floor, dz),
+                _ => (shared, shared, floor, floor, dz),
+            }
+        } else if marker > FEC_RIGHT_INDEX_MARKER_MAX {
+            // 0xFD..=0xFF reserved; decode cleanly as plain nb16 frame.
+            (header_idx_l, header_idx_l, 0, 0, 0)
+        } else if (marker & 0x80) != 0 {
+            let init_idx_r = ((marker & 0x7F) as i8).clamp(0, 88);
+            (header_idx_l, init_idx_r, 0, 0, 0)
+        } else {
+            // Pre-nb16 frames leave byte 4 zero and share the left index.
+            (header_idx_l, header_idx_l, 0, 0, 0)
+        };
     let mut pred_l = l_tagged as i32;
     let mut pred_r = i16::from_le_bytes([fec_bytes[2], fec_bytes[3]]) as i32;
     let mut idx_l = init_idx_l;
@@ -2172,5 +2208,37 @@ mod tests {
             assert!(snr_db >= min_snr_db,
                     "kbps={kbps}: VBR round-trip SNR {snr_db:.1} dB < {min_snr_db:.1} dB");
         }
+    }
+
+    #[test]
+    fn test_fec_hard_panned_late_transient_no_silent_ear_bleed() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for k in 20..SUBFRAME_FRAMES {
+            let v = if k % 2 == 0 { 24_000 } else { -24_000 };
+            pcm[k * 2] = v;
+            pcm[k * 2 + 1] = 0;
+        }
+        let mut fec = [0u8; ADPCM_FEC_BYTES];
+        encode_fec_subframe(&pcm, &mut fec);
+        let mut dec = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_fec_subframe_to_f32(&fec, &mut dec));
+        let r_peak_lsb = dec.iter().skip(1).step_by(2).fold(0.0f32, |m, s| m.max(s.abs())) * 32_768.0;
+        assert!(r_peak_lsb < 32.0, "silent R ear leaked {r_peak_lsb:.1} LSB");
+    }
+
+    #[test]
+    fn test_vbr_post_transient_min_step_decays_to_quiet_tail() {
+        let mut pcm = [0i16; SUBFRAME_STEREO_SAMPLES];
+        for k in 12..30 {
+            let v = (28_000.0 * (-((k - 12) as f32) / 3.0).exp()) as i16;
+            pcm[k * 2] = v;
+            pcm[k * 2 + 1] = v;
+        }
+        let mut enc = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
+        let len = encode_vbr_subframe(&pcm, 256, &mut enc);
+        let mut dec = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(decode_vbr_subframe_to_f32(&enc[..len], &mut dec));
+        let end_tail_lsb = dec[200..].iter().fold(0.0f32, |m, s| m.max(s.abs())) * 32_768.0;
+        assert!(end_tail_lsb < 16.0, "post-transient tail noise too high: {end_tail_lsb:.1} LSB");
     }
 }

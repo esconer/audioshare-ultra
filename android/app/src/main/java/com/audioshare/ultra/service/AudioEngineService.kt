@@ -11,6 +11,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaMetadata
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.media.session.MediaSession
@@ -28,6 +29,9 @@ import androidx.core.app.NotificationCompat
 import com.audioshare.ultra.MainActivity
 import com.audioshare.ultra.R
 import com.audioshare.ultra.ui.HostPinStore
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
@@ -92,10 +96,14 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         @Volatile
         var isLocallyMutedState: Boolean = false
             private set
+        private val _isLocallyMutedFlow = MutableStateFlow(false)
+        val isLocallyMutedFlow: StateFlow<Boolean> = _isLocallyMutedFlow.asStateFlow()
 
         @Volatile
         var isMicMutedState: Boolean = false
             private set
+        private val _isMicMutedFlow = MutableStateFlow(false)
+        val isMicMutedFlow: StateFlow<Boolean> = _isMicMutedFlow.asStateFlow()
 
         // Process-wide single-thread executor and generation counters matching
         // the process-wide Rust statics (`GLOBAL_ANDROID_CLIENT` /
@@ -116,6 +124,22 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         ): Boolean
 
         @JvmStatic
+        external fun nativeStartClientConfigured(
+            hostAddr: String,
+            isUsb: Boolean,
+            gainDb: Float,
+            pin: String,
+            dolbyEffects: Boolean,
+            bassDb: Float,
+            presDb: Float,
+            trebDb: Float,
+            role: Int,
+            crossfeed: Boolean,
+            nightMode: Boolean,
+            gamingLock: Boolean
+        ): Boolean
+
+        @JvmStatic
         external fun nativeStopClient()
 
         @JvmStatic
@@ -126,6 +150,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeReportBluetoothDelayMs(delayMs: Int)
+
+        @JvmStatic
+        external fun nativeRequestExclusiveMmapReclaim()
 
         @JvmStatic
         external fun nativeSendMediaCommand(cmdCode: Int)
@@ -177,9 +204,21 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
         @JvmStatic
         external fun nativeSetScannerPaused(paused: Boolean)
+
+        @JvmStatic
+        external fun nativeInstallCrashHook(crashLogPath: String)
     }
 
     private var wifiLock: WifiManager.WifiLock? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        runCatching {
+            val crashPath = java.io.File(filesDir, "audioshare-ultra-crash.log").absolutePath
+            nativeInstallCrashHook(crashPath)
+        }
+    }
+
     private var wakeLock: PowerManager.WakeLock? = null
     private var perfHintSession: PerformanceHintManager.Session? = null
     private var audioManager: AudioManager? = null
@@ -191,10 +230,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         set(value) {
             field = value
             isLocallyMutedState = value
+            _isLocallyMutedFlow.value = value
         }
     // Last value handed to native A/V sync. Device callbacks can re-report the
     // same route repeatedly; log only real transitions to keep the report useful.
     private var lastReportedBtDelayMs: Int = -1
+    private var lastReportedBtRouteMode: String = ""
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
@@ -202,6 +243,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // Raw low-latency output is the default. `true` opts into the shared
     // mixer so OEM post-processing (Dolby Atmos, Dirac, system EQ) applies.
     private var dolbyEffects: Boolean = false
+    // Tracks whether audio focus was interrupted (call / notification / loss)
+    // so regaining focus triggers one bounded Exclusive MMAP reclaim attempt
+    // if AAudio was kicked down to the shared mixer.
+    private var lostAudioFocus: Boolean = false
     // Only microphone / internal-audio capture may declare the MICROPHONE
     // foreground-service type. Plain playback must never request it.
     private var micCaptureActive: Boolean = false
@@ -218,6 +263,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         set(value) {
             field = value
             isMicMutedState = value
+            _isMicMutedFlow.value = value
         }
     private var serviceDestroyed: Boolean = false
     private var serviceStopped: Boolean = false
@@ -356,14 +402,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             dolbyEffects = intent.getBooleanExtra("DOLBY_ENABLED", dolbyEffects)
             prefs.edit().putBoolean("dolby_fx", dolbyEffects).apply()
-            // OEM Dolby daemons watch the focus attributes, so the focus
-            // request must match the AAudio stream profile. Re-requesting
-            // also abandons the stale attributes from the previous mode.
-            requestAudioFocus(dolbyEffects)
-            // The routed device query follows the focus attributes, so the
-            // Bluetooth report must be refreshed after the mode change.
-            reportBluetoothRoute()
+            // Reopen the AAudio stream BEFORE querying `reportBluetoothRoute()`
+            // and refresh once more after Android's HAL settles (400 ms) so
+            // `bluetooth_delay_ms` does not stay stuck on Samsung's 290 ms
+            // normal-mixer Dolby delay after toggling Dolby OFF.
             applyDspFromPrefs()
+            reportBluetoothRoute()
+            mainHandler.postDelayed({
+                if (!serviceDestroyed && isStreaming) reportBluetoothRoute()
+            }, 400L)
             if (foregroundStarted) {
                 startForegroundNotification(currentHostAddr, currentIsUsb)
             }
@@ -504,6 +551,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 nativeSetGainDb(savedGain)
                 if (isStreaming) {
                     requestAudioFocus(dolbyEffects)
+                    if (lostAudioFocus && !dolbyEffects) {
+                        lostAudioFocus = false
+                        runCatching { nativeRequestExclusiveMmapReclaim() }
+                    }
                 }
                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
             }
@@ -534,12 +585,16 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 // Re-claim audio focus so the app that stole it pauses instead
                 // of playing over us after the user unmutes.
                 requestAudioFocus(dolbyEffects)
+                if (lostAudioFocus && !dolbyEffects) {
+                    lostAudioFocus = false
+                    runCatching { nativeRequestExclusiveMmapReclaim() }
+                }
             }
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
         }
         if (intent?.action == "ACTION_REMOTE_PLAY_PAUSE") {
-            remoteMediaPlaying = !remoteMediaPlaying
+            updateMediaSessionPlaybackState(!remoteMediaPlaying)
             nativeSendMediaCommand(10)
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
@@ -583,13 +638,37 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             } catch (_: Exception) {}
         }
 
+        // Snapshot saved DSP / gaming-lock settings before spawning the native
+        // RX thread so the very first feedback packet and audio frame already
+        // carry the user's configuration atomically.
+        val bassDb = prefs.getFloat("bass_db", 0.0f)
+        val vocalDb = prefs.getFloat("vocal_db", 0.0f)
+        val trebleDb = prefs.getFloat("treble_db", 0.0f)
+        val channelRole = prefs.getInt("channel_role", 0)
+        val crossfeed = prefs.getBoolean("crossfeed", false)
+        val nightMode = prefs.getBoolean("night_mode", false)
+        val gamingLock = prefs.getBoolean("gaming_lock", false)
+
         // Creating the native AAudio client blocks while the stream is
         // negotiated. The foreground notification is already up (synchronously,
         // on main), so the blocking work can safely move to the engine thread.
         val gen = connectGen.incrementAndGet()
         runOnEngine {
             val started = runCatching {
-                nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
+                nativeStartClientConfigured(
+                    hostAddr,
+                    isUsb,
+                    gainDb,
+                    pin,
+                    dolbyEffects,
+                    bassDb,
+                    vocalDb,
+                    trebleDb,
+                    channelRole,
+                    crossfeed,
+                    nightMode,
+                    gamingLock
+                )
             }.getOrDefault(false)
             mainHandler.post { handleClientStartResult(started, hostAddr, gen) }
         }
@@ -635,63 +714,51 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         startForegroundNotification(currentHostAddr, currentIsUsb)
         scheduleSilenceWatchdog()
         // Re-apply the active Bluetooth route delay now that the native
-        // ClientEngine exists, and restore saved Studio EQ / DSP settings.
+        // ClientEngine exists, and refresh DSP prefs in case the user adjusted
+        // controls while the AAudio open was blocking.
         reportBluetoothRoute()
         applyDspFromPrefs()
-        // Restore both the saved Host Quality Mode (1..=5) and the compressed
-        // codec backend (20 = Rust VBR, 21 = Opus RLD) on every stream start.
-        // The native client keeps these in separate pending slots, so the two
-        // calls cannot overwrite each other before the RX thread sends them.
-        val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
-        val savedQuality = prefs.getInt("quality_mode", 0).coerceIn(0, 4)
-        nativeSendMediaCommand(savedQuality + 1)
-        // Restore the compressed bitrate target (30..34 = 96/160/256/320/510 kbps)
-        // in its own slot as well.
-        val savedBitrateCmd = when (prefs.getInt("target_bitrate_kbps", 256)) {
-            96 -> 30
-            160 -> 31
-            320 -> 33
-            510 -> 34
-            else -> 32
-        }
-        nativeSendMediaCommand(savedBitrateCmd)
-        // Compressed codec is always Opus RLD: pure-Rust VBR is no longer a
-        // user-selectable backend (legacy prefs must not re-enable it).
-        nativeSendMediaCommand(21)
         refreshAdpfHintSession()
         scheduleAdpfRefresh()
     }
 
+    private fun updateMediaSessionPlaybackState(playing: Boolean) {
+        remoteMediaPlaying = playing
+        mediaSession?.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or
+                        PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                )
+                .setState(
+                    if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    0L,
+                    1.0f
+                )
+                .build()
+        )
+    }
+
     private fun setupHardwareBluetoothMediaSession() {
         if (mediaSession != null) return
-        fun updateSessionState(playing: Boolean) {
-            remoteMediaPlaying = playing
-            mediaSession?.setPlaybackState(
-                PlaybackState.Builder()
-                    .setActions(
-                        PlaybackState.ACTION_PLAY or
-                            PlaybackState.ACTION_PAUSE or
-                            PlaybackState.ACTION_PLAY_PAUSE or
-                            PlaybackState.ACTION_SKIP_TO_NEXT or
-                            PlaybackState.ACTION_SKIP_TO_PREVIOUS
-                    )
-                    .setState(
-                        if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                        0L,
-                        1.0f
-                    )
+        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
+            setMetadata(
+                MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, "AudioShare Ultra")
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, "PC Audio")
                     .build()
             )
-        }
-        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() {
-                    updateSessionState(true)
+                    updateMediaSessionPlaybackState(true)
                     nativeSendMediaCommand(10)
                     if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
                 override fun onPause() {
-                    updateSessionState(false)
+                    updateMediaSessionPlaybackState(false)
                     nativeSendMediaCommand(10)
                     if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
@@ -709,7 +776,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                             KeyEvent.KEYCODE_MEDIA_PLAY,
                             KeyEvent.KEYCODE_MEDIA_PAUSE,
                             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                                updateSessionState(!remoteMediaPlaying)
+                                updateMediaSessionPlaybackState(!remoteMediaPlaying)
                                 nativeSendMediaCommand(10)
                                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                                 return true
@@ -729,7 +796,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             })
             isActive = true
         }
-        updateSessionState(true)
+        updateMediaSessionPlaybackState(true)
     }
 
     /// Report the active Bluetooth route independently of the Compose UI.
@@ -761,24 +828,24 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun reportBluetoothRoute() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val fallbackBtDelayMs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val (fallbackBtDelayMs, routeMode) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val attrs = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build()
             val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
             when (routedType) {
-                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145 to "A2DP"
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60 to "SCO"
                 AudioDeviceInfo.TYPE_BLE_HEADSET,
-                AudioDeviceInfo.TYPE_BLE_SPEAKER -> 45
-                AudioDeviceInfo.TYPE_HEARING_AID -> 65
+                AudioDeviceInfo.TYPE_BLE_SPEAKER -> 45 to "BLE-Audio"
+                AudioDeviceInfo.TYPE_HEARING_AID -> 65 to "Hearing-Aid"
                 else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     routedType == AudioDeviceInfo.TYPE_BLE_BROADCAST
                 ) {
-                    45
+                    45 to "BLE-Audio"
                 } else {
-                    0
+                    0 to "None"
                 }
             }
         } else {
@@ -787,15 +854,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             @Suppress("DEPRECATION")
             val scoRouted = am.isBluetoothScoOn()
             when {
-                a2dpRouted -> 145
-                scoRouted -> 60
-                else -> 0
+                a2dpRouted -> 145 to "A2DP"
+                scoRouted -> 60 to "SCO"
+                else -> 0 to "None"
             }
         }
         val reportedDelayMs = if (fallbackBtDelayMs > 0) {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             val manualOverride = prefs.getInt("bt_delay_override_ms", 0)
-            if (manualOverride in 40..350) {
+            if (manualOverride in 40..450) {
                 // Live BT Lip-Sync Calibration slider value wins over the
                 // estimate for any active Bluetooth route (A2DP, BLE Audio, SCO).
                 manualOverride
@@ -806,17 +873,22 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                     val m = am.javaClass.getMethod("getOutputLatency", Int::class.javaPrimitiveType)
                     (m.invoke(am, AudioManager.STREAM_MUSIC) as? Int) ?: 0
                 }.getOrDefault(0)
-                if (avdtpMs in 35..350) avdtpMs else 185
+                if (avdtpMs in 35..450) avdtpMs else 185
             } else {
                 fallbackBtDelayMs
             }
         } else {
             0
         }
-        if (reportedDelayMs != lastReportedBtDelayMs) {
+        if (reportedDelayMs != lastReportedBtDelayMs || routeMode != lastReportedBtRouteMode) {
             lastReportedBtDelayMs = reportedDelayMs
+            lastReportedBtRouteMode = routeMode
             runCatching {
-                nativeLogEvent(0, "bt-route", "Bluetooth route delay changed to ${reportedDelayMs}ms")
+                nativeLogEvent(
+                    0,
+                    "bt-route",
+                    "Bluetooth route delay changed to ${reportedDelayMs}ms (mode=${routeMode})",
+                )
             }
         }
         nativeReportBluetoothDelayMs(reportedDelayMs)
@@ -908,14 +980,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 .getOrDefault(IntArray(0))
                 .distinct()
                 .toIntArray()
-            // Before the Rust thread has published its TID, keep a session for
-            // the caller so a short race does not disable the hint entirely.
-            val tids = if (nativeTids.isNotEmpty()) {
-                nativeTids
-            } else {
-                intArrayOf(android.os.Process.myTid())
-            }
-            perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L)
+            if (nativeTids.isEmpty()) return
+            perfHintSession = hintMgr?.createHintSession(nativeTids, 2_500_000L)
         } catch (_: Exception) {
         }
     }
@@ -1467,6 +1533,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 "Audio focus change: $focusLabel"
             )
         }
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS ||
+            focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        ) {
+            lostAudioFocus = true
+        }
         if (isLocallyMuted) {
             // Never unmute a user-muted or headphone-unplugged stream when a
             // transient notification finishes and returns AUDIOFOCUS_GAIN.
@@ -1488,7 +1560,13 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK ->
                 nativeSetGainDb((liveGainDb - 12.0f).coerceAtLeast(-96.0f))
-            AudioManager.AUDIOFOCUS_GAIN -> nativeSetGainDb(liveGainDb)
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                nativeSetGainDb(liveGainDb)
+                if (lostAudioFocus && isStreaming && !dolbyEffects) {
+                    lostAudioFocus = false
+                    runCatching { nativeRequestExclusiveMmapReclaim() }
+                }
+            }
         }
     }
 
@@ -1529,6 +1607,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private fun releaseClientPlaybackResources() {
         focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
         focusRequest = null
+        lostAudioFocus = false
         audioDeviceCallback?.let { callback ->
             try {
                 val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager

@@ -126,6 +126,9 @@ impl ClientFeedbackPacket {
             if !key.verify_feedback(body, packet.feedback_seq, &packet.auth_tag) {
                 return None;
             }
+        } else if packet.auth_tag != [0u8; AEAD_TAG_LEN] {
+            // Client has a PIN configured while this host is unencrypted.
+            return None;
         }
         Some(packet)
     }
@@ -673,6 +676,33 @@ mod tests {
         packet.encode_signed(None, &mut buf);
         assert_eq!(&buf[20..36], &[0u8; AEAD_TAG_LEN]);
         assert!(ClientFeedbackPacket::decode_verified(&buf, None).is_some());
+    }
+
+    #[test]
+    fn test_unencrypted_host_rejects_signed_feedback_with_nonzero_tag() {
+        let key = SessionKey::from_pin("4829");
+        let packet = ClientFeedbackPacket {
+            fec_rate_permille: 37,
+            bluetooth_delay_ms: 142,
+            hardware_delay_ms: 21,
+            client_volume: 76,
+            requested_mode: 20,
+            feedback_seq: 1,
+            auth_tag: [0u8; AEAD_TAG_LEN],
+        };
+        let mut signed_buf = [0u8; CONTROL_FEEDBACK_LEN];
+        packet.encode_signed(Some(&key), &mut signed_buf);
+        assert_ne!(&signed_buf[20..36], &[0u8; AEAD_TAG_LEN]);
+        assert!(
+            ClientFeedbackPacket::decode_verified(&signed_buf, None).is_none(),
+            "unencrypted host must reject PIN-encrypted feedback"
+        );
+
+        // A genuinely unencrypted client (zeroed tag) must still be admitted.
+        let mut unsigned_buf = [0u8; CONTROL_FEEDBACK_LEN];
+        packet.encode_signed(None, &mut unsigned_buf);
+        assert_eq!(&unsigned_buf[20..36], &[0u8; AEAD_TAG_LEN]);
+        assert!(ClientFeedbackPacket::decode_verified(&unsigned_buf, None).is_some());
     }
 
     #[test]

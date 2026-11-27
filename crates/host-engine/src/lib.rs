@@ -41,6 +41,12 @@ use discovery_and_os::HostVolumeMonitor;
 
 pub const DEFAULT_PORT: u16 = 65530;
 const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
+/// Loopback-only goodbye datagram emitted by `AdbUsbWatcher` when an ADB TCP
+/// bridge session closes so `HostEngine` evicts the closed `127.0.0.1` port
+/// immediately instead of waiting for the 10 s idle sweep.
+pub(crate) const CONTROL_MAGIC_BYE: &[u8; 8] = b"ASULBYE1";
+/// Drop an idle warm Tier-0 Opus encoder after 15 s of spotless lossless audio.
+const OPUS_WARM_IDLE_COOLDOWN: Duration = Duration::from_secs(15);
 /// Hard cap on tracked clients. `active_clients_count` is a `u8`, so an
 /// unbounded map would silently wrap to 0 at 256 clients and disable the
 /// virtual-speaker guard in the middle of a live stream. New peers are
@@ -61,23 +67,31 @@ const CRITICAL_LOSS_THRESHOLD_PERMILLE: u16 = 200;
 /// rung. Exact [P-1]/[P-2] Opus RED still fits at the floors below, so the
 /// stability ladder keeps audio continuous without the audible 64 kbps floor.
 const SEVERE_LOSS_THRESHOLD_PERMILLE: u16 = 280;
-/// Smart Auto's compressed Opus floor. Four 2.5 ms subframes at 128 kbps pack
-/// into ~172 B (4 B RED header + 4 x (1 B length + 41 B tagged Opus payload))
-/// inside the 255 B `OpusRedHistory` slot, leaving ~83 B of headroom.
-const SMART_AUTO_OPUS_FLOOR_KBPS: u16 = 128;
+/// Smart Auto's compressed Opus floor. Four 2.5 ms subframes at 160 kbps pack
+/// into ~212 B (4 B RED header + 4 x (1 B length + 51 B tagged Opus payload))
+/// inside the 255 B `OpusRedHistory` slot, leaving ~43 B of headroom while
+/// preserving clean 2.5 ms CELT transient resolution.
+const SMART_AUTO_OPUS_FLOOR_KBPS: u16 = 160;
+/// Quiet duration before Smart DTX tears down the encoder and parks clients
+/// (1200 x 2.5 ms = 3.0 s) so natural movie/dialogue pauses never chop whispers.
+const SMART_DTX_SILENT_SUBFRAMES: u32 = 1200;
 /// Floor for the explicit 2.4 GHz stability profile under severe loss.
 const MAX_STABILITY_OPUS_FLOOR_KBPS: u16 = 96;
 /// Consecutive ~500 ms feedback windows above
 /// [`SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE`] required before Smart Auto may
 /// escalate from 5 ms (2 sf) to 10 ms (4 sf) framing.
 const SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS: u8 = 2;
-/// Feedback heartbeats arrive at roughly this cadence; several clients
-/// reporting inside one such window count as a single observation.
-const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(500);
+/// Minimum spacing between distinct ~500 ms feedback observations. 350 ms
+/// collapses multi-client bursts inside one window without dropping a single
+/// client's 500 ms heartbeat that arrives a few ms early due to Wi-Fi jitter.
+const SMART_AUTO_FEEDBACK_WINDOW: Duration = Duration::from_millis(350);
 /// Minimum interval between Opus encoder recreation attempts after a genuine
 /// creation/encode failure. One attempt per 2 s instead of one per 2.5 ms TX
 /// tick (200 Hz) keeps recovery bounded while still healing transient errors.
 const OPUS_ENCODER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Grace window during which a newcomer joining an already-active multi-peer
+/// session cannot override the host's quality profile or target bitrate.
+const JOIN_PROFILE_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
 /// Sustained spotless lossless operation required before SmartAuto promotes
 /// from 16-bit Lossless (~1.5 Mbps) up to full-capacity 24-bit Studio Master
 /// (~2.8-4.5+ Mbps) on Wi-Fi links.
@@ -265,6 +279,15 @@ impl HighLossWindowGate {
         self.armed
     }
 
+    /// Disarm once the paced governor decays below the high-loss tier without
+    /// counting stale per-client loss reports as a fresh consecutive window.
+    fn sync_governor(&mut self, governed_loss_permille: u16) {
+        if governed_loss_permille <= SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+            self.armed = false;
+            self.consecutive_windows = 0;
+        }
+    }
+
     #[inline]
     fn allows_four_subframes(&self) -> bool {
         self.armed
@@ -325,6 +348,13 @@ impl OpusEncoderRetry {
     }
 }
 
+/// True when a remote quality/bitrate command from a peer is outside any
+/// newcomer join-grace window.
+#[inline]
+fn should_apply_remote_profile_cmd(grace_until: Option<Instant>, now: Instant) -> bool {
+    grace_until.map(|until| now >= until).unwrap_or(true)
+}
+
 /// Advance a warm Opus encoder with one live subframe while Smart Auto is in
 /// its lossless tier or immediately after allocating a fresh Opus encoder
 /// mid-stream. The encoded output is intentionally discarded: this primes the
@@ -351,6 +381,7 @@ fn warm_opus_lookahead(
 struct CleanLinkPromoter {
     clean_since: Option<Instant>,
     master_24bit: bool,
+    was_all_usb: bool,
 }
 
 impl CleanLinkPromoter {
@@ -358,6 +389,7 @@ impl CleanLinkPromoter {
         Self {
             clean_since: None,
             master_24bit: false,
+            was_all_usb: false,
         }
     }
 
@@ -370,11 +402,19 @@ impl CleanLinkPromoter {
         has_clients: bool,
         now: Instant,
     ) -> bool {
+        let usb_to_wifi_transition = self.was_all_usb && !all_usb;
+        self.was_all_usb = has_clients && all_usb;
         if !has_clients || bt_active || governed_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE
         {
             self.clean_since = None;
             self.master_24bit = false;
             return false;
+        }
+        if usb_to_wifi_transition {
+            // A Wi-Fi client joined a USB-only session: require a fresh 30 s
+            // spotless Wi-Fi window before promoting to 24-bit Master.
+            self.clean_since = None;
+            self.master_24bit = false;
         }
         if all_usb && raw_loss_permille <= SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
             self.master_24bit = true;
@@ -484,16 +524,16 @@ fn select_tx_profile(
     all_clients_usb: bool,
 ) -> (CodecMode, usize, u16) {
     // Classic BT A2DP is ~185 ms regardless; forcing 400 pps (1 sf) over
-    // 2.4 GHz Wi-Fi only worsens single-antenna BT/Wi-Fi contention. The same
-    // guard applies to the auto-USB fast path: a wired tether has ample
-    // headroom and no 802.11 TX queue, so 2.5 ms packetization is free there,
-    // but an active BT link still needs the steadier 5 ms framing.
+    // Wi-Fi worsens 802.11 contention and air-time overhead, so 1-sf (2.5 ms)
+    // framing is permitted ONLY when every active receiver is on USB (`all_clients_usb`).
+    // Any non-USB session strictly enforces `subframes >= 2` even when
+    // `gaming_lock = true` or `configured_subframes = 1`.
     let gaming_lock = raw_gaming_lock && !bt_active;
-    let usb_fast_path = all_clients_usb && !bt_active;
-    let base_subframes = if gaming_lock || usb_fast_path {
+    let usb_fast_path = all_clients_usb;
+    let base_subframes = if usb_fast_path {
         1
     } else {
-        configured_subframes.clamp(1, 2) as usize
+        configured_subframes.clamp(2, 2) as usize
     };
 
     match profile {
@@ -516,8 +556,8 @@ fn select_tx_profile(
                 // Pure selector: 4 sf is the *candidate* framing. The live TX
                 // loop additionally requires two consecutive high-loss windows
                 // before actually using it (HighLossWindowGate). The bitrate
-                // never goes below 128 kbps: four 2.5 ms Opus subframes plus
-                // exact [P-1]/[P-2] RED are ~172 B inside the 255 B slot.
+                // never goes below 160 kbps: four 2.5 ms Opus subframes plus
+                // exact [P-1]/[P-2] RED are ~212 B inside the 255 B slot.
                 (
                     CodecMode::CompressedLowDelay,
                     if gaming_lock { 2 } else { 4 },
@@ -527,10 +567,11 @@ fn select_tx_profile(
             } else if bt_active && any_wifi_client {
                 // Single-antenna Wi-Fi + A2DP link: stay on transparent Opus
                 // instead of probing 1+ Mbps lossless that A2DP re-encodes anyway.
+                // 256 kbps (2-sf RED ~168 B <= 255 B) prevents Opus->A2DP cascading grit.
                 (
                     CodecMode::CompressedLowDelay,
                     2,
-                    selected_kbps.clamp(96, 192),
+                    selected_kbps.clamp(160, 256),
                 )
             } else if worst_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE {
                 // Smooth intra-Opus bitrate scaling (zero codec switch, zero
@@ -544,7 +585,7 @@ fn select_tx_profile(
                 };
                 (
                     CodecMode::CompressedLowDelay,
-                    if gaming_lock { 1 } else { 2 },
+                    if usb_fast_path { 1 } else { 2 },
                     smooth_kbps,
                 )
             } else {
@@ -1054,6 +1095,7 @@ pub struct NetworkInterfaceInfo {
 fn is_usb_interface_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("rndis")
+        || lower.contains("remote ndis")
         || lower.contains("usb")
         || lower.contains("ncm")
         || lower.starts_with("enx")
@@ -1500,6 +1542,122 @@ fn split_packet_fec<'a>(
     }
 }
 
+const ROUTE_ERROR_EVICT_THRESHOLD: u16 = 20;
+
+#[inline]
+fn is_fatal_route_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(code) = err.raw_os_error() {
+        if matches!(
+            code,
+            libc::ENETUNREACH | libc::EHOSTUNREACH | libc::ECONNREFUSED
+        ) {
+            return true;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(code) = err.raw_os_error() {
+        // WSAENETUNREACH (10051), WSAEHOSTUNREACH (10065), WSAECONNREFUSED (10061)
+        if matches!(code, 10051 | 10065 | 10061) {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSendOutcome {
+    Sent,
+    FatalRouteError,
+}
+
+fn apply_peer_send_outcomes(
+    map: &mut HashMap<SocketAddr, ConnectedClient>,
+    outcomes: &[(SocketAddr, PeerSendOutcome)],
+) -> (Vec<SocketAddr>, bool) {
+    let mut evicted = Vec::new();
+    for &(addr, outcome) in outcomes {
+        match outcome {
+            PeerSendOutcome::Sent => {
+                if let Some(client) = map.get_mut(&addr) {
+                    client.consecutive_send_errors = 0;
+                }
+            }
+            PeerSendOutcome::FatalRouteError => {
+                let should_evict = if let Some(client) = map.get_mut(&addr) {
+                    client.consecutive_send_errors =
+                        client.consecutive_send_errors.saturating_add(1);
+                    client.consecutive_send_errors >= ROUTE_ERROR_EVICT_THRESHOLD
+                } else {
+                    false
+                };
+                if should_evict {
+                    map.remove(&addr);
+                    evicted.push(addr);
+                }
+            }
+        }
+    }
+    let any_nonzero = map.values().any(|c| c.consecutive_send_errors > 0);
+    (evicted, any_nonzero)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_peer_send_outcomes(
+    outcomes: &[(SocketAddr, PeerSendOutcome)],
+    clients: &Mutex<HashMap<SocketAddr, ConnectedClient>>,
+    telemetry: &HostTelemetry,
+    cached_targets: &mut Vec<SocketAddr>,
+    cached_all_usb: &mut bool,
+    loss_governor: &mut LossGovernor,
+    high_loss_gate: &mut HighLossWindowGate,
+    any_peer_has_send_errors: &mut bool,
+) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+    let (evicted, any_nonzero) = apply_peer_send_outcomes(&mut map, outcomes);
+    *any_peer_has_send_errors = any_nonzero;
+    if !evicted.is_empty() {
+        let remaining = map.len();
+        telemetry
+            .active_clients_count
+            .store(remaining.min(u8::MAX as usize) as u8, Ordering::Relaxed);
+        HostEngine::refresh_client_delay_telemetry(&map, telemetry);
+        HostEngine::refresh_gaming_lock_telemetry(&map, telemetry);
+        cached_targets.clear();
+        for c in map.values() {
+            if !c.muted {
+                cached_targets.push(c.addr);
+            }
+        }
+        *cached_all_usb = HostEngine::all_active_targets_are_usb(&map);
+        if map.is_empty() {
+            *loss_governor = LossGovernor::new(Instant::now());
+            *high_loss_gate = HighLossWindowGate::new();
+        }
+        drop(map);
+        for addr in evicted {
+            audioshare_protocol::diagnostics::info(
+                "host-clients",
+                format!(
+                    "evicted {} after {} consecutive fatal route errors (remaining {})",
+                    addr, ROUTE_ERROR_EVICT_THRESHOLD, remaining
+                ),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pack_and_send(
     socket: &UdpSocket,
@@ -1511,7 +1669,10 @@ fn pack_and_send(
     session_key: Option<&SessionKey>,
     targets: &[SocketAddr],
     telemetry: &HostTelemetry,
+    any_peer_has_send_errors: bool,
+    outcomes: &mut Vec<(SocketAddr, PeerSendOutcome)>,
 ) -> bool {
+    outcomes.clear();
     let Ok(pkt_len) =
         pack_datagram_with_key(header, primary, fec_n1, fec_n2, session_key, datagram)
     else {
@@ -1524,12 +1685,18 @@ fn pack_and_send(
                 telemetry
                     .bytes_sent
                     .fetch_add(pkt_len as u64, Ordering::Relaxed);
+                if any_peer_has_send_errors {
+                    outcomes.push((target_addr, PeerSendOutcome::Sent));
+                }
             }
-            Err(_) => {
+            Err(err) => {
                 // Non-blocking UDP send failures are otherwise silent (the
                 // socket cannot report an ICMP error from `recv_from`). Count
                 // them so a saturating link is visible in diagnostics.
                 telemetry.tx_send_errors.fetch_add(1, Ordering::Relaxed);
+                if is_fatal_route_error(&err) {
+                    outcomes.push((target_addr, PeerSendOutcome::FatalRouteError));
+                }
             }
         }
     }
@@ -1555,6 +1722,10 @@ pub struct ConnectedClient {
     /// client entry so kicking/expiring a peer clears the replay state and a
     /// fresh session may legitimately restart at sequence 1.
     pub feedback_window: FeedbackReplayWindow,
+    /// Consecutive fatal route errors (`ENETUNREACH` / `EHOSTUNREACH` /
+    /// `ECONNREFUSED`) observed on `send_to`. Reset on any successful send or
+    /// incoming client packet; peer is evicted at `ROUTE_ERROR_EVICT_THRESHOLD`.
+    pub consecutive_send_errors: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1629,6 +1800,9 @@ pub struct HostTelemetry {
     /// A large value points at an OS audio-stack stall (BT route change, device
     /// sleep, a wedged loopback capture) rather than a network problem.
     pub capture_cb_max_gap_ms: AtomicU16,
+    /// Count of capture-callback gaps strictly exceeding 20 ms after the
+    /// initial 500 ms stream warmup (or post-rebind warmup).
+    pub capture_cb_gaps_over_20ms: AtomicU64,
     /// Failed `send_to` calls on the real-time TX socket. The socket is
     /// non-blocking, so without this counter a saturated link drops silently.
     pub tx_send_errors: AtomicU64,
@@ -1670,6 +1844,7 @@ impl Default for HostTelemetry {
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
             capture_cb_max_gap_ms: AtomicU16::new(0),
+            capture_cb_gaps_over_20ms: AtomicU64::new(0),
             tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
@@ -1696,7 +1871,7 @@ impl HostTelemetry {
             "Host: profile={:?} codec={} opus={} bitrate={}kbps \
              pkt_interval={:.2}ms subframes={} dtx={} smart_dtx={} \
              packets_sent={} bytes_sent={} send_err={} \
-             cap_buf={:.2}ms cap_max_gap={}ms rebinds={} rej_hs={}",
+             cap_buf={:.2}ms cap_max_gap={}ms cap_gaps_gt20ms={} rebinds={} rej_hs={}",
             profile,
             codec,
             self.prefer_opus.load(Ordering::Relaxed),
@@ -1712,6 +1887,7 @@ impl HostTelemetry {
             self.tx_send_errors.load(Ordering::Relaxed),
             self.capture_buffer_us.load(Ordering::Relaxed) as f32 / 1000.0,
             self.capture_cb_max_gap_ms.load(Ordering::Relaxed),
+            self.capture_cb_gaps_over_20ms.load(Ordering::Relaxed),
             self.hotplug_rebinds.load(Ordering::Relaxed),
             self.rejected_handshakes.load(Ordering::Relaxed),
         )
@@ -1730,9 +1906,24 @@ impl HostTelemetry {
             .load(Ordering::Relaxed)
             .max(bt);
         let packet_ms = (self.tx_packet_interval_us.load(Ordering::Relaxed) / 1000) as u16;
+        // Include Linux PipeWire/WASAPI capture buffering and Opus RLD encoder
+        // lookahead so the host's ProcessLatency offset covers the full
+        // capture-to-ear pipeline.
+        let cap_ms = ((self.capture_buffer_us.load(Ordering::Relaxed) / 1000) as u16).min(30);
+        let codec_ms = if self.active_codec_mode.load(Ordering::Relaxed)
+            == audioshare_protocol::wire::CodecMode::OpusRld as u8
+        {
+            3
+        } else {
+            0
+        };
         // `downstream` already includes BT delay + excess FIFO above the 10 ms
-        // base floor. Add the base floor and this packet's framing interval.
-        downstream.saturating_add(10).saturating_add(packet_ms)
+        // base floor. Add the base floor, framing, capture backlog, and codec lookahead.
+        downstream
+            .saturating_add(10)
+            .saturating_add(packet_ms)
+            .saturating_add(cap_ms)
+            .saturating_add(codec_ms)
     }
 }
 
@@ -1757,7 +1948,8 @@ fn pump_pcm_fd_nonblocking(
     start_epoch: Instant,
 ) {
     const SUBFRAME_BYTES: usize = SUBFRAME_STEREO_SAMPLES * 4; // 960
-    let mut byte_buf = [0u8; SUBFRAME_BYTES];
+    const MAX_DRAIN_SUBFRAMES: usize = 4;
+    let mut byte_buf = [0u8; SUBFRAME_BYTES * MAX_DRAIN_SUBFRAMES];
     let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
     let mut filled = 0usize;
 
@@ -1801,9 +1993,8 @@ fn pump_pcm_fd_nonblocking(
             continue;
         }
 
-        // `read` never blocks here, so a short read simply means "more
-        // bytes are still in flight". Accumulate until a whole subframe
-        // is available.
+        // Drain up to 4 complete 960 B subframes per poll() wakeup so a 10 ms
+        // PipeWire quantum empties cleanly without multiple poll()/notify() hops.
         let n = unsafe {
             libc::read(
                 fd,
@@ -1813,17 +2004,23 @@ fn pump_pcm_fd_nonblocking(
         };
         if n > 0 {
             filled += n as usize;
-            if filled < SUBFRAME_BYTES {
-                continue;
+            let mut processed = 0usize;
+            while filled - processed >= SUBFRAME_BYTES {
+                for (dst, chunk) in f32_buf
+                    .iter_mut()
+                    .zip(byte_buf[processed..processed + SUBFRAME_BYTES].chunks_exact(4))
+                {
+                    *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                ring.push_samples(&f32_buf);
+                processed += SUBFRAME_BYTES;
             }
-            debug_assert_eq!(filled, SUBFRAME_BYTES);
-            filled = 0;
-            heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-            for (dst, chunk) in f32_buf.iter_mut().zip(byte_buf.chunks_exact(4)) {
-                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if processed > 0 {
+                byte_buf.copy_within(processed..filled, 0);
+                filled -= processed;
+                heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                wakeup.notify();
             }
-            ring.push_samples(&f32_buf);
-            wakeup.notify();
             continue;
         }
         if n == 0 {
@@ -1983,6 +2180,7 @@ impl HostEngine {
             capture_buffer_us: AtomicU32::new(0),
             rejected_handshakes: AtomicU64::new(0),
             capture_cb_max_gap_ms: AtomicU16::new(0),
+            capture_cb_gaps_over_20ms: AtomicU64::new(0),
             tx_send_errors: AtomicU64::new(0),
             #[cfg(test)]
             opus_encoder_allocs: AtomicU64::new(0),
@@ -2007,6 +2205,7 @@ impl HostEngine {
                     client_volume: 100,
                     gaming_lock: false,
                     feedback_window: FeedbackReplayWindow::default(),
+                    consecutive_send_errors: 0,
                 },
             );
         }
@@ -2032,6 +2231,10 @@ impl HostEngine {
             .map_err(|e| format!("Failed to bind UDP port {}: {}", config.bind_port, e))?;
         configure_realtime_udp_socket(&socket)
             .map_err(|e| format!("Failed to set real-time socket options: {}", e))?;
+        // Tighten the host TX socket's kernel send buffer to 128 KB (keeping
+        // 1 MB SO_RCVBUF on receivers) to prevent multi-second kernel queueing
+        // on stalled Wi-Fi links.
+        let _ = socket2::SockRef::from(&socket).set_send_buffer_size(131_072);
         let _ = socket.set_nonblocking(true);
 
         let ring = Arc::new(BurstDecouplerRing::new());
@@ -2359,7 +2562,7 @@ impl HostEngine {
                 promote_thread_realtime();
 
                 fn query_default_monitor() -> Option<String> {
-                    if let Ok(out) = Command::new("pactl").arg("get-default-source").output() {
+                    if let Ok(out) = crate::discovery_and_os::pactl_command().arg("get-default-source").output() {
                         if out.status.success() {
                             let src = String::from_utf8_lossy(&out.stdout).trim().to_string();
                             if src == "AudioShare_Ultra.monitor" {
@@ -2367,7 +2570,7 @@ impl HostEngine {
                             }
                         }
                     }
-                    Command::new("pactl")
+                    crate::discovery_and_os::pactl_command()
                         .arg("get-default-sink")
                         .output()
                         .ok()
@@ -2400,7 +2603,19 @@ impl HostEngine {
                             while watcher_running.load(Ordering::Relaxed)
                                 && watcher_active.load(Ordering::Relaxed)
                             {
-                                std::thread::sleep(Duration::from_secs(2));
+                                for _ in 0..40 {
+                                    if !watcher_running.load(Ordering::Relaxed)
+                                        || !watcher_active.load(Ordering::Relaxed)
+                                    {
+                                        break;
+                                    }
+                                    std::thread::sleep(Duration::from_millis(50));
+                                }
+                                if !watcher_running.load(Ordering::Relaxed)
+                                    || !watcher_active.load(Ordering::Relaxed)
+                                {
+                                    break;
+                                }
                                 if let Some(current) = query_default_monitor() {
                                     if current != last {
                                         last = current.clone();
@@ -2423,14 +2638,14 @@ impl HostEngine {
                     //    low latency. A non-blocking poll reader drains its
                     //    stdout so a silent sink cannot wedge the thread.
                     let child = Command::new("parec")
-                        .env("PIPEWIRE_LATENCY", "240/48000")
+                        .env("PIPEWIRE_LATENCY", "120/48000")
                         .args([
                             "--raw",
                             "--format=float32le",
                             "--rate=48000",
                             "--channels=2",
-                            "--latency-msec=5",
-                            "--process-time-msec=3",
+                            "--latency-msec=3",
+                            "--process-time-msec=2",
                             &format!("--device={}", current_monitor),
                         ])
                         .stdout(Stdio::piped())
@@ -2514,6 +2729,7 @@ impl HostEngine {
 
                     if capture_active.load(Ordering::Relaxed)
                         && capture_running.load(Ordering::Relaxed)
+                        && sink_generation.load(Ordering::Acquire) == generation
                     {
                         std::thread::sleep(Duration::from_millis(50));
                     }
@@ -3042,7 +3258,15 @@ impl HostEngine {
                         .unwrap_or_else(|e| e.into_inner())
                         .clone();
                     while watcher_running.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(500));
+                        for _ in 0..10 {
+                            if !watcher_running.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        if !watcher_running.load(Ordering::Relaxed) {
+                            break;
+                        }
                         if let Some(current) = cpal::default_host()
                             .default_output_device()
                             .and_then(|d| d.name().ok())
@@ -3079,7 +3303,11 @@ impl HostEngine {
                     start_instant,
                 ) {
                     Ok(proc_stream) => Some(HostCaptureStream::WindowsProcess(proc_stream)),
-                    Err(_) => {
+                    Err(err) => {
+                        app_routing::clear_windows_target_capture_pid();
+                        app_routing::set_windows_app_isolation_error(Some(format!(
+                            "App isolation (PID {bound_target_pid}) failed: {err} — fell back to Full System Audio"
+                        )));
                         bound_target_pid = 0;
                         Self::spawn_loopback_capture(
                             Arc::clone(&ring),
@@ -3159,6 +3387,8 @@ impl HostEngine {
         // entering the compressed tier does not emit lookahead silence.
         // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
+        let mut opus_last_active_at: Option<Instant> = None;
+        let mut apply_overflow_fade_in = false;
         // Retain the most recently transmitted live f32 subframe so switching
         // from Lossless/24-bit/VBR into Opus mid-stream can immediately prime
         // the new encoder's 2.5 ms lookahead instead of emitting a silence hole.
@@ -3184,11 +3414,21 @@ impl HostEngine {
         const SALT_ROTATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
         let mut last_client_sweep = Instant::now();
         let mut last_dtx_heartbeat = Instant::now();
+        let mut was_dtx_active = false;
+        let mut dtx_entry_confirm_pending = false;
+        let mut any_peer_has_send_errors = false;
+        let mut send_outcomes: Vec<(SocketAddr, PeerSendOutcome)> =
+            Vec::with_capacity(MAX_CONNECTED_CLIENTS);
+        let capture_idle_ms: u64 = 40;
+        // Suppresses connect-time quality/bitrate overrides from legacy APKs
+        // joining a session that already has another active receiver.
+        let mut join_override_grace: HashMap<IpAddr, Instant> = HashMap::new();
         // Capture-callback gap instrumentation. Anchors are reset when the
         // capture source changes, so a rebind's fresh heartbeat is never
         // compared against the old stream's epoch.
         let mut last_observed_cb_ms: u64 = 0;
         let mut last_observed_rebinds: u16 = 0;
+        let mut capture_warmup_since = start_instant;
         // Edge-triggered TX logs: only write when the framing actually moves.
         let mut last_logged_codec_mode = telemetry.active_codec_mode.load(Ordering::Relaxed);
         let mut last_logged_subframes = telemetry.tx_subframes_per_packet.load(Ordering::Relaxed);
@@ -3365,18 +3605,31 @@ impl HostEngine {
             // producer, so both reset the anchor rather than reporting a
             // meaningless spike.
             let observed_rebinds = telemetry.hotplug_rebinds.load(Ordering::Relaxed);
-            if use_test_tone || observed_rebinds != last_observed_rebinds {
+            let rebind = observed_rebinds != last_observed_rebinds;
+            if use_test_tone || rebind || telemetry.dtx_silent_mode.load(Ordering::Relaxed) {
                 last_observed_cb_ms = 0;
+                // DTX silence re-anchors only the callback epoch. The warmup
+                // epoch survives so resumed audio measures gaps immediately.
+                if use_test_tone || rebind {
+                    capture_warmup_since = tick_now;
+                }
                 last_observed_rebinds = observed_rebinds;
             } else {
                 let cb_ms = capture_heartbeat_ms.load(Ordering::Relaxed);
                 if cb_ms > last_observed_cb_ms {
-                    if last_observed_cb_ms > 0 {
+                    if last_observed_cb_ms > 0
+                        && capture_warmup_since.elapsed() >= Duration::from_millis(500)
+                    {
                         let gap = cb_ms - last_observed_cb_ms;
                         telemetry.capture_cb_max_gap_ms.fetch_max(
                             gap.min(u16::MAX as u64) as u16,
                             Ordering::Relaxed,
                         );
+                        if gap > 20 {
+                            telemetry
+                                .capture_cb_gaps_over_20ms
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     last_observed_cb_ms = cb_ms;
                 }
@@ -3418,6 +3671,8 @@ impl HostEngine {
                         continue;
                     }
                     let newly_joined = !map.contains_key(&src_addr);
+                    let had_other_active = newly_joined
+                        && map.values().any(|c| !c.muted && c.addr != src_addr);
                     // Only query OS interfaces when inserting a genuinely new
                     // client (never on every 500 ms heartbeat in the RT loop!).
                     let is_usb = if newly_joined {
@@ -3425,8 +3680,8 @@ impl HostEngine {
                     } else {
                         false
                     };
-                    map.entry(src_addr)
-                        .or_insert(ConnectedClient {
+                    {
+                        let entry = map.entry(src_addr).or_insert(ConnectedClient {
                             addr: src_addr,
                             last_seen: Instant::now(),
                             is_usb,
@@ -3437,8 +3692,11 @@ impl HostEngine {
                             client_volume: 100,
                             gaming_lock: false,
                             feedback_window: FeedbackReplayWindow::default(),
-                        })
-                        .last_seen = Instant::now();
+                            consecutive_send_errors: 0,
+                        });
+                        entry.last_seen = Instant::now();
+                        entry.consecutive_send_errors = 0;
+                    }
                     telemetry
                         .active_clients_count
                         .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
@@ -3453,6 +3711,12 @@ impl HostEngine {
                     cached_all_usb = Self::all_active_targets_are_usb(&map);
                     drop(map);
                     if newly_joined {
+                        if had_other_active {
+                            join_override_grace.insert(
+                                src_addr.ip(),
+                                Instant::now() + JOIN_PROFILE_OVERRIDE_GRACE,
+                            );
+                        }
                         audioshare_protocol::diagnostics::info(
                             "host-clients",
                             format!(
@@ -3501,6 +3765,7 @@ impl HostEngine {
                                 continue;
                             }
                             entry.last_seen = Instant::now();
+                            entry.consecutive_send_errors = 0;
                             entry.fec_rate_permille = fb.fec_rate_permille;
                             entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
                             entry.hardware_delay_ms = fb.hardware_delay_ms;
@@ -3510,17 +3775,19 @@ impl HostEngine {
                             }
                             allow_remote_commands = !entry.muted;
                         } else {
-                            // Reject continuing heartbeats (`feedback_seq > 1`)
+                            // Reject continuing heartbeats (`feedback_seq > 8`)
                             // from recently kicked IPs during their 15 s
                             // cooldown so clicking Kick actually keeps an
                             // active client out instead of auto-rejoining in
                             // 500 ms. A deliberate fresh reconnect starts a new
-                            // `ClientEngine` at `feedback_seq == 1`, which is
-                            // admitted immediately and clears the cooldown.
+                            // `ClientEngine` at `feedback_seq == 1` (and retries
+                            // every 150 ms); accepting `seq <= 8` prevents one
+                            // lost UDP handshake packet on Wi-Fi from locking out
+                            // a valid reconnect behind the 15 s kick cooldown.
                             {
                                 let mut kicked =
                                     kicked_clients.lock().unwrap_or_else(|e| e.into_inner());
-                                if fb.feedback_seq == 1 {
+                                if fb.feedback_seq <= 8 {
                                     kicked.remove(&src_addr.ip());
                                 } else if kicked
                                     .get(&src_addr.ip())
@@ -3547,9 +3814,17 @@ impl HostEngine {
                                 continue;
                             }
                             let is_usb = is_usb_subnet_ip(src_addr.ip());
+                            let had_other_active =
+                                map.values().any(|c| !c.muted && c.addr != src_addr);
                             newly_joined = true;
                             newly_joined_usb = is_usb;
                             allow_remote_commands = true;
+                            if had_other_active {
+                                join_override_grace.insert(
+                                    src_addr.ip(),
+                                    Instant::now() + JOIN_PROFILE_OVERRIDE_GRACE,
+                                );
+                            }
                             map.insert(
                                 src_addr,
                                 ConnectedClient {
@@ -3563,6 +3838,7 @@ impl HostEngine {
                                     client_volume: fb.client_volume,
                                     gaming_lock: gaming_lock_update.unwrap_or(false),
                                     feedback_window: accepted_window,
+                                    consecutive_send_errors: 0,
                                 },
                             );
                         }
@@ -3629,21 +3905,27 @@ impl HostEngine {
                         }
 
                         // Remote quality-mode (1..=5) and bitrate (30..=34) selection.
-                        if (1..=5).contains(&fb.requested_mode) {
-                            telemetry
-                                .quality_profile
-                                .store(fb.requested_mode - 1, Ordering::Relaxed);
-                        } else {
-                            let kbps = match fb.requested_mode {
-                                30 => Some(96u16),
-                                31 => Some(160),
-                                32 => Some(256),
-                                33 => Some(320),
-                                34 => Some(510),
-                                _ => None,
-                            };
-                            if let Some(kbps) = kbps {
-                                telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                        let cmd_now = Instant::now();
+                        if should_apply_remote_profile_cmd(
+                            join_override_grace.get(&src_addr.ip()).copied(),
+                            cmd_now,
+                        ) {
+                            if (1..=5).contains(&fb.requested_mode) {
+                                telemetry
+                                    .quality_profile
+                                    .store(fb.requested_mode - 1, Ordering::Relaxed);
+                            } else {
+                                let kbps = match fb.requested_mode {
+                                    30 => Some(96u16),
+                                    31 => Some(160),
+                                    32 => Some(256),
+                                    33 => Some(320),
+                                    34 => Some(510),
+                                    _ => None,
+                                };
+                                if let Some(kbps) = kbps {
+                                    telemetry.target_bitrate_kbps.store(kbps, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -3659,6 +3941,29 @@ impl HostEngine {
                             ),
                         );
                     }
+                } else if len >= 8
+                    && &ctrl_buf[..8] == CONTROL_MAGIC_BYE
+                    && src_addr.ip().is_loopback()
+                {
+                    let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+                    if map.remove(&src_addr).is_some() {
+                        telemetry
+                            .active_clients_count
+                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
+                        Self::refresh_client_delay_telemetry(&map, &telemetry);
+                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
+                        cached_targets.clear();
+                        for c in map.values() {
+                            if !c.muted {
+                                cached_targets.push(c.addr);
+                            }
+                        }
+                        cached_all_usb = Self::all_active_targets_are_usb(&map);
+                        if map.is_empty() {
+                            loss_governor = LossGovernor::new(Instant::now());
+                            high_loss_gate = HighLossWindowGate::new();
+                        }
+                    }
                 } else if len >= 8 && &ctrl_buf[..8] == b"ASULCTRL" {
                     // Legacy v1 (0.2.x) client tried to join a v2 host. Count
                     // the rejection so operators can spot version mismatches.
@@ -3669,6 +3974,7 @@ impl HostEngine {
             // 2b. Expire clients that stopped sending HELLO/feedback, and refresh lock-free cached_targets
             if last_client_sweep.elapsed() >= Duration::from_secs(1) {
                 last_client_sweep = Instant::now();
+                join_override_grace.retain(|_, until| *until > last_client_sweep);
                 if let Ok(mut map) = clients.try_lock() {
                     let before = map.len();
                     map.retain(|_, client| client.last_seen.elapsed() < Duration::from_secs(10));
@@ -3705,7 +4011,7 @@ impl HostEngine {
                             .max()
                             .unwrap_or(0);
                         loss_governor.update(raw_worst, now_sweep);
-                        high_loss_gate.observe(raw_worst, loss_governor.value, now_sweep);
+                        high_loss_gate.sync_governor(loss_governor.value);
                     }
                     let raw_worst_for_promo = map
                         .values()
@@ -3762,11 +4068,6 @@ impl HostEngine {
                 any_wifi,
                 cached_all_usb,
             );
-            // Publish the bitrate actually driving the TX codec on every tick.
-            // Diagnostics reports this instead of the raw UI selection.
-            telemetry
-                .effective_bitrate_kbps
-                .store(tx_bitrate_kbps, Ordering::Relaxed);
             // Hysteresis lives in session state, not in the pure 8-arg
             // `select_tx_profile` helper used by unit tests: a single lossy
             // feedback window must not jump Smart Auto from 5 ms to 10 ms.
@@ -3775,7 +4076,15 @@ impl HostEngine {
                 && !high_loss_gate.allows_four_subframes()
             {
                 subframes_per_pkt = 2;
+                // Keep a 2-sf stream on the 2-sf intra-Opus rung (up to 224k,
+                // ~148 B RED) instead of stranding it at the 4-sf floor.
+                tx_bitrate_kbps = selected_kbps.clamp(SMART_AUTO_OPUS_FLOOR_KBPS, 224);
             }
+            // Publish the bitrate actually driving the TX codec on every tick.
+            // Diagnostics reports this instead of the raw UI selection.
+            telemetry
+                .effective_bitrate_kbps
+                .store(tx_bitrate_kbps, Ordering::Relaxed);
             let use_pcm24 = profile == QualityProfile::StudioLossless24Bit
                 || (profile == QualityProfile::SmartAuto
                     && dynamic_codec_mode == CodecMode::StudioLosslessLpc
@@ -3859,10 +4168,22 @@ impl HostEngine {
                     while ring.available_samples() > needed_samples + SUBFRAME_STEREO_SAMPLES * 4 {
                         ring.pop_exact_or_dither(&mut discard, &mut dummy_rng);
                     }
+                    // Reset predictive FEC / Opus state across the dropped gap
+                    // and fade in the first kept subframe without advancing `seq`.
+                    fec_hist_len = 0;
+                    opus_red.clear();
+                    opus_encoder = None;
+                    opus_last_active_at = None;
+                    has_prev_subframe = false;
+                    prev_f32_subframe.fill(0.0);
+                    apply_overflow_fade_in = true;
                 } else if avail < needed_samples {
                     let now_ms = start_instant.elapsed().as_millis() as u64;
                     let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
-                    if now_ms.saturating_sub(last_cb) <= 80 {
+                    // Linux PipeWire delivers 2.5-5 ms chunks; fall back to silence
+                    // after 40 ms on track-change/suspend pauses instead of starving
+                    // the client for 80 ms. Windows keeps 80 ms for 10-22 ms WASAPI.
+                    if now_ms.saturating_sub(last_cb) <= capture_idle_ms {
                         capture_wakeup.wait_bounded(seen, Duration::from_micros(1500));
                         continue;
                     }
@@ -3915,6 +4236,7 @@ impl HostEngine {
             // DTX silence is evaluated (below), so a silent packet never builds
             // codec state nor discards FEC history.
             let mut packet_is_silent = true;
+            let mut first_active_sub_idx: Option<usize> = None;
             let mut packet_max_vu_pct: u8 = 0;
 
             for sub_idx in 0..subframes_per_pkt {
@@ -3936,6 +4258,11 @@ impl HostEngine {
                     f32_subframe.fill(0.0);
                 }
 
+                if apply_overflow_fade_in && sub_idx == 0 {
+                    apply_raised_cosine_fade_in(f32_subframe, 32);
+                    apply_overflow_fade_in = false;
+                }
+
                 // Inject 2.5ms Acoustic Latency Sonar Chirp if requested by user
                 if telemetry.trigger_sonar_ping.swap(false, Ordering::Relaxed) {
                     audioshare_protocol::sync_and_eq::LatencySonar::inject_chirp(f32_subframe);
@@ -3948,19 +4275,27 @@ impl HostEngine {
                         .store(now_us, Ordering::Relaxed);
                 }
 
-                let i16_subframe = &mut i16_subframes[sub_idx];
-                let max_abs = noise_shaper.quantize_stereo_subframe(f32_subframe, i16_subframe);
-                let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
+                // Compute VU peak and DTX activity directly from `f32_subframe` so
+                // OpusRld / 24-bit Master / DTX / idle paths skip redundant
+                // 16-bit noise-shaped quantization.
+                let mut peak_f32 = 0.0f32;
+                for &s in f32_subframe.iter() {
+                    if s.is_finite() {
+                        peak_f32 = peak_f32.max(s.abs());
+                    }
+                }
+                peak_f32 = peak_f32.min(1.0);
+                let vu_pct = (peak_f32.sqrt() * 100.0).min(100.0) as u8;
                 packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
-                // Studio Master 24-bit must preserve -85..-100 dBFS reverb
-                // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
-                let active_audio = if use_pcm24 {
-                    f32_subframe.iter().any(|s| s.abs() > 1.0e-5)
-                } else {
-                    max_abs > 3
-                };
+                // Studio Master 24-bit preserves -100 dBFS reverb tails
+                // (`1.0e-5`); 16-bit / compressed paths use `-88.0 dBFS`
+                // (`4.0e-5`) so quiet fades and acoustic tails are not chopped.
+                let active_audio = is_subframe_audio_active(peak_f32, use_pcm24);
                 if active_audio {
+                    if first_active_sub_idx.is_none() {
+                        first_active_sub_idx = Some(sub_idx);
+                    }
                     packet_is_silent = false;
                     silent_subframes = 0;
                 } else {
@@ -3980,16 +4315,21 @@ impl HostEngine {
             // encoder in the DTX branch below -- 200 allocations/sec of silence.
             let is_dtx_active = telemetry.enable_smart_dtx.load(Ordering::Relaxed)
                 && packet_is_silent
-                && silent_subframes > 200;
+                && silent_subframes > SMART_DTX_SILENT_SUBFRAMES;
             telemetry
                 .dtx_silent_mode
                 .store(is_dtx_active, Ordering::Relaxed);
+            if was_dtx_active && !is_dtx_active {
+                let fade_idx = first_active_sub_idx.unwrap_or(0);
+                apply_raised_cosine_fade_in(&mut f32_subframes[fade_idx], 32);
+            }
 
             // No receivers or Smart DTX silence: no codec state is needed.
             // VU/codec telemetry was published above and the DTX heartbeat and
             // packet pacer below keep running, but nothing is allocated here.
             if !has_targets || is_dtx_active {
                 opus_encoder = None;
+                opus_last_active_at = None;
                 fec_hist_len = 0;
                 has_prev_subframe = false;
                 prev_f32_subframe.fill(0.0);
@@ -4000,6 +4340,7 @@ impl HostEngine {
             }
             if !prefer_opus {
                 opus_encoder = None;
+                opus_last_active_at = None;
             }
 
             // Lazily allocate the Opus encoder only for a real, audible packet
@@ -4025,6 +4366,7 @@ impl HostEngine {
                 opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                 if opus_encoder.is_none() {
                     opus_retry.note_failure(tick_now);
+                    opus_last_active_at = None;
                 } else if has_prev_subframe {
                     warm_opus_lookahead(&mut opus_encoder, &prev_f32_subframe, tx_bitrate_kbps);
                 }
@@ -4063,9 +4405,10 @@ impl HostEngine {
                         let entry_start = primary_cursor;
                         let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
                         let opus_len = opus_encoder.as_mut().and_then(|encoder| {
-                            encoder.encode_subframe_f32(
+                            encoder.encode_subframe_f32_for_bundle(
                                 &f32_subframes[sub_idx],
                                 tx_bitrate_kbps,
+                                subframes_per_pkt as u8,
                                 &mut enc_primary,
                             )
                         });
@@ -4098,6 +4441,7 @@ impl HostEngine {
                     }
                     if opus_ok {
                         fec_hist_len = 0;
+                        opus_last_active_at = Some(tick_now);
                     }
                 }
 
@@ -4106,6 +4450,22 @@ impl HostEngine {
                     // Opus failure. `primary_cursor` is 0 on the rebuild path,
                     // so no stale Opus bytes can survive in the datagram.
                     for sub_idx in 0..subframes_per_pkt {
+                        if use_pcm24 {
+                            // 24-bit Master encodes from `f32_subframes`; fast-round
+                            // only for the optional ADPCM FEC backup without touching
+                            // `noise_shaper` state.
+                            for (dst, &s) in i16_subframes[sub_idx]
+                                .iter_mut()
+                                .zip(f32_subframes[sub_idx].iter())
+                            {
+                                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                            }
+                        } else {
+                            noise_shaper.quantize_stereo_subframe(
+                                &f32_subframes[sub_idx],
+                                &mut i16_subframes[sub_idx],
+                            );
+                        }
                         fec_hist.copy_within(0..3, 1);
                         encode_fec_subframe(&i16_subframes[sub_idx], &mut fec_hist[0]);
                         fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
@@ -4127,8 +4487,8 @@ impl HostEngine {
                                 .copy_from_slice(&enc_primary[..enc_len]);
                             primary_cursor += enc_len;
                         } else if use_pcm24 {
-                            // Keep SmartAuto's warm Opus lookahead primed even
-                            // while promoted to 24-bit Master so a sudden Wi-Fi
+                            // Keep SmartAuto's warm Opus lookahead primed while
+                            // inside the 15 s cooldown window so a sudden Wi-Fi
                             // fade never drops to silence on entry into Opus.
                             if profile == QualityProfile::SmartAuto
                                 && prefer_opus
@@ -4156,11 +4516,8 @@ impl HostEngine {
                                 .copy_from_slice(&enc_24[..enc_len]);
                             primary_cursor += enc_len;
                         } else {
-                            // Tier 0 of Smart Auto is lossless, but the Opus
-                            // encoder is kept primed so a sudden loss spike
-                            // does not start with codec warm-up silence. USB
-                            // tethered links have ample headroom, so an all-USB
-                            // session skips that work entirely.
+                            // Tier 0 of Smart Auto is lossless; keep Opus primed
+                            // only during the 15 s cooldown after active Opus use.
                             if profile == QualityProfile::SmartAuto
                                 && prefer_opus
                                 && !cached_all_usb
@@ -4186,25 +4543,27 @@ impl HostEngine {
                     }
                     // Leaving Opus for any non-SmartAuto-Tier0 profile (e.g.
                     // manual StudioLossless / 24-bit / VBR): drop the stale
-                    // Opus encoder immediately so a later switch back to Opus
-                    // allocates a fresh encoder primed with live audio rather
-                    // than replaying stale lookahead samples from seconds ago.
+                    // Opus encoder immediately. For SmartAuto Tier 0, cool down
+                    // and drop the idle warm encoder after 15 s of spotless lossless.
                     let keep_warm_for_smart_auto = profile == QualityProfile::SmartAuto
                         && dynamic_codec_mode == CodecMode::StudioLosslessLpc
                         && prefer_opus
-                        && !cached_all_usb;
+                        && !cached_all_usb
+                        && opus_last_active_at
+                            .map(|t| tick_now.saturating_duration_since(t) < OPUS_WARM_IDLE_COOLDOWN)
+                            .unwrap_or(false);
                     if !keep_warm_for_smart_auto {
                         opus_encoder = None;
+                        opus_last_active_at = None;
                     }
                 }
                 prev_f32_subframe = f32_subframes[subframes_per_pkt - 1];
                 has_prev_subframe = true;
             } else if profile != QualityProfile::SmartAuto {
                 // Leaving compressed/SmartAuto: drop the codec state so a
-                // later compressed period starts clean. SmartAuto Tier 0
-                // intentionally keeps the encoder warm for the first
-                // compressed packet after a loss spike.
+                // later compressed period starts clean.
                 opus_encoder = None;
+                opus_last_active_at = None;
             }
 
             // If an Opus encode failed mid-packet we fell back to VBR above;
@@ -4232,14 +4591,25 @@ impl HostEngine {
             // `is_dtx_active` was evaluated right after subframe collection,
             // before any encoder allocation or encoding work.
             let mut sent_any = false;
+            let mut tx_packet_started_at: Option<Instant> = None;
             if is_dtx_active {
                 // Receivers drop their Opus decoder and sequencer state on
                 // SilenceHeartbeat; reset the sender's codec/FEC history to match.
                 opus_encoder = None;
+                opus_last_active_at = None;
                 fec_hist_len = 0;
                 let heartbeat_now = Instant::now();
-                if dtx_heartbeat_due(last_dtx_heartbeat, heartbeat_now) {
+                // Force an immediate SilenceHeartbeat on DTX entry plus one
+                // confirmation heartbeat on the next tick so a single dropped
+                // Wi-Fi packet never leaves the client burning 200 ms of PLC.
+                let entering_dtx = !was_dtx_active;
+                let send_dtx = entering_dtx
+                    || dtx_entry_confirm_pending
+                    || dtx_heartbeat_due(last_dtx_heartbeat, heartbeat_now);
+                if send_dtx {
+                    dtx_entry_confirm_pending = entering_dtx;
                     last_dtx_heartbeat = heartbeat_now;
+                    tx_packet_started_at = Some(Instant::now());
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
                         subframe_count: subframes_per_pkt as u8,
@@ -4278,9 +4648,28 @@ impl HostEngine {
                         active_key.as_ref(),
                         &cached_targets,
                         &telemetry,
+                        any_peer_has_send_errors,
+                        &mut send_outcomes,
+                    );
+                    reconcile_peer_send_outcomes(
+                        &send_outcomes,
+                        &clients,
+                        &telemetry,
+                        &mut cached_targets,
+                        &mut cached_all_usb,
+                        &mut loss_governor,
+                        &mut high_loss_gate,
+                        &mut any_peer_has_send_errors,
                     );
                 }
+                was_dtx_active = true;
             } else if has_targets {
+                was_dtx_active = false;
+                dtx_entry_confirm_pending = false;
+                // Anchor pacing to the START of packet transmission (before
+                // any `SplitPerSubframe` 1 ms inter-split sleep) so 24-bit
+                // Wi-Fi splitting never adds >5 ms per 5 ms audio cycle.
+                tx_packet_started_at = Some(Instant::now());
                 let hdr = WireHeader {
                     mode: dynamic_codec_mode,
                     subframe_count: subframes_per_pkt as u8,
@@ -4312,11 +4701,11 @@ impl HostEngine {
                 // Pack paired 4-subframe ADPCM FEC ([N-1,N-3] + [N-2,N-4]) on
                 // 4-sf framing AND opportunistically on 2-sf framing whenever
                 // the full 496-byte pair fits inside the safe UDP MTU (e.g.
-                // LPC-compressed 16-bit Lossless and Adaptive VBR). That lets a
-                // Wi-Fi signal dip drop two consecutive 5 ms packets (10 ms)
-                // and still heal every subframe cleanly without PLC or extra
-                // packet splitting.
+                // LPC-compressed 16-bit Lossless and Adaptive VBR). Disable
+                // 4-frame pair_fec for 24-bit PCM so bundles stay under 1380 B
+                // whenever possible.
                 let pair_fec = dynamic_codec_mode != CodecMode::OpusRld
+                    && !use_pcm24
                     && (subframes_per_pkt == 4
                         || (subframes_per_pkt >= 2
                             && datagram_fits(
@@ -4363,6 +4752,18 @@ impl HostEngine {
                             active_key.as_ref(),
                             &cached_targets,
                             &telemetry,
+                            any_peer_has_send_errors,
+                            &mut send_outcomes,
+                        );
+                        reconcile_peer_send_outcomes(
+                            &send_outcomes,
+                            &clients,
+                            &telemetry,
+                            &mut cached_targets,
+                            &mut cached_all_usb,
+                            &mut loss_governor,
+                            &mut high_loss_gate,
+                            &mut any_peer_has_send_errors,
                         );
                     }
                     DatagramPlan::SplitPerSubframe => {
@@ -4371,6 +4772,12 @@ impl HostEngine {
                         // audio by sending one subframe per datagram, with the
                         // FEC history re-based to each new packet sequence.
                         for split_idx in 0..subframes_per_pkt {
+                            // Spread split 24-bit datagrams across 1 ms on Wi-Fi
+                            // so silence->music transitions never blast 20 us
+                            // microbursts into the 802.11 TX queue.
+                            if split_idx > 0 && !cached_all_usb {
+                                std::thread::sleep(Duration::from_micros(1_000));
+                            }
                             let (start, end) = subframe_ranges[split_idx];
                             let mut split_hdr = hdr;
                             split_hdr.subframe_count = 1;
@@ -4414,10 +4821,28 @@ impl HostEngine {
                                 active_key.as_ref(),
                                 &cached_targets,
                                 &telemetry,
+                                any_peer_has_send_errors,
+                                &mut send_outcomes,
                             );
+                            reconcile_peer_send_outcomes(
+                                &send_outcomes,
+                                &clients,
+                                &telemetry,
+                                &mut cached_targets,
+                                &mut cached_all_usb,
+                                &mut loss_governor,
+                                &mut high_loss_gate,
+                                &mut any_peer_has_send_errors,
+                            );
+                            if cached_targets.is_empty() {
+                                break;
+                            }
                         }
                     }
                 }
+            } else {
+                was_dtx_active = false;
+                dtx_entry_confirm_pending = false;
             }
 
             // Store the just-sent packet P as the new [P-1] for the next OpusRld
@@ -4467,10 +4892,10 @@ impl HostEngine {
             let capture_active = !use_test_tone
                 && (start_instant.elapsed().as_millis() as u64)
                     .saturating_sub(capture_heartbeat_ms.load(Ordering::Relaxed))
-                    <= 80;
+                    <= capture_idle_ms;
             if capture_active {
                 if sent_any {
-                    last_tx_instant = Instant::now();
+                    last_tx_instant = tx_packet_started_at.unwrap_or_else(Instant::now);
                 }
                 // Keep the isochronous deadline anchored so a later capture
                 // stall does not trigger a catch-up burst.
@@ -4492,10 +4917,38 @@ impl HostEngine {
                     next_tick += step_interval;
                 }
                 if sent_any {
-                    last_tx_instant = Instant::now();
+                    last_tx_instant = tx_packet_started_at.unwrap_or_else(Instant::now);
                 }
             }
         }
+    }
+}
+
+/// Classify whether a subframe peak exceeds the Smart DTX silence floor:
+/// `-100 dBFS` (`1.0e-5`) for 24-bit Master, `-88.0 dBFS` (`4.0e-5`) for 16-bit/compressed.
+#[inline]
+fn is_subframe_audio_active(peak_f32: f32, use_pcm24: bool) -> bool {
+    if use_pcm24 {
+        peak_f32 > 1.0e-5
+    } else {
+        peak_f32 > 4.0e-5
+    }
+}
+
+/// Apply a smooth raised-cosine fade-in across `frames` stereo frames (e.g.
+/// 32 frames = 0.67 ms at 48 kHz) after a capture ring overflow discard so the
+/// receiver hears zero click across the discontinuity.
+#[inline]
+fn apply_raised_cosine_fade_in(pcm: &mut [f32; SUBFRAME_STEREO_SAMPLES], frames: usize) {
+    let n = frames.min(SUBFRAME_FRAMES);
+    if n == 0 {
+        return;
+    }
+    for i in 0..n {
+        let alpha = (i as f32) / (n as f32);
+        let w = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+        pcm[i * 2] *= w;
+        pcm[i * 2 + 1] *= w;
     }
 }
 
@@ -4599,8 +5052,20 @@ mod tests {
         t.max_client_downstream_delay_ms
             .store(185, Ordering::Relaxed);
         t.tx_packet_interval_us.store(5_000, Ordering::Relaxed);
-        // 185 downstream + 10 ms base floor + 5 ms packetization.
+        // 185 downstream + 10 ms base floor + 5 ms packetization + 0 cap + 0 lossless.
         assert_eq!(t.video_lipsync_offset_ms(), 200);
+
+        t.capture_buffer_us.store(7_500, Ordering::Relaxed);
+        t.active_codec_mode.store(
+            audioshare_protocol::wire::CodecMode::OpusRld as u8,
+            Ordering::Relaxed,
+        );
+        // + 7 ms capture buffering + 3 ms Opus RLD lookahead.
+        assert_eq!(t.video_lipsync_offset_ms(), 210);
+
+        t.capture_buffer_us.store(50_000, Ordering::Relaxed);
+        // Capture contribution is capped at 30 ms.
+        assert_eq!(t.video_lipsync_offset_ms(), 233);
     }
 
     #[test]
@@ -4608,16 +5073,19 @@ mod tests {
         let t = HostTelemetry::new();
         let baseline = t.diagnostics_summary();
         assert!(baseline.contains("cap_max_gap=0ms"), "{baseline}");
+        assert!(baseline.contains("cap_gaps_gt20ms=0"), "{baseline}");
         assert!(baseline.contains("send_err=0 "), "{baseline}");
         assert!(baseline.contains("profile=SmartAuto"), "{baseline}");
         assert!(baseline.contains("codec=Lossless LPC"), "{baseline}");
 
         t.capture_cb_max_gap_ms.store(37, Ordering::Relaxed);
+        t.capture_cb_gaps_over_20ms.store(3, Ordering::Relaxed);
         t.tx_send_errors.store(9, Ordering::Relaxed);
         t.hotplug_rebinds.store(2, Ordering::Relaxed);
         t.rejected_handshakes.store(4, Ordering::Relaxed);
         let summary = t.diagnostics_summary();
         assert!(summary.contains("cap_max_gap=37ms"), "{summary}");
+        assert!(summary.contains("cap_gaps_gt20ms=3"), "{summary}");
         assert!(summary.contains("send_err=9 "), "{summary}");
         assert!(summary.contains("rebinds=2"), "{summary}");
         assert!(summary.contains("rej_hs=4"), "{summary}");
@@ -4669,6 +5137,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
         map.insert(
@@ -4684,6 +5153,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
         map.insert(
@@ -4699,6 +5169,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
 
@@ -5011,6 +5482,8 @@ mod tests {
             "enx001122334455",
             "enp0s20f0u1",
             "ENX001122334455",
+            "Remote NDIS based Internet Sharing Device",
+            "Remote NDIS Compatible Device",
         ] {
             assert!(is_usb_interface_name(name), "{} should be USB", name);
         }
@@ -5366,6 +5839,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -5417,7 +5891,7 @@ mod tests {
         );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 2));
 
-        // SmartAuto on Wi-Fi + BT stays compressed (192k, 2 sf) instead of probing lossless.
+        // SmartAuto on Wi-Fi + BT stays compressed (256k, 2 sf) instead of probing lossless.
         let (mode, sf, kbps) = select_tx_profile(
             QualityProfile::SmartAuto,
             2,
@@ -5428,7 +5902,7 @@ mod tests {
             true,
             false,
         );
-        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 192));
+        assert_eq!((mode, sf, kbps), (CodecMode::CompressedLowDelay, 2, 256));
 
         // Clean wired/speaker SmartAuto still stays lossless.
         let (mode, sf, _) = select_tx_profile(
@@ -5460,8 +5934,8 @@ mod tests {
         );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 1));
 
-        // An active BT link suppresses the USB fast path just like gaming lock:
-        // A2DP needs the steadier 5 ms framing to avoid Wi-Fi/BT contention.
+        // Pure USB with active BT still keeps the wired USB 1-sf fast path
+        // because there is no 802.11 Wi-Fi/BT contention on a USB tether.
         let (_, sf, _) = select_tx_profile(
             QualityProfile::StudioLossless,
             2,
@@ -5469,10 +5943,10 @@ mod tests {
             0,
             false,
             true,
-            true,
+            false,
             true,
         );
-        assert_eq!(sf, 2, "BT active must disable auto-USB 1-sf framing");
+        assert_eq!(sf, 1, "pure USB keeps 1-sf fast path even when BT is active");
 
         // A Wi-Fi client in the mix disables the fast path entirely.
         let (_, sf, _) = select_tx_profile(
@@ -5500,6 +5974,35 @@ mod tests {
             true,
         );
         assert_eq!((mode, sf), (CodecMode::CompressedLowDelay, 4));
+    }
+
+    #[test]
+    fn test_select_tx_profile_non_usb_never_yields_one_subframe() {
+        for profile in [
+            QualityProfile::StudioLossless,
+            QualityProfile::StudioLossless24Bit,
+            QualityProfile::LowLatencyCompressed,
+            QualityProfile::SmartAuto,
+        ] {
+            for loss in [0u16, 50, 90, 200] {
+                for bt_active in [false, true] {
+                    let (_, sf, _) = select_tx_profile(
+                        profile,
+                        1,     // configured_subframes = 1
+                        256,
+                        loss,
+                        true,  // gaming_lock = true
+                        bt_active,
+                        true,  // any_wifi_client = true
+                        false, // all_clients_usb = false
+                    );
+                    assert!(
+                        sf >= 2,
+                        "non-USB session yielded {sf} sf for {profile:?} loss={loss} bt={bt_active}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5556,6 +6059,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -5601,6 +6105,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -6413,27 +6918,31 @@ mod tests {
                     }
                     let n1 = parsed.fec_n1_payload;
                     let n2 = parsed.fec_n2_payload;
+                    let mut n1_sf = 0usize;
+                    let mut n2_sf = 0usize;
                     if !n1.is_empty() {
                         assert_eq!(n1[0], TAG_OPUS_RED, "fec_n1 must be TAG_OPUS_RED");
-                        let mut sf_count = 0usize;
                         assert!(
-                            unpack_opus_red_blob(n1, |_, _| sf_count += 1),
+                            unpack_opus_red_blob(n1, |_, _| n1_sf += 1),
                             "fec_n1 RED blob must unpack cleanly"
                         );
-                        assert_eq!(sf_count, 4);
-                        if n2.is_empty() {
-                            saw_n1_only = true;
-                        }
                     }
                     if !n2.is_empty() {
                         assert_eq!(n2[0], TAG_OPUS_RED, "fec_n2 must be TAG_OPUS_RED");
-                        let mut sf_count = 0usize;
                         assert!(
-                            unpack_opus_red_blob(n2, |_, _| sf_count += 1),
+                            unpack_opus_red_blob(n2, |_, _| n2_sf += 1),
                             "fec_n2 RED blob must unpack cleanly"
                         );
-                        assert_eq!(sf_count, 4);
-                        if !n1.is_empty() {
+                    }
+                    if n1_sf > 0 || n2_sf > 0 {
+                        let valid_sf = |c: usize| c == 4 || (1..=2).contains(&c);
+                        assert!(
+                            valid_sf(n1_sf) && (n2_sf == 0 || valid_sf(n2_sf)),
+                            "unexpected RED subframe counts: n1={n1_sf}, n2={n2_sf}"
+                        );
+                        if n2.is_empty() {
+                            saw_n1_only = true;
+                        } else if !n1.is_empty() {
                             saw_both_red += 1;
                         }
                     }
@@ -6449,12 +6958,12 @@ mod tests {
             "expected >= 5 consecutive 4-subframe Opus RLD packets, got {opus_packets_seen}"
         );
         assert!(
-            saw_n1_only,
-            "expected ramp-up packet with [P-1] RED present and [P-2] empty"
+            saw_n1_only || saw_both_red >= 4,
+            "expected ramp-up packet with [P-1] RED present (unsplit n1-only or split n1+n2)"
         );
         assert!(
             saw_both_red >= 3,
-            "expected steady-state packets with both [P-1] and [P-2] RED blobs, got {saw_both_red}"
+            "expected steady-state packets with both RED blobs, got {saw_both_red}"
         );
     }
 
@@ -6497,7 +7006,7 @@ mod tests {
             (CodecMode::CompressedLowDelay, 2, 510)
         );
         // SmartAuto walks smoothly from lossless -> 320k -> 224k -> 160k 4sf
-        // -> 128k 4sf floor. There is no 64 kbps rung any more.
+        // (160k 4sf floor). There is no 64 kbps or 128 kbps rung any more.
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 0, false, false, true, false),
             (CodecMode::StudioLosslessLpc, 2, 510)
@@ -6516,11 +7025,11 @@ mod tests {
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 220, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 128)
+            (CodecMode::CompressedLowDelay, 4, 160)
         );
         assert_eq!(
             select_tx_profile(QualityProfile::SmartAuto, 2, 510, 320, false, false, true, false),
-            (CodecMode::CompressedLowDelay, 4, 128)
+            (CodecMode::CompressedLowDelay, 4, 160)
         );
     }
 
@@ -6541,7 +7050,7 @@ mod tests {
         );
         assert_eq!(mode, CodecMode::CompressedLowDelay);
         assert_eq!(sf, 4, "expected 10 ms (4 sf) framing at 350 permille");
-        assert!(kbps >= 128, "SmartAuto 350 permille selected {kbps} kbps (<128)");
+        assert!(kbps >= 160, "SmartAuto 350 permille selected {kbps} kbps (<160)");
         assert_ne!(kbps, 64);
         assert_ne!(kbps, 96);
     }
@@ -6652,6 +7161,24 @@ mod tests {
         assert!(!flapping.observe(0, 0, t + Duration::from_millis(500)));
         assert!(!flapping.observe(350, 350, t + Duration::from_millis(1_000)));
         assert!(!flapping.allows_four_subframes());
+
+        // Jittered 2nd report at +480 ms (just under 500 ms, >= 350 ms window)
+        // must be accepted and arm 4 sf.
+        let mut jittered = HighLossWindowGate::new();
+        assert!(!jittered.observe(350, 350, t));
+        assert!(jittered.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(jittered.allows_four_subframes());
+
+        // sync_governor(350) after a single spike must NOT arm 4 sf, while
+        // sync_governor(40) disarms an armed gate.
+        let mut synced = HighLossWindowGate::new();
+        assert!(!synced.observe(350, 350, t));
+        synced.sync_governor(350);
+        assert!(!synced.allows_four_subframes());
+        assert!(synced.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(synced.allows_four_subframes());
+        synced.sync_governor(40);
+        assert!(!synced.allows_four_subframes());
     }
 
     #[test]
@@ -6692,5 +7219,260 @@ mod tests {
             summary.contains("bitrate=128kbps"),
             "diagnostics must print the effective TX bitrate, not the raw selection: {summary}"
         );
+    }
+
+    #[test]
+    fn test_joining_second_client_does_not_override_host_profile_during_grace() {
+        use audioshare_protocol::crypto::AEAD_TAG_LEN;
+        use audioshare_protocol::wire::CONTROL_FEEDBACK_LEN;
+
+        let t = Instant::now();
+        assert!(should_apply_remote_profile_cmd(None, t));
+        assert!(!should_apply_remote_profile_cmd(
+            Some(t + Duration::from_millis(500)),
+            t,
+        ));
+        assert!(should_apply_remote_profile_cmd(Some(t), t));
+
+        // Live TX loop: Peer A is already connected on LowLatencyCompressed;
+        // Peer B joining immediately with SmartAuto (mode 1) must not flip it.
+        let (mut engine, port) = start_test_host();
+        engine.telemetry.quality_profile.store(
+            QualityProfile::LowLatencyCompressed as u8,
+            Ordering::Relaxed,
+        );
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        let peer_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let send_fb = |sock: &UdpSocket, seq: u32, mode: u8| {
+            let mut buf = [0u8; CONTROL_FEEDBACK_LEN];
+            ClientFeedbackPacket {
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                client_volume: 100,
+                requested_mode: mode,
+                hardware_delay_ms: 0,
+                feedback_seq: seq,
+                auth_tag: [0u8; AEAD_TAG_LEN],
+            }
+            .encode_signed(None, &mut buf);
+            sock.send_to(&buf, dest).unwrap();
+        };
+
+        send_fb(&peer_a, 1, 0);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && engine.telemetry.active_clients_count.load(Ordering::Relaxed) < 1
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.telemetry.active_clients_count.load(Ordering::Relaxed), 1);
+
+        // Peer B joins with requested_mode = 1 (SmartAuto) + bitrate 30 (96k).
+        send_fb(&peer_b, 1, 1);
+        send_fb(&peer_b, 2, 30);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && engine.telemetry.active_clients_count.load(Ordering::Relaxed) < 2
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            engine.telemetry.quality_profile.load(Ordering::Relaxed),
+            QualityProfile::LowLatencyCompressed as u8,
+            "newcomer joining an active session must not override host profile"
+        );
+        assert_eq!(
+            engine.telemetry.target_bitrate_kbps.load(Ordering::Relaxed),
+            256,
+            "newcomer joining an active session must not override host bitrate"
+        );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_clean_link_promoter_resets_24bit_when_wifi_joins_usb() {
+        let mut promoter = CleanLinkPromoter::new();
+        let t0 = Instant::now();
+
+        // Pure USB immediately enables 24-bit Master.
+        assert!(promoter.update(0, 0, false, true, true, t0));
+        assert!(promoter.is_master_24bit());
+
+        // When a Wi-Fi client joins (all_usb: true -> false), 24-bit Master must
+        // immediately reset and require a full 30 s spotless Wi-Fi window.
+        assert!(!promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(1)));
+        assert!(!promoter.is_master_24bit());
+        assert!(!promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(29)));
+        assert!(promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(32)));
+    }
+
+    #[test]
+    fn test_apply_raised_cosine_fade_in() {
+        let mut pcm = [1.0f32; SUBFRAME_STEREO_SAMPLES];
+        apply_raised_cosine_fade_in(&mut pcm, 32);
+        assert_eq!(pcm[0], 0.0);
+        assert_eq!(pcm[1], 0.0);
+        assert!(pcm[30] > 0.4 && pcm[30] < 0.6);
+        assert!(pcm[62] > 0.99);
+        assert_eq!(pcm[64], 1.0);
+        assert_eq!(pcm[65], 1.0);
+    }
+
+    #[test]
+    fn test_control_magic_bye_evicts_only_sending_loopback_port() {
+        let (mut engine, port) = start_test_host();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        let peer_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr_a = peer_a.local_addr().unwrap();
+        let addr_b = peer_b.local_addr().unwrap();
+
+        peer_a.send_to(CONTROL_MAGIC_HELLO, dest).unwrap();
+        peer_b.send_to(CONTROL_MAGIC_HELLO, dest).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && engine.connected_clients().len() < 2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.connected_clients().len(), 2);
+
+        // peer_a sends ASULBYE1; peer_a must be evicted immediately while peer_b stays.
+        peer_a.send_to(CONTROL_MAGIC_BYE, dest).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && engine.connected_clients().len() > 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = engine.connected_clients();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].addr, addr_b);
+        assert!(!remaining.iter().any(|c| c.addr == addr_a));
+        engine.stop();
+    }
+
+    #[test]
+    fn test_route_error_eviction_after_threshold_and_reset_on_success() {
+        fn client(addr: SocketAddr, is_usb: bool) -> ConnectedClient {
+            ConnectedClient {
+                addr,
+                last_seen: Instant::now(),
+                is_usb,
+                muted: false,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 0,
+                client_volume: 100,
+                gaming_lock: false,
+                feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
+            }
+        }
+
+        // Verify fatal vs transient classification.
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::NetworkUnreachable
+        )));
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::HostUnreachable
+        )));
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::ENETUNREACH
+            )));
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::EHOSTUNREACH
+            )));
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::ECONNREFUSED
+            )));
+        }
+        assert!(!is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+
+        let usb_peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let dead_wifi: SocketAddr = "192.168.1.99:41002".parse().unwrap();
+        let mut map = HashMap::new();
+        map.insert(usb_peer, client(usb_peer, true));
+        map.insert(dead_wifi, client(dead_wifi, false));
+
+        // 19 fatal errors keep the peer, then 1 success resets its counter to 0.
+        for _ in 0..(ROUTE_ERROR_EVICT_THRESHOLD - 1) {
+            let (evicted, any_nonzero) = apply_peer_send_outcomes(
+                &mut map,
+                &[(dead_wifi, PeerSendOutcome::FatalRouteError)],
+            );
+            assert!(evicted.is_empty());
+            assert!(any_nonzero);
+        }
+        assert_eq!(
+            map.get(&dead_wifi).unwrap().consecutive_send_errors,
+            ROUTE_ERROR_EVICT_THRESHOLD - 1
+        );
+        let (evicted, any_nonzero) =
+            apply_peer_send_outcomes(&mut map, &[(dead_wifi, PeerSendOutcome::Sent)]);
+        assert!(evicted.is_empty());
+        assert!(!any_nonzero);
+        assert_eq!(map.get(&dead_wifi).unwrap().consecutive_send_errors, 0);
+
+        // Now accumulate 20 consecutive fatal errors via reconcile_peer_send_outcomes
+        // and verify immediate eviction + telemetry/target refresh.
+        let telemetry = HostTelemetry::new();
+        HostEngine::refresh_client_delay_telemetry(&map, &telemetry);
+        let clients = Mutex::new(map);
+        let mut cached_targets = vec![usb_peer, dead_wifi];
+        let mut cached_all_usb = false;
+        let mut loss_governor = LossGovernor::new(Instant::now());
+        let mut high_loss_gate = HighLossWindowGate::new();
+        let mut any_peer_has_send_errors = false;
+
+        for i in 1..=ROUTE_ERROR_EVICT_THRESHOLD {
+            let outcomes = [
+                (usb_peer, PeerSendOutcome::Sent),
+                (dead_wifi, PeerSendOutcome::FatalRouteError),
+            ];
+            reconcile_peer_send_outcomes(
+                &outcomes,
+                &clients,
+                &telemetry,
+                &mut cached_targets,
+                &mut cached_all_usb,
+                &mut loss_governor,
+                &mut high_loss_gate,
+                &mut any_peer_has_send_errors,
+            );
+            if i < ROUTE_ERROR_EVICT_THRESHOLD {
+                assert_eq!(clients.lock().unwrap().len(), 2);
+                assert!(any_peer_has_send_errors);
+            }
+        }
+
+        let final_map = clients.lock().unwrap();
+        assert_eq!(final_map.len(), 1);
+        assert!(final_map.contains_key(&usb_peer));
+        assert!(!final_map.contains_key(&dead_wifi));
+        assert!(!any_peer_has_send_errors);
+        assert_eq!(cached_targets, vec![usb_peer]);
+        assert!(cached_all_usb);
+        assert_eq!(telemetry.active_clients_count.load(Ordering::Relaxed), 1);
+        assert!(!telemetry.any_wifi_client.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_smart_dtx_threshold_16bit_vs_24bit() {
+        // -90 dBFS (~3.16e-5): preserved in 24-bit (> 1.0e-5), silent in 16-bit (<= 4.0e-5).
+        assert!(!is_subframe_audio_active(3.0e-5, false));
+        assert!(is_subframe_audio_active(3.0e-5, true));
+        // Above -88.0 dBFS (> 4.0e-5): active in both modes.
+        assert!(is_subframe_audio_active(5.0e-5, false));
+        assert!(is_subframe_audio_active(5.0e-5, true));
+        // Below -100 dBFS (<= 1.0e-5): silent in both modes.
+        assert!(!is_subframe_audio_active(5.0e-6, false));
+        assert!(!is_subframe_audio_active(5.0e-6, true));
     }
 }

@@ -19,7 +19,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.rememberScrollState
@@ -61,6 +60,10 @@ private fun codecModeName(mode: Long): String = when (mode.toInt()) {
     else -> "Unknown"
 }
 
+private fun sendServiceAction(context: Context, intent: Intent) {
+    runCatching { context.startService(intent) }
+}
+
 /**
  * Telemetry-heavy hero. All 16 Hz snapshot reads are confined to this leaf
  * (and the two other telemetry leaves), keeping them out of the Connect/EQ/
@@ -75,7 +78,12 @@ private fun HeroStageSection(
     hostAddress: String,
     sleepRemainingMins: Int,
     gamingLock: Boolean,
-    latencyDebug: Boolean
+    latencyDebug: Boolean,
+    isLocallyMuted: Boolean,
+    onPrev: () -> Unit,
+    onPlayPause: () -> Unit,
+    onNext: () -> Unit,
+    onToggleMute: () -> Unit
 ) {
     val t = telemetry()
     val heroGlow = when {
@@ -157,29 +165,57 @@ private fun HeroStageSection(
         if (isConnected) {
             val vuNow = t.getOrElse(24) { 0L }.toInt().coerceIn(0, 100)
             FluidAudioVisualizer(vuPct = vuNow, isLive = !dtxSilent)
-        }
-        if (isConnected) {
+            val estMs = t.getOrElse(20) { 0L } / 10.0
+            val btMs = t.getOrElse(17) { 0L }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    .padding(top = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                StatusBadge("Pkts: ${t[0]}")
-                StatusBadge("FEC: ${t[2]}")
-                StatusBadge("Drift: ${t[4]} ppm")
-                if (groupDelay > 0) {
-                    StatusBadge("Sync: +${groupDelay}ms")
-                }
-                if (latencyDebug) {
-                    val estMs = t.getOrElse(20) { 0L } / 10.0
-                    val targetMs = t.getOrElse(14) { 0L } / 1000.0
-                    val bufferedMs = t.getOrElse(15) { 0L } / 1000.0
-                    StatusBadge(
-                        text = "Est ${"%.1f".format(estMs)}ms • FIFO ${"%.1f".format(bufferedMs)}/${"%.1f".format(targetMs)}ms",
-                        containerColor = Color(0xFF14532D),
-                        contentColor = Color(0xFF86EFAC)
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        text = "${"%.1f".format(estMs)} ms",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
+                    Text(
+                        text = buildString {
+                            append(if (btMs > 0) "BT A2DP ${btMs}ms" else "Est. Latency")
+                            if (groupDelay > 0) append(" • Sync +${groupDelay}ms")
+                            if (latencyDebug) append(" • Drift ${t[4]}ppm")
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudioColors.Muted
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    FilledTonalIconButton(onClick = onPrev, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.SkipPrevious, "Previous", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(onClick = onPlayPause, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.PlayArrow, "Play / Pause", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(onClick = onNext, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Rounded.SkipNext, "Next", Modifier.size(18.dp))
+                    }
+                    FilledTonalIconButton(
+                        onClick = onToggleMute,
+                        modifier = Modifier.size(36.dp),
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = if (isLocallyMuted) StudioColors.WarnBg else StudioColors.AccentDeep
+                        )
+                    ) {
+                        Icon(
+                            if (isLocallyMuted) Icons.Rounded.VolumeOff else Icons.Rounded.VolumeUp,
+                            if (isLocallyMuted) "Unmute" else "Mute",
+                            tint = if (isLocallyMuted) StudioColors.WarnFg else StudioColors.AccentSoft,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }
@@ -247,7 +283,7 @@ private fun TelemetryDrawerSection(
 
             if (btEarbudsDetected) {
                 val activeBtMs = t.getOrElse(17) { 185L }
-                    .toInt().coerceIn(40, 350)
+                    .toInt().coerceIn(40, 450)
                 StatusBadge(
                     text = "Bluetooth Audio Active: Reporting +${activeBtMs}ms A/V Sync Offset to PC",
                     containerColor = Color(0xFF14532D),
@@ -266,9 +302,9 @@ private fun TelemetryDrawerSection(
                 }
                 Slider(
                     value = (if (btDelayOverrideMs == 0) activeBtMs else btDelayOverrideMs).toFloat(),
-                    onValueChange = { onBtOverrideChanged(it.toInt().coerceIn(40, 350)) },
+                    onValueChange = { onBtOverrideChanged(it.toInt().coerceIn(40, 450)) },
                     onValueChangeFinished = onBtOverrideFinished,
-                    valueRange = 40f..350f
+                    valueRange = 40f..450f
                 )
             }
 
@@ -413,6 +449,47 @@ private fun PartyTelemetrySection(
     }
 }
 
+private fun appVersionLabel(context: Context): String = runCatching {
+    val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        context.packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.PackageInfoFlags.of(0)
+        )
+    } else {
+        @Suppress("DEPRECATION")
+        context.packageManager.getPackageInfo(context.packageName, 0)
+    }
+    val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        info.longVersionCode
+    } else {
+        @Suppress("DEPRECATION")
+        info.versionCode.toLong()
+    }
+    "v${info.versionName ?: "unknown"} ($code)"
+}.getOrDefault("unknown")
+
+private fun buildAndroidDiagnosticsReport(context: Context): String? {
+    val nativeDiag = runCatching { AudioEngineService.nativeGetDiagnostics() }
+        .getOrNull()?.takeIf { it.isNotBlank() } ?: return null
+    val header = buildString {
+        appendLine("App     : AudioShare Ultra ${appVersionLabel(context)}")
+        appendLine(
+            "Device  : ${Build.MANUFACTURER} ${Build.MODEL} " +
+                "(Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})"
+        )
+    }
+    val crashFile = java.io.File(context.filesDir, "audioshare-ultra-crash.log")
+    val crashTail = runCatching {
+        if (crashFile.isFile && crashFile.length() > 0L) {
+            val text = crashFile.readText()
+            "\n--- Last Native Crash Log ---\n" + text.takeLast(4000)
+        } else {
+            ""
+        }
+    }.getOrDefault("")
+    return header + nativeDiag + crashTail
+}
+
 /**
  * Shared Copy/Share diagnostics actions used by both the Tools bottom sheet and
  * the Connect-tab telemetry drawer. [onDone] runs before any Snackbar is shown
@@ -431,8 +508,7 @@ private fun DiagnosticsActionsRow(
     ) {
         OutlinedButton(
             onClick = {
-                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                    .getOrNull()?.takeIf { it.isNotBlank() }
+                val diag = buildAndroidDiagnosticsReport(context)
                 // Dismiss first so the Snackbar is not hidden behind the sheet.
                 onDone()
                 if (diag == null) {
@@ -465,8 +541,7 @@ private fun DiagnosticsActionsRow(
         }
         OutlinedButton(
             onClick = {
-                val diag = runCatching { AudioEngineService.nativeGetDiagnostics() }
-                    .getOrNull()?.takeIf { it.isNotBlank() }
+                val diag = buildAndroidDiagnosticsReport(context)
                 onDone()
                 if (diag != null) {
                     // Capture the nullable local into a non-null local before use.
@@ -501,6 +576,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by vm.uiState.collectAsState()
+    val isLocallyMuted by AudioEngineService.isLocallyMutedFlow.collectAsState()
+    val isMicMuted by AudioEngineService.isMicMutedFlow.collectAsState()
 
     /**
      * Reads are served from the collected [state] so Compose observes every
@@ -610,8 +687,6 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         { it.compressedBitrateKbps },
         { s, v -> s.copy(compressedBitrateKbps = v) }
     )
-    // false = pure-Rust VBR (default), true = bundled pure-Rust Opus RLD.
-    var useOpus by vmField({ it.useOpus }, { s, v -> s.copy(useOpus = v) })
     var btDelayOverrideMs by vmField(
         { it.btDelayOverrideMs },
         { s, v -> s.copy(btDelayOverrideMs = v) }
@@ -693,7 +768,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         // adjusted the preamp while muted, so touching EQ/switches never
         // accidentally unmutes a muted stream.
         if (updatePreamp && isConnected && AudioEngineService.isLocallyMutedState) {
-            context.startService(
+            sendServiceAction(
+                context,
                 Intent(context, AudioEngineService::class.java).apply {
                     action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
                 }
@@ -711,7 +787,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 action = "ACTION_SET_DOLBY"
                 putExtra("DOLBY_ENABLED", enabled)
             }
-            context.startService(intent)
+            sendServiceAction(context, intent)
         }
     }
 
@@ -721,6 +797,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     var connectAttemptId by remember { mutableIntStateOf(0) }
     var lastConnectIsUsb by remember { mutableStateOf<Boolean?>(null) }
     var promptedSilentRejectAttempt by remember { mutableIntStateOf(-1) }
+    var awaitingConnectResult by remember { mutableStateOf(false) }
 
     // The service is the single owner of the projection session. Mirror its
     // state so a system-revoked projection (or a failed start) flips the
@@ -759,6 +836,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         AudioEngineService.EXTRA_STREAM_ACTIVE,
                         false
                     )
+                    awaitingConnectResult = false
+                    lastHandledAuthFailures = 0L
                     val err = intent.getStringExtra(AudioEngineService.EXTRA_STREAM_ERROR)
                     if (!err.isNullOrBlank()) {
                         scope.launch { snackbarHostState.showSnackbar(err) }
@@ -769,8 +848,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     if (linkedHost.isNotEmpty()) {
                         hostAddress = linkedHost
                         pinCode = linkedPin
+                        awaitingConnectResult = true
                         connectAttemptId += 1
                         lastHandledAuthFailures = 0L
+                        telemetry = TelemetrySnapshot()
                         showPinMismatchDialog = false
                     }
                 }
@@ -804,8 +885,10 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         hostAddress = addr
         pinCode = cleanPin
         lastConnectIsUsb = isUsb
+        awaitingConnectResult = true
         connectAttemptId += 1
         lastHandledAuthFailures = 0L
+        telemetry = TelemetrySnapshot()
         showPinMismatchDialog = false
         prefs.edit().putString("last_host_addr", addr).apply()
         HostPinStore.savePin(prefs, addr, cleanPin)
@@ -969,8 +1052,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     // sending zero datagrams back. Prompt once after 2.5 s of 0 packets when
     // the target advertises `enc=1` OR when connecting via USB (`127.0.0.1`)
     // / manual IP (neither emits LAN discovery beacons for that exact address).
-    LaunchedEffect(isConnected, hostAddress, connectAttemptId) {
-        if (!isConnected) return@LaunchedEffect
+    LaunchedEffect(isConnected, awaitingConnectResult, hostAddress, connectAttemptId) {
+        if (!isConnected || awaitingConnectResult) return@LaunchedEffect
         val attempt = connectAttemptId
         delay(3500)
         if (!isConnected || showPinMismatchDialog || promptedSilentRejectAttempt == attempt) {
@@ -986,7 +1069,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
         val isUsbOrManual = matchedLanEntry == null
         val anyLanHostEncrypted = discoveredHosts.any { it.split("|").getOrNull(3) == "1" }
         val shouldPromptForPin =
-            targetEncryptedOnLan || (isUsbOrManual && (anyLanHostEncrypted || pinCode.isNotEmpty()))
+            targetEncryptedOnLan || pinCode.isNotEmpty() ||
+                (isUsbOrManual && anyLanHostEncrypted)
         if (shouldPromptForPin && telemetry.rxPackets == 0L) {
             promptedSilentRejectAttempt = attempt
             pinMismatchDraft = ""
@@ -1004,16 +1088,23 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 if (isConnected && !AudioEngineService.isStreaming) {
                     isConnected = false
                 }
+                val pollAttempt = connectAttemptId
                 val (raw, nativeAuthFailures) = withContext(Dispatchers.IO) {
                     val stats = AudioEngineService.nativeGetTelemetry()
                     val authFails = runCatching { AudioEngineService.nativeGetAuthFailures() }
                         .getOrDefault(stats.getOrElse(5) { 0L })
                     stats to authFails
                 }
+                // Drop results sampled from the outgoing ClientEngine while a
+                // reconnect / corrected-PIN swap was in flight.
+                if (pollAttempt != connectAttemptId || awaitingConnectResult) {
+                    delay(60)
+                    continue
+                }
                 vm.updateTelemetry(raw)
 
                 val currentAuthFailures = maxOf(raw.getOrElse(5) { 0L }, nativeAuthFailures)
-                if (isConnected && currentAuthFailures > lastHandledAuthFailures) {
+                if (isConnected && !awaitingConnectResult && currentAuthFailures > lastHandledAuthFailures) {
                     lastHandledAuthFailures = currentAuthFailures
                     if (!showPinMismatchDialog) {
                         pinMismatchDraft = ""
@@ -1115,13 +1206,22 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 hostAddress = hostAddress,
                 sleepRemainingMins = sleepTimerMinutes,
                 gamingLock = gamingLock,
-                latencyDebug = latencyDebug
+                latencyDebug = latencyDebug,
+                isLocallyMuted = isLocallyMuted,
+                onPrev = { AudioEngineService.nativeSendMediaCommand(12) },
+                onPlayPause = { AudioEngineService.nativeSendMediaCommand(10) },
+                onNext = { AudioEngineService.nativeSendMediaCommand(11) },
+                onToggleMute = {
+                    sendServiceAction(context, Intent(context, AudioEngineService::class.java).apply {
+                        action = "ACTION_TOGGLE_MUTE"
+                    })
+                }
             )
 
             // Surface local speaker mute in-app (e.g. after headphone unplug or
             // AUDIOFOCUS_LOSS) so users with notifications disabled on Android
             // 13+ are never stranded in silent playback with no Unmute button.
-            if (isConnected && AudioEngineService.isLocallyMutedState) {
+            if (isConnected && isLocallyMuted) {
                 StudioCard {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1138,7 +1238,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             val i = Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_CLEAR_LOCAL_MUTE
                             }
-                            context.startService(i)
+                            sendServiceAction(context, i)
                         }) {
                             Text("Unmute")
                         }
@@ -1274,7 +1374,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 val intent = Intent(context, AudioEngineService::class.java).apply {
                                     action = AudioEngineService.ACTION_STOP_CLIENT_ONLY
                                 }
-                                context.startService(intent)
+                                sendServiceAction(context, intent)
                                 isConnected = false
                             } else {
                                 // Primary connect: omit IS_USB so the service
@@ -1401,7 +1501,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     },
                     onBtOverrideFinished = {
                         prefs.edit().putInt("bt_delay_override_ms", btDelayOverrideMs).apply()
-                        context.startService(
+                        sendServiceAction(
+                            context,
                             Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
@@ -1410,7 +1511,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     onBtAuto = {
                         btDelayOverrideMs = 0
                         prefs.edit().putInt("bt_delay_override_ms", 0).apply()
-                        context.startService(
+                        sendServiceAction(
+                            context,
                             Intent(context, AudioEngineService::class.java).apply {
                                 action = AudioEngineService.ACTION_SET_BT_OFFSET
                             }
@@ -1427,6 +1529,26 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
             } // End Tab 0
 
             if (selectedTab == 1) {
+                fun selectHostQualityMode(mode: Int, mediaCmd: Int) {
+                    if (!isConnected) {
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Connect to a host to control host mode")
+                        }
+                        return
+                    }
+                    qualityMode = mode
+                    prefs.edit().putInt("quality_mode", mode).apply()
+                    AudioEngineService.nativeSendMediaCommand(mediaCmd)
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    SectionEyebrow("Host Stream Profile")
+                    if (!isConnected) StatusBadge("Connect to control host")
+                }
                 // 4 intent-driven host quality cards, surfaced directly on the tab.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1437,11 +1559,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Lossless / Opus",
                         badge = "Default",
                         selected = qualityMode == 0,
-                        onClick = {
-                            qualityMode = 0
-                            prefs.edit().putInt("quality_mode", 0).apply()
-                            AudioEngineService.nativeSendMediaCommand(1)
-                        },
+                        onClick = { selectHostQualityMode(0, 1) },
                         modifier = Modifier.weight(1f)
                     )
                     ModePresetCard(
@@ -1450,10 +1568,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         badge = if (qualityMode == 4) "24-Bit" else "16-Bit",
                         selected = qualityMode == 1 || qualityMode == 4,
                         onClick = {
-                            if (qualityMode != 1 && qualityMode != 4) {
-                                qualityMode = 1
-                                prefs.edit().putInt("quality_mode", 1).apply()
-                                AudioEngineService.nativeSendMediaCommand(2)
+                            if (!isConnected || (qualityMode != 1 && qualityMode != 4)) {
+                                selectHostQualityMode(1, 2)
                             }
                         },
                         modifier = Modifier.weight(1f)
@@ -1468,11 +1584,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Best for 2.4G / BT",
                         badge = "Opus ${compressedBitrateKbps}k",
                         selected = qualityMode == 2,
-                        onClick = {
-                            qualityMode = 2
-                            prefs.edit().putInt("quality_mode", 2).apply()
-                            AudioEngineService.nativeSendMediaCommand(3)
-                        },
+                        onClick = { selectHostQualityMode(2, 3) },
                         modifier = Modifier.weight(1f)
                     )
                     ModePresetCard(
@@ -1480,11 +1592,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         subtitle = "Through walls",
                         badge = "10 ms",
                         selected = qualityMode == 3,
-                        onClick = {
-                            qualityMode = 3
-                            prefs.edit().putInt("quality_mode", 3).apply()
-                            AudioEngineService.nativeSendMediaCommand(4)
-                        },
+                        onClick = { selectHostQualityMode(3, 4) },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -1614,9 +1722,14 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
                 AnimatedVisibility(visible = showEqDrawer) {
                     StudioCard {
+                        ParametricEqCurveCanvas(
+                            bassDb = bassDb,
+                            vocalDb = vocalDb,
+                            trebleDb = trebleDb
+                        )
                         StudioFaderRow(
                             title = "Sub-Bass",
-                            freqLabel = "80 Hz",
+                            freqLabel = "90 Hz",
                             value = bassDb,
                             valueRange = -12.0f..12.0f,
                             onValueChange = {
@@ -1718,11 +1831,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                             ).forEach { (idx, label) ->
                                 FilterChip(
                                     selected = qualityMode == idx,
-                                    onClick = {
-                                        qualityMode = idx
-                                        prefs.edit().putInt("quality_mode", idx).apply()
-                                        AudioEngineService.nativeSendMediaCommand(idx + 1)
-                                    },
+                                    onClick = { selectHostQualityMode(idx, idx + 1) },
                                     label = { Text(label) }
                                 )
                             }
@@ -1751,9 +1860,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     FilterChip(
                                         selected = effectiveBitrate == kbps,
                                         onClick = {
-                                            compressedBitrateKbps = kbps
-                                            prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
-                                            AudioEngineService.nativeSendMediaCommand(30 + idx)
+                                            if (!isConnected) {
+                                                scope.launch {
+                                                    snackbarHostState.showSnackbar("Connect to a host to control host mode")
+                                                }
+                                            } else {
+                                                compressedBitrateKbps = kbps
+                                                prefs.edit().putInt("target_bitrate_kbps", kbps).apply()
+                                                AudioEngineService.nativeSendMediaCommand(30 + idx)
+                                            }
                                         },
                                         label = { Text("$kbps kbps") }
                                     )
@@ -1807,7 +1922,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_STOP_PARTY_CAST
                                     }
-                                    context.startService(stopIntent)
+                                    sendServiceAction(context, stopIntent)
                                 }
                             }
                         )
@@ -1820,7 +1935,8 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 muteHostSpeakerInParty = mute
                                 prefs.edit().putBoolean("party_mute_local", mute).apply()
                                 if (castPhoneInternalAudio) {
-                                    context.startService(
+                                    sendServiceAction(
+                                        context,
                                         Intent(context, AudioEngineService::class.java).apply {
                                             action = AudioEngineService.ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE
                                             putExtra("MUTE_LOCAL", mute)
@@ -1940,7 +2056,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 val stopIntent = Intent(context, AudioEngineService::class.java).apply {
                                     action = AudioEngineService.ACTION_STOP_PHONE_MIC
                                 }
-                                context.startService(stopIntent)
+                                sendServiceAction(context, stopIntent)
                             } else {
                                 // If the user hasn't picked a PC yet and is still
                                 // on the legacy RNDIS default, auto-pick the first
@@ -1973,7 +2089,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                     )
                     AnimatedVisibility(visible = sharePhoneMic && !castPhoneInternalAudio) {
                         val micVu = ((telemetry.partyPacked ushr 40) and 0xFFL).toInt().coerceIn(0, 100)
-                        val micMuted = AudioEngineService.isMicMutedState
+                        val micMuted = isMicMuted
                         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             HorizontalDivider(color = Color(0xFF243047))
                             Row(
@@ -1991,7 +2107,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                     val toggleIntent = Intent(context, AudioEngineService::class.java).apply {
                                         action = AudioEngineService.ACTION_TOGGLE_MIC_MUTE
                                     }
-                                    context.startService(toggleIntent)
+                                    sendServiceAction(context, toggleIntent)
                                 }) {
                                     Text(if (micMuted) "Unmute Mic" else "Mute Mic")
                                 }
@@ -2060,14 +2176,13 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                                 else -> sleepTimerMinutes > 30
                             },
                             onClick = {
-                                runCatching {
-                                    context.startService(
-                                        Intent(context, AudioEngineService::class.java).apply {
-                                            action = AudioEngineService.ACTION_SET_SLEEP_TIMER
-                                            putExtra("MINUTES", mins)
-                                        }
-                                    )
-                                }
+                                sendServiceAction(
+                                    context,
+                                    Intent(context, AudioEngineService::class.java).apply {
+                                        action = AudioEngineService.ACTION_SET_SLEEP_TIMER
+                                        putExtra("MINUTES", mins)
+                                    }
+                                )
                             },
                             label = { Text(lbl) }
                         )
@@ -2097,6 +2212,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 DiagnosticsActionsRow(
                     snackbarHostState = snackbarHostState,
                     onDone = { showToolsSheet = false }
+                )
+                val versionText = remember(context) { appVersionLabel(context) }
+                Text(
+                    "AudioShare Ultra $versionText",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = StudioColors.Muted
                 )
                 Spacer(Modifier.height(12.dp))
             }
@@ -2156,12 +2277,12 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
 
     // Automatically prompt when the target host rejects the active PIN.
     if (showPinMismatchDialog) {
-        val targetNorm = hostAddress.trim().lowercase()
+        val targetNorm = HostPinStore.normalizeHost(hostAddress)
         val hostLabel = discoveredHosts.firstNotNullOfOrNull { entry ->
             val parts = entry.split("|")
             val name = parts.getOrNull(0)
-            val addr = parts.getOrNull(1)
-            if (addr?.trim()?.lowercase() == targetNorm && !name.isNullOrBlank()) {
+            val addr = HostPinStore.normalizeHost(parts.getOrNull(1).orEmpty())
+            if (targetNorm.isNotEmpty() && addr == targetNorm && !name.isNullOrBlank()) {
                 "$name ($hostAddress)"
             } else {
                 null

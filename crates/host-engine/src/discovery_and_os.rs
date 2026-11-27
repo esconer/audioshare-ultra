@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "windows")]
 use std::io::BufRead;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use std::process::Command;
 #[cfg(target_os = "windows")]
-use std::process::{Child, Stdio};
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
@@ -106,6 +106,14 @@ pub(crate) fn silent_command(program: &str) -> Command {
     {
         cmd
     }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+pub(crate) fn pactl_command() -> Command {
+    let mut cmd = Command::new("pactl");
+    cmd.env("LC_ALL", "C").env("LANG", "C");
+    cmd
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +391,66 @@ impl Drop for DiscoveryScanner {
     }
 }
 
+/// Serial numbers that still need `adb reverse` on this poll.
+///
+/// A newly attached device is always armed immediately, even while another
+/// device is streaming, so multi-phone setups keep working. The periodic
+/// re-arm is only allowed when no ADB TCP session is active: running
+/// `adb reverse` every 10 s during playback injects control traffic into the
+/// same USB/ADB link that carries the audio tunnel.
+fn adb_reverse_targets<'a>(
+    serials: &'a [String],
+    armed: &HashSet<String>,
+    periodic: bool,
+) -> Vec<&'a str> {
+    serials
+        .iter()
+        .filter(|serial| periodic || !armed.contains(serial.as_str()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Run an `adb` CLI command with periodic `running` checks so `Drop` can kill
+/// a slow/cold-starting `adb` child and join within ~25 ms.
+fn run_adb_interruptible(
+    args: &[&str],
+    running: &AtomicBool,
+    timeout: Duration,
+    capture_stdout: bool,
+) -> Option<std::process::Output> {
+    if !running.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut child = silent_command("adb")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(if capture_stdout {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !running.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 pub struct AdbUsbWatcher {
     running: Arc<AtomicBool>,
     pub usb_device_connected: Arc<AtomicBool>,
@@ -400,22 +468,32 @@ impl AdbUsbWatcher {
         // Shared across every accepted ADB reverse session so a flood of
         // connects cannot spawn unbounded reader/writer thread pairs.
         let active_sessions = Arc::new(AtomicUsize::new(0));
+        let watcher_sessions = Arc::clone(&active_sessions);
 
         let handle = std::thread::Builder::new()
             .name("as-ultra-adb-watcher".into())
             .spawn(move || {
-                let mut was_connected = false;
                 let mut last_reverse: Option<Instant> = None;
+                // Serials whose reverse tunnel was armed since they attached.
+                // Cleared when `adb devices` goes empty (unplug/daemon restart)
+                // so a reattached device is armed immediately.
+                let mut armed_serials: HashSet<String> = HashSet::new();
                 while run_clone.load(Ordering::Relaxed) {
-                    // Enumerate all attached ADB devices in the "device" state so
-                    // `adb reverse` still succeeds when multiple phones or an
-                    // emulator + phone are connected simultaneously (bare
-                    // `adb get-state` / `adb reverse` fails with "more than one
-                    // device/emulator").
-                    let serials: Vec<String> = silent_command("adb")
-                        .args(["devices"])
-                        .output()
-                        .ok()
+                    // Pause `adb devices` / `adb reverse` polling while an ADB
+                    // audio session is active so discovery never contends with
+                    // the live USB/ADB audio tunnel.
+                    if watcher_sessions.load(Ordering::Acquire) == 0 {
+                        // Enumerate all attached ADB devices in the "device" state so
+                        // `adb reverse` still succeeds when multiple phones or an
+                        // emulator + phone are connected simultaneously (bare
+                        // `adb get-state` / `adb reverse` fails with "more than one
+                        // device/emulator").
+                        let serials: Vec<String> = run_adb_interruptible(
+                            &["devices"],
+                            &run_clone,
+                            Duration::from_secs(3),
+                            true,
+                        )
                         .filter(|o| o.status.success())
                         .map(|o| {
                             String::from_utf8_lossy(&o.stdout)
@@ -434,33 +512,45 @@ impl AdbUsbWatcher {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let has_device = !serials.is_empty();
+                        let has_device = !serials.is_empty();
 
-                    usb_clone.store(has_device, Ordering::Relaxed);
+                        usb_clone.store(has_device, Ordering::Relaxed);
 
-                    // `adb reverse` is not durable across a USB cable yank or
-                    // an ADB daemon restart: the tunnel silently disappears
-                    // while `adb devices` still reports a device. Re-arm it
-                    // on the initial attach (fast path) and then every 10 s
-                    // for as long as the device stays attached.
-                    if has_device {
-                        let initial_attach = !was_connected;
-                        let periodic = last_reverse
-                            .map(|t| t.elapsed() >= Duration::from_secs(10))
-                            .unwrap_or(false);
-                        if initial_attach || periodic {
-                            let port_spec = format!("tcp:{}", port);
-                            for serial in &serials {
-                                let _ = silent_command("adb")
-                                    .args(["-s", serial, "reverse", &port_spec, &port_spec])
-                                    .output();
+                        // `adb reverse` is not durable across a USB cable yank or
+                        // an ADB daemon restart: the tunnel silently disappears
+                        // while `adb devices` still reports a device. Re-arm on
+                        // initial attach, and periodically only while no session
+                        // is active so discovery never competes with a live
+                        // audio tunnel.
+                        if has_device {
+                            let periodic = watcher_sessions.load(Ordering::Acquire) == 0
+                                && last_reverse
+                                    .map(|t| t.elapsed() >= Duration::from_secs(10))
+                                    .unwrap_or(true);
+                            let targets = adb_reverse_targets(&serials, &armed_serials, periodic);
+                            if !targets.is_empty() {
+                                let port_spec = format!("tcp:{}", port);
+                                for serial in targets {
+                                    if watcher_sessions.load(Ordering::Acquire) > 0
+                                        || !run_clone.load(Ordering::Relaxed)
+                                    {
+                                        break;
+                                    }
+                                    let _ = run_adb_interruptible(
+                                        &["-s", serial, "reverse", &port_spec, &port_spec],
+                                        &run_clone,
+                                        Duration::from_secs(3),
+                                        false,
+                                    );
+                                    armed_serials.insert(serial.to_string());
+                                }
+                                last_reverse = Some(Instant::now());
                             }
-                            last_reverse = Some(Instant::now());
+                        } else {
+                            armed_serials.clear();
+                            last_reverse = None;
                         }
-                    } else {
-                        last_reverse = None;
                     }
-                    was_connected = has_device;
                     // Poll `run_clone` every 50 ms instead of blocking in an
                     // uninterruptible 2 s sleep so `AdbUsbWatcher::drop()`
                     // returns immediately without freezing the desktop GUI.
@@ -513,14 +603,20 @@ impl AdbUsbWatcher {
 }
 
 /// Maximum number of simultaneous `adb reverse` TCP sessions bridged by one
-/// `AdbUsbWatcher`. Each session owns two detached worker threads, so capping
-/// sessions also bounds the thread/channel fan-out from a buggy or hostile peer.
+/// `AdbUsbWatcher`. Each session owns two worker threads, so capping sessions
+/// also bounds the thread/channel fan-out from a buggy or hostile peer.
 const MAX_ADB_TCP_SESSIONS: usize = 8;
 
 /// Overall deadline for a single framed read (length prefix or packet body).
 /// The socket's 200 ms read timeout still unblocks the worker sooner on
 /// shutdown; this is only a safety net against a stalled peer.
 const ADB_TCP_READ_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Bounded outbound ADB audio queue ceiling in 2.5 ms subframes (~35 ms).
+/// When USB stalls briefly, whole oldest UDP datagrams are shed before
+/// starting a TCP frame write rather than aborting or accumulating bufferbloat.
+const ADB_OUT_MAX_QUEUED_SUBFRAMES: usize = 14;
+const ADB_OUT_QUEUE_CAP: usize = 32;
 
 /// One reserved slot in the shared session counter. Cloned into both worker
 /// threads so the slot is released only when the last clone drops — i.e. after
@@ -619,6 +715,143 @@ fn read_exact_interruptible<T: Read>(
     Ok(())
 }
 
+/// Write a complete framed packet to the ADB TCP stream, retrying `Interrupted`
+/// while failing cleanly on `TimedOut` / `WriteZero` / peer close.
+fn write_all_interruptible<W: Write>(
+    writer: &mut W,
+    buf: &[u8],
+    alive: &AtomicBool,
+    running: &AtomicBool,
+) -> std::io::Result<()> {
+    let mut written = 0usize;
+    while written < buf.len() {
+        if !alive.load(Ordering::Relaxed) || !running.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "ADB TCP session stopping",
+            ));
+        }
+        match writer.write(&buf[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "ADB TCP write returned 0 bytes",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Non-blocking UDP receive on a blocking `UdpSocket` without mutating
+/// `O_NONBLOCK`/`FIONBIO`. Returns `WouldBlock` when no datagram is queued.
+#[inline]
+fn udp_recv_nonblocking(socket: &UdpSocket, buf: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let rc = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if rc >= 0 {
+            Ok(rc as usize)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn ioctlsocket(s: usize, cmd: i32, argp: *mut u32) -> i32;
+        }
+        const FIONREAD: i32 = 0x4004_667F;
+        let mut avail: u32 = 0;
+        let rc = unsafe { ioctlsocket(socket.as_raw_socket() as usize, FIONREAD, &mut avail) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if avail == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        socket.recv(buf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (socket, buf);
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+    }
+}
+
+#[derive(Clone)]
+struct AdbQueuedFrame {
+    subframes: usize,
+    framed_len: usize,
+    framed: [u8; 2 + crate::MAX_SAFE_UDP_PAYLOAD],
+}
+
+impl AdbQueuedFrame {
+    fn from_udp_payload(payload: &[u8]) -> Option<Self> {
+        let len = payload.len();
+        if len == 0 || len > crate::MAX_SAFE_UDP_PAYLOAD {
+            return None;
+        }
+        let subframes = if len >= 2 && payload[0] == audioshare_protocol::wire::WIRE_MAGIC {
+            ((payload[1] >> 3) & 0x07).clamp(1, 4) as usize
+        } else {
+            1
+        };
+        let mut framed = [0u8; 2 + crate::MAX_SAFE_UDP_PAYLOAD];
+        framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
+        framed[2..2 + len].copy_from_slice(payload);
+        Some(Self {
+            subframes,
+            framed_len: 2 + len,
+            framed,
+        })
+    }
+}
+
+/// Push one datagram into the bounded outbound ADB queue and shed the oldest
+/// whole datagrams whenever queued audio exceeds `max_subframes`.
+fn push_and_shed_adb_frame(
+    queue: &mut VecDeque<AdbQueuedFrame>,
+    queued_subframes: &mut usize,
+    frame: AdbQueuedFrame,
+    max_subframes: usize,
+    max_cap: usize,
+) -> usize {
+    let mut dropped = 0usize;
+    while queue.len() >= max_cap {
+        if let Some(old) = queue.pop_front() {
+            *queued_subframes = queued_subframes.saturating_sub(old.subframes);
+            dropped += 1;
+        } else {
+            break;
+        }
+    }
+    *queued_subframes += frame.subframes;
+    queue.push_back(frame);
+    while *queued_subframes > max_subframes && queue.len() > 1 {
+        if let Some(old) = queue.pop_front() {
+            *queued_subframes = queued_subframes.saturating_sub(old.subframes);
+            dropped += 1;
+        } else {
+            break;
+        }
+    }
+    dropped
+}
+
 /// Bridge one `adb reverse` TCP connection to the local UDP `HostEngine`
 /// using `[u16_be len][datagram]` framing.
 fn spawn_host_adb_tcp_session(
@@ -655,7 +888,12 @@ fn spawn_host_adb_tcp_session(
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    {
+        let tcp_ref = socket2::SockRef::from(&stream);
+        let _ = tcp_ref.set_send_buffer_size(32_768);
+        let _ = tcp_ref.set_recv_buffer_size(32_768);
+    }
     let Ok(mut tcp_writer) = stream.try_clone() else {
         return;
     };
@@ -671,19 +909,32 @@ fn spawn_host_adb_tcp_session(
     if udp_rx.connect((Ipv4Addr::LOCALHOST, host_udp_port)).is_err() {
         return;
     }
+    // Keep loopback relay socket buffers tight (48 KB RX / 32 KB TX) so an
+    // ADB/USB stall cannot buffer hundreds of milliseconds inside the kernel.
+    {
+        let udp_ref = socket2::SockRef::from(&udp_rx);
+        let _ = udp_ref.set_recv_buffer_size(49_152);
+        let _ = udp_ref.set_send_buffer_size(32_768);
+    }
     let _ = udp_rx.set_read_timeout(Some(Duration::from_millis(200)));
     let Ok(udp_tx) = udp_rx.try_clone() else {
         return;
     };
+    let Ok(udp_bye) = udp_rx.try_clone() else {
+        return;
+    };
     let alive = Arc::new(AtomicBool::new(true));
+    let bye_sent = Arc::new(AtomicBool::new(false));
 
     let alive_in = Arc::clone(&alive);
     let run_in = Arc::clone(&host_running);
     let slot_in = Arc::clone(&slot);
-    let mut tcp_reader = stream;
+    let bye_in = Arc::clone(&bye_sent);
+    let mut tcp_reader = BufReader::with_capacity(8192, stream);
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-in".into())
         .spawn(move || {
+            let _rt_guard = crate::RealtimeThreadGuard::enter();
             let mut pkt = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed) {
                 let Ok(raw_len) =
@@ -707,6 +958,9 @@ fn spawn_host_adb_tcp_session(
                 let _ = udp_tx.send(&pkt[..len]);
             }
             alive_in.store(false, Ordering::Release);
+            if !bye_in.swap(true, Ordering::AcqRel) {
+                let _ = udp_tx.send(crate::CONTROL_MAGIC_BYE);
+            }
             let _ = tcp_writer_for_reader.shutdown(std::net::Shutdown::Both);
             drop(slot_in);
         });
@@ -714,28 +968,85 @@ fn spawn_host_adb_tcp_session(
     let alive_out = Arc::clone(&alive);
     let run_out = Arc::clone(&host_running);
     let slot_out = Arc::clone(&slot);
+    let bye_out = Arc::clone(&bye_sent);
     let _ = std::thread::Builder::new()
         .name("as-ultra-adb-out".into())
         .spawn(move || {
-            let mut framed = [0u8; 2 + crate::MAX_SAFE_UDP_PAYLOAD];
+            let _rt_guard = crate::RealtimeThreadGuard::enter();
+            let mut pkt_buf = [0u8; crate::MAX_SAFE_UDP_PAYLOAD];
+            let mut queue: VecDeque<AdbQueuedFrame> = VecDeque::with_capacity(ADB_OUT_QUEUE_CAP);
+            let mut queued_subframes: usize = 0;
+
             while alive_out.load(Ordering::Relaxed) && run_out.load(Ordering::Relaxed) {
-                match udp_rx.recv(&mut framed[2..]) {
-                    Ok(len) if len > 0 && len <= crate::MAX_SAFE_UDP_PAYLOAD => {
-                        framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
-                        if tcp_writer.write_all(&framed[..2 + len]).is_err() {
+                if queue.is_empty() {
+                    match udp_rx.recv(&mut pkt_buf) {
+                        Ok(len) => {
+                            if let Some(frame) = AdbQueuedFrame::from_udp_payload(&pkt_buf[..len]) {
+                                push_and_shed_adb_frame(
+                                    &mut queue,
+                                    &mut queued_subframes,
+                                    frame,
+                                    ADB_OUT_MAX_QUEUED_SUBFRAMES,
+                                    ADB_OUT_QUEUE_CAP,
+                                );
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut
+                                || e.kind() == std::io::ErrorKind::Interrupted
+                                || e.kind() == std::io::ErrorKind::ConnectionReset =>
+                        {
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                // Drain any additional buffered UDP datagrams and shed oldest
+                // whole datagrams above ~35 ms before starting a TCP write.
+                for _ in 0..64 {
+                    match udp_recv_nonblocking(&udp_rx, &mut pkt_buf) {
+                        Ok(len) => {
+                            if let Some(frame) = AdbQueuedFrame::from_udp_payload(&pkt_buf[..len]) {
+                                push_and_shed_adb_frame(
+                                    &mut queue,
+                                    &mut queued_subframes,
+                                    frame,
+                                    ADB_OUT_MAX_QUEUED_SUBFRAMES,
+                                    ADB_OUT_QUEUE_CAP,
+                                );
+                            }
+                        }
+                        Err(ref e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::Interrupted
+                                || e.kind() == std::io::ErrorKind::ConnectionReset =>
+                        {
                             break;
                         }
+                        Err(_) => break,
                     }
-                    Ok(_) => {}
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut
-                            || e.kind() == std::io::ErrorKind::Interrupted
-                            || e.kind() == std::io::ErrorKind::ConnectionReset => {}
-                    Err(_) => break,
+                }
+
+                if let Some(front) = queue.pop_front() {
+                    queued_subframes = queued_subframes.saturating_sub(front.subframes);
+                    if write_all_interruptible(
+                        &mut tcp_writer,
+                        &front.framed[..front.framed_len],
+                        &alive_out,
+                        &run_out,
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
                 }
             }
             alive_out.store(false, Ordering::Release);
+            if !bye_out.swap(true, Ordering::AcqRel) {
+                let _ = udp_bye.send(crate::CONTROL_MAGIC_BYE);
+            }
             let _ = tcp_writer.shutdown(std::net::Shutdown::Both);
             drop(slot_out);
         });
@@ -744,16 +1055,26 @@ fn spawn_host_adb_tcp_session(
 impl Drop for AdbUsbWatcher {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        // Do NOT block the caller/GUI thread joining `as-ultra-adb-watcher`:
-        // it may be waiting on a slow/cold-starting `adb` child process and
-        // holds no network sockets. It checks `running` every 50 ms and exits
-        // promptly on its own. Always join `tcp_bridge_handle` (<=50 ms) so
-        // the loopback TCP port is released cleanly before any restart.
-        let _ = self.handle.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
         if let Some(h) = self.tcp_bridge_handle.take() {
             let _ = h.join();
         }
     }
+}
+
+/// Validate Windows Wi-Fi Direct SoftAP credentials before stopping any active
+/// hotspot or spawning PowerShell.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_windows_softap_credentials(ssid: &str, password: &str) -> Result<(), String> {
+    if ssid.trim().is_empty() {
+        return Err("Wi-Fi Direct SoftAP SSID cannot be empty".into());
+    }
+    if password.len() < 8 {
+        return Err("Wi-Fi Direct SoftAP password must be at least 8 characters".into());
+    }
+    Ok(())
 }
 
 /// 1-Hop Wi-Fi Direct / SoftAP Hotspot Controller (Bypasses congested or AP-isolated routers)
@@ -788,6 +1109,7 @@ impl DirectHotspotController {
 
         #[cfg(target_os = "windows")]
         {
+            validate_windows_softap_credentials(ssid, password)?;
             Self::stop_direct_hotspot();
             let safe_ssid = ssid.replace('\'', "''");
             let safe_pass = password.replace('\'', "''");
@@ -809,16 +1131,17 @@ impl DirectHotspotController {
                  $pub.Start(); \
                  for ($i = 0; $i -lt 40; $i++) {{ \
                      $st = $pub.Status.ToString(); \
-                     if ($st -eq 'Started') {{ Write-Output 'ASULTRA_SOFTAP_READY'; break }} \
-                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ Write-Output \"ASULTRA_SOFTAP_FAILED:$st\"; exit 1 }} \
+                     if ($st -eq 'Started') {{ [Console]::Out.WriteLine('ASULTRA_SOFTAP_READY'); [Console]::Out.Flush(); break }} \
+                     if ($st -eq 'Aborted' -or $st -eq 'Stopped') {{ [Console]::Out.WriteLine(\"ASULTRA_SOFTAP_FAILED:$st\"); [Console]::Out.Flush(); exit 1 }} \
                      Start-Sleep -Milliseconds 100 \
                  }}; \
-                 if ($pub.Status.ToString() -ne 'Started') {{ Write-Output 'ASULTRA_SOFTAP_FAILED:Timeout'; exit 1 }}; \
+                 if ($pub.Status.ToString() -ne 'Started') {{ [Console]::Out.WriteLine('ASULTRA_SOFTAP_FAILED:Timeout'); [Console]::Out.Flush(); exit 1 }}; \
                  while ($true) {{ Start-Sleep -Seconds 3600 }}",
                 safe_ssid, safe_pass
             );
+            let encoded = encode_powershell_utf16le_base64(&script);
             let mut child = silent_command("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -943,6 +1266,22 @@ fn encode_powershell_utf16le_base64(script: &str) -> String {
 pub fn is_windows_firewall_configured() -> bool {
     #[cfg(target_os = "windows")]
     {
+        // Prefer structured PowerShell NetSecurity properties (`Enabled == True`,
+        // `Action == Allow`) because `netsh advfirewall` localizes field names
+        // and values on non-English Windows installs.
+        if let Ok(o) = silent_command("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "if (Get-NetFirewallRule -DisplayName 'AudioShare_Ultra_UDP' -ErrorAction SilentlyContinue | Where-Object { $_.Enabled.ToString() -eq 'True' -and $_.Action.ToString() -eq 'Allow' } | Select-Object -First 1) { 'OK' }",
+            ])
+            .output()
+        {
+            if o.status.success() {
+                return String::from_utf8_lossy(&o.stdout).trim() == "OK";
+            }
+        }
         silent_command("netsh")
             .args([
                 "advfirewall",
@@ -1198,7 +1537,7 @@ fn parse_pactl_volume_percent(output: &str) -> Option<u8> {
 
 #[cfg(target_os = "linux")]
 fn read_linux_master_volume() -> Option<u8> {
-    let mute = Command::new("pactl")
+    let mute = pactl_command()
         .args(["get-sink-mute", "@DEFAULT_SINK@"])
         .output()
         .ok()?;
@@ -1212,7 +1551,7 @@ fn read_linux_master_volume() -> Option<u8> {
         return Some(0);
     }
 
-    let volume = Command::new("pactl")
+    let volume = pactl_command()
         .args(["get-sink-volume", "@DEFAULT_SINK@"])
         .output()
         .ok()?;
@@ -1443,7 +1782,7 @@ pub struct VirtualSpeakerAndRadioGuard {
 #[cfg(target_os = "linux")]
 fn pactl_get_default(kind: &str) -> Option<String> {
     let arg = format!("get-default-{}", kind);
-    let output = Command::new("pactl").arg(arg).output().ok()?;
+    let output = pactl_command().arg(arg).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1458,13 +1797,13 @@ fn pactl_get_default(kind: &str) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn pactl_set_default(kind: &str, value: &str) {
     let arg = format!("set-default-{}", kind);
-    let _ = Command::new("pactl").args([arg.as_str(), value]).output();
+    let _ = pactl_command().args([arg.as_str(), value]).output();
 }
 
 /// True when a PulseAudio sink with this exact name is already registered.
 #[cfg(target_os = "linux")]
 fn pactl_sink_exists(name: &str) -> bool {
-    let Ok(output) = Command::new("pactl")
+    let Ok(output) = pactl_command()
         .args(["list", "short", "sinks"])
         .output()
     else {
@@ -1526,12 +1865,13 @@ impl VirtualSpeakerAndRadioGuard {
             let mut pactl_module_id = None;
             let sink_ready = if enable_virtual_speaker {
                 if pactl_sink_exists("AudioShare_Ultra") {
-                    // A previous session (or another guard) already registered
-                    // this sink. Reuse it, but never unload a module we did
-                    // not create in Drop.
+                    // Reuse an existing sink. If per-app routing created it in
+                    // this process, adopt ownership so Drop unloads it cleanly
+                    // without leaving a zombie null-sink behind.
+                    pactl_module_id = crate::app_routing::take_created_sink_module_id();
                     true
                 } else {
-                    if let Ok(output) = Command::new("pactl")
+                    if let Ok(output) = pactl_command()
                         .args([
                             "load-module",
                             "module-null-sink",
@@ -1668,7 +2008,7 @@ impl Drop for VirtualSpeakerAndRadioGuard {
 
         #[cfg(target_os = "linux")]
         if let Some(ref id) = self.pactl_module_id {
-            let _ = Command::new("pactl").args(["unload-module", id]).output();
+            let _ = pactl_command().args(["unload-module", id]).output();
         }
 
         #[cfg(target_os = "windows")]
@@ -1928,11 +2268,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_adb_reverse_targets_arms_new_devices_while_streaming() {
+        let serials = vec!["phone-a".to_string(), "phone-b".to_string()];
+        let mut armed = HashSet::new();
+        armed.insert("phone-a".to_string());
+
+        // Periodic re-arm is suppressed while a tunnel is live, but a newly
+        // attached phone must still be armed immediately.
+        assert_eq!(
+            adb_reverse_targets(&serials, &armed, false),
+            vec!["phone-b"]
+        );
+
+        // With no active session, the periodic pass re-arms every device.
+        assert_eq!(
+            adb_reverse_targets(&serials, &armed, true),
+            vec!["phone-a", "phone-b"]
+        );
+
+        // Already-armed devices are skipped when the periodic pass is off.
+        assert!(adb_reverse_targets(&serials[..1], &armed, false).is_empty());
+    }
+
+    #[test]
     fn test_encode_powershell_utf16le_base64() {
         // Acceptance test (n1 item 2): "hi" -> UTF-16LE `68 00 69 00` -> base64.
         assert_eq!(encode_powershell_utf16le_base64("hi"), "aABpAA==");
         // Non-ASCII: "é" (U+00E9) -> UTF-16LE `E9 00` -> base64.
         assert_eq!(encode_powershell_utf16le_base64("é"), "6QA=");
+    }
+
+    #[test]
+    fn test_windows_softap_credentials_validation() {
+        assert!(validate_windows_softap_credentials("", "audioshare88").is_err());
+        assert!(validate_windows_softap_credentials("   ", "audioshare88").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "short").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "1234567").is_err());
+        assert!(validate_windows_softap_credentials("AudioShare_5G", "audioshare88").is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_softap_start_rejects_invalid_credentials_without_powershell() {
+        assert!(DirectHotspotController::start_direct_5ghz_hotspot("", "audioshare88").is_err());
+        assert!(DirectHotspotController::start_direct_5ghz_hotspot("AudioShare_5G", "short").is_err());
     }
 
     #[test]
@@ -2098,5 +2477,39 @@ mod tests {
             let _ = sock.bind(&bind_addr.into());
         }
         drop(scanner1);
+    }
+
+    #[test]
+    fn test_adb_queue_sheds_oldest_whole_datagrams() {
+        let mut queue: VecDeque<AdbQueuedFrame> = VecDeque::with_capacity(ADB_OUT_QUEUE_CAP);
+        let mut queued_subframes = 0usize;
+        let mut total_dropped = 0usize;
+
+        // Enqueue 10 2-subframe packets (20 subframes = 50 ms) with a 14-subframe ceiling.
+        for seq in 0..10u8 {
+            let mut pkt = vec![0u8; 32];
+            pkt[0] = audioshare_protocol::wire::WIRE_MAGIC;
+            pkt[1] = 2 << 3; // subframe_count = 2
+            pkt[2] = seq;
+            let frame = AdbQueuedFrame::from_udp_payload(&pkt).unwrap();
+            total_dropped += push_and_shed_adb_frame(
+                &mut queue,
+                &mut queued_subframes,
+                frame,
+                ADB_OUT_MAX_QUEUED_SUBFRAMES,
+                ADB_OUT_QUEUE_CAP,
+            );
+        }
+
+        assert_eq!(total_dropped, 3, "oldest 3 packets (6 sf) must be shed");
+        assert_eq!(queued_subframes, 14);
+        assert_eq!(queue.len(), 7);
+        // Verify newest 7 packets (seq 3..=9) remain intact with valid framing.
+        for (idx, item) in queue.iter().enumerate() {
+            let expected_seq = (idx + 3) as u8;
+            let frame_len = u16::from_be_bytes([item.framed[0], item.framed[1]]) as usize;
+            assert_eq!(frame_len, 32);
+            assert_eq!(item.framed[4], expected_seq);
+        }
     }
 }

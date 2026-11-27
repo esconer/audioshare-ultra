@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Queue errors below this are sub-frame phase beat between packet arrival
@@ -31,49 +31,110 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-fn sinc_table() -> &'static [[f32; SINC_TAPS]; SINC_PHASES + 1] {
-    static TABLE: OnceLock<[[f32; SINC_TAPS]; SINC_PHASES + 1]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        const BETA: f64 = 7.5;
-        const FC: f64 = 0.96;
-        const HALF_WIDTH: f64 = (SINC_TAPS as f64) * 0.5;
-        let inv_i0_beta = 1.0 / bessel_i0(BETA);
-        let mut table = [[0.0f32; SINC_TAPS]; SINC_PHASES + 1];
+fn build_sinc_table(fc: f64) -> [[f32; SINC_TAPS]; SINC_PHASES + 1] {
+    const BETA: f64 = 7.5;
+    const HALF_WIDTH: f64 = (SINC_TAPS as f64) * 0.5;
+    let inv_i0_beta = 1.0 / bessel_i0(BETA);
+    let mut table = [[0.0f32; SINC_TAPS]; SINC_PHASES + 1];
 
-        // Generate all phases 0..=SINC_PHASES continuously from the same
-        // Kaiser-windowed sinc formula (FC = 0.96). Hardcoding unit impulses at
-        // phase 0/1 creates an 11.8x kernel discontinuity that causes severe
-        // mirror imaging on 96/192 kHz DACs and fractional clock-drift sweeps;
-        // exact 1:1 unity pass-through is handled explicitly when
-        // `ratio == 1.0 && phase == 0.0`.
-        for p in 0..=SINC_PHASES {
-            let frac = (p as f64) / (SINC_PHASES as f64);
-            let mut raw = [0.0f64; SINC_TAPS];
-            let mut sum = 0.0f64;
-            for k in 0..SINC_TAPS {
-                let x = (k as f64) - (SINC_CENTER as f64) - frac;
-                let norm_x = x / HALF_WIDTH;
-                let win = bessel_i0(BETA * (1.0 - norm_x * norm_x).max(0.0).sqrt()) * inv_i0_beta;
-                let sinc = if x.abs() < 1e-12 {
-                    1.0
-                } else {
-                    let arg = std::f64::consts::PI * FC * x;
-                    arg.sin() / arg
-                };
-                let coeff = sinc * win;
-                raw[k] = coeff;
-                sum += coeff;
-            }
-            let inv_sum = 1.0 / sum;
-            for k in 0..SINC_TAPS {
-                table[p][k] = (raw[k] * inv_sum) as f32;
-            }
+    // Generate all phases 0..=SINC_PHASES continuously from the same
+    // Kaiser-windowed sinc formula. Hardcoding unit impulses at phase 0/1
+    // creates an 11.8x kernel discontinuity that causes severe mirror imaging
+    // on 96/192 kHz DACs and fractional clock-drift sweeps; exact 1:1 unity
+    // pass-through is handled explicitly when `ratio == 1.0 && phase == 0.0`.
+    for p in 0..=SINC_PHASES {
+        let frac = (p as f64) / (SINC_PHASES as f64);
+        let mut raw = [0.0f64; SINC_TAPS];
+        let mut sum = 0.0f64;
+        for k in 0..SINC_TAPS {
+            let x = (k as f64) - (SINC_CENTER as f64) - frac;
+            let norm_x = x / HALF_WIDTH;
+            let win = bessel_i0(BETA * (1.0 - norm_x * norm_x).max(0.0).sqrt()) * inv_i0_beta;
+            let sinc = if x.abs() < 1e-12 {
+                1.0
+            } else {
+                let arg = std::f64::consts::PI * fc * x;
+                arg.sin() / arg
+            };
+            let coeff = sinc * win;
+            raw[k] = coeff;
+            sum += coeff;
         }
-        table
-    })
+        let inv_sum = 1.0 / sum;
+        for k in 0..SINC_TAPS {
+            table[p][k] = (raw[k] * inv_sum) as f32;
+        }
+    }
+    table
 }
 
-/// 1. Jitter-Immune Windowed-Min DLL + 16-Tap Kaiser Windowed-Sinc Polyphase Resampler
+fn sinc_table() -> &'static [[f32; SINC_TAPS]; SINC_PHASES + 1] {
+    static TABLE: OnceLock<[[f32; SINC_TAPS]; SINC_PHASES + 1]> = OnceLock::new();
+    TABLE.get_or_init(|| build_sinc_table(0.96))
+}
+
+#[derive(Clone, Copy)]
+struct AaBiquadStage {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl AaBiquadStage {
+    const fn identity() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1_l: 0.0,
+            z2_l: 0.0,
+            z1_r: 0.0,
+            z2_r: 0.0,
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.z1_l = 0.0;
+        self.z2_l = 0.0;
+        self.z1_r = 0.0;
+        self.z2_r = 0.0;
+    }
+
+    fn configure_lowpass(&mut self, norm_fc: f32, q: f32) {
+        let w0 = std::f32::consts::TAU * norm_fc;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        self.b0 = ((1.0 - cos_w0) * 0.5) * inv_a0;
+        self.b1 = (1.0 - cos_w0) * inv_a0;
+        self.b2 = self.b0;
+        self.a1 = (-2.0 * cos_w0) * inv_a0;
+        self.a2 = (1.0 - alpha) * inv_a0;
+        self.reset_state();
+    }
+
+    #[inline(always)]
+    fn process_pair(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let yl = self.b0 * in_l + self.z1_l;
+        self.z1_l = self.b1 * in_l - self.a1 * yl + self.z2_l;
+        self.z2_l = self.b2 * in_l - self.a2 * yl;
+
+        let yr = self.b0 * in_r + self.z1_r;
+        self.z1_r = self.b1 * in_r - self.a1 * yr + self.z2_r;
+        self.z2_r = self.b2 * in_r - self.a2 * yr;
+        (yl, yr)
+    }
+}
+
+/// 1. Jitter-Immune Windowed-Min DLL + 20-Tap Kaiser Windowed-Sinc Polyphase Resampler
 pub struct ClockDriftResampler {
     phase: f64,
     /// Conversion from the 48 kHz network stream to the output device.
@@ -85,25 +146,22 @@ pub struct ClockDriftResampler {
     pub ratio: f64,
     hist_l: [f32; SINC_TAPS],
     hist_r: [f32; SINC_TAPS],
+    /// Bandwidth-scaled Kaiser-sinc table used only when downsampling (`base_ratio > 1.02`).
+    custom_sinc: Option<Box<[[f32; SINC_TAPS]; SINC_PHASES + 1]>>,
     /// Running sum of (observed queue depth - clock setpoint) over the current
     /// 200-tick window. A windowed mean of the *error* cancels periodic HAL
     /// burst sawtooths while tracking both positive and negative drift.
     err_sum_window: f64,
     window_ticks: u32,
     integral_err: f64,
-    // 2nd-order Butterworth anti-aliasing LPF. Active only when the input rate
-    // exceeds the output rate by >2% (44.1 kHz A2DP, 96 kHz -> 48 kHz capture);
-    // completely bypassed (zero CPU cost) on native 48 kHz streams.
+    low_jitter_fast_acq: bool,
+    acq_windows: u32,
+    // 4th-order cascaded Butterworth anti-aliasing LPF (2 biquad stages, -24 dB/oct).
+    // Active only when the input rate exceeds the output rate by >2% (44.1 kHz A2DP,
+    // 96 kHz -> 48 kHz capture); completely bypassed (zero CPU cost) on native 48 kHz streams.
     aa_active: bool,
-    aa_b0: f32,
-    aa_b1: f32,
-    aa_b2: f32,
-    aa_a1: f32,
-    aa_a2: f32,
-    aa_z1_l: f32,
-    aa_z2_l: f32,
-    aa_z1_r: f32,
-    aa_z2_r: f32,
+    aa_stage1: AaBiquadStage,
+    aa_stage2: AaBiquadStage,
 }
 
 impl ClockDriftResampler {
@@ -114,24 +172,28 @@ impl ClockDriftResampler {
             ratio: 1.0,
             hist_l: [0.0; SINC_TAPS],
             hist_r: [0.0; SINC_TAPS],
+            custom_sinc: None,
             err_sum_window: 0.0,
             window_ticks: 0,
             integral_err: 0.0,
+            low_jitter_fast_acq: false,
+            acq_windows: 0,
             aa_active: false,
-            aa_b0: 1.0,
-            aa_b1: 0.0,
-            aa_b2: 0.0,
-            aa_a1: 0.0,
-            aa_a2: 0.0,
-            aa_z1_l: 0.0,
-            aa_z2_l: 0.0,
-            aa_z1_r: 0.0,
-            aa_z2_r: 0.0,
+            aa_stage1: AaBiquadStage::identity(),
+            aa_stage2: AaBiquadStage::identity(),
         }
     }
 
+    /// Enable gated fast initial clock-drift acquisition (~10 s) when the caller
+    /// observes a clean, low-jitter link (`jitter < 2 ms && empty_ticks == 0`).
+    #[inline]
+    pub fn set_low_jitter_fast_acq(&mut self, enabled: bool) {
+        self.low_jitter_fast_acq = enabled;
+    }
+
     /// Configure exact input -> output sample rates. Automatically enables the
-    /// Butterworth anti-aliasing filter only when downsampling (`ratio > 1.02`).
+    /// 4th-order Butterworth anti-aliasing filter + bandwidth-scaled Kaiser-sinc
+    /// kernel only when downsampling (`ratio > 1.02`).
     #[inline]
     pub fn set_sample_rates(&mut self, input_rate_hz: u32, output_rate_hz: u32) {
         let in_r = input_rate_hz.clamp(8_000, 384_000) as f64;
@@ -139,34 +201,31 @@ impl ClockDriftResampler {
         let new_base = in_r / out_r;
         if (new_base - self.base_ratio).abs() > 1e-9 {
             self.base_ratio = new_base;
-            self.ratio = new_base;
-            self.err_sum_window = 0.0;
-            self.window_ticks = 0;
-            self.integral_err = 0.0;
+            self.reset_clock_controller();
             self.configure_anti_aliasing(new_base);
+            if new_base > 1.02 {
+                let fc = (0.90 / new_base).clamp(0.05, 0.96);
+                self.custom_sinc = Some(Box::new(build_sinc_table(fc)));
+            } else {
+                self.custom_sinc = None;
+            }
         }
     }
 
     fn configure_anti_aliasing(&mut self, base_ratio: f64) {
-        self.aa_z1_l = 0.0;
-        self.aa_z2_l = 0.0;
-        self.aa_z1_r = 0.0;
-        self.aa_z2_r = 0.0;
+        self.aa_stage1.reset_state();
+        self.aa_stage2.reset_state();
         if base_ratio <= 1.02 {
             self.aa_active = false;
             return;
         }
-        // Cutoff at 0.45 * output_rate expressed in input-rate normalized cycles.
+        // 4th-order cascaded Butterworth (-24 dB/oct): Q1 = 1/(2*cos(pi/8)),
+        // Q2 = 1/(2*cos(3*pi/8)). Cutoff at 0.45 * output_rate in input cycles.
+        const Q1: f32 = 0.541_196_1;
+        const Q2: f32 = 1.306_563;
         let norm_fc = (0.45 / base_ratio).clamp(0.02, 0.46) as f32;
-        let w0 = std::f32::consts::TAU * norm_fc;
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() * std::f32::consts::FRAC_1_SQRT_2;
-        let inv_a0 = 1.0 / (1.0 + alpha);
-        self.aa_b0 = ((1.0 - cos_w0) * 0.5) * inv_a0;
-        self.aa_b1 = (1.0 - cos_w0) * inv_a0;
-        self.aa_b2 = self.aa_b0;
-        self.aa_a1 = (-2.0 * cos_w0) * inv_a0;
-        self.aa_a2 = (1.0 - alpha) * inv_a0;
+        self.aa_stage1.configure_lowpass(norm_fc, Q1);
+        self.aa_stage2.configure_lowpass(norm_fc, Q2);
         self.aa_active = true;
     }
 
@@ -178,16 +237,8 @@ impl ClockDriftResampler {
             return (safe_l, safe_r);
         }
         const ANTI_DENORMAL: f32 = 1.0e-25;
-        let xl = safe_l + ANTI_DENORMAL;
-        let yl = self.aa_b0 * xl + self.aa_z1_l;
-        self.aa_z1_l = self.aa_b1 * xl - self.aa_a1 * yl + self.aa_z2_l;
-        self.aa_z2_l = self.aa_b2 * xl - self.aa_a2 * yl;
-
-        let xr = safe_r + ANTI_DENORMAL;
-        let yr = self.aa_b0 * xr + self.aa_z1_r;
-        self.aa_z1_r = self.aa_b1 * xr - self.aa_a1 * yr + self.aa_z2_r;
-        self.aa_z2_r = self.aa_b2 * xr - self.aa_a2 * yr;
-        (yl, yr)
+        let (l1, r1) = self.aa_stage1.process_pair(safe_l + ANTI_DENORMAL, safe_r + ANTI_DENORMAL);
+        self.aa_stage2.process_pair(l1, r1)
     }
 
     /// Point the resampler at the sample rate AAudio actually opened.
@@ -229,6 +280,26 @@ impl ClockDriftResampler {
         }
     }
 
+    /// Clear the in-progress 500 ms error window after a stall/PLC event while
+    /// preserving the learned steady-state crystal offset (`integral_err`, `ratio`).
+    #[inline]
+    pub fn reset_clock_window(&mut self) {
+        self.err_sum_window = 0.0;
+        self.window_ticks = 0;
+    }
+
+    /// Reset the entire clock-drift controller (`ratio`, `integral_err`,
+    /// `acq_windows`, and the active error window) back to `base_ratio` while
+    /// preserving the configured sample-rate ratio and filter state.
+    #[inline]
+    pub fn reset_clock_controller(&mut self) {
+        self.ratio = self.base_ratio;
+        self.integral_err = 0.0;
+        self.acq_windows = 0;
+        self.err_sum_window = 0.0;
+        self.window_ticks = 0;
+    }
+
     /// Observe current queue depth every 2.5ms subframe.
     /// Uses a 200-subframe (500ms) error-relative windowed mean so periodic HAL
     /// bursts cancel out while tracking both positive and negative crystal drift.
@@ -242,21 +313,21 @@ impl ClockDriftResampler {
 
         if self.window_ticks >= 200 {
             let err = self.err_sum_window / (self.window_ticks as f64);
+            let fast_acq = self.low_jitter_fast_acq && self.acq_windows < 20;
 
             // Hold the learned crystal offset inside the deadband rather than
-            // decaying it (the old `*= 0.9` erased the offset every 500 ms).
-            // Anti-windup clamps per-window steps; +/-100.0 gives full
-            // +/-500 ppm steady-state integral authority for real crystals.
+            // decaying it. Anti-windup clamps per-window steps; +/-120.0 gives
+            // +/-600 ppm steady-state integral authority for real crystals.
             if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
-                let step = err.clamp(-1.0, 1.0) * 0.6;
-                self.integral_err = (self.integral_err + step).clamp(-80.0, 80.0);
+                let ki_step = if fast_acq { 2.5 } else { 0.6 };
+                let step = err.clamp(-1.0, 1.0) * ki_step;
+                self.integral_err = (self.integral_err + step).clamp(-120.0, 120.0);
             }
 
-            // Symmetric +/- 400 ppm crystal-drift authority with smooth slewing.
-            // Removes the +2500 ppm spike jump that caused audible pitch warble
-            // after Wi-Fi bursts; large backlogs are trimmed with a declick splice.
+            // Symmetric +/- 600 ppm crystal-drift authority with well-damped P/I slewing.
             const KP: f64 = 0.00012;
-            const MAX_DRIFT_RATIO: f64 = 0.0004;
+            const MAX_DRIFT_RATIO: f64 = 0.0006;
+            const MAX_FAST_STEP_RATIO: f64 = 0.000025; // <= 25 ppm per 500 ms window
             let corr = (KP * err + 0.000005 * self.integral_err)
                 .clamp(-MAX_DRIFT_RATIO, MAX_DRIFT_RATIO);
             let target_ratio = self.base_ratio * (1.0 + corr);
@@ -266,7 +337,14 @@ impl ClockDriftResampler {
             } else {
                 self.base_ratio
             };
-            self.ratio = (0.75 * prev_ratio + 0.25 * target_ratio).max(1e-9);
+            let ema = if fast_acq { 0.40 } else { 0.25 };
+            let mut next_ratio = (1.0 - ema) * prev_ratio + ema * target_ratio;
+            if fast_acq {
+                let max_delta = self.base_ratio * MAX_FAST_STEP_RATIO;
+                next_ratio = next_ratio.clamp(prev_ratio - max_delta, prev_ratio + max_delta);
+            }
+            self.ratio = next_ratio.max(1e-9);
+            self.acq_windows = self.acq_windows.saturating_add(1);
             self.err_sum_window = 0.0;
             self.window_ticks = 0;
         }
@@ -292,6 +370,7 @@ impl ClockDriftResampler {
         phase: f64,
         hist_l: &[f32; SINC_TAPS],
         hist_r: &[f32; SINC_TAPS],
+        custom_sinc: Option<&[[f32; SINC_TAPS]; SINC_PHASES + 1]>,
     ) -> (f32, f32) {
         // Preserve bit-exact unity pass-through ONLY when truly locked at 1:1
         // with zero fractional phase; all other ratios (96/192 kHz DACs, 44.1
@@ -301,7 +380,10 @@ impl ClockDriftResampler {
             return (hist_l[SINC_CENTER], hist_r[SINC_CENTER]);
         }
         let frac = (phase as f32).clamp(0.0, 1.0);
-        let table = sinc_table();
+        let table = match custom_sinc {
+            Some(t) => t,
+            None => sinc_table(),
+        };
         let scaled = frac * (SINC_PHASES as f32);
         let idx = (scaled as usize).min(SINC_PHASES - 1);
         let alpha = scaled - (idx as f32);
@@ -366,8 +448,13 @@ impl ClockDriftResampler {
 
         while in_idx < in_frames && out_idx < max_out_frames {
             while self.phase < 1.0 && out_idx < max_out_frames {
-                let (l, r) =
-                    Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+                let (l, r) = Self::interpolate_sinc_stereo(
+                    self.ratio,
+                    self.phase,
+                    &self.hist_l,
+                    &self.hist_r,
+                    self.custom_sinc.as_deref(),
+                );
                 out_stereo[out_idx * 2] = l;
                 out_stereo[out_idx * 2 + 1] = r;
                 out_idx += 1;
@@ -396,8 +483,13 @@ impl ClockDriftResampler {
         let max_out_frames = out_stereo.len() / 2;
         let mut out_idx = self.process(in_stereo, out_stereo);
         while self.phase < 1.0 && out_idx < max_out_frames {
-            let (l, r) =
-                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+            let (l, r) = Self::interpolate_sinc_stereo(
+                self.ratio,
+                self.phase,
+                &self.hist_l,
+                &self.hist_r,
+                self.custom_sinc.as_deref(),
+            );
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             out_idx += 1;
@@ -492,8 +584,13 @@ impl ClockDriftResampler {
                 );
                 self.phase -= 1.0;
             }
-            let (l, r) =
-                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+            let (l, r) = Self::interpolate_sinc_stereo(
+                self.ratio,
+                self.phase,
+                &self.hist_l,
+                &self.hist_r,
+                self.custom_sinc.as_deref(),
+            );
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             self.phase += self.ratio;
@@ -525,6 +622,7 @@ struct CachePadded<T>(T);
 pub struct BurstDecouplerRing {
     write_idx: CachePadded<AtomicUsize>,
     read_idx: CachePadded<AtomicUsize>,
+    needs_recovery_fade: CachePadded<AtomicBool>,
     // Heap-boxed to avoid a 256 KB stack frame during `new()` on Android threads.
     buf: Box<[UnsafeCell<f32>]>,
 }
@@ -540,6 +638,7 @@ impl BurstDecouplerRing {
         Self {
             write_idx: CachePadded(AtomicUsize::new(0)),
             read_idx: CachePadded(AtomicUsize::new(0)),
+            needs_recovery_fade: CachePadded(AtomicBool::new(false)),
             buf,
         }
     }
@@ -552,11 +651,7 @@ impl BurstDecouplerRing {
         let r = self.read_idx.0.load(Ordering::Acquire);
         let w = self.write_idx.0.load(Ordering::Acquire);
         let diff = w.wrapping_sub(r);
-        if diff > FIFO_CAPACITY {
-            0
-        } else {
-            diff
-        }
+        diff.min(FIFO_CAPACITY)
     }
 
     /// Total interleaved samples the ring can hold. Callers that translate a
@@ -576,13 +671,14 @@ impl BurstDecouplerRing {
     pub fn clear_when_quiescent(&self) {
         let w = self.write_idx.0.load(Ordering::Acquire);
         self.read_idx.0.store(w, Ordering::Release);
+        self.needs_recovery_fade.0.store(false, Ordering::Relaxed);
     }
 
     #[inline]
     pub fn push_samples(&self, samples: &[f32]) -> usize {
         let w = self.write_idx.0.load(Ordering::Relaxed);
         let r = self.read_idx.0.load(Ordering::Acquire);
-        let free = FIFO_CAPACITY - w.wrapping_sub(r);
+        let free = FIFO_CAPACITY.saturating_sub(w.wrapping_sub(r));
         // The ring is stereo-interleaved. An odd write count would shift every
         // subsequent Left/Right pair by one sample, so always write whole frames.
         let to_write = samples.len().min(free) & !1;
@@ -641,10 +737,23 @@ impl BurstDecouplerRing {
             if req_even < out.len() {
                 out[req_even] = 0.0;
             }
+            if self.needs_recovery_fade.0.swap(false, Ordering::Relaxed) {
+                let fade_frames = (req_even / 2).min(16);
+                if fade_frames > 1 {
+                    for frame in 0..fade_frames {
+                        let phase =
+                            core::f32::consts::PI * frame as f32 / (fade_frames - 1) as f32;
+                        let gain = 0.5 * (1.0 - phase.cos());
+                        out[frame * 2] *= gain;
+                        out[frame * 2 + 1] *= gain;
+                    }
+                }
+            }
             self.read_idx.0
                 .store(r.wrapping_add(req_even), Ordering::Release);
             true
         } else if req_even > 0 && (avail & !1) > 0 {
+            self.needs_recovery_fade.0.store(true, Ordering::Relaxed);
             // Partial underrun: copy what is left, cross-fading the final
             // frames to zero and zero-filling the remainder. Without the fade,
             // a callback only one frame short would leave the output near
@@ -682,6 +791,7 @@ impl BurstDecouplerRing {
             out[safe_avail..].fill(0.0);
             false
         } else {
+            self.needs_recovery_fade.0.store(true, Ordering::Relaxed);
             // Inject -90 dBFS TPDF comfort dither so Bluetooth earbuds never sleep during DTX silence
             inject_bluetooth_keepalive_dither(out, dither_rng);
             false
@@ -721,15 +831,21 @@ impl TruePeakLimiter {
 
     #[inline]
     pub fn process_in_place(&mut self, stereo_samples: &mut [f32]) {
-        const THRESHOLD: f32 = 0.85; // -1.4 dBFS soft-knee start
-        // -0.4 dBFS leaves headroom for 4-point Hermite inter-sample peaks
-        // when clock drift != 0 or 44.1 kHz Bluetooth resampling is active.
-        const CEILING: f32 = 0.955;
+        const THRESHOLD: f32 = 0.85; // -1.4 dBFS soft-knee start when boosting
+        const BOOST_CEILING: f32 = 0.955;
+        const UNITY_CEILING: f32 = 0.995;
+        const UNITY_THRESHOLD: f32 = 0.985;
         const ATTACK: f32 = 0.25;
         const RELEASE: f32 = 0.0005;
 
         for frame in stereo_samples.chunks_exact_mut(2) {
-            self.current_gain_linear += 0.01 * (self.target_gain_linear - self.current_gain_linear);
+            let gain_diff = self.target_gain_linear - self.current_gain_linear;
+            if gain_diff.abs() <= 1.0e-5 {
+                // Snap past f32 ULP stall (exact 1.0 unity / exact 0.0 mute, no subnormals).
+                self.current_gain_linear = self.target_gain_linear;
+            } else {
+                self.current_gain_linear += 0.01 * gain_diff;
+            }
             // A non-finite or astronomically huge capture sample (driver glitch,
             // decoder damage) must not propagate NaN/Inf into the ring, DAC, or
             // envelope follower (finite > 2e37 * 15.85 would overflow to Inf and
@@ -752,50 +868,44 @@ impl TruePeakLimiter {
                 self.envelope += ATTACK * (peak - self.envelope);
             } else {
                 self.envelope += RELEASE * (peak - self.envelope);
+                if self.envelope < 1.0e-15 {
+                    self.envelope = 0.0;
+                }
             }
 
-            // At unity gain the limiter must be bit-transparent below the
-            // ceiling. The soft knee exists to absorb pre-amp boost, not to
-            // re-compress material that already fits; applying it at 0 dB
-            // audibly squashes peaks between -1.4 dBFS and -0.1 dBFS. Keep
-            // the envelope updated above so later gain changes start from the
-            // real signal level.
-            //
-            // p4-C1: the old condition bypassed the knee for peak <= CEILING
-            // (0.955) then jumped abruptly into the THRESHOLD (0.85) formula
-            // the instant a sample exceeded 0.955 -- a ~10% downward step on
-            // every kick/snare (audible crackle). Use a C1-continuous unity
-            // knee starting at UNITY_THRESHOLD = 0.92: <= 0.92 stays bit-exact,
-            // 0.92 -> 0.955 is monotonic with slope 1.0 at the knee start
-            // (zero step), and the ceiling is still honoured.
-            // Blend the knee smoothly over 1.0..=1.05 (+0.42 dB) so sweeping
-            // the preamp slider through 0 dB produces no gain step.
-            const UNITY_THRESHOLD: f32 = 0.92;
-            let boost_blend = ((self.current_gain_linear - 1.0) / 0.05).clamp(0.0, 1.0);
+            // At unity gain (<= 0 dB) remain bit-transparent up to 0.985 with a
+            // 0.995 ceiling; when boosting > 0 dB, blend smoothly down to the
+            // 0.85 soft knee / 0.955 ceiling.
+            let boost_blend = if self.current_gain_linear <= 1.0 + 1.0e-5 {
+                0.0
+            } else {
+                ((self.current_gain_linear - 1.0) / 0.05).clamp(0.0, 1.0)
+            };
             let knee_start = UNITY_THRESHOLD - (UNITY_THRESHOLD - THRESHOLD) * boost_blend;
+            let ceiling = UNITY_CEILING - (UNITY_CEILING - BOOST_CEILING) * boost_blend;
             let det = self.envelope.max(peak);
             if det > knee_start {
                 let over = det - knee_start;
-                let headroom = CEILING - knee_start;
+                let headroom = ceiling - knee_start;
                 let compressed = knee_start + headroom * (over / (over + headroom));
                 let scale = compressed / det;
                 l *= scale;
                 r *= scale;
             }
 
-            frame[0] = l.clamp(-CEILING, CEILING);
-            frame[1] = r.clamp(-CEILING, CEILING);
+            frame[0] = l.clamp(-ceiling, ceiling);
+            frame[1] = r.clamp(-ceiling, ceiling);
         }
     }
 }
 
 /// Transparent safety soft-clipper applied *after* fractional resampling so
-/// 4-point Hermite inter-sample overshoots (> 0.96) smoothly round off below
-/// 0.999 instead of hard-clipping in AAudio/CPAL. Bit-transparent <= 0.96.
+/// inter-sample overshoots (> 0.988) smoothly round off below 0.999 instead of
+/// hard-clipping in AAudio/CPAL. Bit-transparent <= 0.988.
 #[inline]
 pub fn soft_limit_post_resample(samples: &mut [f32]) {
-    const KNEE: f32 = 0.96;
-    const HEADROOM: f32 = 0.039; // asymptotic ceiling = 0.999
+    const KNEE: f32 = 0.988;
+    const HEADROOM: f32 = 0.011; // asymptotic ceiling = 0.999
     for s in samples.iter_mut() {
         if !s.is_finite() {
             *s = 0.0;
@@ -834,6 +944,8 @@ pub fn inject_bluetooth_keepalive_dither(out: &mut [f32], rng_state: &mut u32) {
 pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &mut [f32]) {
     const CENTER_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2; // -3.0 dB (0.7071)
     const SURROUND_MIX: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const SURROUND_71_MIX: f32 = 0.5;
+    const BACK_CENTER_MIX: f32 = 0.5;
     // Equal-power headroom for the stereo bus
     const HEADROOM: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
@@ -844,13 +956,27 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
     for i in 0..frames {
         let src = &in_interleaved[i * channels..(i + 1) * channels];
         let (l, r) = match channels {
+            0 => (0.0, 0.0),
             1 => (src[0], src[0]),
             2 => (src[0], src[1]),
+            3 => {
+                // 3.0 / 2.1: FL(0), FR(1), FC/LFE(2)
+                let c = src[2] * CENTER_MIX;
+                ((src[0] + c) * HEADROOM, (src[1] + c) * HEADROOM)
+            }
             4 => {
                 // Quad: FL, FR, BL, BR
                 (
                     (src[0] + SURROUND_MIX * src[2]) * HEADROOM,
                     (src[1] + SURROUND_MIX * src[3]) * HEADROOM,
+                )
+            }
+            5 => {
+                // 5.0: FL(0), FR(1), FC(2), BL(3), BR(4)
+                let c = src[2] * CENTER_MIX;
+                (
+                    (src[0] + c + SURROUND_MIX * src[3]) * HEADROOM,
+                    (src[1] + c + SURROUND_MIX * src[4]) * HEADROOM,
                 )
             }
             6 => {
@@ -861,21 +987,49 @@ pub fn downmix_to_stereo(in_interleaved: &[f32], channels: usize, out_stereo: &m
                     (src[1] + c + SURROUND_MIX * src[5]) * HEADROOM,
                 )
             }
-            8 => {
-                // 7.1: FL, FR, FC, LFE, BL, BR, SL, SR
+            7 => {
+                // 6.1 / 7.0: preserve Center dialogue (src[2]), Back Center (src[4]), and side/surround pair
                 let c = src[2] * CENTER_MIX;
+                let bc = src[4] * BACK_CENTER_MIX;
                 (
-                    (src[0] + c + SURROUND_MIX * (src[4] + src[6])) * HEADROOM,
-                    (src[1] + c + SURROUND_MIX * (src[5] + src[7])) * HEADROOM,
+                    (src[0] + c + bc + SURROUND_71_MIX * src[5]) * HEADROOM,
+                    (src[1] + c + bc + SURROUND_71_MIX * src[6]) * HEADROOM,
                 )
             }
-            _ => (src[0], *src.get(1).unwrap_or(&src[0])),
+            8.. => {
+                // 7.1+ (7.1, Windows Spatial 7.1.2/7.1.4, 16-ch virtual cables):
+                // FL(0), FR(1), FC(2), LFE(3), BL(4), BR(5), SL(6), SR(7)
+                let c = src[2] * CENTER_MIX;
+                (
+                    (src[0] + c + SURROUND_71_MIX * (src[4] + src[6])) * HEADROOM,
+                    (src[1] + c + SURROUND_71_MIX * (src[5] + src[7])) * HEADROOM,
+                )
+            }
         };
         // Keep non-finite capture samples out of the resampler history and the
         // downstream limiter; one NaN would otherwise survive every later
         // interpolation stage.
-        out_stereo[i * 2] = if l.is_finite() { l } else { 0.0 };
-        out_stereo[i * 2 + 1] = if r.is_finite() { r } else { 0.0 };
+        let mut out_l = if l.is_finite() { l } else { 0.0 };
+        let mut out_r = if r.is_finite() { r } else { 0.0 };
+        if channels >= 3 {
+            // Transparent multi-channel soft-limiter prevents 5.1/7.1 downmix
+            // peaks from hard-clipping in 16/24-bit host quantizers while
+            // staying bit-exact <= 0.92 and untouched for mono/stereo.
+            const KNEE: f32 = 0.92;
+            const OVER_HEADROOM: f32 = 0.075; // asymptotic ceiling = 0.995
+            let al = out_l.abs();
+            if al > KNEE {
+                let over = al - KNEE;
+                out_l = (KNEE + OVER_HEADROOM * (over / (over + OVER_HEADROOM))).copysign(out_l);
+            }
+            let ar = out_r.abs();
+            if ar > KNEE {
+                let over = ar - KNEE;
+                out_r = (KNEE + OVER_HEADROOM * (over / (over + OVER_HEADROOM))).copysign(out_r);
+            }
+        }
+        out_stereo[i * 2] = out_l;
+        out_stereo[i * 2 + 1] = out_r;
     }
 }
 
@@ -952,6 +1106,7 @@ pub fn push_mono_mic_chunk(
             stereo[i * 2 + 1] = sample;
         }
 
+        resampler.sanitize_phase_and_ratio();
         let phase_before = resampler.phase;
         let produced = resampler.process(&stereo[..frames * 2], out_scratch);
         if produced > 0 {
@@ -1087,12 +1242,40 @@ mod tests {
 
     #[test]
     fn test_soft_limit_post_resample_bounds_overshoot() {
-        let mut s = [1.23f32, -1.23, 0.5, -0.5, 0.96, -0.96];
+        let mut s = [1.23f32, -1.23, 0.5, -0.5, 0.985, -0.985, 0.988, -0.988];
         soft_limit_post_resample(&mut s);
         assert!(s.iter().all(|v| v.abs() < 0.999));
-        assert_eq!(s[4], 0.96); // bit-transparent at/below the knee
-        assert_eq!(s[5], -0.96);
-        assert!(s[0] > 0.96 && s[0] < 0.999);
+        assert_eq!(s[2], 0.5);
+        assert_eq!(s[3], -0.5);
+        assert_eq!(s[4], 0.985); // bit-transparent below the knee
+        assert_eq!(s[5], -0.985);
+        assert_eq!(s[6], 0.988); // bit-transparent at the knee
+        assert_eq!(s[7], -0.988);
+        assert!(s[0] > 0.988 && s[0] < 0.999);
+        assert!(s[1] < -0.988 && s[1] > -0.999);
+    }
+
+    #[test]
+    fn test_reset_clock_controller_restores_base_ratio_and_clears_state() {
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(44_100);
+        let expected_base = 48_000.0 / 44_100.0;
+        for _ in 0..450 {
+            resampler.update_clock_loop(12.0, 8.0);
+        }
+        assert_ne!(resampler.ratio, expected_base);
+        assert_ne!(resampler.integral_err, 0.0);
+        assert!(resampler.acq_windows > 0);
+        assert!(resampler.window_ticks > 0);
+        assert_ne!(resampler.err_sum_window, 0.0);
+
+        resampler.reset_clock_controller();
+        assert_eq!(resampler.base_ratio, expected_base);
+        assert_eq!(resampler.ratio, expected_base);
+        assert_eq!(resampler.integral_err, 0.0);
+        assert_eq!(resampler.acq_windows, 0);
+        assert_eq!(resampler.err_sum_window, 0.0);
+        assert_eq!(resampler.window_ticks, 0);
     }
 
     #[test]
@@ -1141,7 +1324,7 @@ mod tests {
 
         for &s in &signal {
             assert!(
-                s.abs() <= 0.989,
+                s.abs() <= 0.995,
                 "unity gain must still honour ceiling: {}",
                 s
             );
@@ -1149,7 +1332,7 @@ mod tests {
         // After the envelope tracks the full-scale input the soft knee must
         // pull it below the hard clamp, so this is not just clipping.
         assert!(
-            signal[signal.len() - 1].abs() < 0.96,
+            signal[signal.len() - 1].abs() < 0.995,
             "soft knee should engage for overs: {}",
             signal[signal.len() - 1]
         );
@@ -1249,14 +1432,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clock_controller_bounds_correction_to_400ppm() {
+    fn test_clock_controller_bounds_correction_to_600ppm() {
         let mut resampler = ClockDriftResampler::new();
         // Normal drift: err = 1.0 subframe
         for _ in 0..200 {
             resampler.update_clock_loop(3.0, 2.0);
         }
         let normal_corr = resampler.ratio - 1.0;
-        assert!(normal_corr > 0.0 && normal_corr <= 0.0004);
+        assert!(normal_corr > 0.0 && normal_corr <= 0.0006);
 
         let mut spike_resampler = ClockDriftResampler::new();
         for _ in 0..200 {
@@ -1264,8 +1447,8 @@ mod tests {
         }
         let spike_corr = spike_resampler.ratio - 1.0;
         assert!(
-            spike_corr > 0.0 && spike_corr <= 0.0004 + 1e-9,
-            "Spike correction must stay within +/-400 ppm to prevent pitch warble: {}",
+            spike_corr > 0.0 && spike_corr <= 0.0006 + 1e-9,
+            "Spike correction must stay within +/-600 ppm to prevent pitch warble: {}",
             spike_corr
         );
     }
@@ -1467,6 +1650,29 @@ mod tests {
         let mut out = [0.0f32; 4]; // room for 2 frames only
         downmix_to_stereo(&input, 2, &mut out);
         assert_eq!(out, [0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_preserves_center_dialogue_on_odd_and_spatial_layouts() {
+        // Center-only dialogue (channel 2 = 0.8) must land equally in L & R at
+        // 0.8 * (1/sqrt(2)) * (1/sqrt(2)) = 0.4 on 3, 5, 7, 10 (7.1.2), 12 (7.1.4), and 16 ch.
+        for channels in [3usize, 5, 7, 10, 12, 16] {
+            let mut input = vec![0.0f32; channels * 2];
+            input[2] = 0.8;
+            input[channels + 2] = -0.8;
+            let mut out = [0.0f32; 4];
+            downmix_to_stereo(&input, channels, &mut out);
+            assert!(
+                (out[0] - 0.4).abs() < 1e-5 && (out[1] - 0.4).abs() < 1e-5,
+                "channels={channels} dropped Center dialogue: {:?}",
+                out
+            );
+            assert!(
+                (out[2] + 0.4).abs() < 1e-5 && (out[3] + 0.4).abs() < 1e-5,
+                "channels={channels} frame 1 mismatch: {:?}",
+                out
+            );
+        }
     }
 
     #[test]
@@ -1679,6 +1885,23 @@ mod tests {
     }
 
     #[test]
+    fn test_push_mono_mic_chunk_recovers_from_nan_phase() {
+        let ring = BurstDecouplerRing::new();
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_sample_rates(16_000, 48_000);
+        resampler.phase = f64::NAN;
+        let mono = vec![0.25f32; 256];
+        let mut scratch = [0.0f32; 128];
+        // With an un-sanitized phase_before, `NaN as usize == 0` forces
+        // `consumed == 0` on every retry and this call never returns.
+        push_mono_mic_chunk(&ring, &mono, &mut resampler, true, &mut scratch);
+        assert!(resampler.phase.is_finite());
+        let out = drain_ring(&ring);
+        assert!(!out.is_empty(), "resampler must have emitted frames");
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
     fn test_windowed_sinc_resampler_high_freq_snr_under_clock_drift() {
         // Verify that +200 ppm clock drift on a 15 kHz sine wave (sweeping
         // through all fractional phases in [0, 1)) maintains > 70 dB SNR
@@ -1832,5 +2055,144 @@ mod tests {
         let n = resampler.process(&bad_in, &mut out);
         assert!(n > 0);
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn test_true_peak_limiter_converges_to_exact_unity_and_flushes_denormals() {
+        let mut limiter = TruePeakLimiter::new(12.0);
+        // Establish a real (non-zero) envelope before returning to 0 dB.
+        for _ in 0..2000 {
+            let mut frame = [0.25f32, -0.25];
+            limiter.process_in_place(&mut frame);
+        }
+        limiter.set_gain_db(0.0);
+        for _ in 0..2000 {
+            let mut frame = [0.25f32, -0.25];
+            limiter.process_in_place(&mut frame);
+        }
+        // Without the 1.0e-5 snap the f32 ULP step stalls at ~1.000006.
+        assert_eq!(
+            limiter.current_gain_linear, 1.0,
+            "0 dB pre-amp must converge to exact unity"
+        );
+
+        limiter.set_gain_db(-96.0);
+        for _ in 0..2000 {
+            let mut frame = [0.0f32, 0.0];
+            limiter.process_in_place(&mut frame);
+        }
+        assert_eq!(
+            limiter.current_gain_linear, 0.0,
+            "mute must snap to exact 0.0, not a subnormal tail"
+        );
+        // RELEASE = 0.0005 needs ~69k samples to decay from ~1.0 below 1.0e-15.
+        for _ in 0..100_000 {
+            let mut frame = [0.0f32, 0.0];
+            limiter.process_in_place(&mut frame);
+        }
+        assert_eq!(
+            limiter.envelope, 0.0,
+            "envelope must not decay into denormals"
+        );
+        // Deterministic subnormal injection proves the flush branch directly.
+        limiter.envelope = 1.0e-16;
+        let mut frame = [0.0f32, 0.0];
+        limiter.process_in_place(&mut frame);
+        assert_eq!(limiter.envelope, 0.0);
+    }
+
+    #[test]
+    fn test_downmix_to_stereo_71_bounds_peaks_and_preserves_61_back_center() {
+        // 1. Worst-case coherent full-scale 7.1 input must be bounded below 0.995
+        //    by the multi-channel soft limiter instead of exceeding 1.0.
+        let full_71 = [1.0f32; 8];
+        let mut out_71 = [0.0f32; 2];
+        downmix_to_stereo(&full_71, 8, &mut out_71);
+        assert!(out_71.iter().all(|s| s.is_finite() && *s > 0.92 && *s < 0.995));
+
+        // 2. 7.1 combined Back + Side surround power (SURROUND_71_MIX = 0.5)
+        //    must match a single front channel instead of drowning Center by +6 dB.
+        let surround_only_71 = [0.0f32, 0.0, 0.0, 0.0, 0.8, 0.8, 0.8, 0.8];
+        let front_only_71 = [0.8f32, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut out_surr = [0.0f32; 2];
+        let mut out_front = [0.0f32; 2];
+        downmix_to_stereo(&surround_only_71, 8, &mut out_surr);
+        downmix_to_stereo(&front_only_71, 8, &mut out_front);
+        assert!((out_surr[0] - out_front[0]).abs() < 1.0e-6);
+        assert!((out_surr[1] - out_front[1]).abs() < 1.0e-6);
+
+        // 3. 6.1 Back Center (src[4]) must land equally in L & R at 0.5 * HEADROOM,
+        //    and side surrounds (src[5], src[6]) use SURROUND_71_MIX (0.5).
+        let back_center_61 = [0.0f32, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0];
+        let mut out_61 = [0.0f32; 2];
+        downmix_to_stereo(&back_center_61, 7, &mut out_61);
+        let expected_bc = 0.8 * 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out_61[0] - expected_bc).abs() < 1.0e-6);
+        assert!((out_61[1] - expected_bc).abs() < 1.0e-6);
+
+        // 4. Stereo (channels <= 2) must remain bit-exact untouched even > 0.92.
+        let hot_stereo = [1.5f32, -1.5];
+        let mut out_stereo = [0.0f32; 2];
+        downmix_to_stereo(&hot_stereo, 2, &mut out_stereo);
+        assert_eq!(out_stereo, hot_stereo);
+    }
+
+    #[test]
+    fn test_downsampling_aa_rejects_aliasing_96k_and_44k1() {
+        for (in_r, out_r, freq, min_atten_db) in [
+            (96_000u32, 48_000u32, 36_000.0f64, 40.0f64),
+            (48_000u32, 44_100u32, 23_000.0f64, 45.0f64),
+        ] {
+            let mut r = ClockDriftResampler::new();
+            r.set_sample_rates(in_r, out_r);
+            let n_in = 8192usize;
+            let mut input = vec![0.0f32; n_in * 2];
+            for i in 0..n_in {
+                let v = (std::f64::consts::TAU * freq * (i as f64) / (in_r as f64)).sin() as f32 * 0.5;
+                input[i * 2] = v;
+                input[i * 2 + 1] = v;
+            }
+            let mut output = vec![0.0f32; n_in * 2];
+            let out_f = r.process(&input, &mut output);
+            let alias_rms = (output[1000..out_f * 2]
+                .iter()
+                .map(|&x| (x as f64).powi(2))
+                .sum::<f64>()
+                / ((out_f * 2 - 1000) as f64))
+                .sqrt();
+            let in_rms = 0.5 / std::f64::consts::SQRT_2;
+            let atten_db = -20.0 * (alias_rms / in_rms).log10();
+            assert!(
+                atten_db >= min_atten_db,
+                "{in_r}->{out_r} @ {freq} Hz alias rejection {atten_db:.1} dB < {min_atten_db} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn test_burst_decoupler_underrun_recovery_fades_in() {
+        let ring = BurstDecouplerRing::new();
+        let mut out = [0.0f32; 64];
+        let mut rng = 42u32;
+        assert!(!ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert_eq!(ring.push_samples(&[0.5f32; 64]), 64);
+        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert!(out[0].abs() < 1e-6, "recovery must fade in from 0.0, got {}", out[0]);
+        assert!((out[32] - 0.5).abs() < 1e-6, "fade-in must finish within 16 frames");
+    }
+
+    #[test]
+    fn test_clock_loop_fast_acq_respects_25ppm_step_cap() {
+        let mut res = ClockDriftResampler::new();
+        res.set_low_jitter_fast_acq(true);
+        let mut prev = res.ratio;
+        for _ in 0..10 {
+            for _ in 0..200 {
+                res.update_clock_loop(4.0, 2.0);
+            }
+            let delta_ppm = ((res.ratio - prev) / res.base_ratio).abs() * 1e6;
+            assert!(delta_ppm <= 25.0 + 1e-6, "window step exceeded 25 ppm: {delta_ppm}");
+            prev = res.ratio;
+        }
     }
 }

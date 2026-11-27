@@ -1,5 +1,16 @@
 //! Microsecond Group Sync, Spatial Channel Routing, Audiophile Bauer Crossfeed & Studio EQ.
 
+/// Clamp finite samples to `[-1.0e6, 1.0e6]` and replace NaN/Inf with `0.0`
+/// so extreme driver glitches cannot overflow filter state to `Inf`/`NaN`.
+#[inline(always)]
+fn sanitize_audio_sample(s: f32) -> f32 {
+    if s.is_finite() {
+        s.clamp(-1.0e6, 1.0e6)
+    } else {
+        0.0
+    }
+}
+
 /// 1. Spatial Channel Role for Multi-Phone Stereo Pairing & 5.1/7.1 Rear Surround
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,8 +202,8 @@ impl BauerCrossfeedFilter {
         const RAMP_STEP: f32 = 1.0 / 384.0; // ~8 ms smooth ramp @ 48 kHz
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_l = sanitize_audio_sample(frame[0]) + ANTI_DENORMAL;
+            let in_r = sanitize_audio_sample(frame[1]) + ANTI_DENORMAL;
 
             // Low-pass filter current samples (head shadow simulation)
             self.lp_l += ALPHA_700HZ * (in_l - self.lp_l);
@@ -238,6 +249,7 @@ impl BauerCrossfeedFilter {
 pub struct GroupSyncEstimator {
     pub clock_offset_us: i64,
     pub min_rtt_us: u32,
+    rejected_streak: u32,
 }
 
 impl GroupSyncEstimator {
@@ -245,6 +257,7 @@ impl GroupSyncEstimator {
         Self {
             clock_offset_us: 0,
             min_rtt_us: u32::MAX,
+            rejected_streak: 0,
         }
     }
 
@@ -259,6 +272,7 @@ impl GroupSyncEstimator {
 
         let is_first = self.min_rtt_us == u32::MAX;
         if rtt <= self.min_rtt_us.saturating_add(1500) {
+            self.rejected_streak = 0;
             if rtt < self.min_rtt_us {
                 self.min_rtt_us = rtt;
             }
@@ -269,7 +283,17 @@ impl GroupSyncEstimator {
                     ((self.clock_offset_us as i128 * 7 + offset as i128) / 8) as i64;
             }
         } else {
-            self.min_rtt_us = self.min_rtt_us.saturating_add(50);
+            self.rejected_streak = self.rejected_streak.saturating_add(1);
+            if self.rejected_streak >= 5 {
+                // Transport switched to a higher-RTT link (e.g. USB -> Wi-Fi):
+                // re-anchor `min_rtt_us` instead of freezing offset updates.
+                self.min_rtt_us = rtt;
+                self.rejected_streak = 0;
+                self.clock_offset_us =
+                    ((self.clock_offset_us as i128 * 7 + offset as i128) / 8) as i64;
+            } else {
+                self.min_rtt_us = self.min_rtt_us.saturating_add(50);
+            }
         }
     }
 
@@ -460,12 +484,12 @@ impl StereoBiquad {
                 self.a2 += COEFF_SLEW * (self.tgt_a2 - self.a2);
             }
 
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_l = sanitize_audio_sample(frame[0]) + ANTI_DENORMAL;
             let out_l = self.b0 * in_l + self.z1_l;
             self.z1_l = self.b1 * in_l - self.a1 * out_l + self.z2_l;
             self.z2_l = self.b2 * in_l - self.a2 * out_l;
 
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + ANTI_DENORMAL;
+            let in_r = sanitize_audio_sample(frame[1]) + ANTI_DENORMAL;
             let out_r = self.b0 * in_r + self.z1_r;
             self.z1_r = self.b1 * in_r - self.a1 * out_r + self.z2_r;
             self.z2_r = self.b2 * in_r - self.a2 * out_r;
@@ -496,7 +520,9 @@ impl StereoBiquad {
                 + (self.b2 - self.tgt_b2).abs()
                 + (self.a1 - self.tgt_a1).abs()
                 + (self.a2 - self.tgt_a2).abs();
-            if err < 1.0e-5 {
+            // 5.0e-5 clears the f32 ULP stall floor (~1.1e-5 across 5 coeffs
+            // when |b1|, |a1| ~= 2.0 on the 90 Hz bass band) with <0.0005 dB delta.
+            if err < 5.0e-5 {
                 self.b0 = self.tgt_b0;
                 self.b1 = self.tgt_b1;
                 self.b2 = self.tgt_b2;
@@ -647,8 +673,8 @@ impl NightModeCompressor {
             return;
         }
         for frame in stereo.chunks_exact_mut(2) {
-            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
-            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            let l = sanitize_audio_sample(frame[0]);
+            let r = sanitize_audio_sample(frame[1]);
             self.gain_env += 0.008 * (1.0 - self.gain_env);
             frame[0] = (l * self.gain_env).clamp(-0.98, 0.98);
             frame[1] = (r * self.gain_env).clamp(-0.98, 0.98);
@@ -662,17 +688,16 @@ impl NightModeCompressor {
     #[inline]
     pub fn process_in_place(&mut self, stereo: &mut [f32]) {
         for frame in stereo.chunks_exact_mut(2) {
-            let l = if frame[0].is_finite() { frame[0] } else { 0.0 };
-            let r = if frame[1].is_finite() { frame[1] } else { 0.0 };
+            let l = sanitize_audio_sample(frame[0]);
+            let r = sanitize_audio_sample(frame[1]);
             let peak = l.abs().max(r.abs()) + 1.0e-25;
 
-            // 1.5 ms attack, 100 ms release. The old 93 us attack / 26 ms
-            // release tracked 60-200 Hz waveform cycles and modulated their
-            // gain, adding harmonics.
+            // 1.5 ms attack, ~74 ms release: preserves <2% 100 Hz bass THD
+            // while recovering faster so whispers after loud hits stay audible.
             if peak > self.env {
                 self.env += 0.014 * (peak - self.env);
             } else {
-                self.env += 0.0002 * (peak - self.env);
+                self.env += 0.00028 * (peak - self.env);
             }
 
             // Feed-forward peak: a transient on top of a quiet envelope must
@@ -687,9 +712,14 @@ impl NightModeCompressor {
             let coeff = if target_gain < self.gain_env {
                 0.5
             } else {
-                0.001
+                0.0018
             };
             self.gain_env += coeff * (target_gain - self.gain_env);
+            // Prevent a whisper-boosted gain_env (up to 3.5x) from hard-clipping
+            // a sudden loud onset against the +/-0.84 ceiling on sample 0.
+            if peak * self.gain_env > 0.82 {
+                self.gain_env = 0.82 / peak;
+            }
 
             frame[0] = (l * self.gain_env).clamp(-0.84, 0.84);
             frame[1] = (r * self.gain_env).clamp(-0.84, 0.84);
@@ -724,24 +754,57 @@ impl LatencySonar {
     #[inline]
     pub fn detect_chirp_return(stereo_subframe: &[f32; 240]) -> bool {
         let mut zero_crossings = 0u32;
-        let mut max_peak = 0.0f32;
         let mut prev = stereo_subframe[0];
+        let mut max_peak = prev.abs();
+        let mut sig_energy = prev * prev;
         for i in 1..120 {
             let cur = stereo_subframe[i * 2];
             if cur.abs() > max_peak {
                 max_peak = cur.abs();
             }
+            sig_energy += cur * cur;
             if (cur >= 0.0 && prev < 0.0) || (cur < 0.0 && prev >= 0.0) {
                 zero_crossings += 1;
             }
             prev = cur;
         }
-        // A full 2.5ms chirp has ~34 zero crossings, but a real acoustic
-        // return almost always straddles two capture subframes. The larger
-        // half then has 12-22 crossings, so the old >=20 threshold missed
-        // most split returns. Keep a peak floor so low-level noise cannot
-        // trigger the measurement.
-        max_peak > 0.12 && zero_crossings >= 12
+        if max_peak <= 0.12 || !(12..=48).contains(&zero_crossings) || sig_energy <= 1e-6 {
+            return false;
+        }
+
+        // Matched-filter check against the 3.5 -> 7.0 kHz chirp template across
+        // split offsets so steady single tones (e.g. 5 kHz) do not false-trigger.
+        let mut tmpl = [0.0f32; 120];
+        for (i, slot) in tmpl.iter_mut().enumerate() {
+            let t = (i as f32) / 120.0;
+            let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * t).cos());
+            let freq = 3500.0 + 1750.0 * t;
+            *slot = ((i as f32) * 2.0 * std::f32::consts::PI * freq / 48_000.0).sin() * window;
+        }
+
+        let mut best_corr = 0.0f32;
+        for shift in -80i32..=80i32 {
+            let mut dot = 0.0f32;
+            let mut tmpl_e = 0.0f32;
+            let mut overlap = 0usize;
+            for i in 0..120i32 {
+                let j = i - shift;
+                if (0..120).contains(&j) {
+                    let s = stereo_subframe[(i as usize) * 2];
+                    let t = tmpl[j as usize];
+                    dot += s * t;
+                    tmpl_e += t * t;
+                    overlap += 1;
+                }
+            }
+            if overlap >= 30 && tmpl_e > 1e-6 {
+                let corr = dot.abs() / (sig_energy * tmpl_e).sqrt();
+                if corr > best_corr {
+                    best_corr = corr;
+                }
+            }
+        }
+        best_corr >= 0.75
     }
 }
 
@@ -750,6 +813,7 @@ impl LatencySonar {
 pub struct NoiseShapedQuantizer {
     err_l: f32,
     err_r: f32,
+    prev_diff_abs: f32,
     rng: u32,
 }
 
@@ -758,6 +822,7 @@ impl NoiseShapedQuantizer {
         Self {
             err_l: 0.0,
             err_r: 0.0,
+            prev_diff_abs: 0.0,
             rng: 0x2468_ACE1,
         }
     }
@@ -790,6 +855,7 @@ impl NoiseShapedQuantizer {
             if in_l.abs() < 1.0e-7 && in_r.abs() < 1.0e-7 {
                 self.err_l = 0.0;
                 self.err_r = 0.0;
+                self.prev_diff_abs = 0.0;
                 dst_i16[i * 2] = 0;
                 dst_i16[i * 2 + 1] = 0;
                 continue;
@@ -801,17 +867,13 @@ impl NoiseShapedQuantizer {
             let r1 = ((self.rng & 0xFFFF) as f32 / 65535.0) - 0.5;
             let r2 = (((self.rng >> 16) & 0xFFFF) as f32 / 65535.0) - 0.5;
             let dither_l = r1 + r2;
-            // Anti-phase dither doubles the noise in the Mid-Side encoder's
-            // Side channel (`L - R`), forcing 2-3 bits/sample even for a mono
-            // or centered signal. Use correlated dither when the channels are
-            // effectively identical so Side stays zero, and independent TPDF
-            // otherwise.
-            let dither_r = if (in_l - in_r).abs() < 1.0e-5 {
-                // Correlated dither alone is not enough: after any genuinely
-                // stereo sample the two 0.85 error integrators hold different
-                // fractional values, so equal inputs still round differently
-                // and the Mid-Side encoder sees phantom Side energy. Converge
-                // the states so centered passages quantize to out_l == out_r.
+            // Require sustained centered correlation (`|L-R| < 1e-5` across
+            // consecutive samples) before converging `err_r = err_l`, so a
+            // single-sample stereo waveform crossing never clobbers `err_r`.
+            let diff_abs = (in_l - in_r).abs();
+            let sustained_mono = diff_abs < 1.0e-5 && self.prev_diff_abs < 1.0e-5;
+            self.prev_diff_abs = diff_abs;
+            let dither_r = if sustained_mono {
                 self.err_r = self.err_l;
                 dither_l
             } else {
@@ -868,10 +930,16 @@ impl MicRumbleAndNoiseGate {
         const GATE_THRESH: f32 = 0.0056; // -45 dBFS noise gate threshold
 
         for frame in stereo.chunks_exact_mut(2) {
-            let in_l = (if frame[0].is_finite() { frame[0] } else { 0.0 }) + 1.0e-25;
-            let in_r = (if frame[1].is_finite() { frame[1] } else { 0.0 }) + 1.0e-25;
-            let hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
-            let hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
+            let in_l = sanitize_audio_sample(frame[0]);
+            let in_r = sanitize_audio_sample(frame[1]);
+            let mut hp_l = R * (self.hp_y1_l + in_l - self.hp_x1_l);
+            let mut hp_r = R * (self.hp_y1_r + in_r - self.hp_x1_r);
+            if hp_l.abs() < 1.0e-15 {
+                hp_l = 0.0;
+            }
+            if hp_r.abs() < 1.0e-15 {
+                hp_r = 0.0;
+            }
             self.hp_x1_l = in_l;
             self.hp_y1_l = hp_l;
             self.hp_x1_r = in_r;
@@ -883,6 +951,9 @@ impl MicRumbleAndNoiseGate {
             // pauses instead of gating each syllable and pumping the noise floor.
             let coeff = if peak > self.gate_env { 0.25 } else { 0.00025 };
             self.gate_env += coeff * (peak - self.gate_env);
+            if self.gate_env < 1.0e-15 {
+                self.gate_env = 0.0;
+            }
 
             let gate_gain = (self.gate_env / GATE_THRESH).clamp(0.05, 1.0);
             frame[0] = hp_l * gate_gain;
@@ -1345,6 +1416,24 @@ mod tests {
     }
 
     #[test]
+    fn test_latency_sonar_rejects_nyquist_click() {
+        // A 16 kHz (Nyquist) alternating click has 119 zero crossings but no
+        // 3.5-7.0 kHz chirp structure; it must not false-trigger the sonar.
+        let mut click = [0.0f32; 240];
+        for i in 0..120 {
+            let v = if i % 2 == 0 { 0.8 } else { -0.8 };
+            click[i * 2] = v;
+            click[i * 2 + 1] = v;
+        }
+        assert!(!LatencySonar::detect_chirp_return(&click));
+
+        // A genuine chirp must still be detected after adding the upper bound.
+        let mut chirp = [0.0f32; 240];
+        LatencySonar::inject_chirp(&mut chirp);
+        assert!(LatencySonar::detect_chirp_return(&chirp));
+    }
+
+    #[test]
     fn test_noise_shaped_quantizer() {
         let mut quantizer = NoiseShapedQuantizer::new();
         let src = [0.25f32; 240];
@@ -1705,5 +1794,87 @@ mod tests {
             build_qr_connect_uri("fe80::1", 65530, Some("4829")),
             "asultra://connect?host=[fe80::1]:65530&pin=4829"
         );
+    }
+
+    #[test]
+    fn test_all_upstream_dsp_filters_survive_huge_finite_glitch() {
+        let mut eq = StudioEqualizer::new();
+        eq.update_if_changed(60, 0, 0); // engage +6 dB bass first
+        for _ in 0..240 {
+            let mut frame = [0.25f32, -0.25];
+            eq.process(&mut frame);
+        }
+        eq.update_if_changed(120, 0, 0); // +12 dB -> slewing = true
+        assert!(eq.bass.slewing, "test must start from an active coefficient slew");
+        let mut xfeed = BauerCrossfeedFilter::new();
+        let mut night = NightModeCompressor::new();
+        let mut mic = MicRumbleAndNoiseGate::new();
+
+        // Test both the spec vector (1.0e38) and the true biquad overflow trigger (f32::MAX).
+        for &glitch in &[1.0e38f32, f32::MAX] {
+            let mut buf = [glitch, -glitch, 0.25, -0.25];
+            eq.process(&mut buf);
+            xfeed.process_in_place(&mut buf);
+            night.process_in_place(&mut buf);
+            mic.process_in_place(&mut buf);
+            assert!(buf.iter().all(|s| s.is_finite()), "glitch produced NaN/Inf");
+        }
+
+        // 2000 normal frames settle the 5.0e-5 coefficient snap and filter states.
+        let mut frame = [0.25f32, -0.25];
+        for _ in 0..2000 {
+            eq.process(&mut frame);
+            xfeed.process_in_place(&mut frame);
+            night.process_in_place(&mut frame);
+            mic.process_in_place(&mut frame);
+        }
+        assert!(
+            frame.iter().all(|s| s.is_finite() && s.abs() > 0.01),
+            "DSP chain stayed muted after a huge finite glitch: {:?}",
+            frame
+        );
+        assert!(
+            !eq.bass.slewing,
+            "90 Hz bass coefficient slew must settle at the 5.0e-5 threshold"
+        );
+
+        // Verify Night Mode whisper -> loud onset does not hard-clip at +/-0.84.
+        let mut onset_night = NightModeCompressor::new();
+        for _ in 0..2000 {
+            let mut whisper = [0.01f32, 0.01];
+            onset_night.process_in_place(&mut whisper);
+        }
+        assert!(onset_night.gain_env > 2.5);
+        let mut loud = [0.6f32, -0.6];
+        onset_night.process_in_place(&mut loud);
+        assert!(
+            loud[0].abs() <= 0.82 + 1.0e-5 && loud[1].abs() <= 0.82 + 1.0e-5,
+            "whisper-boosted Night Mode onset clipped past 0.82 soft cap: {:?}",
+            loud
+        );
+    }
+
+    #[test]
+    fn test_group_sync_recovers_after_5_usb_to_wifi_rtt_jumps() {
+        let mut sync = GroupSyncEstimator::new();
+        sync.record_ptp_exchange(0, 100, 100, 200);
+        assert_eq!(sync.min_rtt_us, 200);
+        for _ in 0..4 {
+            sync.record_ptp_exchange(0, 2000, 2000, 4000);
+        }
+        assert!(sync.min_rtt_us < 1000);
+        sync.record_ptp_exchange(0, 2000, 2000, 4000);
+        assert_eq!(sync.min_rtt_us, 4000);
+    }
+
+    #[test]
+    fn test_latency_sonar_rejects_5khz_steady_tone() {
+        let mut tone = [0.0f32; 240];
+        for i in 0..120 {
+            let s = (i as f32 * std::f32::consts::TAU * 5000.0 / 48_000.0).sin() * 0.15;
+            tone[i * 2] = s;
+            tone[i * 2 + 1] = s;
+        }
+        assert!(!LatencySonar::detect_chirp_return(&tone));
     }
 }

@@ -35,58 +35,6 @@ use audioshare_protocol::sync_and_eq::{build_qr_connect_uri, ChannelRole};
 use eframe::egui;
 use ui_widgets as uw;
 
-// ---------------------------------------------------------------------------
-// Compile-time bridge for the session-key API supplied by lanes A/D/E.
-// ---------------------------------------------------------------------------
-// Those lanes add `set_session_key(Option<SessionKey>)` to HostEngine,
-// ClientEngine and PhoneMicReceiver. Until they land this local trait keeps the
-// desktop crate compiling and preserves the old `set_encryption_pin` behavior.
-// Rust always prefers an inherent method over a same-named trait method, so
-// once the lanes merge the calls in `apply_pin_now` transparently switch to the
-// optimized single-derivation path without any further edits here.
-thread_local! {
-    static FALLBACK_PIN: std::cell::RefCell<Option<String>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn set_fallback_pin(pin: Option<&str>) {
-    FALLBACK_PIN.with(|slot| *slot.borrow_mut() = pin.map(str::to_owned));
-}
-
-#[allow(dead_code)] // only reached by the pre-merge fallback impls
-fn fallback_pin() -> Option<String> {
-    FALLBACK_PIN.with(|slot| slot.borrow().clone())
-}
-
-#[allow(dead_code)]
-trait SetSessionKeyCompat {
-    fn set_session_key(&self, key: Option<SessionKey>);
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for HostEngine {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for ClientEngine {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
-#[allow(dead_code)]
-impl SetSessionKeyCompat for PhoneMicReceiver {
-    fn set_session_key(&self, _key: Option<SessionKey>) {
-        let pin = fallback_pin();
-        self.set_encryption_pin(pin.as_deref());
-    }
-}
-
 fn main() -> eframe::Result<()> {
     // Write the ring-buffered diagnostics on a fatal panic before panic=abort.
     let crash_path = AudioShareApp::config_file_path().with_file_name("audioshare-ultra-crash.log");
@@ -290,6 +238,8 @@ enum SettingsTab {
 /// thread never stalls on `pkexec`, `netsh`, `nmcli`, or `netsh wlan`.
 enum BgTaskResult {
     Firewall { msg: String, firewall_ok: bool },
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    FirewallProbe { firewall_ok: bool },
     HotspotStart {
         result: Result<String, String>,
     },
@@ -432,6 +382,19 @@ fn lipsync_offset_to_apply(
     should_apply_lipsync(bt_delay_ms, last_applied_ms).then_some(bt_delay_ms)
 }
 
+/// Format a manual lip-sync hint for Windows hosts when an active Bluetooth
+/// peer adds playback delay (Windows lacks PipeWire per-sink negative video
+/// offset injection).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn format_windows_bt_lipsync_hint(offset_ms: u32) -> Option<String> {
+    if offset_ms == 0 {
+        return None;
+    }
+    Some(format!(
+        "VLC/mpv audio delay: -{offset_ms} ms • Enable Earbud Gaming / Low-Latency Mode or LE Audio (LC3) to reduce browser lag to ~40-60 ms."
+    ))
+}
+
 /// Default pairing adapter: the first Wi-Fi/Ethernet interface. The interface
 /// list sorts USB tethering first so the Android host page can surface it, but
 /// a QR code containing the RNDIS address is unreachable for a phone that is
@@ -472,6 +435,18 @@ fn refreshed_qr_iface_index(interfaces: &[NetworkInterfaceInfo], selected: usize
     }
 }
 
+/// Resolve whether the desktop client should send a pairing PIN to the target
+/// host. Discovered open hosts (`use_pin = false`) must connect unencrypted
+/// even when this machine's own host PIN encryption is enabled.
+fn effective_client_pin(use_pin: bool, encryption_enabled: bool, pin: &str) -> Option<&str> {
+    let trimmed = pin.trim();
+    if use_pin && encryption_enabled && !trimmed.is_empty() {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
 impl AudioShareApp {
     /// Side-effect-free construction shared by `new()` and the config unit
     /// tests. Deliberately does **not** enumerate NICs, bind the discovery UDP
@@ -495,7 +470,7 @@ impl AudioShareApp {
             firewall_task_in_flight: false,
             hotspot_task_in_flight: false,
             #[cfg(target_os = "windows")]
-            windows_firewall_ok: false,
+            windows_firewall_ok: true,
             dark_mode: true,
             minimize_on_close: true,
             autostart_stream_on_launch: false,
@@ -571,14 +546,36 @@ impl AudioShareApp {
         app.scanner = Some(DiscoveryScanner::start());
         #[cfg(target_os = "windows")]
         {
-            app.windows_firewall_ok = is_windows_firewall_configured();
+            // Probe PowerShell/netsh off the UI thread so cold launch stays <50 ms.
+            let tx = app.bg_task_tx.clone();
+            std::thread::spawn(move || {
+                let firewall_ok = is_windows_firewall_configured();
+                let _ = tx.send(BgTaskResult::FirewallProbe { firewall_ok });
+            });
         }
-        app.load_persistent_config();
+        if Self::config_file_path().exists() {
+            app.load_persistent_config();
+        } else {
+            app.pairing_pin = Self::generate_initial_pairing_pin();
+        }
         let launched_via_autostart = std::env::args().any(|a| a == "--autostart");
         if app.autostart_stream_on_launch || launched_via_autostart {
             app.toggle_host();
         }
         app
+    }
+
+    /// Generate a 6-digit OS-CSPRNG-seeded PIN for first-run installs so no
+    /// two machines share a static default PIN on public/campus Wi-Fi.
+    ///
+    /// `RandomState::new()` seeds its SipHash-1-3 keys from the OS random
+    /// source (`hashmap_random_keys`); the process ID is the hashed payload.
+    fn generate_initial_pairing_pin() -> String {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(std::process::id() as u64);
+        format!("{:06}", 100_000 + (h.finish() % 900_000))
     }
 
     #[cfg(test)]
@@ -878,6 +875,10 @@ impl AudioShareApp {
                         .store(self.target_bitrate_kbps, Ordering::Relaxed);
                     engine
                         .telemetry
+                        .effective_bitrate_kbps
+                        .store(self.target_bitrate_kbps, Ordering::Relaxed);
+                    engine
+                        .telemetry
                         .enable_group_sync
                         .store(self.enable_group_sync, Ordering::Relaxed);
                     engine
@@ -912,7 +913,7 @@ impl AudioShareApp {
         }
     }
 
-    fn connect_client(&mut self, addr: SocketAddr) {
+    fn connect_client(&mut self, addr: SocketAddr, use_pin: bool) {
         if self.pin_dirty {
             self.apply_pin_now();
         }
@@ -930,11 +931,7 @@ impl AudioShareApp {
             preamp_gain_db: self.preamp_gain_db,
             dolby_effects: false,
         };
-        let pin_opt = if self.enable_pin_encryption && !self.pairing_pin.trim().is_empty() {
-            Some(self.pairing_pin.trim())
-        } else {
-            None
-        };
+        let pin_opt = effective_client_pin(use_pin, self.enable_pin_encryption, &self.pairing_pin);
         match ClientEngine::connect_with_pin(cfg, pin_opt) {
             Ok(engine) => {
                 self.sync_client_dsp_atomics(&engine);
@@ -1056,6 +1053,14 @@ impl AudioShareApp {
                     let _ = firewall_ok;
                     self.show_toast(msg);
                 }
+                BgTaskResult::FirewallProbe { firewall_ok } => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.windows_firewall_ok = firewall_ok;
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = firewall_ok;
+                }
                 BgTaskResult::HotspotStart { result } => {
                     self.hotspot_task_in_flight = false;
                     match result {
@@ -1102,22 +1107,12 @@ impl AudioShareApp {
         // share the resulting SessionKey (Copy) with all three engines. The old
         // path called set_encryption_pin() three times, re-running 65,536
         // PBKDF2 rounds per engine (~3x) on every PIN apply.
-        //
-        // `set_session_key(Option<SessionKey>)` is supplied by the
-        // client-engine / host-engine / virtual-mic lanes (A/D/E). Until those
-        // inherent methods exist, the local SetSessionKeyCompat trait above
-        // routes the call through `set_encryption_pin` (and the one PBKDF2
-        // derivation we just did is discarded — a correctness-only fallback).
-        // After merge the inherent method wins and the single derived key is
-        // used directly on all three engines.
         let key = pin.map(|p| {
             let mut derived = SessionKey::from_pin(p);
             // Fresh nonce salt so a live re-apply never reuses a keystream.
             derived.rotate_session_salt();
             derived
         });
-        set_fallback_pin(pin);
-
         if let Some(ref host) = self.host_engine {
             host.set_session_key(key);
         }
@@ -1475,11 +1470,10 @@ impl eframe::App for AudioShareApp {
                         let mode_id = host.telemetry.active_codec_mode.load(Ordering::Relaxed);
                         let clients = host.telemetry.active_clients_count.load(Ordering::Relaxed);
                         let kb = host.telemetry.bytes_sent.load(Ordering::Relaxed) / 1024;
-                        let display_kbps = if self.quality_profile == QualityProfile::MaxStability24Ghz {
-                            self.target_bitrate_kbps.clamp(96, 160)
-                        } else {
-                            self.target_bitrate_kbps
-                        };
+                        let display_kbps = host
+                            .telemetry
+                            .effective_bitrate_kbps
+                            .load(Ordering::Relaxed);
                         let codec_label = if dtx {
                             "Smart DTX Sleep (0.6 kbps)".to_string()
                         } else if mode_id == 4 {
@@ -1614,11 +1608,11 @@ impl eframe::App for AudioShareApp {
             self.direct_hotspot_active = false;
             self.hotspot_task_in_flight = false;
         }
-        if self.selected_app_idx.is_some() {
-            let _ = restore_all_apps_to_default_sink();
-        }
         if let Some(mut host) = self.host_engine.take() {
             host.stop();
+        }
+        if self.selected_app_idx.is_some() {
+            let _ = restore_all_apps_to_default_sink();
         }
         if let Some(mut client) = self.client_engine.take() {
             client.stop();
@@ -1882,6 +1876,13 @@ impl AudioShareApp {
                             if ui.button(lbl).clicked() || enter_pressed {
                                 self.apply_pin_now();
                             }
+                            if ui.button("New PIN").clicked() {
+                                self.pairing_pin = Self::generate_initial_pairing_pin();
+                                // Clicking New PIN implies the user intends to use it;
+                                // enable and apply immediately so PC & Android never disagree.
+                                self.enable_pin_encryption = true;
+                                self.apply_pin_now();
+                            }
                         });
                     }
                     SettingsTab::GeneralAndDiagnostics => {
@@ -1929,6 +1930,16 @@ impl AudioShareApp {
                         ui.label(
                             egui::RichText::new("Diagnostics").size(13.5).strong(),
                         );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "AudioShare Ultra v{} ({}/{})",
+                                env!("CARGO_PKG_VERSION"),
+                                std::env::consts::OS,
+                                std::env::consts::ARCH,
+                            ))
+                            .size(11.5)
+                            .color(p.muted_text),
+                        );
                         if ui.button("Copy Diagnostics Report").clicked() {
                             let mut summary = format!(
                                 "HostMsg : {}\nClientMg: {}",
@@ -1958,6 +1969,21 @@ impl AudioShareApp {
                                         .diagnostics_summary(DESKTOP_OUTPUT_BUFFER_MS),
                                 );
                             }
+                            if let Some(ref mic) = self.phone_mic_receiver {
+                                summary.push_str(&format!(
+                                    "\nPhoneRx : mode={:?} out={} rx_pkts={} peak={}% auth_fail={}",
+                                    self.phone_rx_mode,
+                                    mic.output_device_name,
+                                    mic.mic_packets_received.load(Ordering::Relaxed),
+                                    mic.mic_peak_level_pct.load(Ordering::Relaxed),
+                                    mic.auth_failures.load(Ordering::Relaxed),
+                                ));
+                            }
+                            #[cfg(target_os = "windows")]
+                            summary.push_str(&format!(
+                                "\nWinFW   : configured={}",
+                                self.windows_firewall_ok
+                            ));
                             ui.ctx().copy_text(
                                 audioshare_protocol::diagnostics::export_report(&summary),
                             );
@@ -2076,12 +2102,13 @@ impl AudioShareApp {
                 "Mute PC Speakers While Streaming (Virtual Speaker)",
                 "Routes PC audio exclusively to connected devices and restores speakers on disconnect",
                 &mut self.enable_virtual_speaker,
-            ) && self.host_engine.is_some()
-            {
-                let _ = self.os_guard.take();
-                self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
-                    self.enable_virtual_speaker,
-                ));
+            ) {
+                if self.host_engine.is_some() {
+                    let _ = self.os_guard.take();
+                    self.os_guard = Some(VirtualSpeakerAndRadioGuard::acquire(
+                        self.enable_virtual_speaker,
+                    ));
+                }
                 self.save_persistent_config();
             }
 
@@ -2097,12 +2124,41 @@ impl AudioShareApp {
                     format!("Phone Bluetooth Active (A2DP {} ms)", bt_delay)
                 };
                 #[cfg(not(target_os = "linux"))]
+                let bt_mode_label = if bt_delay <= 65 {
+                    "LE/Low-Latency"
+                } else {
+                    "A2DP"
+                };
+                #[cfg(not(target_os = "linux"))]
                 let bt_pill_text = format!(
-                    "Phone Bluetooth Active (A2DP {} ms • Total Stream Delay ~{} ms)",
-                    bt_delay, total_lipsync
+                    "Phone Bluetooth Active ({} {} ms • Total Stream Delay ~{} ms)",
+                    bt_mode_label, bt_delay, total_lipsync
                 );
                 let _ = total_lipsync;
-                uw::status_pill(ui, &bt_pill_text, p.warn_bg, p.warn_fg);
+                ui.horizontal_wrapped(|ui| {
+                    uw::status_pill(ui, &bt_pill_text, p.warn_bg, p.warn_fg);
+                    #[cfg(target_os = "linux")]
+                    if !self.auto_bt_video_lipsync
+                        && ui.small_button("Enable Video Lip-Sync").clicked()
+                    {
+                        self.auto_bt_video_lipsync = true;
+                        self.save_persistent_config();
+                    }
+                    #[cfg(target_os = "windows")]
+                    if let Some(hint) = format_windows_bt_lipsync_hint(u32::from(
+                        if total_lipsync > 0 {
+                            total_lipsync
+                        } else {
+                            bt_delay
+                        },
+                    )) {
+                        ui.label(
+                            egui::RichText::new(hint)
+                                .size(11.5)
+                                .color(p.muted_text),
+                        );
+                    }
+                });
             }
 
             #[cfg(target_os = "windows")]
@@ -2996,7 +3052,7 @@ impl AudioShareApp {
                                 return;
                             }
                             self.usb_buffer_mode = host.is_usb;
-                            self.connect_client(host.addr);
+                            self.connect_client(host.addr, host.encrypted);
                         }
                     });
                 }
@@ -3038,7 +3094,7 @@ impl AudioShareApp {
                         match parsed {
                             Ok(addr) => {
                                 self.usb_buffer_mode = is_usb_subnet_ip(addr.ip());
-                                self.connect_client(addr);
+                                self.connect_client(addr, self.enable_pin_encryption);
                             }
                             Err(_) => {
                                 self.client_status_msg = format!(
@@ -3688,6 +3744,19 @@ mod tests {
     }
 
     #[test]
+    fn test_format_windows_bt_lipsync_hint() {
+        assert_eq!(format_windows_bt_lipsync_hint(0), None);
+        let hint = format_windows_bt_lipsync_hint(245).expect("non-zero delay produces hint");
+        assert!(hint.contains("-245 ms"), "unexpected hint: {hint}");
+        assert!(
+            hint.contains(
+                "Enable Earbud Gaming / Low-Latency Mode or LE Audio (LC3) to reduce browser lag to ~40-60 ms."
+            ),
+            "missing low-latency/LC3 tip: {hint}"
+        );
+    }
+
+    #[test]
     fn test_qr_iface_defaults_to_wifi_and_keeps_manual_choice() {
         let usb = NetworkInterfaceInfo {
             name: "enp0s20f0u1".into(),
@@ -3873,6 +3942,16 @@ phone_rx_mode=1
         assert_eq!(effective_pin(true, ""), None);
         assert_eq!(effective_pin(false, "1234"), None);
         assert_eq!(effective_pin(false, ""), None);
+    }
+
+    #[test]
+    fn test_effective_client_pin_respects_open_host_flag() {
+        // Discovered open host (use_pin = false) ignores local host PIN encryption.
+        assert_eq!(effective_client_pin(false, true, "482910"), None);
+        // Encrypted host or manual IP with encryption ON uses trimmed PIN.
+        assert_eq!(effective_client_pin(true, true, " 482910 "), Some("482910"));
+        assert_eq!(effective_client_pin(true, false, "482910"), None);
+        assert_eq!(effective_client_pin(true, true, "   "), None);
     }
 
     fn icon_pixel(icon: &egui::IconData, x: usize, y: usize) -> [u8; 4] {

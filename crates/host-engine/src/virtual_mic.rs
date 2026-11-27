@@ -507,9 +507,13 @@ fn push_one_subframe(
             .as_mut()
             .map(|decoder| decoder.decode_subframe_at_seq(play_seq, &slot.data[..len], &mut frame))
             .unwrap_or(false);
+        let switching_to_opus = !*opus_stream_active;
         *opus_stream_active = true;
         if decoded_ok {
             note_pcm_level(&frame, peak, chirp);
+            if switching_to_opus {
+                sequencer.arm_declick();
+            }
             // Splice with the sequencer's predictor/history so a following
             // WSOLA or FEC frame does not click at the codec boundary.
             sequencer.finalize_external_frame(&mut frame, false);
@@ -542,6 +546,9 @@ fn push_one_subframe(
     } else {
         // Existing single-codec rebuild path (lossless / VBR / ADPCM FEC):
         // the sequencer holds the decoded PCM produced on arrival.
+        if *opus_stream_active && !sequencer.is_slot_missing(play_seq) {
+            sequencer.arm_declick();
+        }
         let st = sequencer.pop_next(play_seq, &mut frame);
         if st != STATUS_EMPTY {
             // Rebuilding a non-Opus frame closes the Opus epoch; drop stale
@@ -576,11 +583,12 @@ struct LinuxVirtualMicOutput {
     child: Child,
     writer: Option<std::thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
 impl LinuxVirtualMicOutput {
-    fn start(fifo: Arc<BurstDecouplerRing>, running: Arc<AtomicBool>) -> Option<Self> {
+    fn start(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
         let mut child = Command::new("pacat")
             .args([
                 "--playback",
@@ -603,7 +611,12 @@ impl LinuxVirtualMicOutput {
             return None;
         };
 
+        // Dedicated per-instance stop flag: dropping a dead LinuxVirtualMicOutput
+        // to respawn pacat must NEVER clear PhoneMicReceiver::running.
+        let running = Arc::new(AtomicBool::new(true));
         let writer_running = Arc::clone(&running);
+        let exited = Arc::new(AtomicBool::new(false));
+        let writer_exited = Arc::clone(&exited);
         let writer = match std::thread::Builder::new()
             .name("as-ultra-phone-mic-sink".into())
             .spawn(move || {
@@ -623,6 +636,7 @@ impl LinuxVirtualMicOutput {
                         std::thread::sleep(Duration::from_micros(500));
                     }
                 }
+                writer_exited.store(true, Ordering::Release);
             }) {
             Ok(handle) => handle,
             Err(_) => {
@@ -636,7 +650,13 @@ impl LinuxVirtualMicOutput {
             child,
             writer: Some(writer),
             running,
+            exited,
         })
+    }
+
+    #[inline]
+    fn has_exited(&mut self) -> bool {
+        self.exited.load(Ordering::Acquire) || matches!(self.child.try_wait(), Ok(Some(_)))
     }
 }
 
@@ -659,11 +679,93 @@ fn session_key_from_pin(pin: Option<&str>) -> Option<SessionKey> {
         .map(SessionKey::from_pin)
 }
 
+#[inline]
+fn wait_udp_readable(socket: &UdpSocket, timeout: Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        let _ = unsafe { libc::ppoll(&mut pfd, 1, &ts, core::ptr::null()) };
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::fd::AsRawFd;
+        let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe { libc::poll(&mut pfd, 1, ms) };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[repr(C)]
+        struct FdSet {
+            fd_count: u32,
+            fd_array: [usize; 64],
+        }
+        #[repr(C)]
+        struct Timeval {
+            tv_sec: i32,
+            tv_usec: i32,
+        }
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn select(
+                nfds: i32,
+                readfds: *mut FdSet,
+                writefds: *mut core::ffi::c_void,
+                exceptfds: *mut core::ffi::c_void,
+                timeout: *const Timeval,
+            ) -> i32;
+        }
+        let mut readfds = FdSet {
+            fd_count: 1,
+            fd_array: [0; 64],
+        };
+        readfds.fd_array[0] = socket.as_raw_socket() as usize;
+        let tv = Timeval {
+            tv_sec: timeout.as_secs() as i32,
+            tv_usec: timeout.subsec_micros() as i32,
+        };
+        let _ = unsafe {
+            select(
+                0,
+                &mut readfds,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &tv,
+            )
+        };
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = socket;
+        std::thread::sleep(timeout);
+    }
+}
+
 pub struct PhoneMicReceiver {
     running: Arc<AtomicBool>,
     /// Shared with the RX thread so a PIN edit in the desktop UI applies to
     /// already-running receivers instead of only to the next start.
     session_key: Arc<Mutex<Option<SessionKey>>>,
+    /// Bumped when `session_key` changes so the RX thread refreshes its cached
+    /// key only on mutation instead of locking on every tick.
+    key_version: Arc<AtomicU64>,
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
     pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
@@ -681,8 +783,6 @@ pub struct PhoneMicReceiver {
     pactl_mic_source_module_id: Option<String>,
     #[cfg(target_os = "linux")]
     prev_default_source: Option<String>,
-    #[cfg(target_os = "linux")]
-    linux_output: Option<LinuxVirtualMicOutput>,
     /// Bridges `adb reverse tcp:65532 tcp:65532` into the local UDP receiver
     /// socket so USB-connected phones can share their microphone without Wi-Fi
     /// or Windows Firewall rules, even when PC->Phone Broadcast is stopped.
@@ -737,6 +837,7 @@ impl PhoneMicReceiver {
         let output_device_name = "Default Output".to_string();
 
         let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
+        let key_version = Arc::new(AtomicU64::new(0));
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
         configure_realtime_udp_socket(&socket)
@@ -746,7 +847,7 @@ impl PhoneMicReceiver {
         #[cfg(target_os = "linux")]
         let (pactl_mic_module_id, pactl_mic_source_module_id, prev_default_source) =
             if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                let prev_src = Command::new("pactl")
+                let prev_src = crate::discovery_and_os::pactl_command()
                     .arg("get-default-source")
                     .output()
                     .ok()
@@ -764,7 +865,7 @@ impl PhoneMicReceiver {
                     });
 
                 // 1. Create underlying null sink to receive the phone's audio stream silently
-                let sink_id = Command::new("pactl")
+                let sink_id = crate::discovery_and_os::pactl_command()
                     .args([
                         "load-module",
                         "module-null-sink",
@@ -783,7 +884,7 @@ impl PhoneMicReceiver {
 
                 // 2. Create a true non-monitor Virtual Microphone (`module-remap-source`)
                 //    so Zoom, Discord, Google Meet, Teams & Chrome show it as a real Microphone Input!
-                let remap_id = Command::new("pactl")
+                let remap_id = crate::discovery_and_os::pactl_command()
                     .args([
                         "load-module",
                         "module-remap-source",
@@ -804,7 +905,7 @@ impl PhoneMicReceiver {
                 // Do not overwrite `AudioShare_Ultra.monitor` if Linux per-app
                 // capture is currently isolating an application.
                 if prev_src.as_deref() != Some("AudioShare_Ultra.monitor") {
-                    let _ = Command::new("pactl")
+                    let _ = crate::discovery_and_os::pactl_command()
                         .args(["set-default-source", "AudioShare_Phone_Mic"])
                         .output();
                 }
@@ -826,15 +927,6 @@ impl PhoneMicReceiver {
 
         let mic_fifo = Arc::new(BurstDecouplerRing::new());
 
-        #[cfg(target_os = "linux")]
-        let linux_output = if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-            LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo), Arc::clone(&running))
-        } else {
-            None
-        };
-        #[cfg(target_os = "linux")]
-        let linux_output_active = linux_output.is_some();
-
         let run_clone = Arc::clone(&running);
         let pkts_clone = Arc::clone(&mic_packets_received);
         let peak_clone = Arc::clone(&mic_peak_level_pct);
@@ -842,6 +934,7 @@ impl PhoneMicReceiver {
         let auth_fail_clone = Arc::clone(&auth_failures);
         let mic_fifo_thread = Arc::clone(&mic_fifo);
         let session_key_thread = Arc::clone(&session_key);
+        let key_version_thread = Arc::clone(&key_version);
         let (sink_ready_tx, sink_ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
         let handle = std::thread::Builder::new()
@@ -862,12 +955,23 @@ impl PhoneMicReceiver {
                 // Helper to open (and reopen on hotplug/sleep-resume error) the
                 // CPAL output sink. VirtualMicForCalls uses `require_preferred = true`
                 // so it NEVER silently falls back to PC Speakers and howls.
+                #[cfg(target_os = "linux")]
+                let mut linux_output = if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                    LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo_thread))
+                } else {
+                    None
+                };
+                #[cfg(target_os = "linux")]
+                let mut linux_output_active = linux_output.is_some();
+
                 #[cfg(not(target_os = "android"))]
-                let open_sink = || -> Result<Option<(cpal::Stream, Arc<AtomicBool>)>, String> {
+                let open_sink = |linux_out_active: bool| -> Result<Option<(cpal::Stream, Arc<AtomicBool>)>, String> {
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = linux_out_active;
                     #[cfg(target_os = "linux")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
-                            if linux_output_active {
+                            if linux_out_active {
                                 Ok(None)
                             } else {
                                 crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
@@ -893,9 +997,11 @@ impl PhoneMicReceiver {
                     #[cfg(target_os = "windows")]
                     {
                         if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                            let target_name = crate::find_vbcable_output_device_name()
+                                .or_else(|| windows_vbcable_name.clone());
                             crate::ClientPreviewSink::spawn_preferred_strict_with_cb_frames(
                                 Arc::clone(&mic_fifo_thread),
-                                windows_vbcable_name.as_deref(),
+                                target_name.as_deref(),
                                 true,
                                 Some(Arc::clone(&observed_cb_frames)),
                             )
@@ -927,7 +1033,16 @@ impl PhoneMicReceiver {
                 };
 
                 #[cfg(not(target_os = "android"))]
-                let mut mic_out: Option<(cpal::Stream, Arc<AtomicBool>)> = match open_sink() {
+                let mut mic_out: Option<(cpal::Stream, Arc<AtomicBool>)> = match open_sink({
+                    #[cfg(target_os = "linux")]
+                    {
+                        linux_output_active
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        false
+                    }
+                }) {
                     Ok(s) => {
                         let _ = sink_ready_tx.send(Ok(()));
                         s
@@ -990,13 +1105,21 @@ impl PhoneMicReceiver {
                 let mut fb_primary_frames: u32 = 0;
                 let mut fb_recovered_or_lost: u32 = 0;
                 let mut last_target_depth: i16 = 0;
+                let mut key_version_seen = key_version_thread.load(Ordering::Acquire);
+                let mut key_for_batch = *session_key_thread
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
 
                 while run_clone.load(Ordering::Relaxed) {
-                    // PIN edits from the UI land between batches; snapshot once
-                    // per 2.5 ms tick instead of locking on every datagram.
-                    let key_for_batch = *session_key_thread
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
+                    // PIN edits from the UI land between batches; only lock
+                    // when `key_version` changes instead of on every tick.
+                    let current_key_version = key_version_thread.load(Ordering::Acquire);
+                    if current_key_version != key_version_seen {
+                        key_for_batch = *session_key_thread
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        key_version_seen = current_key_version;
+                    }
                     // Size the decoupler target to cover at least one full OS
                     // callback period plus 3 subframes (7.5 ms) of network
                     // jitter margin. The sink reports the backend's real
@@ -1006,37 +1129,12 @@ impl PhoneMicReceiver {
                     let base_target_subframes = mic_fifo_target_subframes(cb_frames);
                     let local_delay_ms =
                         pc_receiver_effective_delay_ms(mode, base_target_subframes);
-                    // PC speakers phase-align with the slowest peer phone;
-                    // the call virtual mic keeps its fixed low-latency target.
-                    let target_subframes = aligned_pc_receiver_target_subframes(
-                        mode,
-                        base_target_subframes,
-                        max_group_delay_ms,
-                        local_delay_ms,
-                    );
-                    let target_depth = target_subframes.ceil() as i16;
                     // BT Party group sync may inflate target_subframes up to 64,
                     // but only the base cushion belongs in the sequencer. The
                     // extra group-alignment depth is injected as a one-shot
                     // FIFO pad once prebuffer completes, mirroring ClientEngine.
                     let base_depth = base_target_subframes.ceil() as i16;
-                    // In pull-sink mode the FIFO oscillates by one callback
-                    // burst below `target_subframes`; center the clock-loop
-                    // setpoint at the sawtooth midpoint so both +ppm and -ppm
-                    // drift track without bias.
                     let cb_subframes = cb_frames as f32 / SUBFRAME_FRAMES as f32;
-                    let clock_setpoint = if pull_sink_active {
-                        (target_subframes - 0.5 * cb_subframes).max(1.0)
-                    } else {
-                        target_subframes
-                    };
-                    let fifo_watermark = resampler
-                        .subframes_to_samples(target_subframes.ceil() as usize)
-                        .min(
-                            mic_fifo_thread
-                                .capacity_samples()
-                                .saturating_sub(SUBFRAME_STEREO_SAMPLES + 16),
-                        );
 
                     while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
                         let parsed =
@@ -1059,6 +1157,15 @@ impl PhoneMicReceiver {
                         {
                             last_sender_addr = Some(src_addr);
                             max_group_delay_ms = (parsed.header.stream_id as u16) * 2;
+                            // PC speakers phase-align with the slowest peer phone;
+                            // the call virtual mic keeps its fixed low-latency target.
+                            let target_subframes = aligned_pc_receiver_target_subframes(
+                                mode,
+                                base_target_subframes,
+                                max_group_delay_ms,
+                                local_delay_ms,
+                            );
+                            let target_depth = target_subframes.ceil() as i16;
                             pkts_clone.fetch_add(1, Ordering::Relaxed);
                             last_packet_arrival = Instant::now();
                             let base_seq = parsed.header.sequence;
@@ -1110,6 +1217,7 @@ impl PhoneMicReceiver {
                             if dtx_silent || seq_delta > resync_ahead || seq_delta < -160 {
                                 dtx_silent = false;
                                 sequencer.reset();
+                                resampler.reset_clock_window();
                                 opus_decoder = None;
                                 for slot in &mut opus_ring {
                                     slot.seq = None;
@@ -1372,6 +1480,8 @@ impl PhoneMicReceiver {
                         prebuffer_ready = false;
                         dtx_silent = false;
                         last_sender_addr = None;
+                        max_group_delay_ms = 0;
+                        last_target_depth = 0;
                         sequencer.reset();
                         opus_decoder = None;
                         opus_stream_active = false;
@@ -1395,17 +1505,53 @@ impl PhoneMicReceiver {
                             mic_out = None;
                             sink_reopen.mark_failed();
                         }
-                        // `now` is defined below at :1374; use a distinct name.
+                        #[cfg(target_os = "linux")]
+                        {
+                            let pacat_dead = linux_output
+                                .as_mut()
+                                .map(|o| o.has_exited())
+                                .unwrap_or(false);
+                            if pacat_dead {
+                                linux_output = None;
+                                linux_output_active = false;
+                                sink_reopen.mark_failed();
+                            }
+                        }
+                        // `now` is defined below; use a distinct name.
                         let reopen_now = Instant::now();
-                        if mic_out.is_none() && sink_reopen.due(reopen_now) {
+                        #[cfg(target_os = "linux")]
+                        let need_reopen = mic_out.is_none() && !linux_output_active;
+                        #[cfg(not(target_os = "linux"))]
+                        let need_reopen = mic_out.is_none();
+                        if need_reopen && sink_reopen.due(reopen_now) {
                             mic_fifo_thread.clear_when_quiescent();
-                            // open_sink() takes NO args and returns the final
-                            // Option<(Stream, Arc<AtomicBool>)>: Ok(None) is
-                            // legitimate on Linux (pacat) / fallback paths.
-                            match open_sink() {
+                            #[cfg(target_os = "linux")]
+                            if mode == PhoneRxRoutingMode::VirtualMicForCalls {
+                                linux_output =
+                                    LinuxVirtualMicOutput::start(Arc::clone(&mic_fifo_thread));
+                                linux_output_active = linux_output.is_some();
+                            }
+                            // open_sink() returns the final Option<(Stream, Arc<AtomicBool>)>:
+                            // Ok(None) is legitimate on Linux (pacat) / fallback paths.
+                            match open_sink({
+                                #[cfg(target_os = "linux")]
+                                {
+                                    linux_output_active
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    false
+                                }
+                            }) {
                                 Ok(reopened) => {
                                     mic_out = reopened;
-                                    sink_reopen.record_attempt(reopen_now, true);
+                                    #[cfg(target_os = "linux")]
+                                    let sink_live = mic_out.is_some() || linux_output_active;
+                                    #[cfg(not(target_os = "linux"))]
+                                    let sink_live = mic_out.is_some();
+                                    // PlayOnPcSpeakers maps transient open failures to Ok(None);
+                                    // stay armed with 500 ms backoff until a real sink opens.
+                                    sink_reopen.record_attempt(reopen_now, sink_live);
                                 }
                                 Err(_) => {
                                     sink_reopen.record_attempt(reopen_now, false);
@@ -1421,6 +1567,29 @@ impl PhoneMicReceiver {
                             }
                         }
                     }
+
+                    let target_subframes = aligned_pc_receiver_target_subframes(
+                        mode,
+                        base_target_subframes,
+                        max_group_delay_ms,
+                        local_delay_ms,
+                    );
+                    // In pull-sink mode the FIFO oscillates by one callback
+                    // burst below `target_subframes`; center the clock-loop
+                    // setpoint at the sawtooth midpoint so both +ppm and -ppm
+                    // drift track without bias.
+                    let clock_setpoint = if pull_sink_active {
+                        (target_subframes - 0.5 * cb_subframes).max(1.0)
+                    } else {
+                        target_subframes
+                    };
+                    let fifo_watermark = resampler
+                        .subframes_to_samples(target_subframes.ceil() as usize)
+                        .min(
+                            mic_fifo_thread
+                                .capacity_samples()
+                                .saturating_sub(SUBFRAME_STEREO_SAMPLES + 16),
+                        );
 
                     let now = Instant::now();
                     // Do not let `next_tick` accumulate while the receiver is
@@ -1530,21 +1699,69 @@ impl PhoneMicReceiver {
                         }
                     }
 
-                    std::thread::sleep(Duration::from_micros(600));
+                    let wait_dur = if initialized && prebuffer_ready {
+                        next_tick
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(2))
+                    } else {
+                        Duration::from_millis(2)
+                    };
+                    wait_udp_readable(&socket, wait_dur);
                 }
             })
             .map_err(|e| format!("Failed to spawn PhoneMicReceiver thread: {}", e))?;
+
+        #[cfg(target_os = "linux")]
+        let cleanup_linux_on_err = |prev_src: Option<String>,
+                                    src_mod: Option<String>,
+                                    sink_mod: Option<String>| {
+            if let Some(prev) = prev_src {
+                let cur = crate::discovery_and_os::pactl_command()
+                    .arg("get-default-source")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if cur.is_empty() || cur == "AudioShare_Phone_Mic" {
+                    let _ = crate::discovery_and_os::pactl_command()
+                        .args(["set-default-source", &prev])
+                        .output();
+                }
+            }
+            if let Some(id) = src_mod {
+                let _ = crate::discovery_and_os::pactl_command()
+                    .args(["unload-module", &id])
+                    .output();
+            }
+            if let Some(id) = sink_mod {
+                let _ = crate::discovery_and_os::pactl_command()
+                    .args(["unload-module", &id])
+                    .output();
+            }
+        };
 
         match sink_ready_rx.recv_timeout(Duration::from_secs(4)) {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 running.store(false, Ordering::Release);
                 let _ = handle.join();
+                #[cfg(target_os = "linux")]
+                cleanup_linux_on_err(
+                    prev_default_source,
+                    pactl_mic_source_module_id,
+                    pactl_mic_module_id,
+                );
                 return Err(format!("Failed to open output device '{}': {}", output_device_name, err));
             }
             Err(_) => {
                 running.store(false, Ordering::Release);
                 let _ = handle.join();
+                #[cfg(target_os = "linux")]
+                cleanup_linux_on_err(
+                    prev_default_source,
+                    pactl_mic_source_module_id,
+                    pactl_mic_module_id,
+                );
                 return Err(format!("Timed out opening output device '{}'", output_device_name));
             }
         }
@@ -1561,6 +1778,7 @@ impl PhoneMicReceiver {
         Ok(Self {
             running,
             session_key,
+            key_version,
             mic_packets_received,
             mic_peak_level_pct,
             last_chirp_rx_timestamp_us,
@@ -1572,8 +1790,6 @@ impl PhoneMicReceiver {
             pactl_mic_source_module_id,
             #[cfg(target_os = "linux")]
             prev_default_source,
-            #[cfg(target_os = "linux")]
-            linux_output,
             adb_usb_watcher,
             handle: Some(handle),
         })
@@ -1587,6 +1803,7 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = session_key_from_pin(pin);
+        self.key_version.fetch_add(1, Ordering::AcqRel);
         self.auth_failures.store(0, Ordering::Relaxed);
     }
 
@@ -1598,6 +1815,7 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = key;
+        self.key_version.fetch_add(1, Ordering::AcqRel);
         self.auth_failures.store(0, Ordering::Relaxed);
     }
 
@@ -1609,27 +1827,25 @@ impl PhoneMicReceiver {
         }
         #[cfg(target_os = "linux")]
         {
-            // Stop pacat first, restore previous default source if it still
-            // points at AudioShare_Phone_Mic, then remove remap source and sink.
-            drop(self.linux_output.take());
+            // RX thread already stopped and dropped `linux_output` before join().
             if let Some(prev_src) = self.prev_default_source.take() {
-                let current_src = Command::new("pactl")
+                let current_src = crate::discovery_and_os::pactl_command()
                     .arg("get-default-source")
                     .output()
                     .ok()
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_default();
                 if current_src.is_empty() || current_src == "AudioShare_Phone_Mic" {
-                    let _ = Command::new("pactl")
+                    let _ = crate::discovery_and_os::pactl_command()
                         .args(["set-default-source", &prev_src])
                         .output();
                 }
             }
             if let Some(id) = self.pactl_mic_source_module_id.take() {
-                let _ = Command::new("pactl").args(["unload-module", &id]).output();
+                let _ = crate::discovery_and_os::pactl_command().args(["unload-module", &id]).output();
             }
             if let Some(id) = self.pactl_mic_module_id.take() {
-                let _ = Command::new("pactl").args(["unload-module", &id]).output();
+                let _ = crate::discovery_and_os::pactl_command().args(["unload-module", &id]).output();
             }
         }
     }
@@ -1673,6 +1889,15 @@ mod tests {
         state.record_attempt(t2, true);
         assert!(!state.pending);
         assert!(!state.due(t2 + Duration::from_secs(10)));
+
+        // A later pacat/sink exit re-arms reopen immediately and enforces 500 ms backoff.
+        state.mark_failed();
+        assert!(state.due(t2 + Duration::from_secs(10)));
+        let t3 = t2 + Duration::from_secs(10);
+        state.record_attempt(t3, false);
+        assert!(state.pending);
+        assert!(!state.due(t3 + Duration::from_millis(499)));
+        assert!(state.due(t3 + Duration::from_millis(500)));
     }
 
     #[test]
