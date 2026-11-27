@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-android-jni"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-cli"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-client-engine"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-desktop-gui"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-client-engine",
  "audioshare-host-engine",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-host-engine"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-protocol",
  "cpal",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-protocol"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "chacha20poly1305",
  "getrandom 0.2.17",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "audioshare-sim-tests"
-version = "1.0.0-beta.3"
+version = "1.0.0-rc.2"
 dependencies = [
  "audioshare-host-engine",
  "audioshare-protocol",
