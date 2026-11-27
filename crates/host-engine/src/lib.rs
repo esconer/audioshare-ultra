@@ -45,6 +45,8 @@ const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
 /// bridge session closes so `HostEngine` evicts the closed `127.0.0.1` port
 /// immediately instead of waiting for the 10 s idle sweep.
 pub(crate) const CONTROL_MAGIC_BYE: &[u8; 8] = b"ASULBYE1";
+/// Drop an idle warm Tier-0 Opus encoder after 15 s of spotless lossless audio.
+const OPUS_WARM_IDLE_COOLDOWN: Duration = Duration::from_secs(15);
 /// Hard cap on tracked clients. `active_clients_count` is a `u8`, so an
 /// unbounded map would silently wrap to 0 at 256 clients and disable the
 /// virtual-speaker guard in the middle of a live stream. New peers are
@@ -379,6 +381,7 @@ fn warm_opus_lookahead(
 struct CleanLinkPromoter {
     clean_since: Option<Instant>,
     master_24bit: bool,
+    was_all_usb: bool,
 }
 
 impl CleanLinkPromoter {
@@ -386,6 +389,7 @@ impl CleanLinkPromoter {
         Self {
             clean_since: None,
             master_24bit: false,
+            was_all_usb: false,
         }
     }
 
@@ -398,11 +402,19 @@ impl CleanLinkPromoter {
         has_clients: bool,
         now: Instant,
     ) -> bool {
+        let usb_to_wifi_transition = self.was_all_usb && !all_usb;
+        self.was_all_usb = has_clients && all_usb;
         if !has_clients || bt_active || governed_loss_permille > SMART_AUTO_COMPRESS_THRESHOLD_PERMILLE
         {
             self.clean_since = None;
             self.master_24bit = false;
             return false;
+        }
+        if usb_to_wifi_transition {
+            // A Wi-Fi client joined a USB-only session: require a fresh 30 s
+            // spotless Wi-Fi window before promoting to 24-bit Master.
+            self.clean_since = None;
+            self.master_24bit = false;
         }
         if all_usb && raw_loss_permille <= SMART_AUTO_MASTER_DEMOTE_LOSS_PERMILLE {
             self.master_24bit = true;
@@ -1083,6 +1095,7 @@ pub struct NetworkInterfaceInfo {
 fn is_usb_interface_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("rndis")
+        || lower.contains("remote ndis")
         || lower.contains("usb")
         || lower.contains("ncm")
         || lower.starts_with("enx")
@@ -1806,7 +1819,8 @@ fn pump_pcm_fd_nonblocking(
     start_epoch: Instant,
 ) {
     const SUBFRAME_BYTES: usize = SUBFRAME_STEREO_SAMPLES * 4; // 960
-    let mut byte_buf = [0u8; SUBFRAME_BYTES];
+    const MAX_DRAIN_SUBFRAMES: usize = 4;
+    let mut byte_buf = [0u8; SUBFRAME_BYTES * MAX_DRAIN_SUBFRAMES];
     let mut f32_buf = [0.0f32; SUBFRAME_STEREO_SAMPLES];
     let mut filled = 0usize;
 
@@ -1850,9 +1864,8 @@ fn pump_pcm_fd_nonblocking(
             continue;
         }
 
-        // `read` never blocks here, so a short read simply means "more
-        // bytes are still in flight". Accumulate until a whole subframe
-        // is available.
+        // Drain up to 4 complete 960 B subframes per poll() wakeup so a 10 ms
+        // PipeWire quantum empties cleanly without multiple poll()/notify() hops.
         let n = unsafe {
             libc::read(
                 fd,
@@ -1862,17 +1875,23 @@ fn pump_pcm_fd_nonblocking(
         };
         if n > 0 {
             filled += n as usize;
-            if filled < SUBFRAME_BYTES {
-                continue;
+            let mut processed = 0usize;
+            while filled - processed >= SUBFRAME_BYTES {
+                for (dst, chunk) in f32_buf
+                    .iter_mut()
+                    .zip(byte_buf[processed..processed + SUBFRAME_BYTES].chunks_exact(4))
+                {
+                    *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                ring.push_samples(&f32_buf);
+                processed += SUBFRAME_BYTES;
             }
-            debug_assert_eq!(filled, SUBFRAME_BYTES);
-            filled = 0;
-            heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
-            for (dst, chunk) in f32_buf.iter_mut().zip(byte_buf.chunks_exact(4)) {
-                *dst = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if processed > 0 {
+                byte_buf.copy_within(processed..filled, 0);
+                filled -= processed;
+                heartbeat_ms.store(start_epoch.elapsed().as_millis() as u64, Ordering::Relaxed);
+                wakeup.notify();
             }
-            ring.push_samples(&f32_buf);
-            wakeup.notify();
             continue;
         }
         if n == 0 {
@@ -2082,6 +2101,10 @@ impl HostEngine {
             .map_err(|e| format!("Failed to bind UDP port {}: {}", config.bind_port, e))?;
         configure_realtime_udp_socket(&socket)
             .map_err(|e| format!("Failed to set real-time socket options: {}", e))?;
+        // Tighten the host TX socket's kernel send buffer to 128 KB (keeping
+        // 1 MB SO_RCVBUF on receivers) to prevent multi-second kernel queueing
+        // on stalled Wi-Fi links.
+        let _ = socket2::SockRef::from(&socket).set_send_buffer_size(131_072);
         let _ = socket.set_nonblocking(true);
 
         let ring = Arc::new(BurstDecouplerRing::new());
@@ -2576,6 +2599,7 @@ impl HostEngine {
 
                     if capture_active.load(Ordering::Relaxed)
                         && capture_running.load(Ordering::Relaxed)
+                        && sink_generation.load(Ordering::Acquire) == generation
                     {
                         std::thread::sleep(Duration::from_millis(50));
                     }
@@ -3233,6 +3257,8 @@ impl HostEngine {
         // entering the compressed tier does not emit lookahead silence.
         // Other lossless profiles drop it so a later switch starts clean.
         let mut opus_encoder: Option<OpusStreamEncoder> = None;
+        let mut opus_last_active_at: Option<Instant> = None;
+        let mut apply_overflow_fade_in = false;
         // Retain the most recently transmitted live f32 subframe so switching
         // from Lossless/24-bit/VBR into Opus mid-stream can immediately prime
         // the new encoder's 2.5 ms lookahead instead of emitting a silence hole.
@@ -3260,7 +3286,7 @@ impl HostEngine {
         let mut last_dtx_heartbeat = Instant::now();
         let mut was_dtx_active = false;
         let mut dtx_entry_confirm_pending = false;
-        let capture_idle_ms: u64 = if cfg!(target_os = "linux") { 40 } else { 80 };
+        let capture_idle_ms: u64 = 40;
         // Suppresses connect-time quality/bitrate overrides from legacy APKs
         // joining a session that already has another active receiver.
         let mut join_override_grace: HashMap<IpAddr, Instant> = HashMap::new();
@@ -4004,6 +4030,15 @@ impl HostEngine {
                     while ring.available_samples() > needed_samples + SUBFRAME_STEREO_SAMPLES * 4 {
                         ring.pop_exact_or_dither(&mut discard, &mut dummy_rng);
                     }
+                    // Reset predictive FEC / Opus state across the dropped gap
+                    // and fade in the first kept subframe without advancing `seq`.
+                    fec_hist_len = 0;
+                    opus_red.clear();
+                    opus_encoder = None;
+                    opus_last_active_at = None;
+                    has_prev_subframe = false;
+                    prev_f32_subframe.fill(0.0);
+                    apply_overflow_fade_in = true;
                 } else if avail < needed_samples {
                     let now_ms = start_instant.elapsed().as_millis() as u64;
                     let last_cb = capture_heartbeat_ms.load(Ordering::Relaxed);
@@ -4084,6 +4119,11 @@ impl HostEngine {
                     f32_subframe.fill(0.0);
                 }
 
+                if apply_overflow_fade_in && sub_idx == 0 {
+                    apply_raised_cosine_fade_in(f32_subframe, 32);
+                    apply_overflow_fade_in = false;
+                }
+
                 // Inject 2.5ms Acoustic Latency Sonar Chirp if requested by user
                 if telemetry.trigger_sonar_ping.swap(false, Ordering::Relaxed) {
                     audioshare_protocol::sync_and_eq::LatencySonar::inject_chirp(f32_subframe);
@@ -4096,17 +4136,25 @@ impl HostEngine {
                         .store(now_us, Ordering::Relaxed);
                 }
 
-                let i16_subframe = &mut i16_subframes[sub_idx];
-                let max_abs = noise_shaper.quantize_stereo_subframe(f32_subframe, i16_subframe);
-                let vu_pct = (((max_abs as f32) / 32767.0).sqrt() * 100.0).min(100.0) as u8;
+                // Compute VU peak and DTX activity directly from `f32_subframe` so
+                // OpusRld / 24-bit Master / DTX / idle paths skip redundant
+                // 16-bit noise-shaped quantization.
+                let mut peak_f32 = 0.0f32;
+                for &s in f32_subframe.iter() {
+                    if s.is_finite() {
+                        peak_f32 = peak_f32.max(s.abs());
+                    }
+                }
+                peak_f32 = peak_f32.min(1.0);
+                let vu_pct = (peak_f32.sqrt() * 100.0).min(100.0) as u8;
                 packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
                 // Studio Master 24-bit must preserve -85..-100 dBFS reverb
                 // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
                 let active_audio = if use_pcm24 {
-                    f32_subframe.iter().any(|s| s.abs() > 1.0e-5)
+                    peak_f32 > 1.0e-5
                 } else {
-                    max_abs > 3
+                    (peak_f32 * 32766.0) > 3.5
                 };
                 if active_audio {
                     packet_is_silent = false;
@@ -4138,6 +4186,7 @@ impl HostEngine {
             // packet pacer below keep running, but nothing is allocated here.
             if !has_targets || is_dtx_active {
                 opus_encoder = None;
+                opus_last_active_at = None;
                 fec_hist_len = 0;
                 has_prev_subframe = false;
                 prev_f32_subframe.fill(0.0);
@@ -4148,6 +4197,7 @@ impl HostEngine {
             }
             if !prefer_opus {
                 opus_encoder = None;
+                opus_last_active_at = None;
             }
 
             // Lazily allocate the Opus encoder only for a real, audible packet
@@ -4173,6 +4223,7 @@ impl HostEngine {
                 opus_encoder = OpusStreamEncoder::new(tx_bitrate_kbps);
                 if opus_encoder.is_none() {
                     opus_retry.note_failure(tick_now);
+                    opus_last_active_at = None;
                 } else if has_prev_subframe {
                     warm_opus_lookahead(&mut opus_encoder, &prev_f32_subframe, tx_bitrate_kbps);
                 }
@@ -4211,9 +4262,10 @@ impl HostEngine {
                         let entry_start = primary_cursor;
                         let mut enc_primary = [0u8; MAX_LOSSLESS_SUBFRAME_BYTES];
                         let opus_len = opus_encoder.as_mut().and_then(|encoder| {
-                            encoder.encode_subframe_f32(
+                            encoder.encode_subframe_f32_for_bundle(
                                 &f32_subframes[sub_idx],
                                 tx_bitrate_kbps,
+                                subframes_per_pkt as u8,
                                 &mut enc_primary,
                             )
                         });
@@ -4246,6 +4298,7 @@ impl HostEngine {
                     }
                     if opus_ok {
                         fec_hist_len = 0;
+                        opus_last_active_at = Some(tick_now);
                     }
                 }
 
@@ -4254,6 +4307,22 @@ impl HostEngine {
                     // Opus failure. `primary_cursor` is 0 on the rebuild path,
                     // so no stale Opus bytes can survive in the datagram.
                     for sub_idx in 0..subframes_per_pkt {
+                        if use_pcm24 {
+                            // 24-bit Master encodes from `f32_subframes`; fast-round
+                            // only for the optional ADPCM FEC backup without touching
+                            // `noise_shaper` state.
+                            for (dst, &s) in i16_subframes[sub_idx]
+                                .iter_mut()
+                                .zip(f32_subframes[sub_idx].iter())
+                            {
+                                *dst = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                            }
+                        } else {
+                            noise_shaper.quantize_stereo_subframe(
+                                &f32_subframes[sub_idx],
+                                &mut i16_subframes[sub_idx],
+                            );
+                        }
                         fec_hist.copy_within(0..3, 1);
                         encode_fec_subframe(&i16_subframes[sub_idx], &mut fec_hist[0]);
                         fec_hist_len = (fec_hist_len + 1).min(fec_hist.len());
@@ -4275,8 +4344,8 @@ impl HostEngine {
                                 .copy_from_slice(&enc_primary[..enc_len]);
                             primary_cursor += enc_len;
                         } else if use_pcm24 {
-                            // Keep SmartAuto's warm Opus lookahead primed even
-                            // while promoted to 24-bit Master so a sudden Wi-Fi
+                            // Keep SmartAuto's warm Opus lookahead primed while
+                            // inside the 15 s cooldown window so a sudden Wi-Fi
                             // fade never drops to silence on entry into Opus.
                             if profile == QualityProfile::SmartAuto
                                 && prefer_opus
@@ -4304,11 +4373,8 @@ impl HostEngine {
                                 .copy_from_slice(&enc_24[..enc_len]);
                             primary_cursor += enc_len;
                         } else {
-                            // Tier 0 of Smart Auto is lossless, but the Opus
-                            // encoder is kept primed so a sudden loss spike
-                            // does not start with codec warm-up silence. USB
-                            // tethered links have ample headroom, so an all-USB
-                            // session skips that work entirely.
+                            // Tier 0 of Smart Auto is lossless; keep Opus primed
+                            // only during the 15 s cooldown after active Opus use.
                             if profile == QualityProfile::SmartAuto
                                 && prefer_opus
                                 && !cached_all_usb
@@ -4334,25 +4400,27 @@ impl HostEngine {
                     }
                     // Leaving Opus for any non-SmartAuto-Tier0 profile (e.g.
                     // manual StudioLossless / 24-bit / VBR): drop the stale
-                    // Opus encoder immediately so a later switch back to Opus
-                    // allocates a fresh encoder primed with live audio rather
-                    // than replaying stale lookahead samples from seconds ago.
+                    // Opus encoder immediately. For SmartAuto Tier 0, cool down
+                    // and drop the idle warm encoder after 15 s of spotless lossless.
                     let keep_warm_for_smart_auto = profile == QualityProfile::SmartAuto
                         && dynamic_codec_mode == CodecMode::StudioLosslessLpc
                         && prefer_opus
-                        && !cached_all_usb;
+                        && !cached_all_usb
+                        && opus_last_active_at
+                            .map(|t| tick_now.saturating_duration_since(t) < OPUS_WARM_IDLE_COOLDOWN)
+                            .unwrap_or(false);
                     if !keep_warm_for_smart_auto {
                         opus_encoder = None;
+                        opus_last_active_at = None;
                     }
                 }
                 prev_f32_subframe = f32_subframes[subframes_per_pkt - 1];
                 has_prev_subframe = true;
             } else if profile != QualityProfile::SmartAuto {
                 // Leaving compressed/SmartAuto: drop the codec state so a
-                // later compressed period starts clean. SmartAuto Tier 0
-                // intentionally keeps the encoder warm for the first
-                // compressed packet after a loss spike.
+                // later compressed period starts clean.
                 opus_encoder = None;
+                opus_last_active_at = None;
             }
 
             // If an Opus encode failed mid-packet we fell back to VBR above;
@@ -4380,10 +4448,12 @@ impl HostEngine {
             // `is_dtx_active` was evaluated right after subframe collection,
             // before any encoder allocation or encoding work.
             let mut sent_any = false;
+            let mut tx_packet_started_at: Option<Instant> = None;
             if is_dtx_active {
                 // Receivers drop their Opus decoder and sequencer state on
                 // SilenceHeartbeat; reset the sender's codec/FEC history to match.
                 opus_encoder = None;
+                opus_last_active_at = None;
                 fec_hist_len = 0;
                 let heartbeat_now = Instant::now();
                 // Force an immediate SilenceHeartbeat on DTX entry plus one
@@ -4396,6 +4466,7 @@ impl HostEngine {
                 if send_dtx {
                     dtx_entry_confirm_pending = entering_dtx;
                     last_dtx_heartbeat = heartbeat_now;
+                    tx_packet_started_at = Some(Instant::now());
                     let hdr = WireHeader {
                         mode: CodecMode::SilenceHeartbeat,
                         subframe_count: subframes_per_pkt as u8,
@@ -4440,6 +4511,10 @@ impl HostEngine {
             } else if has_targets {
                 was_dtx_active = false;
                 dtx_entry_confirm_pending = false;
+                // Anchor pacing to the START of packet transmission (before
+                // any `SplitPerSubframe` 1 ms inter-split sleep) so 24-bit
+                // Wi-Fi splitting never adds >5 ms per 5 ms audio cycle.
+                tx_packet_started_at = Some(Instant::now());
                 let hdr = WireHeader {
                     mode: dynamic_codec_mode,
                     subframe_count: subframes_per_pkt as u8,
@@ -4471,11 +4546,11 @@ impl HostEngine {
                 // Pack paired 4-subframe ADPCM FEC ([N-1,N-3] + [N-2,N-4]) on
                 // 4-sf framing AND opportunistically on 2-sf framing whenever
                 // the full 496-byte pair fits inside the safe UDP MTU (e.g.
-                // LPC-compressed 16-bit Lossless and Adaptive VBR). That lets a
-                // Wi-Fi signal dip drop two consecutive 5 ms packets (10 ms)
-                // and still heal every subframe cleanly without PLC or extra
-                // packet splitting.
+                // LPC-compressed 16-bit Lossless and Adaptive VBR). Disable
+                // 4-frame pair_fec for 24-bit PCM so bundles stay under 1380 B
+                // whenever possible.
                 let pair_fec = dynamic_codec_mode != CodecMode::OpusRld
+                    && !use_pcm24
                     && (subframes_per_pkt == 4
                         || (subframes_per_pkt >= 2
                             && datagram_fits(
@@ -4638,7 +4713,7 @@ impl HostEngine {
                     <= capture_idle_ms;
             if capture_active {
                 if sent_any {
-                    last_tx_instant = Instant::now();
+                    last_tx_instant = tx_packet_started_at.unwrap_or_else(Instant::now);
                 }
                 // Keep the isochronous deadline anchored so a later capture
                 // stall does not trigger a catch-up burst.
@@ -4660,10 +4735,27 @@ impl HostEngine {
                     next_tick += step_interval;
                 }
                 if sent_any {
-                    last_tx_instant = Instant::now();
+                    last_tx_instant = tx_packet_started_at.unwrap_or_else(Instant::now);
                 }
             }
         }
+    }
+}
+
+/// Apply a smooth raised-cosine fade-in across `frames` stereo frames (e.g.
+/// 32 frames = 0.67 ms at 48 kHz) after a capture ring overflow discard so the
+/// receiver hears zero click across the discontinuity.
+#[inline]
+fn apply_raised_cosine_fade_in(pcm: &mut [f32; SUBFRAME_STEREO_SAMPLES], frames: usize) {
+    let n = frames.min(SUBFRAME_FRAMES);
+    if n == 0 {
+        return;
+    }
+    for i in 0..n {
+        let alpha = (i as f32) / (n as f32);
+        let w = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+        pcm[i * 2] *= w;
+        pcm[i * 2 + 1] *= w;
     }
 }
 
@@ -5194,6 +5286,8 @@ mod tests {
             "enx001122334455",
             "enp0s20f0u1",
             "ENX001122334455",
+            "Remote NDIS based Internet Sharing Device",
+            "Remote NDIS Compatible Device",
         ] {
             assert!(is_usb_interface_name(name), "{} should be USB", name);
         }
@@ -6968,6 +7062,35 @@ mod tests {
             "newcomer joining an active session must not override host bitrate"
         );
         engine.stop();
+    }
+
+    #[test]
+    fn test_clean_link_promoter_resets_24bit_when_wifi_joins_usb() {
+        let mut promoter = CleanLinkPromoter::new();
+        let t0 = Instant::now();
+
+        // Pure USB immediately enables 24-bit Master.
+        assert!(promoter.update(0, 0, false, true, true, t0));
+        assert!(promoter.is_master_24bit());
+
+        // When a Wi-Fi client joins (all_usb: true -> false), 24-bit Master must
+        // immediately reset and require a full 30 s spotless Wi-Fi window.
+        assert!(!promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(1)));
+        assert!(!promoter.is_master_24bit());
+        assert!(!promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(29)));
+        assert!(promoter.update(0, 0, false, false, true, t0 + Duration::from_secs(32)));
+    }
+
+    #[test]
+    fn test_apply_raised_cosine_fade_in() {
+        let mut pcm = [1.0f32; SUBFRAME_STEREO_SAMPLES];
+        apply_raised_cosine_fade_in(&mut pcm, 32);
+        assert_eq!(pcm[0], 0.0);
+        assert_eq!(pcm[1], 0.0);
+        assert!(pcm[30] > 0.4 && pcm[30] < 0.6);
+        assert!(pcm[62] > 0.99);
+        assert_eq!(pcm[64], 1.0);
+        assert_eq!(pcm[65], 1.0);
     }
 
     #[test]

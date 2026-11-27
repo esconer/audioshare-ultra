@@ -507,9 +507,13 @@ fn push_one_subframe(
             .as_mut()
             .map(|decoder| decoder.decode_subframe_at_seq(play_seq, &slot.data[..len], &mut frame))
             .unwrap_or(false);
+        let switching_to_opus = !*opus_stream_active;
         *opus_stream_active = true;
         if decoded_ok {
             note_pcm_level(&frame, peak, chirp);
+            if switching_to_opus {
+                sequencer.arm_declick();
+            }
             // Splice with the sequencer's predictor/history so a following
             // WSOLA or FEC frame does not click at the codec boundary.
             sequencer.finalize_external_frame(&mut frame, false);
@@ -542,6 +546,9 @@ fn push_one_subframe(
     } else {
         // Existing single-codec rebuild path (lossless / VBR / ADPCM FEC):
         // the sequencer holds the decoded PCM produced on arrival.
+        if *opus_stream_active && !sequencer.is_slot_missing(play_seq) {
+            sequencer.arm_declick();
+        }
         let st = sequencer.pop_next(play_seq, &mut frame);
         if st != STATUS_EMPTY {
             // Rebuilding a non-Opus frame closes the Opus epoch; drop stale
@@ -672,11 +679,93 @@ fn session_key_from_pin(pin: Option<&str>) -> Option<SessionKey> {
         .map(SessionKey::from_pin)
 }
 
+#[inline]
+fn wait_udp_readable(socket: &UdpSocket, timeout: Duration) {
+    if timeout.is_zero() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        let _ = unsafe { libc::ppoll(&mut pfd, 1, &ts, core::ptr::null()) };
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        use std::os::fd::AsRawFd;
+        let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe { libc::poll(&mut pfd, 1, ms) };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        #[repr(C)]
+        struct FdSet {
+            fd_count: u32,
+            fd_array: [usize; 64],
+        }
+        #[repr(C)]
+        struct Timeval {
+            tv_sec: i32,
+            tv_usec: i32,
+        }
+        #[link(name = "ws2_32")]
+        extern "system" {
+            fn select(
+                nfds: i32,
+                readfds: *mut FdSet,
+                writefds: *mut core::ffi::c_void,
+                exceptfds: *mut core::ffi::c_void,
+                timeout: *const Timeval,
+            ) -> i32;
+        }
+        let mut readfds = FdSet {
+            fd_count: 1,
+            fd_array: [0; 64],
+        };
+        readfds.fd_array[0] = socket.as_raw_socket() as usize;
+        let tv = Timeval {
+            tv_sec: timeout.as_secs() as i32,
+            tv_usec: timeout.subsec_micros() as i32,
+        };
+        let _ = unsafe {
+            select(
+                0,
+                &mut readfds,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &tv,
+            )
+        };
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = socket;
+        std::thread::sleep(timeout);
+    }
+}
+
 pub struct PhoneMicReceiver {
     running: Arc<AtomicBool>,
     /// Shared with the RX thread so a PIN edit in the desktop UI applies to
     /// already-running receivers instead of only to the next start.
     session_key: Arc<Mutex<Option<SessionKey>>>,
+    /// Bumped when `session_key` changes so the RX thread refreshes its cached
+    /// key only on mutation instead of locking on every tick.
+    key_version: Arc<AtomicU64>,
     pub mic_packets_received: Arc<AtomicU64>,
     pub mic_peak_level_pct: Arc<AtomicU64>,
     pub last_chirp_rx_timestamp_us: Arc<AtomicU64>,
@@ -748,6 +837,7 @@ impl PhoneMicReceiver {
         let output_device_name = "Default Output".to_string();
 
         let session_key = Arc::new(Mutex::new(session_key_from_pin(pin)));
+        let key_version = Arc::new(AtomicU64::new(0));
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .map_err(|e| format!("Failed to bind Phone Mic UDP port {}: {}", port, e))?;
         configure_realtime_udp_socket(&socket)
@@ -844,6 +934,7 @@ impl PhoneMicReceiver {
         let auth_fail_clone = Arc::clone(&auth_failures);
         let mic_fifo_thread = Arc::clone(&mic_fifo);
         let session_key_thread = Arc::clone(&session_key);
+        let key_version_thread = Arc::clone(&key_version);
         let (sink_ready_tx, sink_ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
 
         let handle = std::thread::Builder::new()
@@ -1014,13 +1105,21 @@ impl PhoneMicReceiver {
                 let mut fb_primary_frames: u32 = 0;
                 let mut fb_recovered_or_lost: u32 = 0;
                 let mut last_target_depth: i16 = 0;
+                let mut key_version_seen = key_version_thread.load(Ordering::Acquire);
+                let mut key_for_batch = *session_key_thread
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
 
                 while run_clone.load(Ordering::Relaxed) {
-                    // PIN edits from the UI land between batches; snapshot once
-                    // per 2.5 ms tick instead of locking on every datagram.
-                    let key_for_batch = *session_key_thread
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
+                    // PIN edits from the UI land between batches; only lock
+                    // when `key_version` changes instead of on every tick.
+                    let current_key_version = key_version_thread.load(Ordering::Acquire);
+                    if current_key_version != key_version_seen {
+                        key_for_batch = *session_key_thread
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
+                        key_version_seen = current_key_version;
+                    }
                     // Size the decoupler target to cover at least one full OS
                     // callback period plus 3 subframes (7.5 ms) of network
                     // jitter margin. The sink reports the backend's real
@@ -1118,6 +1217,7 @@ impl PhoneMicReceiver {
                             if dtx_silent || seq_delta > resync_ahead || seq_delta < -160 {
                                 dtx_silent = false;
                                 sequencer.reset();
+                                resampler.reset_clock_window();
                                 opus_decoder = None;
                                 for slot in &mut opus_ring {
                                     slot.seq = None;
@@ -1599,7 +1699,14 @@ impl PhoneMicReceiver {
                         }
                     }
 
-                    std::thread::sleep(Duration::from_micros(600));
+                    let wait_dur = if initialized && prebuffer_ready {
+                        next_tick
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(2))
+                    } else {
+                        Duration::from_millis(2)
+                    };
+                    wait_udp_readable(&socket, wait_dur);
                 }
             })
             .map_err(|e| format!("Failed to spawn PhoneMicReceiver thread: {}", e))?;
@@ -1671,6 +1778,7 @@ impl PhoneMicReceiver {
         Ok(Self {
             running,
             session_key,
+            key_version,
             mic_packets_received,
             mic_peak_level_pct,
             last_chirp_rx_timestamp_us,
@@ -1695,6 +1803,7 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = session_key_from_pin(pin);
+        self.key_version.fetch_add(1, Ordering::AcqRel);
         self.auth_failures.store(0, Ordering::Relaxed);
     }
 
@@ -1706,6 +1815,7 @@ impl PhoneMicReceiver {
             .session_key
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = key;
+        self.key_version.fetch_add(1, Ordering::AcqRel);
         self.auth_failures.store(0, Ordering::Relaxed);
     }
 
