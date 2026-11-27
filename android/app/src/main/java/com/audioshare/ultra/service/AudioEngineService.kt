@@ -123,6 +123,22 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         ): Boolean
 
         @JvmStatic
+        external fun nativeStartClientConfigured(
+            hostAddr: String,
+            isUsb: Boolean,
+            gainDb: Float,
+            pin: String,
+            dolbyEffects: Boolean,
+            bassDb: Float,
+            presDb: Float,
+            trebDb: Float,
+            role: Int,
+            crossfeed: Boolean,
+            nightMode: Boolean,
+            gamingLock: Boolean
+        ): Boolean
+
+        @JvmStatic
         external fun nativeStopClient()
 
         @JvmStatic
@@ -384,10 +400,6 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             val prefs = getSharedPreferences("audioshare_ultra_prefs", Context.MODE_PRIVATE)
             dolbyEffects = intent.getBooleanExtra("DOLBY_ENABLED", dolbyEffects)
             prefs.edit().putBoolean("dolby_fx", dolbyEffects).apply()
-            // OEM Dolby daemons watch the focus attributes, so the focus
-            // request must match the AAudio stream profile. Re-requesting
-            // also abandons the stale attributes from the previous mode.
-            requestAudioFocus(dolbyEffects)
             // Reopen the AAudio stream BEFORE querying `reportBluetoothRoute()`
             // and refresh once more after Android's HAL settles (400 ms) so
             // `bluetooth_delay_ms` does not stay stuck on Samsung's 290 ms
@@ -624,13 +636,37 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             } catch (_: Exception) {}
         }
 
+        // Snapshot saved DSP / gaming-lock settings before spawning the native
+        // RX thread so the very first feedback packet and audio frame already
+        // carry the user's configuration atomically.
+        val bassDb = prefs.getFloat("bass_db", 0.0f)
+        val vocalDb = prefs.getFloat("vocal_db", 0.0f)
+        val trebleDb = prefs.getFloat("treble_db", 0.0f)
+        val channelRole = prefs.getInt("channel_role", 0)
+        val crossfeed = prefs.getBoolean("crossfeed", false)
+        val nightMode = prefs.getBoolean("night_mode", false)
+        val gamingLock = prefs.getBoolean("gaming_lock", false)
+
         // Creating the native AAudio client blocks while the stream is
         // negotiated. The foreground notification is already up (synchronously,
         // on main), so the blocking work can safely move to the engine thread.
         val gen = connectGen.incrementAndGet()
         runOnEngine {
             val started = runCatching {
-                nativeStartClient(hostAddr, isUsb, gainDb, pin, dolbyEffects)
+                nativeStartClientConfigured(
+                    hostAddr,
+                    isUsb,
+                    gainDb,
+                    pin,
+                    dolbyEffects,
+                    bassDb,
+                    vocalDb,
+                    trebleDb,
+                    channelRole,
+                    crossfeed,
+                    nightMode,
+                    gamingLock
+                )
             }.getOrDefault(false)
             mainHandler.post { handleClientStartResult(started, hostAddr, gen) }
         }
@@ -676,14 +712,10 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         startForegroundNotification(currentHostAddr, currentIsUsb)
         scheduleSilenceWatchdog()
         // Re-apply the active Bluetooth route delay now that the native
-        // ClientEngine exists, and restore saved Studio EQ / DSP settings.
+        // ClientEngine exists, and refresh DSP prefs in case the user adjusted
+        // controls while the AAudio open was blocking.
         reportBluetoothRoute()
         applyDspFromPrefs()
-        // Compressed codec is always Opus RLD: pure-Rust VBR is no longer a
-        // user-selectable backend (legacy prefs must not re-enable it). Host
-        // quality profile and bitrate are only sent on explicit UI taps so a
-        // joining phone never overrides an already-configured PC host.
-        nativeSendMediaCommand(21)
         refreshAdpfHintSession()
         scheduleAdpfRefresh()
     }
@@ -934,14 +966,8 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                 .getOrDefault(IntArray(0))
                 .distinct()
                 .toIntArray()
-            // Before the Rust thread has published its TID, keep a session for
-            // the caller so a short race does not disable the hint entirely.
-            val tids = if (nativeTids.isNotEmpty()) {
-                nativeTids
-            } else {
-                intArrayOf(android.os.Process.myTid())
-            }
-            perfHintSession = hintMgr?.createHintSession(tids, 2_500_000L)
+            if (nativeTids.isEmpty()) return
+            perfHintSession = hintMgr?.createHintSession(nativeTids, 2_500_000L)
         } catch (_: Exception) {
         }
     }

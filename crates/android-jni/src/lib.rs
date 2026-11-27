@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "android")]
 use audioshare_client_engine::android_aaudio::AAudioInputGuard;
-use audioshare_client_engine::{ClientConfig, ClientEngine};
+use audioshare_client_engine::{ClientConfig, ClientEngine, ClientStartupOptions};
 use audioshare_host_engine::discovery_and_os::{DiscoveryBeacon, DiscoveryScanner};
 use audioshare_host_engine::virtual_mic::PHONE_MIC_PORT;
 use audioshare_host_engine::{
@@ -1491,6 +1491,24 @@ pub fn android_start_stream(
     pin: Option<&str>,
     dolby_effects: bool,
 ) -> Result<(), String> {
+    android_start_stream_with_options(
+        host_ip_port,
+        is_usb,
+        gain_db,
+        pin,
+        dolby_effects,
+        ClientStartupOptions::default(),
+    )
+}
+
+pub fn android_start_stream_with_options(
+    host_ip_port: &str,
+    is_usb: bool,
+    gain_db: f32,
+    pin: Option<&str>,
+    dolby_effects: bool,
+    options: ClientStartupOptions,
+) -> Result<(), String> {
     let trimmed = host_ip_port.trim();
     let addr: SocketAddr = trimmed
         .parse::<SocketAddr>()
@@ -1521,13 +1539,14 @@ pub fn android_start_stream(
     };
 
     let initial_bt_delay = LAST_REPORTED_BT_DELAY_MS.load(Ordering::Relaxed);
-    let client = ClientEngine::connect_with_pin_and_bt_delay(cfg, pin, initial_bt_delay).map_err(|e| {
-        diagnostics::error(
-            "session-start",
-            format!("connect failed to {}:{} ({})", addr.ip(), addr.port(), e),
-        );
-        e
-    })?;
+    let client =
+        ClientEngine::connect_with_options(cfg, pin, initial_bt_delay, options).map_err(|e| {
+            diagnostics::error(
+                "session-start",
+                format!("connect failed to {}:{} ({})", addr.ip(), addr.port(), e),
+            );
+            e
+        })?;
     // Log the parsed host/port, never the raw input or PIN: the PIN is a
     // separate argument and must not end up in a pasteable diagnostics bundle.
     diagnostics::info(
@@ -1756,6 +1775,34 @@ pub mod android_native {
 
     #[no_mangle]
     pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStartClient(
+        env: JNIEnv,
+        class: JClass,
+        host_addr: JString,
+        is_usb: jboolean,
+        gain_db: jfloat,
+        pin: JString,
+        dolby_effects: jboolean,
+    ) -> jboolean {
+        Java_com_audioshare_ultra_service_AudioEngineService_nativeStartClientConfigured(
+            env,
+            class,
+            host_addr,
+            is_usb,
+            gain_db,
+            pin,
+            dolby_effects,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_audioshare_ultra_service_AudioEngineService_nativeStartClientConfigured(
         mut env: JNIEnv,
         _class: JClass,
         host_addr: JString,
@@ -1763,6 +1810,13 @@ pub mod android_native {
         gain_db: jfloat,
         pin: JString,
         dolby_effects: jboolean,
+        bass_db: jfloat,
+        pres_db: jfloat,
+        treb_db: jfloat,
+        role: jint,
+        crossfeed: jboolean,
+        night_mode: jboolean,
+        gaming_lock: jboolean,
     ) -> jboolean {
         let addr_rust: String = match env.get_string(&host_addr) {
             Ok(s) => s.into(),
@@ -1784,12 +1838,23 @@ pub mod android_native {
         } else {
             Some(pin_trimmed)
         };
-        match android_start_stream(
+        let options = ClientStartupOptions {
+            eq_bass_db_tenths: db_to_tenths(bass_db, -12.0, 12.0),
+            eq_presence_db_tenths: db_to_tenths(pres_db, -12.0, 12.0),
+            eq_treble_db_tenths: db_to_tenths(treb_db, -12.0, 12.0),
+            channel_role: role.clamp(0, 255) as u8,
+            enable_binaural_crossfeed: crossfeed != 0,
+            enable_night_mode: night_mode != 0,
+            gaming_mode_hard_lock: gaming_lock != 0,
+            default_codec_backend_command: 21,
+        };
+        match android_start_stream_with_options(
             &addr_rust,
             is_usb != 0,
             gain_db,
             pin_opt,
             dolby_effects != 0,
+            options,
         ) {
             Ok(()) => 1,
             Err(_) => 0,
