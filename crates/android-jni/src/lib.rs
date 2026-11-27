@@ -1,7 +1,8 @@
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -568,6 +569,156 @@ fn bind_phone_mic_socket(use_hardware_mic: bool) -> std::io::Result<UdpSocket> {
     }
 }
 
+/// Bounded lock-free SPSC ring offloading USB ADB TCP connect/write from the
+/// real-time phone-mic TX thread onto a non-RT helper thread.
+const ADB_MIC_TX_SLOTS: usize = 16;
+
+struct AdbMicFrameSlot {
+    len: AtomicU16,
+    buf: UnsafeCell<[u8; 2 + MAX_SAFE_UDP_PAYLOAD]>,
+}
+
+struct AdbMicTxQueue {
+    write_idx: AtomicUsize,
+    read_idx: AtomicUsize,
+    slots: Box<[AdbMicFrameSlot]>,
+}
+
+unsafe impl Sync for AdbMicTxQueue {}
+
+impl AdbMicTxQueue {
+    fn new() -> Self {
+        let slots = (0..ADB_MIC_TX_SLOTS)
+            .map(|_| AdbMicFrameSlot {
+                len: AtomicU16::new(0),
+                buf: UnsafeCell::new([0u8; 2 + MAX_SAFE_UDP_PAYLOAD]),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            write_idx: AtomicUsize::new(0),
+            read_idx: AtomicUsize::new(0),
+            slots,
+        }
+    }
+
+    /// Enqueue one length-prefixed datagram without blocking or allocating.
+    /// Drops the packet when the 16-slot (~40 ms) ring is full.
+    fn try_push(&self, datagram: &[u8]) -> bool {
+        if datagram.is_empty() || datagram.len() > MAX_SAFE_UDP_PAYLOAD {
+            return false;
+        }
+        let w = self.write_idx.load(Ordering::Relaxed);
+        let r = self.read_idx.load(Ordering::Acquire);
+        if w.wrapping_sub(r) >= ADB_MIC_TX_SLOTS {
+            return false;
+        }
+        let slot = &self.slots[w & (ADB_MIC_TX_SLOTS - 1)];
+        let framed_len = 2 + datagram.len();
+        unsafe {
+            let dst = &mut *slot.buf.get();
+            dst[0..2].copy_from_slice(&(datagram.len() as u16).to_be_bytes());
+            dst[2..framed_len].copy_from_slice(datagram);
+        }
+        slot.len.store(framed_len as u16, Ordering::Release);
+        self.write_idx.store(w.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    fn pop_into(&self, out: &mut [u8; 2 + MAX_SAFE_UDP_PAYLOAD]) -> Option<usize> {
+        let r = self.read_idx.load(Ordering::Relaxed);
+        let w = self.write_idx.load(Ordering::Acquire);
+        if r == w {
+            return None;
+        }
+        let slot = &self.slots[r & (ADB_MIC_TX_SLOTS - 1)];
+        let len = slot.len.load(Ordering::Acquire) as usize;
+        unsafe {
+            let src = &*slot.buf.get();
+            out[..len].copy_from_slice(&src[..len]);
+        }
+        self.read_idx.store(r.wrapping_add(1), Ordering::Release);
+        Some(len)
+    }
+
+    /// Discard stale frames queued while the ADB TCP tunnel was disconnected.
+    fn clear_stale(&self) {
+        let w = self.write_idx.load(Ordering::Acquire);
+        self.read_idx.store(w, Ordering::Release);
+    }
+}
+
+struct AdbMicTcpSender {
+    queue: Arc<AdbMicTxQueue>,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl AdbMicTcpSender {
+    fn spawn(target: SocketAddr) -> Option<Self> {
+        let queue = Arc::new(AdbMicTxQueue::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let q = Arc::clone(&queue);
+        let r = Arc::clone(&running);
+        let handle = std::thread::Builder::new()
+            .name("as-ultra-adb-mic-tx".into())
+            .spawn(move || {
+                let mut stream: Option<TcpStream> = None;
+                let mut last_attempt: Option<Instant> = None;
+                let mut frame_buf = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
+                while r.load(Ordering::Relaxed) {
+                    if stream.is_none()
+                        && last_attempt
+                            .map(|t| t.elapsed() >= Duration::from_millis(400))
+                            .unwrap_or(true)
+                    {
+                        last_attempt = Some(Instant::now());
+                        if let Ok(s) = TcpStream::connect_timeout(&target, Duration::from_millis(250)) {
+                            let _ = s.set_nodelay(true);
+                            let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
+                            q.clear_stale();
+                            stream = Some(s);
+                        }
+                    }
+                    if let Some(len) = q.pop_into(&mut frame_buf) {
+                        if let Some(ref mut s) = stream {
+                            if s.write_all(&frame_buf[..len]).is_err() {
+                                stream = None;
+                            }
+                        }
+                    } else {
+                        std::thread::park_timeout(Duration::from_millis(10));
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self {
+            queue,
+            running,
+            handle: Some(handle),
+        })
+    }
+
+    #[inline]
+    fn enqueue(&self, datagram: &[u8]) {
+        if self.queue.try_push(datagram) {
+            if let Some(ref h) = self.handle {
+                h.thread().unpark();
+            }
+        }
+    }
+}
+
+impl Drop for AdbMicTcpSender {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            h.thread().unpark();
+            let _ = h.join();
+        }
+    }
+}
+
 impl PhoneMicTransmitter {
     pub fn start(target_hosts: &str, use_hardware_mic: bool) -> Result<Self, String> {
         Self::start_with_pin(target_hosts, use_hardware_mic, None)
@@ -750,12 +901,17 @@ impl PhoneMicTransmitter {
                 } else {
                     None
                 };
-                // Persistent TCP_NODELAY stream for USB ADB reverse (`127.0.0.1:65532`)
-                // hardware-mic mode, using the exact 2-byte big-endian length-prefixed
-                // framing expected by `AdbUsbWatcher::spawn_host_adb_tcp_session`.
-                let mut adb_mic_tcp: Option<TcpStream> = None;
-                let mut last_adb_tcp_attempt: Option<Instant> = None;
-                let mut tcp_frame = [0u8; 2 + MAX_SAFE_UDP_PAYLOAD];
+                // Offloaded TCP_NODELAY helper thread for USB ADB reverse
+                // (`127.0.0.1:65532`) hardware-mic mode so blocking connects and
+                // writes never stall the real-time audio TX thread.
+                let mut adb_mic_sender: Option<AdbMicTcpSender> = if use_hardware_mic {
+                    static_targets
+                        .iter()
+                        .find(|t| t.ip().is_loopback())
+                        .and_then(|&t| AdbMicTcpSender::spawn(t))
+                } else {
+                    None
+                };
 
                 while run_clone.load(Ordering::Relaxed) {
                     #[cfg(target_os = "android")]
@@ -1246,32 +1402,11 @@ impl PhoneMicTransmitter {
                         if let Ok(pkt_len) = packed {
                             for target in peers.keys() {
                                 if use_hardware_mic && target.ip().is_loopback() {
-                                    if adb_mic_tcp.is_none()
-                                        && last_adb_tcp_attempt
-                                            .map(|t| t.elapsed() >= Duration::from_secs(1))
-                                            .unwrap_or(true)
-                                    {
-                                        last_adb_tcp_attempt = Some(Instant::now());
-                                        if let Ok(stream) = TcpStream::connect_timeout(
-                                            target,
-                                            Duration::from_millis(250),
-                                        ) {
-                                            let _ = stream.set_nodelay(true);
-                                            let _ = stream.set_write_timeout(Some(
-                                                Duration::from_millis(250),
-                                            ));
-                                            adb_mic_tcp = Some(stream);
-                                        }
+                                    if adb_mic_sender.is_none() {
+                                        adb_mic_sender = AdbMicTcpSender::spawn(*target);
                                     }
-                                    if let Some(ref mut stream) = adb_mic_tcp {
-                                        let len_be = (pkt_len as u16).to_be_bytes();
-                                        tcp_frame[0] = len_be[0];
-                                        tcp_frame[1] = len_be[1];
-                                        tcp_frame[2..2 + pkt_len]
-                                            .copy_from_slice(&dgram[..pkt_len]);
-                                        if stream.write_all(&tcp_frame[..2 + pkt_len]).is_err() {
-                                            adb_mic_tcp = None;
-                                        }
+                                    if let Some(ref sender) = adb_mic_sender {
+                                        sender.enqueue(&dgram[..pkt_len]);
                                     }
                                 } else if target.is_ipv6() {
                                     if socket_v6.is_none() {

@@ -41,6 +41,10 @@ use discovery_and_os::HostVolumeMonitor;
 
 pub const DEFAULT_PORT: u16 = 65530;
 const CONTROL_MAGIC_HELLO: &[u8; 8] = b"ASULTRA1";
+/// Loopback-only goodbye datagram emitted by `AdbUsbWatcher` when an ADB TCP
+/// bridge session closes so `HostEngine` evicts the closed `127.0.0.1` port
+/// immediately instead of waiting for the 10 s idle sweep.
+pub(crate) const CONTROL_MAGIC_BYE: &[u8; 8] = b"ASULBYE1";
 /// Hard cap on tracked clients. `active_clients_count` is a `u8`, so an
 /// unbounded map would silently wrap to 0 at 256 clients and disable the
 /// virtual-speaker guard in the middle of a live stream. New peers are
@@ -3773,6 +3777,29 @@ impl HostEngine {
                             ),
                         );
                     }
+                } else if len >= 8
+                    && &ctrl_buf[..8] == CONTROL_MAGIC_BYE
+                    && src_addr.ip().is_loopback()
+                {
+                    let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+                    if map.remove(&src_addr).is_some() {
+                        telemetry
+                            .active_clients_count
+                            .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
+                        Self::refresh_client_delay_telemetry(&map, &telemetry);
+                        Self::refresh_gaming_lock_telemetry(&map, &telemetry);
+                        cached_targets.clear();
+                        for c in map.values() {
+                            if !c.muted {
+                                cached_targets.push(c.addr);
+                            }
+                        }
+                        cached_all_usb = Self::all_active_targets_are_usb(&map);
+                        if map.is_empty() {
+                            loss_governor = LossGovernor::new(Instant::now());
+                            high_loss_gate = HighLossWindowGate::new();
+                        }
+                    }
                 } else if len >= 8 && &ctrl_buf[..8] == b"ASULCTRL" {
                     // Legacy v1 (0.2.x) client tried to join a v2 host. Count
                     // the rejection so operators can spot version mismatches.
@@ -6940,6 +6967,36 @@ mod tests {
             256,
             "newcomer joining an active session must not override host bitrate"
         );
+        engine.stop();
+    }
+
+    #[test]
+    fn test_control_magic_bye_evicts_only_sending_loopback_port() {
+        let (mut engine, port) = start_test_host();
+        let dest = SocketAddr::from(([127, 0, 0, 1], port));
+        let peer_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr_a = peer_a.local_addr().unwrap();
+        let addr_b = peer_b.local_addr().unwrap();
+
+        peer_a.send_to(CONTROL_MAGIC_HELLO, dest).unwrap();
+        peer_b.send_to(CONTROL_MAGIC_HELLO, dest).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && engine.connected_clients().len() < 2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.connected_clients().len(), 2);
+
+        // peer_a sends ASULBYE1; peer_a must be evicted immediately while peer_b stays.
+        peer_a.send_to(CONTROL_MAGIC_BYE, dest).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && engine.connected_clients().len() > 1 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = engine.connected_clients();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].addr, addr_b);
+        assert!(!remaining.iter().any(|c| c.addr == addr_a));
         engine.stop();
     }
 }

@@ -1235,6 +1235,42 @@ fn read_exact_interruptible<T: Read>(
     Ok(())
 }
 
+/// Write one length-prefixed feedback/control frame to the ADB TCP tunnel.
+///
+/// Transient `WouldBlock`/`TimedOut`/`Interrupted` before any byte of the frame
+/// hits the wire drops the stale feedback packet cleanly instead of tearing down
+/// the healthy audio RX TCP session. Once a partial frame has been written,
+/// finishes it up to `deadline` so big-endian framing is never corrupted.
+fn write_adb_feedback_frame<W: Write>(
+    writer: &mut W,
+    frame: &[u8],
+    deadline: Instant,
+) -> bool {
+    let mut written = 0usize;
+    while written < frame.len() {
+        match writer.write(&frame[written..]) {
+            Ok(0) => return false,
+            Ok(n) => written += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                if written == 0 {
+                    // Nothing entered the stream yet: drop this stale feedback
+                    // packet cleanly without disturbing TCP framing or RX.
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Loopback TCP↔UDP bridge for `adb reverse tcp:P tcp:P`. When the configured
 /// server is loopback and a TCP listener is reachable, ClientEngine's UDP
 /// datagrams are tunnelled over `TCP_NODELAY` to that listener instead of being
@@ -1247,6 +1283,8 @@ fn read_exact_interruptible<T: Read>(
 struct AdbTcpClientBridge {
     running: Arc<AtomicBool>,
     local_udp_addr: SocketAddr,
+    active_tcp: Arc<Mutex<Option<TcpStream>>>,
+    wake_udp: Option<UdpSocket>,
     supervisor_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -1277,17 +1315,19 @@ impl AdbTcpClientBridge {
         };
         let udp_base = UdpSocket::bind(SocketAddr::new(loopback_ip, 0)).ok()?;
         let local_udp_addr = udp_base.local_addr().ok()?;
-        // This socket relays the same real-time audio as the direct UDP path
-        // (the engine sends to `local_udp_addr` instead of the host). Give it
-        // the 1 MB buffers and CS5/AC_VI marking too, otherwise an ADB/USB
-        // scheduling stall can drop audio before it reaches the TCP tunnel.
+        // Apply DSCP/WMM marking, then tighten the bridge loopback receive
+        // buffer to 64 KB so stale feedback/media commands cannot queue up.
         let _ = configure_realtime_udp_socket(&udp_base);
+        let _ = socket2::SockRef::from(&udp_base).set_recv_buffer_size(65_536);
+        let wake_udp = udp_base.try_clone().ok();
         // A bounded read lets the supervisor join the per-session out thread
         // promptly on yank/shutdown instead of blocking forever in recv().
         let _ = udp_base.set_read_timeout(Some(Duration::from_millis(200)));
 
         let running = Arc::new(AtomicBool::new(true));
+        let active_tcp = Arc::new(Mutex::new(None));
         let run_supervisor = Arc::clone(&running);
+        let active_tcp_sup = Arc::clone(&active_tcp);
         let server_addr_clone = server_addr;
         let supervisor_handle = std::thread::Builder::new()
             .name("as-ultra-adb-cli-supervisor".into())
@@ -1296,9 +1336,10 @@ impl AdbTcpClientBridge {
                 // Reuse the probe as the first session when already connected.
                 let mut pending_stream = probe;
                 let mut next_connect = Instant::now();
+                let mut first_connect = true;
 
                 while run_supervisor.load(Ordering::Relaxed) {
-                    let mut tcp_reader = if let Some(stream) = pending_stream.take() {
+                    let tcp_reader = if let Some(stream) = pending_stream.take() {
                         stream
                     } else {
                         if Instant::now() < next_connect {
@@ -1316,21 +1357,30 @@ impl AdbTcpClientBridge {
                             }
                         }
                     };
-                    // Drain any stale feedback/media commands queued in
-                    // `udp_base` while disconnected so reconnecting does not
-                    // replay old Play/Pause/Next taps to the host.
-                    if udp_base.set_nonblocking(true).is_ok() {
-                        let mut discard = [0u8; MAX_SAFE_UDP_PAYLOAD];
-                        while udp_base.recv(&mut discard).is_ok() {}
-                        let _ = udp_base.set_nonblocking(false);
-                        let _ = udp_base.set_read_timeout(Some(Duration::from_millis(200)));
+                    // Drain stale feedback/media commands queued in `udp_base`
+                    // only on reconnects; on the initial connect `ClientEngine`
+                    // may already have posted its unauthenticated `HELLO`.
+                    if !first_connect {
+                        if udp_base.set_nonblocking(true).is_ok() {
+                            let mut discard = [0u8; MAX_SAFE_UDP_PAYLOAD];
+                            while udp_base.recv(&mut discard).is_ok() {}
+                            let _ = udp_base.set_nonblocking(false);
+                            let _ = udp_base.set_read_timeout(Some(Duration::from_millis(200)));
+                        }
                     }
+                    first_connect = false;
                     let _ = tcp_reader.set_nodelay(true);
+                    let _ = socket2::SockRef::from(&tcp_reader).set_send_buffer_size(32_768);
                     let _ = tcp_reader.set_read_timeout(Some(Duration::from_millis(200)));
-                    let _ = tcp_reader.set_write_timeout(Some(Duration::from_millis(50)));
+                    let _ = tcp_reader.set_write_timeout(Some(Duration::from_millis(250)));
+                    if let Ok(shutdown_handle) = tcp_reader.try_clone() {
+                        *active_tcp_sup.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(shutdown_handle);
+                    }
                     let mut tcp_writer = match tcp_reader.try_clone() {
                         Ok(s) => s,
                         Err(_) => {
+                            *active_tcp_sup.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
                             continue;
                         }
@@ -1338,6 +1388,7 @@ impl AdbTcpClientBridge {
                     let udp_tx = match udp_base.try_clone() {
                         Ok(s) => s,
                         Err(_) => {
+                            *active_tcp_sup.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
                             continue;
                         }
@@ -1345,6 +1396,7 @@ impl AdbTcpClientBridge {
                     let udp_rx = match udp_base.try_clone() {
                         Ok(s) => s,
                         Err(_) => {
+                            *active_tcp_sup.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             next_connect = Instant::now() + ADB_TCP_RECONNECT_INTERVAL;
                             continue;
                         }
@@ -1360,11 +1412,12 @@ impl AdbTcpClientBridge {
                         .name("as-ultra-adb-cli-in".into())
                         .spawn(move || {
                             let _rt_guard = RealtimeThreadGuard::enter();
+                            let mut buffered_tcp = std::io::BufReader::with_capacity(8192, tcp_reader);
                             let mut pkt = [0u8; MAX_SAFE_UDP_PAYLOAD];
                             while alive_in.load(Ordering::Relaxed) && run_in.load(Ordering::Relaxed)
                             {
                                 match read_frame_len_interruptible(
-                                    &mut tcp_reader,
+                                    &mut buffered_tcp,
                                     &alive_in,
                                     &run_in,
                                 ) {
@@ -1374,7 +1427,7 @@ impl AdbTcpClientBridge {
                                             break;
                                         }
                                         if read_exact_interruptible(
-                                            &mut tcp_reader,
+                                            &mut buffered_tcp,
                                             &mut pkt[..len],
                                             Instant::now() + ADB_FRAME_READ_DEADLINE,
                                         )
@@ -1403,7 +1456,11 @@ impl AdbTcpClientBridge {
                                 match udp_rx.recv(&mut framed[2..]) {
                                     Ok(len) if len > 0 && len <= MAX_SAFE_UDP_PAYLOAD => {
                                         framed[0..2].copy_from_slice(&(len as u16).to_be_bytes());
-                                        if tcp_writer.write_all(&framed[..2 + len]).is_err() {
+                                        if !write_adb_feedback_frame(
+                                            &mut tcp_writer,
+                                            &framed[..2 + len],
+                                            Instant::now() + ADB_FRAME_READ_DEADLINE,
+                                        ) {
                                             break;
                                         }
                                     }
@@ -1429,6 +1486,13 @@ impl AdbTcpClientBridge {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     session_alive.store(false, Ordering::Release);
+                    if let Some(stream) = active_tcp_sup
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    }
                     if let Some(h) = in_handle {
                         let _ = h.join();
                     }
@@ -1443,6 +1507,8 @@ impl AdbTcpClientBridge {
         Some(Self {
             running,
             local_udp_addr,
+            active_tcp,
+            wake_udp,
             supervisor_handle,
         })
     }
@@ -1451,6 +1517,17 @@ impl AdbTcpClientBridge {
 impl Drop for AdbTcpClientBridge {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
+        if let Some(stream) = self
+            .active_tcp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        if let Some(ref wake) = self.wake_udp {
+            let _ = wake.send_to(&[], self.local_udp_addr);
+        }
         if let Some(h) = self.supervisor_handle.take() {
             let _ = h.join();
         }
@@ -6068,6 +6145,28 @@ mod tests {
             15_000
         );
         usb_client.stop();
+    }
+
+    #[test]
+    fn test_write_adb_feedback_drops_transient_stall_without_aborting() {
+        struct TimeoutWriter;
+        impl Write for TimeoutWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "stalled",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = TimeoutWriter;
+        assert!(write_adb_feedback_frame(
+            &mut w,
+            &[0, 4, 1, 2, 3, 4],
+            Instant::now() + Duration::from_millis(50)
+        ));
     }
 }
 
