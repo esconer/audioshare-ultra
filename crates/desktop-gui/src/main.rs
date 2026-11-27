@@ -382,6 +382,19 @@ fn lipsync_offset_to_apply(
     should_apply_lipsync(bt_delay_ms, last_applied_ms).then_some(bt_delay_ms)
 }
 
+/// Format a manual lip-sync hint for Windows hosts when an active Bluetooth
+/// peer adds playback delay (Windows lacks PipeWire per-sink negative video
+/// offset injection).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn format_windows_bt_lipsync_hint(offset_ms: u32) -> Option<String> {
+    if offset_ms == 0 {
+        return None;
+    }
+    Some(format!(
+        "VLC/mpv audio delay: -{offset_ms} ms • Enable Earbud Gaming / Low-Latency Mode or LE Audio (LC3) to reduce browser lag to ~40-60 ms."
+    ))
+}
+
 /// Default pairing adapter: the first Wi-Fi/Ethernet interface. The interface
 /// list sorts USB tethering first so the Android host page can surface it, but
 /// a QR code containing the RNDIS address is unreachable for a phone that is
@@ -2111,9 +2124,15 @@ impl AudioShareApp {
                     format!("Phone Bluetooth Active (A2DP {} ms)", bt_delay)
                 };
                 #[cfg(not(target_os = "linux"))]
+                let bt_mode_label = if bt_delay <= 65 {
+                    "LE/Low-Latency"
+                } else {
+                    "A2DP"
+                };
+                #[cfg(not(target_os = "linux"))]
                 let bt_pill_text = format!(
-                    "Phone Bluetooth Active (A2DP {} ms • Total Stream Delay ~{} ms)",
-                    bt_delay, total_lipsync
+                    "Phone Bluetooth Active ({} {} ms • Total Stream Delay ~{} ms)",
+                    bt_mode_label, bt_delay, total_lipsync
                 );
                 let _ = total_lipsync;
                 ui.horizontal_wrapped(|ui| {
@@ -2124,6 +2143,20 @@ impl AudioShareApp {
                     {
                         self.auto_bt_video_lipsync = true;
                         self.save_persistent_config();
+                    }
+                    #[cfg(target_os = "windows")]
+                    if let Some(hint) = format_windows_bt_lipsync_hint(u32::from(
+                        if total_lipsync > 0 {
+                            total_lipsync
+                        } else {
+                            bt_delay
+                        },
+                    )) {
+                        ui.label(
+                            egui::RichText::new(hint)
+                                .size(11.5)
+                                .color(p.muted_text),
+                        );
                     }
                 });
             }
@@ -3708,6 +3741,19 @@ mod tests {
         assert_eq!(lipsync_offset_to_apply(false, 160, 0), None);
         // Disabled before anything was applied: nothing to do.
         assert_eq!(lipsync_offset_to_apply(false, 145, 0), None);
+    }
+
+    #[test]
+    fn test_format_windows_bt_lipsync_hint() {
+        assert_eq!(format_windows_bt_lipsync_hint(0), None);
+        let hint = format_windows_bt_lipsync_hint(245).expect("non-zero delay produces hint");
+        assert!(hint.contains("-245 ms"), "unexpected hint: {hint}");
+        assert!(
+            hint.contains(
+                "Enable Earbud Gaming / Low-Latency Mode or LE Audio (LC3) to reduce browser lag to ~40-60 ms."
+            ),
+            "missing low-latency/LC3 tip: {hint}"
+        );
     }
 
     #[test]

@@ -234,6 +234,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     // Last value handed to native A/V sync. Device callbacks can re-report the
     // same route repeatedly; log only real transitions to keep the report useful.
     private var lastReportedBtDelayMs: Int = -1
+    private var lastReportedBtRouteMode: String = ""
     private var currentHostAddr: String = ""
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
@@ -819,24 +820,24 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
 
     private fun reportBluetoothRoute() {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        val fallbackBtDelayMs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        val (fallbackBtDelayMs, routeMode) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val attrs = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                 .build()
             val routedType = am.getAudioDevicesForAttributes(attrs).firstOrNull()?.type
             when (routedType) {
-                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145
-                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> 145 to "A2DP"
+                AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> 60 to "SCO"
                 AudioDeviceInfo.TYPE_BLE_HEADSET,
-                AudioDeviceInfo.TYPE_BLE_SPEAKER -> 45
-                AudioDeviceInfo.TYPE_HEARING_AID -> 65
+                AudioDeviceInfo.TYPE_BLE_SPEAKER -> 45 to "BLE-Audio"
+                AudioDeviceInfo.TYPE_HEARING_AID -> 65 to "Hearing-Aid"
                 else -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     routedType == AudioDeviceInfo.TYPE_BLE_BROADCAST
                 ) {
-                    45
+                    45 to "BLE-Audio"
                 } else {
-                    0
+                    0 to "None"
                 }
             }
         } else {
@@ -845,9 +846,9 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             @Suppress("DEPRECATION")
             val scoRouted = am.isBluetoothScoOn()
             when {
-                a2dpRouted -> 145
-                scoRouted -> 60
-                else -> 0
+                a2dpRouted -> 145 to "A2DP"
+                scoRouted -> 60 to "SCO"
+                else -> 0 to "None"
             }
         }
         val reportedDelayMs = if (fallbackBtDelayMs > 0) {
@@ -871,10 +872,15 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         } else {
             0
         }
-        if (reportedDelayMs != lastReportedBtDelayMs) {
+        if (reportedDelayMs != lastReportedBtDelayMs || routeMode != lastReportedBtRouteMode) {
             lastReportedBtDelayMs = reportedDelayMs
+            lastReportedBtRouteMode = routeMode
             runCatching {
-                nativeLogEvent(0, "bt-route", "Bluetooth route delay changed to ${reportedDelayMs}ms")
+                nativeLogEvent(
+                    0,
+                    "bt-route",
+                    "Bluetooth route delay changed to ${reportedDelayMs}ms (mode=${routeMode})",
+                )
             }
         }
         nativeReportBluetoothDelayMs(reportedDelayMs)
