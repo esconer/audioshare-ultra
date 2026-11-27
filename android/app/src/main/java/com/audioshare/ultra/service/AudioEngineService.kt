@@ -11,6 +11,7 @@ import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaMetadata
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.media.session.MediaSession
@@ -593,7 +594,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             return START_STICKY
         }
         if (intent?.action == "ACTION_REMOTE_PLAY_PAUSE") {
-            remoteMediaPlaying = !remoteMediaPlaying
+            updateMediaSessionPlaybackState(!remoteMediaPlaying)
             nativeSendMediaCommand(10)
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
@@ -721,36 +722,43 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         scheduleAdpfRefresh()
     }
 
+    private fun updateMediaSessionPlaybackState(playing: Boolean) {
+        remoteMediaPlaying = playing
+        mediaSession?.setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or
+                        PlaybackState.ACTION_PAUSE or
+                        PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or
+                        PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                )
+                .setState(
+                    if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
+                    0L,
+                    1.0f
+                )
+                .build()
+        )
+    }
+
     private fun setupHardwareBluetoothMediaSession() {
         if (mediaSession != null) return
-        fun updateSessionState(playing: Boolean) {
-            remoteMediaPlaying = playing
-            mediaSession?.setPlaybackState(
-                PlaybackState.Builder()
-                    .setActions(
-                        PlaybackState.ACTION_PLAY or
-                            PlaybackState.ACTION_PAUSE or
-                            PlaybackState.ACTION_PLAY_PAUSE or
-                            PlaybackState.ACTION_SKIP_TO_NEXT or
-                            PlaybackState.ACTION_SKIP_TO_PREVIOUS
-                    )
-                    .setState(
-                        if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED,
-                        0L,
-                        1.0f
-                    )
+        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
+            setMetadata(
+                MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, "AudioShare Ultra")
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, "PC Audio")
                     .build()
             )
-        }
-        mediaSession = MediaSession(this, "AudioShareUltraMediaSession").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() {
-                    updateSessionState(true)
+                    updateMediaSessionPlaybackState(true)
                     nativeSendMediaCommand(10)
                     if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
                 override fun onPause() {
-                    updateSessionState(false)
+                    updateMediaSessionPlaybackState(false)
                     nativeSendMediaCommand(10)
                     if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                 }
@@ -768,7 +776,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
                             KeyEvent.KEYCODE_MEDIA_PLAY,
                             KeyEvent.KEYCODE_MEDIA_PAUSE,
                             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
-                                updateSessionState(!remoteMediaPlaying)
+                                updateMediaSessionPlaybackState(!remoteMediaPlaying)
                                 nativeSendMediaCommand(10)
                                 if (foregroundStarted) startForegroundNotification(currentHostAddr, currentIsUsb)
                                 return true
@@ -788,7 +796,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             })
             isActive = true
         }
-        updateSessionState(true)
+        updateMediaSessionPlaybackState(true)
     }
 
     /// Report the active Bluetooth route independently of the Compose UI.

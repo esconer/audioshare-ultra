@@ -524,16 +524,16 @@ fn select_tx_profile(
     all_clients_usb: bool,
 ) -> (CodecMode, usize, u16) {
     // Classic BT A2DP is ~185 ms regardless; forcing 400 pps (1 sf) over
-    // 2.4 GHz Wi-Fi only worsens single-antenna BT/Wi-Fi contention. The same
-    // guard applies to the auto-USB fast path: a wired tether has ample
-    // headroom and no 802.11 TX queue, so 2.5 ms packetization is free there,
-    // but an active BT link still needs the steadier 5 ms framing.
+    // Wi-Fi worsens 802.11 contention and air-time overhead, so 1-sf (2.5 ms)
+    // framing is permitted ONLY when every active receiver is on USB (`all_clients_usb`).
+    // Any non-USB session strictly enforces `subframes >= 2` even when
+    // `gaming_lock = true` or `configured_subframes = 1`.
     let gaming_lock = raw_gaming_lock && !bt_active;
-    let usb_fast_path = all_clients_usb && !bt_active;
-    let base_subframes = if gaming_lock || usb_fast_path {
+    let usb_fast_path = all_clients_usb;
+    let base_subframes = if usb_fast_path {
         1
     } else {
-        configured_subframes.clamp(1, 2) as usize
+        configured_subframes.clamp(2, 2) as usize
     };
 
     match profile {
@@ -585,7 +585,7 @@ fn select_tx_profile(
                 };
                 (
                     CodecMode::CompressedLowDelay,
-                    if gaming_lock { 1 } else { 2 },
+                    if usb_fast_path { 1 } else { 2 },
                     smooth_kbps,
                 )
             } else {
@@ -1542,6 +1542,122 @@ fn split_packet_fec<'a>(
     }
 }
 
+const ROUTE_ERROR_EVICT_THRESHOLD: u16 = 20;
+
+#[inline]
+fn is_fatal_route_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(code) = err.raw_os_error() {
+        if matches!(
+            code,
+            libc::ENETUNREACH | libc::EHOSTUNREACH | libc::ECONNREFUSED
+        ) {
+            return true;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(code) = err.raw_os_error() {
+        // WSAENETUNREACH (10051), WSAEHOSTUNREACH (10065), WSAECONNREFUSED (10061)
+        if matches!(code, 10051 | 10065 | 10061) {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSendOutcome {
+    Sent,
+    FatalRouteError,
+}
+
+fn apply_peer_send_outcomes(
+    map: &mut HashMap<SocketAddr, ConnectedClient>,
+    outcomes: &[(SocketAddr, PeerSendOutcome)],
+) -> (Vec<SocketAddr>, bool) {
+    let mut evicted = Vec::new();
+    for &(addr, outcome) in outcomes {
+        match outcome {
+            PeerSendOutcome::Sent => {
+                if let Some(client) = map.get_mut(&addr) {
+                    client.consecutive_send_errors = 0;
+                }
+            }
+            PeerSendOutcome::FatalRouteError => {
+                let should_evict = if let Some(client) = map.get_mut(&addr) {
+                    client.consecutive_send_errors =
+                        client.consecutive_send_errors.saturating_add(1);
+                    client.consecutive_send_errors >= ROUTE_ERROR_EVICT_THRESHOLD
+                } else {
+                    false
+                };
+                if should_evict {
+                    map.remove(&addr);
+                    evicted.push(addr);
+                }
+            }
+        }
+    }
+    let any_nonzero = map.values().any(|c| c.consecutive_send_errors > 0);
+    (evicted, any_nonzero)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_peer_send_outcomes(
+    outcomes: &[(SocketAddr, PeerSendOutcome)],
+    clients: &Mutex<HashMap<SocketAddr, ConnectedClient>>,
+    telemetry: &HostTelemetry,
+    cached_targets: &mut Vec<SocketAddr>,
+    cached_all_usb: &mut bool,
+    loss_governor: &mut LossGovernor,
+    high_loss_gate: &mut HighLossWindowGate,
+    any_peer_has_send_errors: &mut bool,
+) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let mut map = clients.lock().unwrap_or_else(|e| e.into_inner());
+    let (evicted, any_nonzero) = apply_peer_send_outcomes(&mut map, outcomes);
+    *any_peer_has_send_errors = any_nonzero;
+    if !evicted.is_empty() {
+        let remaining = map.len();
+        telemetry
+            .active_clients_count
+            .store(remaining.min(u8::MAX as usize) as u8, Ordering::Relaxed);
+        HostEngine::refresh_client_delay_telemetry(&map, telemetry);
+        HostEngine::refresh_gaming_lock_telemetry(&map, telemetry);
+        cached_targets.clear();
+        for c in map.values() {
+            if !c.muted {
+                cached_targets.push(c.addr);
+            }
+        }
+        *cached_all_usb = HostEngine::all_active_targets_are_usb(&map);
+        if map.is_empty() {
+            *loss_governor = LossGovernor::new(Instant::now());
+            *high_loss_gate = HighLossWindowGate::new();
+        }
+        drop(map);
+        for addr in evicted {
+            audioshare_protocol::diagnostics::info(
+                "host-clients",
+                format!(
+                    "evicted {} after {} consecutive fatal route errors (remaining {})",
+                    addr, ROUTE_ERROR_EVICT_THRESHOLD, remaining
+                ),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pack_and_send(
     socket: &UdpSocket,
@@ -1553,7 +1669,10 @@ fn pack_and_send(
     session_key: Option<&SessionKey>,
     targets: &[SocketAddr],
     telemetry: &HostTelemetry,
+    any_peer_has_send_errors: bool,
+    outcomes: &mut Vec<(SocketAddr, PeerSendOutcome)>,
 ) -> bool {
+    outcomes.clear();
     let Ok(pkt_len) =
         pack_datagram_with_key(header, primary, fec_n1, fec_n2, session_key, datagram)
     else {
@@ -1566,12 +1685,18 @@ fn pack_and_send(
                 telemetry
                     .bytes_sent
                     .fetch_add(pkt_len as u64, Ordering::Relaxed);
+                if any_peer_has_send_errors {
+                    outcomes.push((target_addr, PeerSendOutcome::Sent));
+                }
             }
-            Err(_) => {
+            Err(err) => {
                 // Non-blocking UDP send failures are otherwise silent (the
                 // socket cannot report an ICMP error from `recv_from`). Count
                 // them so a saturating link is visible in diagnostics.
                 telemetry.tx_send_errors.fetch_add(1, Ordering::Relaxed);
+                if is_fatal_route_error(&err) {
+                    outcomes.push((target_addr, PeerSendOutcome::FatalRouteError));
+                }
             }
         }
     }
@@ -1597,6 +1722,10 @@ pub struct ConnectedClient {
     /// client entry so kicking/expiring a peer clears the replay state and a
     /// fresh session may legitimately restart at sequence 1.
     pub feedback_window: FeedbackReplayWindow,
+    /// Consecutive fatal route errors (`ENETUNREACH` / `EHOSTUNREACH` /
+    /// `ECONNREFUSED`) observed on `send_to`. Reset on any successful send or
+    /// incoming client packet; peer is evicted at `ROUTE_ERROR_EVICT_THRESHOLD`.
+    pub consecutive_send_errors: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2076,6 +2205,7 @@ impl HostEngine {
                     client_volume: 100,
                     gaming_lock: false,
                     feedback_window: FeedbackReplayWindow::default(),
+                    consecutive_send_errors: 0,
                 },
             );
         }
@@ -3286,6 +3416,9 @@ impl HostEngine {
         let mut last_dtx_heartbeat = Instant::now();
         let mut was_dtx_active = false;
         let mut dtx_entry_confirm_pending = false;
+        let mut any_peer_has_send_errors = false;
+        let mut send_outcomes: Vec<(SocketAddr, PeerSendOutcome)> =
+            Vec::with_capacity(MAX_CONNECTED_CLIENTS);
         let capture_idle_ms: u64 = 40;
         // Suppresses connect-time quality/bitrate overrides from legacy APKs
         // joining a session that already has another active receiver.
@@ -3547,8 +3680,8 @@ impl HostEngine {
                     } else {
                         false
                     };
-                    map.entry(src_addr)
-                        .or_insert(ConnectedClient {
+                    {
+                        let entry = map.entry(src_addr).or_insert(ConnectedClient {
                             addr: src_addr,
                             last_seen: Instant::now(),
                             is_usb,
@@ -3559,8 +3692,11 @@ impl HostEngine {
                             client_volume: 100,
                             gaming_lock: false,
                             feedback_window: FeedbackReplayWindow::default(),
-                        })
-                        .last_seen = Instant::now();
+                            consecutive_send_errors: 0,
+                        });
+                        entry.last_seen = Instant::now();
+                        entry.consecutive_send_errors = 0;
+                    }
                     telemetry
                         .active_clients_count
                         .store(map.len().min(u8::MAX as usize) as u8, Ordering::Relaxed);
@@ -3629,6 +3765,7 @@ impl HostEngine {
                                 continue;
                             }
                             entry.last_seen = Instant::now();
+                            entry.consecutive_send_errors = 0;
                             entry.fec_rate_permille = fb.fec_rate_permille;
                             entry.bluetooth_delay_ms = fb.bluetooth_delay_ms;
                             entry.hardware_delay_ms = fb.hardware_delay_ms;
@@ -3701,6 +3838,7 @@ impl HostEngine {
                                     client_volume: fb.client_volume,
                                     gaming_lock: gaming_lock_update.unwrap_or(false),
                                     feedback_window: accepted_window,
+                                    consecutive_send_errors: 0,
                                 },
                             );
                         }
@@ -4098,6 +4236,7 @@ impl HostEngine {
             // DTX silence is evaluated (below), so a silent packet never builds
             // codec state nor discards FEC history.
             let mut packet_is_silent = true;
+            let mut first_active_sub_idx: Option<usize> = None;
             let mut packet_max_vu_pct: u8 = 0;
 
             for sub_idx in 0..subframes_per_pkt {
@@ -4149,14 +4288,14 @@ impl HostEngine {
                 let vu_pct = (peak_f32.sqrt() * 100.0).min(100.0) as u8;
                 packet_max_vu_pct = packet_max_vu_pct.max(vu_pct);
 
-                // Studio Master 24-bit must preserve -85..-100 dBFS reverb
-                // tails; a 16-bit max_abs > 3 (-80 dBFS) test truncated them.
-                let active_audio = if use_pcm24 {
-                    peak_f32 > 1.0e-5
-                } else {
-                    (peak_f32 * 32766.0) > 3.5
-                };
+                // Studio Master 24-bit preserves -100 dBFS reverb tails
+                // (`1.0e-5`); 16-bit / compressed paths use `-88.0 dBFS`
+                // (`4.0e-5`) so quiet fades and acoustic tails are not chopped.
+                let active_audio = is_subframe_audio_active(peak_f32, use_pcm24);
                 if active_audio {
+                    if first_active_sub_idx.is_none() {
+                        first_active_sub_idx = Some(sub_idx);
+                    }
                     packet_is_silent = false;
                     silent_subframes = 0;
                 } else {
@@ -4180,6 +4319,10 @@ impl HostEngine {
             telemetry
                 .dtx_silent_mode
                 .store(is_dtx_active, Ordering::Relaxed);
+            if was_dtx_active && !is_dtx_active {
+                let fade_idx = first_active_sub_idx.unwrap_or(0);
+                apply_raised_cosine_fade_in(&mut f32_subframes[fade_idx], 32);
+            }
 
             // No receivers or Smart DTX silence: no codec state is needed.
             // VU/codec telemetry was published above and the DTX heartbeat and
@@ -4505,6 +4648,18 @@ impl HostEngine {
                         active_key.as_ref(),
                         &cached_targets,
                         &telemetry,
+                        any_peer_has_send_errors,
+                        &mut send_outcomes,
+                    );
+                    reconcile_peer_send_outcomes(
+                        &send_outcomes,
+                        &clients,
+                        &telemetry,
+                        &mut cached_targets,
+                        &mut cached_all_usb,
+                        &mut loss_governor,
+                        &mut high_loss_gate,
+                        &mut any_peer_has_send_errors,
                     );
                 }
                 was_dtx_active = true;
@@ -4597,6 +4752,18 @@ impl HostEngine {
                             active_key.as_ref(),
                             &cached_targets,
                             &telemetry,
+                            any_peer_has_send_errors,
+                            &mut send_outcomes,
+                        );
+                        reconcile_peer_send_outcomes(
+                            &send_outcomes,
+                            &clients,
+                            &telemetry,
+                            &mut cached_targets,
+                            &mut cached_all_usb,
+                            &mut loss_governor,
+                            &mut high_loss_gate,
+                            &mut any_peer_has_send_errors,
                         );
                     }
                     DatagramPlan::SplitPerSubframe => {
@@ -4654,7 +4821,22 @@ impl HostEngine {
                                 active_key.as_ref(),
                                 &cached_targets,
                                 &telemetry,
+                                any_peer_has_send_errors,
+                                &mut send_outcomes,
                             );
+                            reconcile_peer_send_outcomes(
+                                &send_outcomes,
+                                &clients,
+                                &telemetry,
+                                &mut cached_targets,
+                                &mut cached_all_usb,
+                                &mut loss_governor,
+                                &mut high_loss_gate,
+                                &mut any_peer_has_send_errors,
+                            );
+                            if cached_targets.is_empty() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -4739,6 +4921,17 @@ impl HostEngine {
                 }
             }
         }
+    }
+}
+
+/// Classify whether a subframe peak exceeds the Smart DTX silence floor:
+/// `-100 dBFS` (`1.0e-5`) for 24-bit Master, `-88.0 dBFS` (`4.0e-5`) for 16-bit/compressed.
+#[inline]
+fn is_subframe_audio_active(peak_f32: f32, use_pcm24: bool) -> bool {
+    if use_pcm24 {
+        peak_f32 > 1.0e-5
+    } else {
+        peak_f32 > 4.0e-5
     }
 }
 
@@ -4944,6 +5137,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
         map.insert(
@@ -4959,6 +5153,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
         map.insert(
@@ -4974,6 +5169,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             },
         );
 
@@ -5643,6 +5839,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -5737,8 +5934,8 @@ mod tests {
         );
         assert_eq!((mode, sf), (CodecMode::StudioLosslessLpc, 1));
 
-        // An active BT link suppresses the USB fast path just like gaming lock:
-        // A2DP needs the steadier 5 ms framing to avoid Wi-Fi/BT contention.
+        // Pure USB with active BT still keeps the wired USB 1-sf fast path
+        // because there is no 802.11 Wi-Fi/BT contention on a USB tether.
         let (_, sf, _) = select_tx_profile(
             QualityProfile::StudioLossless,
             2,
@@ -5746,10 +5943,10 @@ mod tests {
             0,
             false,
             true,
-            true,
+            false,
             true,
         );
-        assert_eq!(sf, 2, "BT active must disable auto-USB 1-sf framing");
+        assert_eq!(sf, 1, "pure USB keeps 1-sf fast path even when BT is active");
 
         // A Wi-Fi client in the mix disables the fast path entirely.
         let (_, sf, _) = select_tx_profile(
@@ -5777,6 +5974,35 @@ mod tests {
             true,
         );
         assert_eq!((mode, sf), (CodecMode::CompressedLowDelay, 4));
+    }
+
+    #[test]
+    fn test_select_tx_profile_non_usb_never_yields_one_subframe() {
+        for profile in [
+            QualityProfile::StudioLossless,
+            QualityProfile::StudioLossless24Bit,
+            QualityProfile::LowLatencyCompressed,
+            QualityProfile::SmartAuto,
+        ] {
+            for loss in [0u16, 50, 90, 200] {
+                for bt_active in [false, true] {
+                    let (_, sf, _) = select_tx_profile(
+                        profile,
+                        1,     // configured_subframes = 1
+                        256,
+                        loss,
+                        true,  // gaming_lock = true
+                        bt_active,
+                        true,  // any_wifi_client = true
+                        false, // all_clients_usb = false
+                    );
+                    assert!(
+                        sf >= 2,
+                        "non-USB session yielded {sf} sf for {profile:?} loss={loss} bt={bt_active}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -5833,6 +6059,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -5878,6 +6105,7 @@ mod tests {
                 client_volume: 100,
                 gaming_lock: false,
                 feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
             }
         }
 
@@ -7121,5 +7349,130 @@ mod tests {
         assert_eq!(remaining[0].addr, addr_b);
         assert!(!remaining.iter().any(|c| c.addr == addr_a));
         engine.stop();
+    }
+
+    #[test]
+    fn test_route_error_eviction_after_threshold_and_reset_on_success() {
+        fn client(addr: SocketAddr, is_usb: bool) -> ConnectedClient {
+            ConnectedClient {
+                addr,
+                last_seen: Instant::now(),
+                is_usb,
+                muted: false,
+                fec_rate_permille: 0,
+                bluetooth_delay_ms: 0,
+                hardware_delay_ms: 0,
+                client_volume: 100,
+                gaming_lock: false,
+                feedback_window: FeedbackReplayWindow::default(),
+                consecutive_send_errors: 0,
+            }
+        }
+
+        // Verify fatal vs transient classification.
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::NetworkUnreachable
+        )));
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::HostUnreachable
+        )));
+        assert!(is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::ENETUNREACH
+            )));
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::EHOSTUNREACH
+            )));
+            assert!(is_fatal_route_error(&std::io::Error::from_raw_os_error(
+                libc::ECONNREFUSED
+            )));
+        }
+        assert!(!is_fatal_route_error(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+
+        let usb_peer: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let dead_wifi: SocketAddr = "192.168.1.99:41002".parse().unwrap();
+        let mut map = HashMap::new();
+        map.insert(usb_peer, client(usb_peer, true));
+        map.insert(dead_wifi, client(dead_wifi, false));
+
+        // 19 fatal errors keep the peer, then 1 success resets its counter to 0.
+        for _ in 0..(ROUTE_ERROR_EVICT_THRESHOLD - 1) {
+            let (evicted, any_nonzero) = apply_peer_send_outcomes(
+                &mut map,
+                &[(dead_wifi, PeerSendOutcome::FatalRouteError)],
+            );
+            assert!(evicted.is_empty());
+            assert!(any_nonzero);
+        }
+        assert_eq!(
+            map.get(&dead_wifi).unwrap().consecutive_send_errors,
+            ROUTE_ERROR_EVICT_THRESHOLD - 1
+        );
+        let (evicted, any_nonzero) =
+            apply_peer_send_outcomes(&mut map, &[(dead_wifi, PeerSendOutcome::Sent)]);
+        assert!(evicted.is_empty());
+        assert!(!any_nonzero);
+        assert_eq!(map.get(&dead_wifi).unwrap().consecutive_send_errors, 0);
+
+        // Now accumulate 20 consecutive fatal errors via reconcile_peer_send_outcomes
+        // and verify immediate eviction + telemetry/target refresh.
+        let telemetry = HostTelemetry::new();
+        HostEngine::refresh_client_delay_telemetry(&map, &telemetry);
+        let clients = Mutex::new(map);
+        let mut cached_targets = vec![usb_peer, dead_wifi];
+        let mut cached_all_usb = false;
+        let mut loss_governor = LossGovernor::new(Instant::now());
+        let mut high_loss_gate = HighLossWindowGate::new();
+        let mut any_peer_has_send_errors = false;
+
+        for i in 1..=ROUTE_ERROR_EVICT_THRESHOLD {
+            let outcomes = [
+                (usb_peer, PeerSendOutcome::Sent),
+                (dead_wifi, PeerSendOutcome::FatalRouteError),
+            ];
+            reconcile_peer_send_outcomes(
+                &outcomes,
+                &clients,
+                &telemetry,
+                &mut cached_targets,
+                &mut cached_all_usb,
+                &mut loss_governor,
+                &mut high_loss_gate,
+                &mut any_peer_has_send_errors,
+            );
+            if i < ROUTE_ERROR_EVICT_THRESHOLD {
+                assert_eq!(clients.lock().unwrap().len(), 2);
+                assert!(any_peer_has_send_errors);
+            }
+        }
+
+        let final_map = clients.lock().unwrap();
+        assert_eq!(final_map.len(), 1);
+        assert!(final_map.contains_key(&usb_peer));
+        assert!(!final_map.contains_key(&dead_wifi));
+        assert!(!any_peer_has_send_errors);
+        assert_eq!(cached_targets, vec![usb_peer]);
+        assert!(cached_all_usb);
+        assert_eq!(telemetry.active_clients_count.load(Ordering::Relaxed), 1);
+        assert!(!telemetry.any_wifi_client.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_smart_dtx_threshold_16bit_vs_24bit() {
+        // -90 dBFS (~3.16e-5): preserved in 24-bit (> 1.0e-5), silent in 16-bit (<= 4.0e-5).
+        assert!(!is_subframe_audio_active(3.0e-5, false));
+        assert!(is_subframe_audio_active(3.0e-5, true));
+        // Above -88.0 dBFS (> 4.0e-5): active in both modes.
+        assert!(is_subframe_audio_active(5.0e-5, false));
+        assert!(is_subframe_audio_active(5.0e-5, true));
+        // Below -100 dBFS (<= 1.0e-5): silent in both modes.
+        assert!(!is_subframe_audio_active(5.0e-6, false));
+        assert!(!is_subframe_audio_active(5.0e-6, true));
     }
 }

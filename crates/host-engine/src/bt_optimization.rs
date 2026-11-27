@@ -210,6 +210,237 @@ pub fn reset_video_lipsync_offset_blocking() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MprisPlaybackStatus {
+    Playing,
+    Paused,
+    Stopped,
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MprisPlayerCandidate {
+    bus_name: String,
+    status: MprisPlaybackStatus,
+    can_control: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbusMprisBackend {
+    Gdbus,
+    DbusSend,
+}
+
+/// Extract `org.mpris.MediaPlayer2.*` D-Bus bus names from either `gdbus` or
+/// `dbus-send` `ListNames` output.
+#[cfg(target_os = "linux")]
+fn parse_mpris_bus_names(output: &str) -> Vec<String> {
+    const PREFIX: &str = "org.mpris.MediaPlayer2.";
+    let mut names = Vec::new();
+    for segment in output.split(['\'', '"']) {
+        if segment.starts_with(PREFIX)
+            && segment.len() > PREFIX.len()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && !names.iter().any(|existing| existing == segment)
+        {
+            names.push(segment.to_string());
+        }
+    }
+    names
+}
+
+/// Parse MPRIS2 `PlaybackStatus` from `gdbus` (`(<'Playing'>,)`) or `dbus-send`
+/// (`variant string "Playing"`) output.
+#[cfg(target_os = "linux")]
+fn parse_mpris_playback_status(output: &str) -> MprisPlaybackStatus {
+    if output.contains("'Playing'") || output.contains("\"Playing\"") {
+        MprisPlaybackStatus::Playing
+    } else if output.contains("'Paused'") || output.contains("\"Paused\"") {
+        MprisPlaybackStatus::Paused
+    } else if output.contains("'Stopped'") || output.contains("\"Stopped\"") {
+        MprisPlaybackStatus::Stopped
+    } else {
+        MprisPlaybackStatus::Unknown
+    }
+}
+
+/// Parse MPRIS2 `CanControl` boolean from `gdbus` (`(<true>,)`) or `dbus-send`
+/// (`variant boolean true`) output.
+#[cfg(target_os = "linux")]
+fn parse_mpris_can_control(output: &str) -> bool {
+    output.contains("<true>")
+        || output
+            .lines()
+            .any(|line| line.trim().ends_with("boolean true"))
+}
+
+/// Choose the best controllable MPRIS2 player:
+/// `"Playing"` > `"Paused"` > any other player with `CanControl == true`.
+/// Players with `CanControl == false` are skipped.
+#[cfg(target_os = "linux")]
+fn select_best_mpris_player(candidates: &[MprisPlayerCandidate]) -> Option<&str> {
+    candidates
+        .iter()
+        .filter(|c| c.can_control)
+        .min_by_key(|c| match c.status {
+            MprisPlaybackStatus::Playing => 0u8,
+            MprisPlaybackStatus::Paused => 1u8,
+            MprisPlaybackStatus::Stopped | MprisPlaybackStatus::Unknown => 2u8,
+        })
+        .map(|c| c.bus_name.as_str())
+}
+
+#[cfg(target_os = "linux")]
+fn run_dbus_list_names(backend: DbusMprisBackend) -> Option<String> {
+    let out = match backend {
+        DbusMprisBackend::Gdbus => Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.DBus",
+                "--object-path",
+                "/org/freedesktop/DBus",
+                "--method",
+                "org.freedesktop.DBus.ListNames",
+            ])
+            .output()
+            .ok()?,
+        DbusMprisBackend::DbusSend => Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.DBus",
+                "--type=method_call",
+                "--print-reply",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.ListNames",
+            ])
+            .output()
+            .ok()?,
+    };
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn query_mpris_property(backend: DbusMprisBackend, bus_name: &str, property: &str) -> Option<String> {
+    let out = match backend {
+        DbusMprisBackend::Gdbus => Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                bus_name,
+                "--object-path",
+                "/org/mpris/MediaPlayer2",
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.mpris.MediaPlayer2.Player",
+                property,
+            ])
+            .output()
+            .ok()?,
+        DbusMprisBackend::DbusSend => {
+            let dest_arg = format!("--dest={bus_name}");
+            let prop_arg = format!("string:{property}");
+            Command::new("dbus-send")
+                .args([
+                    "--session",
+                    &dest_arg,
+                    "--type=method_call",
+                    "--print-reply",
+                    "/org/mpris/MediaPlayer2",
+                    "org.freedesktop.DBus.Properties.Get",
+                    "string:org.mpris.MediaPlayer2.Player",
+                    &prop_arg,
+                ])
+                .output()
+                .ok()?
+        }
+    };
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn invoke_mpris_method(backend: DbusMprisBackend, bus_name: &str, method: &str) -> bool {
+    let member = format!("org.mpris.MediaPlayer2.Player.{method}");
+    let out = match backend {
+        DbusMprisBackend::Gdbus => Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                bus_name,
+                "--object-path",
+                "/org/mpris/MediaPlayer2",
+                "--method",
+                &member,
+            ])
+            .output(),
+        DbusMprisBackend::DbusSend => {
+            let dest_arg = format!("--dest={bus_name}");
+            Command::new("dbus-send")
+                .args([
+                    "--session",
+                    &dest_arg,
+                    "--type=method_call",
+                    "--print-reply",
+                    "/org/mpris/MediaPlayer2",
+                    &member,
+                ])
+                .output()
+        }
+    };
+    out.map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_mpris_via_backend(backend: DbusMprisBackend, method: &str) -> Result<bool, ()> {
+    let Some(list_out) = run_dbus_list_names(backend) else {
+        return Err(());
+    };
+    let names = parse_mpris_bus_names(&list_out);
+    if names.is_empty() {
+        return Ok(false);
+    }
+    let mut candidates = Vec::with_capacity(names.len());
+    for bus_name in names {
+        let status = query_mpris_property(backend, &bus_name, "PlaybackStatus")
+            .map(|s| parse_mpris_playback_status(&s))
+            .unwrap_or(MprisPlaybackStatus::Unknown);
+        let can_control = query_mpris_property(backend, &bus_name, "CanControl")
+            .map(|s| parse_mpris_can_control(&s))
+            .unwrap_or(false);
+        candidates.push(MprisPlayerCandidate {
+            bus_name,
+            status,
+            can_control,
+        });
+    }
+    let Some(target) = select_best_mpris_player(&candidates) else {
+        return Ok(false);
+    };
+    Ok(invoke_mpris_method(backend, target, method))
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_mpris_dbus(method: &str) -> bool {
+    match dispatch_mpris_via_backend(DbusMprisBackend::Gdbus, method) {
+        Ok(dispatched) => dispatched,
+        Err(()) => dispatch_mpris_via_backend(DbusMprisBackend::DbusSend, method).unwrap_or(false),
+    }
+}
+
 /// Executes Play/Pause/Next/Prev on the PC when the user taps their Bluetooth earbuds on the phone
 pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
     if cmd == RemoteMediaCommand::None {
@@ -218,10 +449,10 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
 
     #[cfg(target_os = "linux")]
     {
-        let action = match cmd {
-            RemoteMediaCommand::PlayPause => "play-pause",
-            RemoteMediaCommand::NextTrack => "next",
-            RemoteMediaCommand::PrevTrack => "previous",
+        let (action, mpris_method, xdotool_key) = match cmd {
+            RemoteMediaCommand::PlayPause => ("play-pause", "PlayPause", "XF86AudioPlay"),
+            RemoteMediaCommand::NextTrack => ("next", "Next", "XF86AudioNext"),
+            RemoteMediaCommand::PrevTrack => ("previous", "Previous", "XF86AudioPrev"),
             RemoteMediaCommand::None => return,
         };
         // Rate-limit BEFORE spawning a thread: the feedback packet carrying a
@@ -236,28 +467,45 @@ pub fn execute_remote_media_command(cmd: RemoteMediaCommand) {
             *last = Some(now);
         }
         // This function is called from the host's hard real-time TX loop.
-        // `playerctl` talks to D-Bus/MPRIS and can block for tens of
-        // milliseconds, which would starve every connected client. Run the
-        // subprocess on a detached helper thread instead.
+        // D-Bus/MPRIS calls can block for tens of milliseconds, which would
+        // starve every connected client. Run the subprocesses on a detached
+        // helper thread instead.
         let _ = std::thread::Builder::new()
             .name("as-ultra-media-key".into())
             .spawn(move || {
-                // Try playerctl (MPRIS standard used by Chrome, Firefox, Spotify, VLC).
-                // Fall back to X11 keys whenever it is unavailable OR the
-                // command fails (no active MPRIS player, D-Bus error, etc.).
-                let mpris_ok = Command::new("playerctl")
+                // 1. Try playerctl first if installed.
+                let playerctl_ok = Command::new("playerctl")
                     .arg(action)
                     .output()
                     .map(|o| o.status.success())
                     .unwrap_or(false);
-                if !mpris_ok {
-                    let key = match cmd {
-                        RemoteMediaCommand::PlayPause => "XF86AudioPlay",
-                        RemoteMediaCommand::NextTrack => "XF86AudioNext",
-                        RemoteMediaCommand::PrevTrack => "XF86AudioPrev",
-                        RemoteMediaCommand::None => return,
+                if playerctl_ok {
+                    return;
+                }
+                // 2. Pure gdbus / dbus-send MPRIS2 dispatcher (works on Wayland
+                // without playerctl or xdotool).
+                if dispatch_mpris_dbus(mpris_method) {
+                    return;
+                }
+                // 3. Restrict xdotool fallback to X11 sessions only.
+                let xdotool_ok =
+                    if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland") {
+                        Command::new("xdotool")
+                            .args(["key", xdotool_key])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false)
+                    } else {
+                        false
                     };
-                    let _ = Command::new("xdotool").args(["key", key]).output();
+                if !xdotool_ok {
+                    audioshare_protocol::diagnostics::warn(
+                        "bt-media",
+                        format!(
+                            "remote media command {:?} failed across all backends",
+                            cmd
+                        ),
+                    );
                 }
             });
     }
@@ -391,5 +639,121 @@ Sink #2
         // killed by process exit). Do not assert on the shared static: the
         // parallel apply-offset test writes the same global concurrently.
         reset_video_lipsync_offset_blocking();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mpris_bus_names_gdbus_and_dbus_send() {
+        let gdbus_out = "(['org.freedesktop.DBus', ':1.42', 'org.mpris.MediaPlayer2.brave.instance7559', 'org.mpris.MediaPlayer2.vlc', 'org.mpris.MediaPlayer2.vlc'],)\n";
+        assert_eq!(
+            parse_mpris_bus_names(gdbus_out),
+            vec![
+                "org.mpris.MediaPlayer2.brave.instance7559".to_string(),
+                "org.mpris.MediaPlayer2.vlc".to_string(),
+            ]
+        );
+
+        let dbus_send_out = "\
+method return time=1795773705.870623 sender=org.freedesktop.DBus
+   array [
+      string \"org.freedesktop.DBus\"
+      string \"org.mpris.MediaPlayer2.spotify\"
+      string \"org.mpris.MediaPlayer2.firefox.instance_1_2\"
+   ]
+";
+        assert_eq!(
+            parse_mpris_bus_names(dbus_send_out),
+            vec![
+                "org.mpris.MediaPlayer2.spotify".to_string(),
+                "org.mpris.MediaPlayer2.firefox.instance_1_2".to_string(),
+            ]
+        );
+
+        assert!(parse_mpris_bus_names("(['org.freedesktop.DBus'],)\n").is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_mpris_properties_gdbus_and_dbus_send() {
+        assert_eq!(
+            parse_mpris_playback_status("(<'Playing'>,)"),
+            MprisPlaybackStatus::Playing
+        );
+        assert_eq!(
+            parse_mpris_playback_status("   variant       string \"Paused\""),
+            MprisPlaybackStatus::Paused
+        );
+        assert_eq!(
+            parse_mpris_playback_status("(<'Stopped'>,)"),
+            MprisPlaybackStatus::Stopped
+        );
+        assert_eq!(
+            parse_mpris_playback_status(""),
+            MprisPlaybackStatus::Unknown
+        );
+
+        assert!(parse_mpris_can_control("(<true>,)"));
+        assert!(!parse_mpris_can_control("(<false>,)"));
+        assert!(parse_mpris_can_control("   variant       boolean true"));
+        assert!(!parse_mpris_can_control("   variant       boolean false"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_select_best_mpris_player_prefers_playing_then_paused_then_can_control() {
+        // Playing > Paused > Stopped (all CanControl=true).
+        let candidates = vec![
+            MprisPlayerCandidate {
+                bus_name: "org.mpris.MediaPlayer2.stopped".into(),
+                status: MprisPlaybackStatus::Stopped,
+                can_control: true,
+            },
+            MprisPlayerCandidate {
+                bus_name: "org.mpris.MediaPlayer2.paused".into(),
+                status: MprisPlaybackStatus::Paused,
+                can_control: true,
+            },
+            MprisPlayerCandidate {
+                bus_name: "org.mpris.MediaPlayer2.playing".into(),
+                status: MprisPlaybackStatus::Playing,
+                can_control: true,
+            },
+        ];
+        assert_eq!(
+            select_best_mpris_player(&candidates),
+            Some("org.mpris.MediaPlayer2.playing")
+        );
+
+        // Without Playing, Paused beats Stopped/Unknown with CanControl=true.
+        assert_eq!(
+            select_best_mpris_player(&candidates[..2]),
+            Some("org.mpris.MediaPlayer2.paused")
+        );
+
+        // Stopped/Unknown with CanControl=true still wins over uncontrollable Playing.
+        let mixed = vec![
+            MprisPlayerCandidate {
+                bus_name: "org.mpris.MediaPlayer2.uncontrollable".into(),
+                status: MprisPlaybackStatus::Playing,
+                can_control: false,
+            },
+            MprisPlayerCandidate {
+                bus_name: "org.mpris.MediaPlayer2.stopped_ctrl".into(),
+                status: MprisPlaybackStatus::Stopped,
+                can_control: true,
+            },
+        ];
+        assert_eq!(
+            select_best_mpris_player(&mixed),
+            Some("org.mpris.MediaPlayer2.stopped_ctrl")
+        );
+
+        // No controllable player returns None.
+        let none_ctrl = vec![MprisPlayerCandidate {
+            bus_name: "org.mpris.MediaPlayer2.uncontrollable".into(),
+            status: MprisPlaybackStatus::Playing,
+            can_control: false,
+        }];
+        assert_eq!(select_best_mpris_player(&none_ctrl), None);
     }
 }

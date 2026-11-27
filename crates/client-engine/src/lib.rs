@@ -338,10 +338,12 @@ fn clock_loop_observation(net_subframes: f32, fifo_subframes: f32) -> f32 {
 /// Phase-calibrated setpoint tracker for `ClockDriftResampler`.
 ///
 /// After prebuffer settles (24 ticks = 60 ms), measures the first clean
-/// 200-tick (500 ms) `obs` mean so lockstep packet/HAL phase differences do
-/// not bias `0 ppm` streams away from unity. Afterward, tracks only downward
-/// cushion decay (`raw_setpoint < prev_raw - 0.1`), ignoring upward
-/// spike-cushion target jumps when actual queue depth has not grown.
+/// 200-tick (500 ms) `obs` mean (clamped below at `base_half`) so lockstep
+/// packet/HAL phase differences do not bias `0 ppm` streams away from unity
+/// and deep post-resync watermarks do not pull the anchor above actual fill.
+/// Afterward, tracks downward cushion decay (`raw_setpoint < prev_raw - 0.1`)
+/// and upward queue growth via a 200-tick (`500 ms`) windowed `obs` mean
+/// (`WinObs2_5`: `mean > anchor + 2.5` while `raw_setpoint > anchor + 1.0`).
 #[derive(Clone, Copy)]
 struct ClockAnchorSample {
     obs: f32,
@@ -359,6 +361,8 @@ struct ClockSetpointAnchor {
     obs_count: u16,
     anchored: Option<f32>,
     prev_raw: Option<f32>,
+    win_obs_sum: f64,
+    win_obs_count: u16,
 }
 
 impl ClockSetpointAnchor {
@@ -368,6 +372,8 @@ impl ClockSetpointAnchor {
         self.obs_count = 0;
         self.anchored = None;
         self.prev_raw = None;
+        self.win_obs_sum = 0.0;
+        self.win_obs_count = 0;
     }
 
     fn update(
@@ -375,6 +381,8 @@ impl ClockSetpointAnchor {
         sample: ClockAnchorSample,
         resampler: &mut ClockDriftResampler,
     ) -> Option<f32> {
+        let lower_bound = (sample.base_setpoint - 0.5 * sample.hal_burst_sf - 1.0).max(1.0);
+        let upper_bound = sample.wm_sf + (sample.pkt_subframes.max(1) as f32);
         if self.anchored.is_none() {
             resampler.reset_clock_window();
             if self.warmup_skip < 24 {
@@ -387,10 +395,7 @@ impl ClockSetpointAnchor {
                 return None;
             }
             let mean0 = (self.obs_sum / 200.0) as f32;
-            let capped = mean0.clamp(
-                (sample.wm_sf - sample.hal_burst_sf - 1.0).max(1.0),
-                sample.wm_sf + (sample.pkt_subframes.max(1) as f32),
-            );
+            let capped = mean0.clamp(lower_bound, upper_bound);
             self.anchored = Some(capped);
             self.prev_raw = Some(sample.raw_setpoint);
         }
@@ -399,6 +404,26 @@ impl ClockSetpointAnchor {
         if sample.raw_setpoint < prev_raw - 0.1 {
             let delta = prev_raw - sample.raw_setpoint;
             anchor = (anchor - delta).max(sample.raw_setpoint.min(sample.base_setpoint));
+            self.win_obs_sum = 0.0;
+            self.win_obs_count = 0;
+        } else if sample.raw_setpoint > anchor + 1.0 {
+            self.win_obs_sum += sample.obs as f64;
+            self.win_obs_count += 1;
+            if self.win_obs_count >= 200 {
+                let mean = (self.win_obs_sum / 200.0) as f32;
+                self.win_obs_sum = 0.0;
+                self.win_obs_count = 0;
+                if mean > anchor + 2.5 {
+                    let target_up = sample.raw_setpoint.min(mean).clamp(lower_bound, upper_bound);
+                    if target_up > anchor {
+                        anchor = target_up;
+                        resampler.reset_clock_window();
+                    }
+                }
+            }
+        } else {
+            self.win_obs_sum = 0.0;
+            self.win_obs_count = 0;
         }
         self.anchored = Some(anchor);
         self.prev_raw = Some(sample.raw_setpoint);
@@ -769,6 +794,7 @@ fn effective_wifi_ceiling(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn effective_link_ceiling(
     usb_link: bool,
     bt_active: bool,
@@ -776,11 +802,13 @@ fn effective_link_ceiling(
     now: Instant,
     shield_until: &mut Option<Instant>,
     shield_subframes: &mut f32,
+    hal_burst_sf: f32,
+    hal_margin_sf: f32,
 ) -> f32 {
     if usb_link {
         *shield_until = None;
         *shield_subframes = 0.0;
-        return USB_ADAPTIVE_MAX_SUBFRAMES;
+        return USB_ADAPTIVE_MAX_SUBFRAMES.max(hal_burst_sf + hal_margin_sf + 4.0);
     }
     effective_wifi_ceiling(bt_active, pkt_subframes, now, shield_until, shield_subframes)
 }
@@ -2267,6 +2295,24 @@ impl ClientEngine {
         let mut last_audio_codec_mode: Option<CodecMode> = None;
         let mut last_played_codec_mode: Option<CodecMode> = None;
         let mut last_observed_ring_underruns: u32 = 0;
+        macro_rules! current_ring_underruns {
+            () => {{
+                #[cfg(target_os = "android")]
+                {
+                    aaudio_guard
+                        .as_ref()
+                        .map(|g| g.ring_underrun_count())
+                        .unwrap_or(0)
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    desktop_stream
+                        .as_ref()
+                        .map(|(_, _, _, _, u)| u.load(Ordering::Relaxed))
+                        .unwrap_or(0)
+                }
+            }};
+        }
         let mut backwards_resync_candidate: Option<(u16, u8)> = None;
         let mut consecutive_fec_heals: u32 = 0;
         let mut last_pushed_sample: [f32; 2] = [0.0, 0.0];
@@ -2325,6 +2371,7 @@ impl ClientEngine {
         let mut last_aligned_target_subframes: usize = fifo_target_subframes(initial_wifi_floor);
         let mut prev_clock_target_subframes: usize = last_aligned_target_subframes;
         let mut clock_anchor = ClockSetpointAnchor::default();
+        let mut last_hal_burst_samples: usize = 480;
         let mut last_hal_burst_sf: f32 = 2.0;
         // RFC 3550 Inter-Arrival Jitter Estimator state (microseconds)
         let mut prev_rx_us: Option<u32> = None;
@@ -2402,6 +2449,8 @@ impl ClientEngine {
                         *desktop_stream =
                             Some((stream, rate, err, observed_frames, ring_underruns));
                     }
+                    resampler.reset_clock_controller();
+                    clock_anchor.reset();
                     last_desktop_open_attempt = Some(Instant::now());
                     // Do not feed the blocking CPAL open duration into jitter/spike
                     // estimators, and re-anchor on the live edge after mid-stream reopen.
@@ -2410,7 +2459,6 @@ impl ClientEngine {
                         stream_initialized = false;
                         sequencer.reset();
                         opus_decoder = None;
-                        clock_anchor.reset();
                         consecutive_empty_ticks = 0;
                         backwards_resync_candidate = None;
                         last_played_codec_mode = None;
@@ -2548,6 +2596,8 @@ impl ClientEngine {
                     if let Some(guard) = aaudio_guard.as_ref() {
                         resampler.set_output_sample_rate(guard.sample_rate());
                     }
+                    resampler.reset_clock_controller();
+                    clock_anchor.reset();
                     // AAudio open can block 150-370 ms on Android HALs. Clear the
                     // jitter reference so that open latency never triggers a false
                     // spike cushion, and on mid-stream reopens drain stale pre-open
@@ -2557,7 +2607,6 @@ impl ClientEngine {
                         stream_initialized = false;
                         sequencer.reset();
                         opus_decoder = None;
-                        clock_anchor.reset();
                         consecutive_empty_ticks = 0;
                         backwards_resync_candidate = None;
                         last_played_codec_mode = None;
@@ -2816,6 +2865,8 @@ impl ClientEngine {
                 Instant::now(),
                 &mut scan_shield_until,
                 &mut scan_shield_subframes,
+                last_hal_burst_sf,
+                hal_burst_margin_for_link(last_hal_burst_sf, usb_link),
             )
             .max(initial_wifi_floor);
             // Immediately shed excess cushion when BT disconnects or the 25 s
@@ -2892,6 +2943,7 @@ impl ClientEngine {
                             scan_shield_subframes = 0.0;
                             prebuffer_ready = false;
                             telemetry.prebuffer_ready.store(false, Ordering::Relaxed);
+                            last_observed_ring_underruns = current_ring_underruns!();
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
                             prev_rx_us = None;
@@ -3036,6 +3088,8 @@ impl ClientEngine {
                                             now_jump,
                                             &mut scan_shield_until,
                                             &mut scan_shield_subframes,
+                                            last_hal_burst_sf,
+                                            hal_burst_margin_for_link(last_hal_burst_sf, usb_link),
                                         );
                                         adaptive_wifi_subframes = adaptive_wifi_subframes
                                             .max(scan_shield_subframes)
@@ -3090,6 +3144,7 @@ impl ClientEngine {
                             prev_rx_us = None;
                             opus_decoder = None;
                             last_played_codec_mode = None;
+                            resampler.reset_clock_controller();
                             clock_anchor.reset();
                             slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
@@ -3156,6 +3211,9 @@ impl ClientEngine {
                             // stalls so the arriving recovery burst lands inside the cushion
                             // instead of triggering a post-stall audio skip.
                             let now_rx = Instant::now();
+                            let hal_margin_now =
+                                hal_burst_margin_for_link(last_hal_burst_sf, usb_link);
+                            let hal_floor_now = last_hal_burst_sf + hal_margin_now;
                             let wifi_ceiling = effective_link_ceiling(
                                 usb_link,
                                 bt_now,
@@ -3163,15 +3221,21 @@ impl ClientEngine {
                                 now_rx,
                                 &mut scan_shield_until,
                                 &mut scan_shield_subframes,
+                                last_hal_burst_sf,
+                                hal_margin_now,
                             )
                             .max(initial_wifi_floor);
                             let proactive_floor = ((jitter_estimate_us / 2500.0) * 2.6)
                                 .clamp(initial_wifi_floor, wifi_ceiling);
-                            let spike_floor = spike_cushion_subframes(
-                                initial_wifi_floor,
-                                raw_spike_us,
-                                wifi_ceiling,
-                            );
+                            let spike_floor = if raw_spike_us >= 18_000.0 {
+                                spike_cushion_subframes(
+                                    initial_wifi_floor.max(hal_floor_now),
+                                    raw_spike_us,
+                                    wifi_ceiling,
+                                )
+                            } else {
+                                initial_wifi_floor
+                            };
                             if !usb_link && raw_spike_us >= 50_000.0 {
                                 let shield_armed = update_scan_shield(
                                     bt_now,
@@ -3457,39 +3521,54 @@ impl ClientEngine {
                     }
                 })
                 .unwrap_or(480usize);
+            if hal_burst_samples != last_hal_burst_samples {
+                last_hal_burst_samples = hal_burst_samples;
+                resampler.reset_clock_controller();
+                clock_anchor.reset();
+            }
+            let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
+            last_hal_burst_sf = hal_burst_sf;
+            let hal_margin_sf = hal_burst_margin_for_link(hal_burst_sf, usb_link);
             // Detect silent `BurstDecouplerRing` partial/empty underruns from
             // the audio callback (invisible to HAL XRun counts because the
             // callback returns CONTINUE with faded/zero-filled samples). When
             // one happens during active playback, arm a fade-in so recovery
             // does not click from 0 -> full-scale, and expand the adaptive
             // cushion so the decoupler rises out of the underrun zone.
-            #[cfg(target_os = "android")]
-            let cur_ring_underruns = aaudio_guard
-                .as_ref()
-                .map(|g| g.ring_underrun_count())
-                .unwrap_or(0);
-            #[cfg(not(target_os = "android"))]
-            let cur_ring_underruns = desktop_stream
-                .as_ref()
-                .map(|(_, _, _, _, u)| u.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let ring_underrun_delta = cur_ring_underruns.wrapping_sub(last_observed_ring_underruns);
+            let cur_ring_underruns = current_ring_underruns!();
+            let dtx_or_unready = !stream_initialized
+                || !prebuffer_ready
+                || telemetry.server_dtx_silent.load(Ordering::Relaxed);
+            let ring_underrun_delta = if dtx_or_unready {
+                0
+            } else {
+                cur_ring_underruns.wrapping_sub(last_observed_ring_underruns)
+            };
             last_observed_ring_underruns = cur_ring_underruns;
-            if ring_underrun_delta > 0
-                && stream_initialized
-                && prebuffer_ready
-                && !telemetry.server_dtx_silent.load(Ordering::Relaxed)
-            {
+            if ring_underrun_delta > 0 {
+                let underrun_ceiling = if usb_link {
+                    effective_link_ceiling(
+                        usb_link,
+                        false,
+                        last_pkt_subframe_count,
+                        Instant::now(),
+                        &mut scan_shield_until,
+                        &mut scan_shield_subframes,
+                        hal_burst_sf,
+                        hal_margin_sf,
+                    )
+                    .max(initial_wifi_floor)
+                } else {
+                    adaptive_ceiling
+                };
                 sequencer.arm_fade_in();
-                adaptive_wifi_subframes = (adaptive_wifi_subframes + 2.0).min(adaptive_ceiling);
+                let growth_base = adaptive_wifi_subframes.max(hal_burst_sf + hal_margin_sf);
+                adaptive_wifi_subframes = (growth_base + 2.0).min(underrun_ceiling);
                 cushion_hold_until = Instant::now() + adaptive_hold_duration(usb_link, 6_000);
             }
-            let hal_burst_sf = resampler.samples_to_subframes(hal_burst_samples);
-            last_hal_burst_sf = hal_burst_sf;
 
             // 4. Multi-Phone Group Sync Alignment + Competitive Gaming Hard-Lock
             let gaming_lock = telemetry.gaming_mode_hard_lock.load(Ordering::Relaxed);
-            let hal_margin_sf = hal_burst_margin_for_link(hal_burst_sf, usb_link);
             let base_target = (if gaming_lock {
                 gaming_base_target_subframes(last_pkt_subframe_count, jitter_estimate_us)
             } else {
@@ -3524,6 +3603,7 @@ impl ClientEngine {
             }
             prev_clock_target_subframes = target_fifo_subframes;
 
+            let mut prebuffer_just_became_ready = false;
             if stream_initialized && !telemetry.server_dtx_silent.load(Ordering::Relaxed) {
                 let net_now = (latest_rx_seq.wrapping_add(1).wrapping_sub(next_play_seq) as i16)
                     .max(0) as f32;
@@ -3538,6 +3618,8 @@ impl ClientEngine {
                 // so `seq_delta` never approaches STREAM_RESYNC_AHEAD_SUBFRAMES (180 subframes).
                 if !prebuffer_ready && total_now >= base_fifo_subframes as f32 {
                     prebuffer_ready = true;
+                    prebuffer_just_became_ready = true;
+                    last_observed_ring_underruns = current_ring_underruns!();
                     telemetry.prebuffer_ready.store(true, Ordering::Relaxed);
                     if burst_fifo.available_samples() == 0 {
                         sequencer.arm_fade_in();
@@ -3925,9 +4007,12 @@ impl ClientEngine {
                             now_empty,
                             &mut scan_shield_until,
                             &mut scan_shield_subframes,
+                            hal_burst_sf,
+                            hal_margin_sf,
                         )
                         .max(initial_wifi_floor);
-                        adaptive_wifi_subframes = (adaptive_wifi_subframes + 1.0).min(wifi_ceiling);
+                        let growth_base = adaptive_wifi_subframes.max(hal_burst_sf + hal_margin_sf);
+                        adaptive_wifi_subframes = (growth_base + 1.0).min(wifi_ceiling);
                         if shield_armed {
                             // Grow cushion immediately so Hit #1's arriving packet clump is
                             // retained in the FIFO and shields Hits #2..#12 of the scan.
@@ -3967,6 +4052,7 @@ impl ClientEngine {
                             opus_decoder = None;
                             prev_rx_us = None;
                             last_played_codec_mode = None;
+                            resampler.reset_clock_controller();
                             clock_anchor.reset();
                             slot_codec_mode.fill(None);
                             for slot in &mut opus_ring {
@@ -4099,6 +4185,9 @@ impl ClientEngine {
                 if status == STATUS_EMPTY && was_live_edge {
                     break;
                 }
+            }
+            if prebuffer_just_became_ready {
+                last_observed_ring_underruns = current_ring_underruns!();
             }
 
             // Feed the clock-drift controller once per pass, using the planned
@@ -6568,9 +6657,15 @@ mod tests {
         let now = Instant::now();
         let mut until = None;
         let mut shield = 0.0f32;
+        // Normal wired USB (hal_burst_sf = 2.0, margin = 3.0) stays capped at 12.0 sf.
         assert_eq!(
-            effective_link_ceiling(true, true, 4, now, &mut until, &mut shield),
+            effective_link_ceiling(true, true, 4, now, &mut until, &mut shield, 2.0, 3.0),
             USB_ADAPTIVE_MAX_SUBFRAMES
+        );
+        // 20 ms BT over USB (hal_burst_sf = 8.0, margin = 7.0) lifts ceiling to 19.0 sf.
+        assert_eq!(
+            effective_link_ceiling(true, true, 4, now, &mut until, &mut shield, 8.0, 7.0),
+            19.0
         );
         // Fast USB decay reaches 6.0 sf floor within 4 healthy windows.
         let mut usb_buf = USB_ADAPTIVE_MAX_SUBFRAMES;
@@ -6661,6 +6756,78 @@ mod tests {
 
         anchor.reset();
         assert!(anchor.update(sample(14.0, 16.0), &mut resampler).is_none());
+
+        // 2b. WinObs2_5 upward tracking: 200 ticks with raw_setpoint > anchor + 1.0
+        // and mean(obs) > anchor + 2.5 raises anchor to raw_setpoint.min(mean).
+        let win_sample = |obs, raw_setpoint, wm_sf| ClockAnchorSample {
+            obs,
+            raw_setpoint,
+            base_setpoint: 12.0,
+            wm_sf,
+            hal_burst_sf: 3.0,
+            pkt_subframes: 2,
+        };
+        let mut win_anchor = ClockSetpointAnchor::default();
+        for _ in 0..224 {
+            let _ = win_anchor.update(win_sample(13.0, 14.0, 15.0), &mut resampler);
+        }
+        let base_a = win_anchor.update(win_sample(13.0, 14.0, 15.0), &mut resampler).unwrap();
+        assert!((base_a - 13.0).abs() < 1e-4);
+
+        // Mean of 15.0 (only +2.0 <= +2.5) must NOT lift anchor after 200 ticks.
+        for _ in 0..200 {
+            let a = win_anchor.update(win_sample(15.0, 20.0, 21.0), &mut resampler).unwrap();
+            assert!((a - 13.0).abs() < 1e-4);
+        }
+        // Interrupting raw_setpoint <= anchor + 1.0 (without >= 0.1 downward decay)
+        // resets the 200-tick window.
+        let mut reset_win_anchor = ClockSetpointAnchor::default();
+        for _ in 0..224 {
+            let _ = reset_win_anchor.update(win_sample(13.0, 14.05, 15.0), &mut resampler);
+        }
+        for _ in 0..150 {
+            let _ = reset_win_anchor.update(win_sample(17.0, 14.05, 20.0), &mut resampler);
+        }
+        let reset_a = reset_win_anchor
+            .update(win_sample(17.0, 14.0, 20.0), &mut resampler)
+            .unwrap();
+        assert!((reset_a - 13.0).abs() < 1e-4);
+        // Now 199 ticks at obs = 17.0 (raw_setpoint = 18.0 > 14.0) stay at 13.0,
+        // and the 200th tick lifts anchor to raw_setpoint.min(mean) = 17.0.
+        for _ in 0..199 {
+            let a = reset_win_anchor
+                .update(win_sample(17.0, 18.0, 20.0), &mut resampler)
+                .unwrap();
+            assert!((a - 13.0).abs() < 1e-4);
+        }
+        let lifted_a = reset_win_anchor
+            .update(win_sample(17.0, 18.0, 20.0), &mut resampler)
+            .unwrap();
+        assert!((lifted_a - 17.0).abs() < 1e-4);
+
+        // 2c. base_half lower clamp: post-resync deep wm_sf=110 must NOT pull anchor
+        // up to (110 - 8 - 1) = 101; low obs clamps to (base_setpoint - 0.5*hal_burst - 1).
+        let mut bh_anchor = ClockSetpointAnchor::default();
+        let deep_wm_sample = |obs| ClockAnchorSample {
+            obs,
+            raw_setpoint: 106.0,
+            base_setpoint: 16.0,
+            wm_sf: 110.0,
+            hal_burst_sf: 8.0,
+            pkt_subframes: 2,
+        };
+        for _ in 0..223 {
+            assert!(bh_anchor.update(deep_wm_sample(58.0), &mut resampler).is_none());
+        }
+        let bh_a = bh_anchor.update(deep_wm_sample(58.0), &mut resampler).unwrap();
+        assert!((bh_a - 58.0).abs() < 1e-4);
+
+        let mut low_bh_anchor = ClockSetpointAnchor::default();
+        for _ in 0..223 {
+            assert!(low_bh_anchor.update(deep_wm_sample(5.0), &mut resampler).is_none());
+        }
+        let low_bh_a = low_bh_anchor.update(deep_wm_sample(5.0), &mut resampler).unwrap();
+        assert!((low_bh_a - 11.0).abs() < 1e-4);
 
         // 3. HAL-aware trim margin (`hal_burst_sf + pkt + 1.0`) prevents false
         // backlog trims during normal 48->44.1 HAL bursts while trimming real excess.

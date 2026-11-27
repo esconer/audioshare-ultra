@@ -201,11 +201,7 @@ impl ClockDriftResampler {
         let new_base = in_r / out_r;
         if (new_base - self.base_ratio).abs() > 1e-9 {
             self.base_ratio = new_base;
-            self.ratio = new_base;
-            self.err_sum_window = 0.0;
-            self.window_ticks = 0;
-            self.integral_err = 0.0;
-            self.acq_windows = 0;
+            self.reset_clock_controller();
             self.configure_anti_aliasing(new_base);
             if new_base > 1.02 {
                 let fc = (0.90 / new_base).clamp(0.05, 0.96);
@@ -288,6 +284,18 @@ impl ClockDriftResampler {
     /// preserving the learned steady-state crystal offset (`integral_err`, `ratio`).
     #[inline]
     pub fn reset_clock_window(&mut self) {
+        self.err_sum_window = 0.0;
+        self.window_ticks = 0;
+    }
+
+    /// Reset the entire clock-drift controller (`ratio`, `integral_err`,
+    /// `acq_windows`, and the active error window) back to `base_ratio` while
+    /// preserving the configured sample-rate ratio and filter state.
+    #[inline]
+    pub fn reset_clock_controller(&mut self) {
+        self.ratio = self.base_ratio;
+        self.integral_err = 0.0;
+        self.acq_windows = 0;
         self.err_sum_window = 0.0;
         self.window_ticks = 0;
     }
@@ -892,12 +900,12 @@ impl TruePeakLimiter {
 }
 
 /// Transparent safety soft-clipper applied *after* fractional resampling so
-/// 4-point Hermite inter-sample overshoots (> 0.96) smoothly round off below
-/// 0.999 instead of hard-clipping in AAudio/CPAL. Bit-transparent <= 0.96.
+/// inter-sample overshoots (> 0.988) smoothly round off below 0.999 instead of
+/// hard-clipping in AAudio/CPAL. Bit-transparent <= 0.988.
 #[inline]
 pub fn soft_limit_post_resample(samples: &mut [f32]) {
-    const KNEE: f32 = 0.96;
-    const HEADROOM: f32 = 0.039; // asymptotic ceiling = 0.999
+    const KNEE: f32 = 0.988;
+    const HEADROOM: f32 = 0.011; // asymptotic ceiling = 0.999
     for s in samples.iter_mut() {
         if !s.is_finite() {
             *s = 0.0;
@@ -1234,12 +1242,40 @@ mod tests {
 
     #[test]
     fn test_soft_limit_post_resample_bounds_overshoot() {
-        let mut s = [1.23f32, -1.23, 0.5, -0.5, 0.96, -0.96];
+        let mut s = [1.23f32, -1.23, 0.5, -0.5, 0.985, -0.985, 0.988, -0.988];
         soft_limit_post_resample(&mut s);
         assert!(s.iter().all(|v| v.abs() < 0.999));
-        assert_eq!(s[4], 0.96); // bit-transparent at/below the knee
-        assert_eq!(s[5], -0.96);
-        assert!(s[0] > 0.96 && s[0] < 0.999);
+        assert_eq!(s[2], 0.5);
+        assert_eq!(s[3], -0.5);
+        assert_eq!(s[4], 0.985); // bit-transparent below the knee
+        assert_eq!(s[5], -0.985);
+        assert_eq!(s[6], 0.988); // bit-transparent at the knee
+        assert_eq!(s[7], -0.988);
+        assert!(s[0] > 0.988 && s[0] < 0.999);
+        assert!(s[1] < -0.988 && s[1] > -0.999);
+    }
+
+    #[test]
+    fn test_reset_clock_controller_restores_base_ratio_and_clears_state() {
+        let mut resampler = ClockDriftResampler::new();
+        resampler.set_output_sample_rate(44_100);
+        let expected_base = 48_000.0 / 44_100.0;
+        for _ in 0..450 {
+            resampler.update_clock_loop(12.0, 8.0);
+        }
+        assert_ne!(resampler.ratio, expected_base);
+        assert_ne!(resampler.integral_err, 0.0);
+        assert!(resampler.acq_windows > 0);
+        assert!(resampler.window_ticks > 0);
+        assert_ne!(resampler.err_sum_window, 0.0);
+
+        resampler.reset_clock_controller();
+        assert_eq!(resampler.base_ratio, expected_base);
+        assert_eq!(resampler.ratio, expected_base);
+        assert_eq!(resampler.integral_err, 0.0);
+        assert_eq!(resampler.acq_windows, 0);
+        assert_eq!(resampler.err_sum_window, 0.0);
+        assert_eq!(resampler.window_ticks, 0);
     }
 
     #[test]
