@@ -11,13 +11,19 @@ pub const STATUS_PRIMARY_LOSSLESS: u32 = 1;
 pub const STATUS_HEALED_BY_FEC: u32 = 2;
 const STATUS_BUSY: u32 = 3;
 
-const HISTORY_FRAMES: usize = 360; // 7.5ms pitch search window (down to 133Hz fundamental)
+const HISTORY_FRAMES: usize = 720; // 15.0ms pitch search window (down to 80Hz fundamental)
 const HISTORY_STEREO_SAMPLES: usize = HISTORY_FRAMES * 2;
 const CROSSFADE_FRAMES: usize = 32; // 0.66ms raised-cosine overlap-add crossfade
+/// Tick-1 WSOLA onset splice length (0.17 ms): continues seamlessly from the
+/// last played sample without smearing a 32-frame static-DC flatline.
+const PLC_ONSET_SPLICE_FRAMES: usize = 8;
 /// Linear correction applied when a lossy FEC reconstruction is followed by a
 /// bit-exact primary frame. 8 frames = 0.17 ms at 48 kHz: long enough to hide
 /// the accumulated ADPCM error, short enough to leave the transient intact.
 const FEC_DECLICK_FRAMES: usize = 8;
+/// Bounded spin-wait iterations when `pop_next` collides with an in-flight
+/// `push_primary` (`STATUS_BUSY`) write (~200 ns).
+const POP_BUSY_SPIN_LIMIT: usize = 64;
 
 #[repr(align(64))]
 pub struct SequencerSlot {
@@ -32,8 +38,11 @@ pub struct ZeroJitterSequencer {
     // align(64) slot pads to 1024 bytes) and was returned by value on the
     // stack, risking overflow on Android worker threads.
     slots: Box<[SequencerSlot]>,
-    /// Rolling 7.5ms stereo history for WSOLA pitch-period autocorrelation PLC
+    /// Rolling 15.0ms unattenuated stereo history for WSOLA pitch-period autocorrelation PLC
     history: [f32; HISTORY_STEREO_SAMPLES],
+    /// Exact last stereo sample rendered to `out`, used for boundary declicking
+    /// even while `history` holds unattenuated WSOLA waveforms.
+    last_played: [f32; 2],
     /// Continuation tail for smooth overlap-add when real packets resume after PLC
     plc_recovery_tail: [f32; CROSSFADE_FRAMES * 2],
     consecutive_plc_count: u32,
@@ -60,6 +69,7 @@ impl ZeroJitterSequencer {
         Self {
             slots: slots.into_boxed_slice(),
             history: [0.0; HISTORY_STEREO_SAMPLES],
+            last_played: [0.0; 2],
             plc_recovery_tail: [0.0; CROSSFADE_FRAMES * 2],
             consecutive_plc_count: 0,
             last_pop_was_fec: false,
@@ -80,6 +90,7 @@ impl ZeroJitterSequencer {
             slot.state.store(STATUS_EMPTY, Ordering::Release);
         }
         self.history.fill(0.0);
+        self.last_played = [0.0; 2];
         self.plc_recovery_tail.fill(0.0);
         self.consecutive_plc_count = 0;
         self.last_pop_was_fec = false;
@@ -112,8 +123,7 @@ impl ZeroJitterSequencer {
             self.pending_fade_in = false;
             self.pending_declick = false;
         } else if self.pending_declick {
-            let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
-            let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+            let [last_l, last_r] = self.last_played;
             // 48 frames = 1.0 ms C1-continuous convex raised-cosine crossfade:
             // hides both DC steps and lookahead/phase jumps across codec
             // transitions (e.g. Lossless 0 ms <-> Opus 2.5 ms) or post-stall
@@ -133,11 +143,9 @@ impl ZeroJitterSequencer {
     /// (decode-at-pop Opus / CELT PLC), keeping history and crossfades coherent.
     #[inline]
     pub fn finalize_external_frame(&mut self, out: &mut [f32; SUBFRAME_STEREO_SAMPLES], is_plc: bool) {
-        if is_plc {
-            // CELT PLC maintains its own MDCT overlap; discard any older WSOLA
-            // tail so the next real Opus frame does not splice against stale PCM.
-            self.consecutive_plc_count = 0;
-        } else if self.consecutive_plc_count > 0 {
+        if self.consecutive_plc_count > 0 {
+            // Smoothly splice both WSOLA -> real Opus and WSOLA -> CELT PLC
+            // using the active WSOLA continuation tail before clearing PLC state.
             for i in 0..CROSSFADE_FRAMES {
                 let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
                 let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
@@ -148,8 +156,13 @@ impl ZeroJitterSequencer {
             self.consecutive_plc_count = 0;
             self.pending_declick = false;
         }
+        let _ = is_plc;
         self.apply_boundary_ramps(out);
         self.last_pop_was_fec = false;
+        self.last_played = [
+            out[SUBFRAME_STEREO_SAMPLES - 2],
+            out[SUBFRAME_STEREO_SAMPLES - 1],
+        ];
         self.append_to_history(out);
     }
 
@@ -277,22 +290,12 @@ impl ZeroJitterSequencer {
         self.history[keep..].copy_from_slice(frame);
     }
 
-    /// Find best pitch period P in [48..=240] frames via energy-normalized
-    /// joint-stereo autocorrelation.
-    ///
-    /// Summing L+R before correlating cancels anti-phase content (`L ~= -R`)
-    /// to zero, so every candidate scored 0 and the search fell back to the
-    /// first lag (48 frames = 1 kHz), turning concealment into a buzz. The
-    /// joint inner product `Lt*Lc + Rt*Rc` keeps both channels at the cost of
-    /// two extra multiplies per tap, still negligible against the PLC budget.
+    /// Find best pitch period P in [48..=600] frames (80 Hz .. 1000 Hz) via
+    /// energy-normalized joint-stereo autocorrelation with ±1 lag refinement.
     #[inline]
     fn find_best_pitch_period(&self) -> usize {
         let template_start = HISTORY_FRAMES - CROSSFADE_FRAMES;
-        let mut best_lag = SUBFRAME_FRAMES;
-        let mut best_score = f32::MIN;
-
-        // Step by 2 frames for fast real-time search (< 1.5 us)
-        for lag in (48..=240).step_by(2) {
+        let eval_lag = |lag: usize| -> f32 {
             let cand_start = template_start - lag;
             let mut corr = 0.0f32;
             let mut energy = 1e-6f32;
@@ -305,7 +308,36 @@ impl ZeroJitterSequencer {
                 energy += c_l * c_l + c_r * c_r;
             }
             // Signed squared correlation normalized by candidate window energy (avoids sqrt!)
-            let score = (corr * corr.abs()) / energy;
+            (corr * corr.abs()) / energy
+        };
+
+        let mut coarse_lag = SUBFRAME_FRAMES;
+        let mut best_score = f32::MIN;
+        for lag in (48..=600).step_by(2) {
+            let score = eval_lag(lag);
+            // Require a 0.2% margin over the running peak so integer multiples
+            // (2x, 3x period) do not steal the lock from the true fundamental.
+            let threshold = if best_score == f32::MIN {
+                f32::MIN
+            } else {
+                best_score + best_score.abs() * 0.002
+            };
+            if score > threshold {
+                best_score = score;
+                coarse_lag = lag;
+            }
+        }
+
+        // Refine ±1 frame around coarse peak so odd pitch periods (e.g. 440 Hz = 109)
+        // lock cleanly without frame-to-frame phase drift.
+        let mut best_lag = coarse_lag;
+        let lo = coarse_lag.saturating_sub(1).max(48);
+        let hi = (coarse_lag + 1).min(600);
+        for lag in lo..=hi {
+            if lag == coarse_lag {
+                continue;
+            }
+            let score = eval_lag(lag);
             if score > best_score {
                 best_score = score;
                 best_lag = lag;
@@ -318,88 +350,82 @@ impl ZeroJitterSequencer {
     #[inline]
     pub fn pop_next(&mut self, expected_seq: u16, out: &mut [f32; SUBFRAME_STEREO_SAMPLES]) -> u32 {
         let slot = &self.slots[(expected_seq as usize) & RING_MASK];
-        let cur = slot.state.load(Ordering::Acquire);
-        let cur_seq = (cur >> 16) as u16;
-        let cur_status = cur & 0xFFFF;
-
-        if cur_seq == expected_seq
-            && (cur_status == STATUS_PRIMARY_LOSSLESS || cur_status == STATUS_HEALED_BY_FEC)
-        {
-            let busy_state = ((expected_seq as u32) << 16) | STATUS_BUSY;
-            if slot
-                .state
-                .compare_exchange(cur, busy_state, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                unsafe {
-                    *out = *slot.samples.get();
-                }
-                slot.state.store(
-                    ((expected_seq as u32) << 16) | STATUS_EMPTY,
-                    Ordering::Release,
-                );
-
-                // If recovering from a PLC event, crossfade the first 32 frames to prevent phase click!
-                if self.consecutive_plc_count > 0 {
-                    for i in 0..CROSSFADE_FRAMES {
-                        let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
-                        let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
-                        let w_plc = 1.0 - w_in;
-                        out[i * 2] = out[i * 2] * w_in + self.plc_recovery_tail[i * 2] * w_plc;
-                        out[i * 2 + 1] =
-                            out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
+        for _ in 0..POP_BUSY_SPIN_LIMIT {
+            let cur = slot.state.load(Ordering::Acquire);
+            let cur_seq = (cur >> 16) as u16;
+            let cur_status = cur & 0xFFFF;
+            if cur_seq != expected_seq || cur_status == STATUS_EMPTY {
+                break;
+            }
+            if cur_status == STATUS_BUSY {
+                std::hint::spin_loop();
+                continue;
+            }
+            if cur_status == STATUS_PRIMARY_LOSSLESS || cur_status == STATUS_HEALED_BY_FEC {
+                let busy_state = ((expected_seq as u32) << 16) | STATUS_BUSY;
+                if slot
+                    .state
+                    .compare_exchange_weak(cur, busy_state, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    unsafe {
+                        *out = *slot.samples.get();
                     }
-                    self.consecutive_plc_count = 0;
-                    // The PLC recovery crossfade already spliced frame 0.
-                    // Disarm pending_declick so apply_boundary_ramps() below
-                    // does not add the same step a second time.
-                    self.pending_declick = false;
-                } else if cur_status == STATUS_HEALED_BY_FEC || self.last_pop_was_fec {
-                    // A 124-byte IMA-ADPCM FEC frame stores Left sample 0 in
-                    // the same 16-bit word as the 7-bit step index, so it can
-                    // step by up to 127 LSB (~-48 dBFS) at every boundary:
-                    // primary -> FEC (entry), FEC -> FEC, and FEC -> primary
-                    // (exit). Splice all three from the exact previous output
-                    // sample for 0.17 ms. Convex blending cannot overshoot the
-                    // input peak, unlike the old additive delta ramp.
-                    let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
-                    let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
-                    for i in 0..FEC_DECLICK_FRAMES {
-                        let alpha = (i as f32) / ((FEC_DECLICK_FRAMES - 1) as f32);
-                        let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
-                        out[i * 2] = last_l * w + out[i * 2] * (1.0 - w);
-                        out[i * 2 + 1] = last_r * w + out[i * 2 + 1] * (1.0 - w);
-                    }
-                    // This branch already applied the declick splice; clear
-                    // the arm so apply_boundary_ramps() does not double it.
-                    self.pending_declick = false;
-                }
+                    slot.state.store(
+                        ((expected_seq as u32) << 16) | STATUS_EMPTY,
+                        Ordering::Release,
+                    );
 
-                self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;
-                self.apply_boundary_ramps(out);
-                self.append_to_history(out);
-                return cur_status;
+                    // If recovering from a PLC event, crossfade the first 32 frames to prevent phase click!
+                    if self.consecutive_plc_count > 0 {
+                        for i in 0..CROSSFADE_FRAMES {
+                            let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
+                            let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                            let w_plc = 1.0 - w_in;
+                            out[i * 2] = out[i * 2] * w_in + self.plc_recovery_tail[i * 2] * w_plc;
+                            out[i * 2 + 1] =
+                                out[i * 2 + 1] * w_in + self.plc_recovery_tail[i * 2 + 1] * w_plc;
+                        }
+                        self.consecutive_plc_count = 0;
+                        // The PLC recovery crossfade already spliced frame 0.
+                        // Disarm pending_declick so apply_boundary_ramps() below
+                        // does not add the same step a second time.
+                        self.pending_declick = false;
+                    } else if cur_status == STATUS_HEALED_BY_FEC || self.last_pop_was_fec {
+                        // Splice primary <-> FEC and FEC <-> FEC boundaries from the
+                        // exact previous output sample for 0.17 ms.
+                        let [last_l, last_r] = self.last_played;
+                        for i in 0..FEC_DECLICK_FRAMES {
+                            let alpha = (i as f32) / ((FEC_DECLICK_FRAMES - 1) as f32);
+                            let w = 0.5 * (1.0 + (alpha * std::f32::consts::PI).cos());
+                            out[i * 2] = last_l * w + out[i * 2] * (1.0 - w);
+                            out[i * 2 + 1] = last_r * w + out[i * 2 + 1] * (1.0 - w);
+                        }
+                        self.pending_declick = false;
+                    }
+
+                    self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;
+                    self.apply_boundary_ramps(out);
+                    self.last_played = [
+                        out[SUBFRAME_STEREO_SAMPLES - 2],
+                        out[SUBFRAME_STEREO_SAMPLES - 1],
+                    ];
+                    self.append_to_history(out);
+                    return cur_status;
+                }
+            } else {
+                break;
             }
         }
 
         // WSOLA Pitch-Period Waveform Extrapolation
-        //
-        // At PLC onset the first sample must continue from the last played
-        // sample, not jump to `history[HISTORY_FRAMES - pitch_lag] * 0.90`.
-        // A 10% step at the frame boundary is a broadband click. Crossfade
-        // the first CROSSFADE_FRAMES from the exact last output sample and
-        // ramp the attenuation from the previous frame's value to this
-        // frame's target instead of applying a constant per-frame step.
         self.consecutive_plc_count += 1;
-        // Quiet fade-outs / between-song silence (<-48 dBFS): pitch autocorrelation
-        // on near-zero noise locks onto arbitrary short lags (e.g. 48 frames = 1 kHz)
-        // and produces metallic buzzing. Ramp cleanly to digital silence instead.
+        // Quiet fade-outs / between-song silence (<-48 dBFS): ramp cleanly to digital silence.
         let recent_peak = self.history[(HISTORY_FRAMES - SUBFRAME_FRAMES) * 2..]
             .iter()
             .fold(0.0f32, |m, s| m.max(s.abs()));
         if recent_peak < 0.004 {
-            let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
-            let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+            let [last_l, last_r] = self.last_played;
             for i in 0..SUBFRAME_FRAMES {
                 let w = if i < CROSSFADE_FRAMES {
                     let alpha = (i as f32) / (CROSSFADE_FRAMES as f32);
@@ -412,13 +438,14 @@ impl ZeroJitterSequencer {
             }
             self.plc_recovery_tail.fill(0.0);
             self.last_pop_was_fec = false;
+            self.last_played = [
+                out[SUBFRAME_STEREO_SAMPLES - 2],
+                out[SUBFRAME_STEREO_SAMPLES - 1],
+            ];
             self.append_to_history(out);
             return STATUS_EMPTY;
         }
-        // `history` already holds the previously attenuated PLC frames, so a
-        // compounding 0.90^k collapses volume quadratically (0.90^(k(k+1)/2)).
-        // Apply a gentle single-step decay instead: frame 1 fades 1.0 -> 0.90,
-        // later frames hold a steady 0.92.
+
         let (start_attenuation, target_attenuation) = if self.consecutive_plc_count == 1 {
             (1.0f32, 0.90f32)
         } else if self.consecutive_plc_count <= 16 {
@@ -433,34 +460,44 @@ impl ZeroJitterSequencer {
             (0.0f32, 0.0f32)
         };
         let pitch_lag = self.find_best_pitch_period();
-        let last_l = self.history[(HISTORY_FRAMES - 1) * 2];
-        let last_r = self.history[(HISTORY_FRAMES - 1) * 2 + 1];
+        let [last_l, last_r] = self.last_played;
 
+        // Keep an unattenuated copy of the extrapolated waveform so `self.history`
+        // does not compound `0.85^k` volume collapse across consecutive PLC ticks.
+        let mut raw_plc = [0.0f32; SUBFRAME_STEREO_SAMPLES];
         let copy_start = HISTORY_FRAMES - pitch_lag;
         for i in 0..SUBFRAME_FRAMES {
             let frac = (i as f32) / ((SUBFRAME_FRAMES - 1) as f32);
             let attenuation = start_attenuation + (target_attenuation - start_attenuation) * frac;
             let src_frame = copy_start + (i % pitch_lag);
-            let mut l = self.history[src_frame * 2] * attenuation;
-            let mut r = self.history[src_frame * 2 + 1] * attenuation;
+            let raw_l = self.history[src_frame * 2];
+            let raw_r = self.history[src_frame * 2 + 1];
+            raw_plc[i * 2] = raw_l;
+            raw_plc[i * 2 + 1] = raw_r;
 
-            if i < CROSSFADE_FRAMES {
+            let mut l = raw_l * attenuation;
+            let mut r = raw_r * attenuation;
+
+            if self.consecutive_plc_count == 1 {
+                if i < PLC_ONSET_SPLICE_FRAMES {
+                    let alpha = (i as f32) / ((PLC_ONSET_SPLICE_FRAMES - 1) as f32);
+                    let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
+                    l = last_l * (1.0 - w_in) + l * w_in;
+                    r = last_r * (1.0 - w_in) + r * w_in;
+                }
+            } else if i < CROSSFADE_FRAMES {
                 let alpha = (i as f32) / ((CROSSFADE_FRAMES - 1) as f32);
                 let w_in = 0.5 * (1.0 - (alpha * std::f32::consts::PI).cos());
-                let (prev_l, prev_r) = if self.consecutive_plc_count == 1 {
-                    (last_l, last_r)
-                } else {
-                    (self.plc_recovery_tail[i * 2], self.plc_recovery_tail[i * 2 + 1])
-                };
-                l = prev_l * (1.0 - w_in) + l * w_in;
-                r = prev_r * (1.0 - w_in) + r * w_in;
+                l = self.plc_recovery_tail[i * 2] * (1.0 - w_in) + l * w_in;
+                r = self.plc_recovery_tail[i * 2 + 1] * (1.0 - w_in) + r * w_in;
             }
 
             out[i * 2] = l;
             out[i * 2 + 1] = r;
         }
 
-        // Prepare continuation tail for seamless crossfade when next good packet arrives
+        // Prepare continuation tail at the current output attenuation for the next
+        // PLC frame or real packet recovery.
         for i in 0..CROSSFADE_FRAMES {
             let src_frame = copy_start + ((SUBFRAME_FRAMES + i) % pitch_lag);
             self.plc_recovery_tail[i * 2] = self.history[src_frame * 2] * target_attenuation;
@@ -468,10 +505,12 @@ impl ZeroJitterSequencer {
                 self.history[src_frame * 2 + 1] * target_attenuation;
         }
 
-        // WSOLA concealment already has its own recovery crossfade above. Do
-        // not additionally apply the FEC splice ramp to the next frame.
         self.last_pop_was_fec = false;
-        self.append_to_history(out);
+        self.last_played = [
+            out[SUBFRAME_STEREO_SAMPLES - 2],
+            out[SUBFRAME_STEREO_SAMPLES - 1],
+        ];
+        self.append_to_history(&raw_plc);
         STATUS_EMPTY
     }
 
@@ -953,5 +992,68 @@ mod tests {
                 .all(|&s| s == 0.0),
             "quiet-tail PLC leaked non-zero audio after ramp"
         );
+    }
+
+    #[test]
+    fn test_wsola_plc_holds_steady_gain_at_480hz_and_tracks_100hz_bass() {
+        // 480 Hz (lag = 100 <= 120) previously compounded 0.85^k down to ~0.16.
+        let mut seq480 = ZeroJitterSequencer::new();
+        for s in 0..4u16 {
+            let mut f = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let n = s as usize * SUBFRAME_FRAMES + i;
+                let v = ((n as f32) * std::f32::consts::TAU * 480.0 / 48_000.0).sin() * 0.5;
+                f[i * 2] = v;
+                f[i * 2 + 1] = v;
+            }
+            assert!(seq480.push_primary(s, &f));
+            let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            assert_eq!(seq480.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+        }
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        for miss in 4..16u16 {
+            assert_eq!(seq480.pop_next(miss, &mut out), STATUS_EMPTY);
+        }
+        let peak_12 = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak_12 > 0.40, "480 Hz PLC collapsed to {peak_12}");
+
+        // 100 Hz (lag = 480) across 6 primed frames (720-frame history) must not click.
+        let mut seq100 = ZeroJitterSequencer::new();
+        let mut prev = 0.0f32;
+        for s in 0..6u16 {
+            let mut f = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+            for i in 0..SUBFRAME_FRAMES {
+                let n = s as usize * SUBFRAME_FRAMES + i;
+                let v = ((n as f32) * std::f32::consts::TAU * 100.0 / 48_000.0).sin() * 0.5;
+                f[i * 2] = v;
+                f[i * 2 + 1] = v;
+            }
+            assert!(seq100.push_primary(s, &f));
+            assert_eq!(seq100.pop_next(s, &mut out), STATUS_PRIMARY_LOSSLESS);
+            prev = out[SUBFRAME_STEREO_SAMPLES - 2];
+        }
+        assert_eq!(seq100.pop_next(6, &mut out), STATUS_EMPTY);
+        let mut max_step = 0.0f32;
+        for i in 0..SUBFRAME_FRAMES {
+            max_step = max_step.max((out[i * 2] - prev).abs());
+            prev = out[i * 2];
+        }
+        assert!(max_step < 0.08, "100 Hz PLC onset clicked with step {max_step}");
+    }
+
+    #[test]
+    fn test_finalize_external_wsola_to_celt_plc_crossfades_smoothly() {
+        let mut seq = ZeroJitterSequencer::new();
+        let loud = [0.6f32; SUBFRAME_STEREO_SAMPLES];
+        assert!(seq.push_primary(0, &loud));
+        let mut out = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        assert_eq!(seq.pop_next(0, &mut out), STATUS_PRIMARY_LOSSLESS);
+        assert_eq!(seq.pop_next(1, &mut out), STATUS_EMPTY);
+        assert_eq!(seq.consecutive_plc_count(), 1);
+        let mut celt_plc = [0.0f32; SUBFRAME_STEREO_SAMPLES];
+        seq.finalize_external_frame(&mut celt_plc, true);
+        assert_eq!(seq.consecutive_plc_count(), 0);
+        // Sample 0 must crossfade from active WSOLA tail rather than snapping to 0.0.
+        assert!(celt_plc[0] > 0.4, "WSOLA->CELT PLC snapped to {}", celt_plc[0]);
     }
 }

@@ -33,6 +33,27 @@ pub const MAX_OPUS_SUBFRAME_BYTES: usize = 241;
 /// Maximum Opus packet bytes after the tag.
 pub const MAX_OPUS_PACKET_BYTES: usize = MAX_OPUS_SUBFRAME_BYTES - 1;
 
+/// Maximum tagged Opus subframe size when bundling `subframe_count` subframes
+/// into a single UDP datagram alongside header, AEAD trailer, and up to two
+/// 255-byte RED blobs: `sf * (2 + tagged_len) + 2*255 + 16 + 20 <= 1380`.
+/// For `subframe_count <= 3`, returns [`MAX_OPUS_SUBFRAME_BYTES`] (241 B); for
+/// `subframe_count == 4`, caps at 206 B (205 B Opus + 1 B tag).
+#[inline]
+pub const fn max_opus_subframe_bytes_for_bundle(subframe_count: u8) -> usize {
+    if subframe_count <= 3 {
+        MAX_OPUS_SUBFRAME_BYTES
+    } else {
+        let overhead = crate::wire::HEADER_LEN + crate::wire::MAC_TAG_LEN + 2 * MAX_OPUS_RED_BYTES;
+        let per_entry = (crate::MAX_SAFE_UDP_PAYLOAD - overhead) / (subframe_count as usize);
+        let tagged = per_entry.saturating_sub(2);
+        if tagged < MAX_OPUS_SUBFRAME_BYTES {
+            tagged
+        } else {
+            MAX_OPUS_SUBFRAME_BYTES
+        }
+    }
+}
+
 /// Magic tag identifying an exact Opus REDundancy blob stored inside
 /// `WireHeader::fec_n1` / `fec_n2` when `CodecMode::OpusRld` is active.
 /// Layout: `[TAG_OPUS_RED, base_seq_lo, base_seq_hi, sf_count, (len: u8, bytes[..len]) * sf_count]`
@@ -155,10 +176,11 @@ impl OpusRedHistory {
     /// Rotates `prev1 -> prev2` and packs the newly sent packet into `prev1`.
     ///
     /// When a high-bitrate multi-subframe packet (e.g., 510 kbps 2-subframe
-    /// Opus = ~326 bytes) exceeds the 255-byte single-FEC-slot limit, splits
-    /// `[P-1]` evenly across BOTH independent 255-byte FEC slots (`fec_n1` and
-    /// `fec_n2`) so single-packet Wi-Fi drops still heal with exact Opus frames
-    /// instead of silently sending zero redundancy.
+    /// Opus = ~326 bytes) exceeds the 255-byte single-FEC-slot limit, drops
+    /// `[P-2]` cleanly and splits `[P-1]` across BOTH independent 255-byte FEC
+    /// slots (`fec_n1` and `fec_n2`) so single-packet Wi-Fi drops still heal
+    /// with exact Opus frames instead of silently sending zero redundancy or
+    /// mixing stale `[P-2]` state with partial `[P-1]`.
     #[inline]
     pub fn push_packet(&mut self, base_seq: u16, subframes: &[&[u8]]) {
         let mut packed = [0u8; MAX_OPUS_RED_BYTES];
@@ -168,7 +190,35 @@ impl OpusRedHistory {
             self.prev1[..packed_len].copy_from_slice(&packed[..packed_len]);
             self.prev1_len = packed_len;
         } else if subframes.len() >= 2 {
+            // Try balanced midpoint first, then any split point that packs the
+            // entire `[P-1]` packet across `prev1` + `prev2` without dropping
+            // any subframe.
             let mid = subframes.len() / 2;
+            let mut found_full_split = None;
+            let mut tmp1 = [0u8; MAX_OPUS_RED_BYTES];
+            let mut tmp2 = [0u8; MAX_OPUS_RED_BYTES];
+            for split in std::iter::once(mid).chain((1..subframes.len()).filter(|&s| s != mid)) {
+                if let (Some(l1), Some(l2)) = (
+                    pack_opus_red_blob(base_seq, &subframes[..split], &mut tmp1),
+                    pack_opus_red_blob(
+                        base_seq.wrapping_add(split as u16),
+                        &subframes[split..],
+                        &mut tmp2,
+                    ),
+                ) {
+                    found_full_split = Some((l1, l2));
+                    break;
+                }
+            }
+
+            if let Some((l1, l2)) = found_full_split {
+                self.prev1[..l1].copy_from_slice(&tmp1[..l1]);
+                self.prev2[..l2].copy_from_slice(&tmp2[..l2]);
+                self.prev1_len = l1;
+                self.prev2_len = l2;
+                return;
+            }
+
             let mut len1 =
                 pack_opus_red_blob(base_seq, &subframes[..mid], &mut self.prev1).unwrap_or(0);
             let mut len2 = pack_opus_red_blob(
@@ -177,16 +227,10 @@ impl OpusRedHistory {
                 &mut self.prev2,
             )
             .unwrap_or(0);
-            // Apply the trailing-subframe fallback to EACH half independently.
-            // An asymmetric 510 kbps VBR burst can overflow only one half
-            // (e.g. [80, 80, 200, 200]: first half 166 B fits, second half
-            // 406 B does not); the old `len1 == 0 && len2 == 0` guard left
-            // that half's FEC slot empty. Keep the trailing subframe of
-            // whichever half failed so both RED slots stay populated.
-            // `prev1` stays the first half and `prev2` the second half,
-            // preserving `fec_slices()` ordering.
+            // Apply the trailing-subframe fallback to EACH half independently
+            // while still discarding stale `[P-2]` cleanly.
             if len1 == 0 {
-                let idx = mid - 1; // trailing subframe of the first half
+                let idx = mid - 1;
                 len1 = pack_opus_red_blob(
                     base_seq.wrapping_add(idx as u16),
                     &subframes[idx..idx + 1],
@@ -195,7 +239,7 @@ impl OpusRedHistory {
                 .unwrap_or(0);
             }
             if len2 == 0 {
-                let idx = subframes.len() - 1; // trailing subframe of the second half
+                let idx = subframes.len() - 1;
                 len2 = pack_opus_red_blob(
                     base_seq.wrapping_add(idx as u16),
                     &subframes[idx..idx + 1],
@@ -206,9 +250,10 @@ impl OpusRedHistory {
             self.prev1_len = len1;
             self.prev2_len = len2;
         } else {
-            std::mem::swap(&mut self.prev1, &mut self.prev2);
-            self.prev2_len = self.prev1_len;
+            // Single oversized subframe (> 255 B): drop `[P-2]` cleanly rather
+            // than leaving a stale `[P-2]` ahead of an empty `[P-1]`.
             self.prev1_len = 0;
+            self.prev2_len = 0;
         }
     }
 }
@@ -309,7 +354,22 @@ impl OpusStreamEncoder {
         kbps: u16,
         out: &mut [u8],
     ) -> Option<usize> {
-        if out.len() < MAX_OPUS_SUBFRAME_BYTES {
+        self.encode_subframe_for_bundle(pcm_stereo, kbps, 1, out)
+    }
+
+    /// Encode one 2.5 ms subframe from `i16` samples, capping the encoded size
+    /// to [`max_opus_subframe_bytes_for_bundle`] so `subframe_count` bundled
+    /// frames plus RED/header/AEAD fit inside `MAX_SAFE_UDP_PAYLOAD`.
+    pub fn encode_subframe_for_bundle(
+        &mut self,
+        pcm_stereo: &[i16; SUBFRAME_STEREO_SAMPLES],
+        kbps: u16,
+        subframe_count: u8,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let max_tagged = max_opus_subframe_bytes_for_bundle(subframe_count);
+        let max_pkt = max_tagged.saturating_sub(1);
+        if max_pkt == 0 || out.len() < max_tagged {
             return None;
         }
         self.set_bitrate_kbps(kbps);
@@ -319,13 +379,9 @@ impl OpusStreamEncoder {
         // (the host passes a 481-byte primary-subframe buffer).
         let written = self
             .inner
-            .encode_i16(
-                pcm_stereo,
-                SUBFRAME_FRAMES,
-                &mut out[1..1 + MAX_OPUS_PACKET_BYTES],
-            )
+            .encode_i16(pcm_stereo, SUBFRAME_FRAMES, &mut out[1..1 + max_pkt])
             .ok()?;
-        if written == 0 || written > MAX_OPUS_PACKET_BYTES {
+        if written == 0 || written > max_pkt {
             return None;
         }
         Some(1 + written)
@@ -340,7 +396,21 @@ impl OpusStreamEncoder {
         kbps: u16,
         out: &mut [u8],
     ) -> Option<usize> {
-        if out.len() < MAX_OPUS_SUBFRAME_BYTES {
+        self.encode_subframe_f32_for_bundle(pcm_f32, kbps, 1, out)
+    }
+
+    /// Encode one 2.5 ms `f32` subframe with per-bundle MTU budget enforcement
+    /// (`sf >= 4` caps tagged subframe size to 206 B so `sf*(2+pkt)+fec <= 1380`).
+    pub fn encode_subframe_f32_for_bundle(
+        &mut self,
+        pcm_f32: &[f32; SUBFRAME_STEREO_SAMPLES],
+        kbps: u16,
+        subframe_count: u8,
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let max_tagged = max_opus_subframe_bytes_for_bundle(subframe_count);
+        let max_pkt = max_tagged.saturating_sub(1);
+        if max_pkt == 0 || out.len() < max_tagged {
             return None;
         }
         // RestrictedLowDelay bypasses `opus-rs`'s internal delay-history NaN
@@ -354,9 +424,9 @@ impl OpusStreamEncoder {
         out[0] = TAG_OPUS_RLD;
         let written = self
             .inner
-            .encode(&clean, SUBFRAME_FRAMES, &mut out[1..1 + MAX_OPUS_PACKET_BYTES])
+            .encode(&clean, SUBFRAME_FRAMES, &mut out[1..1 + max_pkt])
             .ok()?;
-        if written == 0 || written > MAX_OPUS_PACKET_BYTES {
+        if written == 0 || written > max_pkt {
             return None;
         }
         Some(1 + written)
@@ -1114,6 +1184,41 @@ mod tests {
         assert!(unpack_opus_red_blob(n1, |seq, p| seen.push((seq, p[0]))));
         assert!(unpack_opus_red_blob(n2, |seq, p| seen.push((seq, p[0]))));
         assert_eq!(seen, vec![(900, 0x11), (901, 0x22), (903, 0x44)]);
+    }
+
+    #[test]
+    fn test_opus_bundle_mtu_budget_and_clean_p2_drop() {
+        assert_eq!(max_opus_subframe_bytes_for_bundle(1), MAX_OPUS_SUBFRAME_BYTES);
+        assert_eq!(max_opus_subframe_bytes_for_bundle(3), MAX_OPUS_SUBFRAME_BYTES);
+        let sf4_cap = max_opus_subframe_bytes_for_bundle(4);
+        assert_eq!(sf4_cap, 206);
+        assert!(
+            4 * (2 + sf4_cap) + 2 * MAX_OPUS_RED_BYTES + crate::wire::HEADER_LEN + crate::wire::MAC_TAG_LEN
+                <= crate::MAX_SAFE_UDP_PAYLOAD
+        );
+
+        let mut enc = OpusStreamEncoder::new(510).unwrap();
+        let mut out = [0u8; MAX_OPUS_SUBFRAME_BYTES];
+        let pcm = tone_frame(0);
+        let len = enc.encode_subframe_for_bundle(&pcm, 510, 4, &mut out).unwrap();
+        assert!(len <= sf4_cap);
+
+        let mut hist = OpusRedHistory::new();
+        let a = [0x11u8; 130];
+        let b = [0x22u8; 130];
+        let c = [0x33u8; 40];
+        let d = [0x44u8; 40];
+        hist.push_packet(900, &[&a, &b, &c, &d]);
+        let (n1, n2) = hist.fec_slices();
+        let mut seen = Vec::new();
+        assert!(unpack_opus_red_blob(n1, |seq, p| seen.push((seq, p[0]))));
+        assert!(unpack_opus_red_blob(n2, |seq, p| seen.push((seq, p[0]))));
+        assert_eq!(seen, vec![(900, 0x11), (901, 0x22), (902, 0x33), (903, 0x44)]);
+
+        // Oversized single subframe must drop [P-2] cleanly (both slots empty).
+        let huge = [0xAAu8; 252];
+        hist.push_packet(904, &[&huge]);
+        assert_eq!(hist.fec_slices(), (&[][..], &[][..]));
     }
 }
 

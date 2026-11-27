@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Queue errors below this are sub-frame phase beat between packet arrival
@@ -31,49 +31,110 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-fn sinc_table() -> &'static [[f32; SINC_TAPS]; SINC_PHASES + 1] {
-    static TABLE: OnceLock<[[f32; SINC_TAPS]; SINC_PHASES + 1]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        const BETA: f64 = 7.5;
-        const FC: f64 = 0.96;
-        const HALF_WIDTH: f64 = (SINC_TAPS as f64) * 0.5;
-        let inv_i0_beta = 1.0 / bessel_i0(BETA);
-        let mut table = [[0.0f32; SINC_TAPS]; SINC_PHASES + 1];
+fn build_sinc_table(fc: f64) -> [[f32; SINC_TAPS]; SINC_PHASES + 1] {
+    const BETA: f64 = 7.5;
+    const HALF_WIDTH: f64 = (SINC_TAPS as f64) * 0.5;
+    let inv_i0_beta = 1.0 / bessel_i0(BETA);
+    let mut table = [[0.0f32; SINC_TAPS]; SINC_PHASES + 1];
 
-        // Generate all phases 0..=SINC_PHASES continuously from the same
-        // Kaiser-windowed sinc formula (FC = 0.96). Hardcoding unit impulses at
-        // phase 0/1 creates an 11.8x kernel discontinuity that causes severe
-        // mirror imaging on 96/192 kHz DACs and fractional clock-drift sweeps;
-        // exact 1:1 unity pass-through is handled explicitly when
-        // `ratio == 1.0 && phase == 0.0`.
-        for p in 0..=SINC_PHASES {
-            let frac = (p as f64) / (SINC_PHASES as f64);
-            let mut raw = [0.0f64; SINC_TAPS];
-            let mut sum = 0.0f64;
-            for k in 0..SINC_TAPS {
-                let x = (k as f64) - (SINC_CENTER as f64) - frac;
-                let norm_x = x / HALF_WIDTH;
-                let win = bessel_i0(BETA * (1.0 - norm_x * norm_x).max(0.0).sqrt()) * inv_i0_beta;
-                let sinc = if x.abs() < 1e-12 {
-                    1.0
-                } else {
-                    let arg = std::f64::consts::PI * FC * x;
-                    arg.sin() / arg
-                };
-                let coeff = sinc * win;
-                raw[k] = coeff;
-                sum += coeff;
-            }
-            let inv_sum = 1.0 / sum;
-            for k in 0..SINC_TAPS {
-                table[p][k] = (raw[k] * inv_sum) as f32;
-            }
+    // Generate all phases 0..=SINC_PHASES continuously from the same
+    // Kaiser-windowed sinc formula. Hardcoding unit impulses at phase 0/1
+    // creates an 11.8x kernel discontinuity that causes severe mirror imaging
+    // on 96/192 kHz DACs and fractional clock-drift sweeps; exact 1:1 unity
+    // pass-through is handled explicitly when `ratio == 1.0 && phase == 0.0`.
+    for p in 0..=SINC_PHASES {
+        let frac = (p as f64) / (SINC_PHASES as f64);
+        let mut raw = [0.0f64; SINC_TAPS];
+        let mut sum = 0.0f64;
+        for k in 0..SINC_TAPS {
+            let x = (k as f64) - (SINC_CENTER as f64) - frac;
+            let norm_x = x / HALF_WIDTH;
+            let win = bessel_i0(BETA * (1.0 - norm_x * norm_x).max(0.0).sqrt()) * inv_i0_beta;
+            let sinc = if x.abs() < 1e-12 {
+                1.0
+            } else {
+                let arg = std::f64::consts::PI * fc * x;
+                arg.sin() / arg
+            };
+            let coeff = sinc * win;
+            raw[k] = coeff;
+            sum += coeff;
         }
-        table
-    })
+        let inv_sum = 1.0 / sum;
+        for k in 0..SINC_TAPS {
+            table[p][k] = (raw[k] * inv_sum) as f32;
+        }
+    }
+    table
 }
 
-/// 1. Jitter-Immune Windowed-Min DLL + 16-Tap Kaiser Windowed-Sinc Polyphase Resampler
+fn sinc_table() -> &'static [[f32; SINC_TAPS]; SINC_PHASES + 1] {
+    static TABLE: OnceLock<[[f32; SINC_TAPS]; SINC_PHASES + 1]> = OnceLock::new();
+    TABLE.get_or_init(|| build_sinc_table(0.96))
+}
+
+#[derive(Clone, Copy)]
+struct AaBiquadStage {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1_l: f32,
+    z2_l: f32,
+    z1_r: f32,
+    z2_r: f32,
+}
+
+impl AaBiquadStage {
+    const fn identity() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1_l: 0.0,
+            z2_l: 0.0,
+            z1_r: 0.0,
+            z2_r: 0.0,
+        }
+    }
+
+    fn reset_state(&mut self) {
+        self.z1_l = 0.0;
+        self.z2_l = 0.0;
+        self.z1_r = 0.0;
+        self.z2_r = 0.0;
+    }
+
+    fn configure_lowpass(&mut self, norm_fc: f32, q: f32) {
+        let w0 = std::f32::consts::TAU * norm_fc;
+        let cos_w0 = w0.cos();
+        let alpha = w0.sin() / (2.0 * q);
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        self.b0 = ((1.0 - cos_w0) * 0.5) * inv_a0;
+        self.b1 = (1.0 - cos_w0) * inv_a0;
+        self.b2 = self.b0;
+        self.a1 = (-2.0 * cos_w0) * inv_a0;
+        self.a2 = (1.0 - alpha) * inv_a0;
+        self.reset_state();
+    }
+
+    #[inline(always)]
+    fn process_pair(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        let yl = self.b0 * in_l + self.z1_l;
+        self.z1_l = self.b1 * in_l - self.a1 * yl + self.z2_l;
+        self.z2_l = self.b2 * in_l - self.a2 * yl;
+
+        let yr = self.b0 * in_r + self.z1_r;
+        self.z1_r = self.b1 * in_r - self.a1 * yr + self.z2_r;
+        self.z2_r = self.b2 * in_r - self.a2 * yr;
+        (yl, yr)
+    }
+}
+
+/// 1. Jitter-Immune Windowed-Min DLL + 20-Tap Kaiser Windowed-Sinc Polyphase Resampler
 pub struct ClockDriftResampler {
     phase: f64,
     /// Conversion from the 48 kHz network stream to the output device.
@@ -85,25 +146,22 @@ pub struct ClockDriftResampler {
     pub ratio: f64,
     hist_l: [f32; SINC_TAPS],
     hist_r: [f32; SINC_TAPS],
+    /// Bandwidth-scaled Kaiser-sinc table used only when downsampling (`base_ratio > 1.02`).
+    custom_sinc: Option<Box<[[f32; SINC_TAPS]; SINC_PHASES + 1]>>,
     /// Running sum of (observed queue depth - clock setpoint) over the current
     /// 200-tick window. A windowed mean of the *error* cancels periodic HAL
     /// burst sawtooths while tracking both positive and negative drift.
     err_sum_window: f64,
     window_ticks: u32,
     integral_err: f64,
-    // 2nd-order Butterworth anti-aliasing LPF. Active only when the input rate
-    // exceeds the output rate by >2% (44.1 kHz A2DP, 96 kHz -> 48 kHz capture);
-    // completely bypassed (zero CPU cost) on native 48 kHz streams.
+    low_jitter_fast_acq: bool,
+    acq_windows: u32,
+    // 4th-order cascaded Butterworth anti-aliasing LPF (2 biquad stages, -24 dB/oct).
+    // Active only when the input rate exceeds the output rate by >2% (44.1 kHz A2DP,
+    // 96 kHz -> 48 kHz capture); completely bypassed (zero CPU cost) on native 48 kHz streams.
     aa_active: bool,
-    aa_b0: f32,
-    aa_b1: f32,
-    aa_b2: f32,
-    aa_a1: f32,
-    aa_a2: f32,
-    aa_z1_l: f32,
-    aa_z2_l: f32,
-    aa_z1_r: f32,
-    aa_z2_r: f32,
+    aa_stage1: AaBiquadStage,
+    aa_stage2: AaBiquadStage,
 }
 
 impl ClockDriftResampler {
@@ -114,24 +172,28 @@ impl ClockDriftResampler {
             ratio: 1.0,
             hist_l: [0.0; SINC_TAPS],
             hist_r: [0.0; SINC_TAPS],
+            custom_sinc: None,
             err_sum_window: 0.0,
             window_ticks: 0,
             integral_err: 0.0,
+            low_jitter_fast_acq: false,
+            acq_windows: 0,
             aa_active: false,
-            aa_b0: 1.0,
-            aa_b1: 0.0,
-            aa_b2: 0.0,
-            aa_a1: 0.0,
-            aa_a2: 0.0,
-            aa_z1_l: 0.0,
-            aa_z2_l: 0.0,
-            aa_z1_r: 0.0,
-            aa_z2_r: 0.0,
+            aa_stage1: AaBiquadStage::identity(),
+            aa_stage2: AaBiquadStage::identity(),
         }
     }
 
+    /// Enable gated fast initial clock-drift acquisition (~10 s) when the caller
+    /// observes a clean, low-jitter link (`jitter < 2 ms && empty_ticks == 0`).
+    #[inline]
+    pub fn set_low_jitter_fast_acq(&mut self, enabled: bool) {
+        self.low_jitter_fast_acq = enabled;
+    }
+
     /// Configure exact input -> output sample rates. Automatically enables the
-    /// Butterworth anti-aliasing filter only when downsampling (`ratio > 1.02`).
+    /// 4th-order Butterworth anti-aliasing filter + bandwidth-scaled Kaiser-sinc
+    /// kernel only when downsampling (`ratio > 1.02`).
     #[inline]
     pub fn set_sample_rates(&mut self, input_rate_hz: u32, output_rate_hz: u32) {
         let in_r = input_rate_hz.clamp(8_000, 384_000) as f64;
@@ -143,30 +205,31 @@ impl ClockDriftResampler {
             self.err_sum_window = 0.0;
             self.window_ticks = 0;
             self.integral_err = 0.0;
+            self.acq_windows = 0;
             self.configure_anti_aliasing(new_base);
+            if new_base > 1.02 {
+                let fc = (0.90 / new_base).clamp(0.05, 0.96);
+                self.custom_sinc = Some(Box::new(build_sinc_table(fc)));
+            } else {
+                self.custom_sinc = None;
+            }
         }
     }
 
     fn configure_anti_aliasing(&mut self, base_ratio: f64) {
-        self.aa_z1_l = 0.0;
-        self.aa_z2_l = 0.0;
-        self.aa_z1_r = 0.0;
-        self.aa_z2_r = 0.0;
+        self.aa_stage1.reset_state();
+        self.aa_stage2.reset_state();
         if base_ratio <= 1.02 {
             self.aa_active = false;
             return;
         }
-        // Cutoff at 0.45 * output_rate expressed in input-rate normalized cycles.
+        // 4th-order cascaded Butterworth (-24 dB/oct): Q1 = 1/(2*cos(pi/8)),
+        // Q2 = 1/(2*cos(3*pi/8)). Cutoff at 0.45 * output_rate in input cycles.
+        const Q1: f32 = 0.541_196_1;
+        const Q2: f32 = 1.306_563;
         let norm_fc = (0.45 / base_ratio).clamp(0.02, 0.46) as f32;
-        let w0 = std::f32::consts::TAU * norm_fc;
-        let cos_w0 = w0.cos();
-        let alpha = w0.sin() * std::f32::consts::FRAC_1_SQRT_2;
-        let inv_a0 = 1.0 / (1.0 + alpha);
-        self.aa_b0 = ((1.0 - cos_w0) * 0.5) * inv_a0;
-        self.aa_b1 = (1.0 - cos_w0) * inv_a0;
-        self.aa_b2 = self.aa_b0;
-        self.aa_a1 = (-2.0 * cos_w0) * inv_a0;
-        self.aa_a2 = (1.0 - alpha) * inv_a0;
+        self.aa_stage1.configure_lowpass(norm_fc, Q1);
+        self.aa_stage2.configure_lowpass(norm_fc, Q2);
         self.aa_active = true;
     }
 
@@ -178,16 +241,8 @@ impl ClockDriftResampler {
             return (safe_l, safe_r);
         }
         const ANTI_DENORMAL: f32 = 1.0e-25;
-        let xl = safe_l + ANTI_DENORMAL;
-        let yl = self.aa_b0 * xl + self.aa_z1_l;
-        self.aa_z1_l = self.aa_b1 * xl - self.aa_a1 * yl + self.aa_z2_l;
-        self.aa_z2_l = self.aa_b2 * xl - self.aa_a2 * yl;
-
-        let xr = safe_r + ANTI_DENORMAL;
-        let yr = self.aa_b0 * xr + self.aa_z1_r;
-        self.aa_z1_r = self.aa_b1 * xr - self.aa_a1 * yr + self.aa_z2_r;
-        self.aa_z2_r = self.aa_b2 * xr - self.aa_a2 * yr;
-        (yl, yr)
+        let (l1, r1) = self.aa_stage1.process_pair(safe_l + ANTI_DENORMAL, safe_r + ANTI_DENORMAL);
+        self.aa_stage2.process_pair(l1, r1)
     }
 
     /// Point the resampler at the sample rate AAudio actually opened.
@@ -250,21 +305,21 @@ impl ClockDriftResampler {
 
         if self.window_ticks >= 200 {
             let err = self.err_sum_window / (self.window_ticks as f64);
+            let fast_acq = self.low_jitter_fast_acq && self.acq_windows < 20;
 
             // Hold the learned crystal offset inside the deadband rather than
-            // decaying it (the old `*= 0.9` erased the offset every 500 ms).
-            // Anti-windup clamps per-window steps; +/-80.0 gives +/-400 ppm
-            // steady-state integral authority for real crystals.
+            // decaying it. Anti-windup clamps per-window steps; +/-120.0 gives
+            // +/-600 ppm steady-state integral authority for real crystals.
             if err.abs() > CLOCK_LOOP_INTEGRAL_DEADBAND_SUBFRAMES {
-                let step = err.clamp(-1.0, 1.0) * 0.6;
-                self.integral_err = (self.integral_err + step).clamp(-80.0, 80.0);
+                let ki_step = if fast_acq { 2.5 } else { 0.6 };
+                let step = err.clamp(-1.0, 1.0) * ki_step;
+                self.integral_err = (self.integral_err + step).clamp(-120.0, 120.0);
             }
 
-            // Symmetric +/- 400 ppm crystal-drift authority with smooth slewing.
-            // Removes the +2500 ppm spike jump that caused audible pitch warble
-            // after Wi-Fi bursts; large backlogs are trimmed with a declick splice.
+            // Symmetric +/- 600 ppm crystal-drift authority with well-damped P/I slewing.
             const KP: f64 = 0.00012;
-            const MAX_DRIFT_RATIO: f64 = 0.0004;
+            const MAX_DRIFT_RATIO: f64 = 0.0006;
+            const MAX_FAST_STEP_RATIO: f64 = 0.000025; // <= 25 ppm per 500 ms window
             let corr = (KP * err + 0.000005 * self.integral_err)
                 .clamp(-MAX_DRIFT_RATIO, MAX_DRIFT_RATIO);
             let target_ratio = self.base_ratio * (1.0 + corr);
@@ -274,7 +329,14 @@ impl ClockDriftResampler {
             } else {
                 self.base_ratio
             };
-            self.ratio = (0.75 * prev_ratio + 0.25 * target_ratio).max(1e-9);
+            let ema = if fast_acq { 0.40 } else { 0.25 };
+            let mut next_ratio = (1.0 - ema) * prev_ratio + ema * target_ratio;
+            if fast_acq {
+                let max_delta = self.base_ratio * MAX_FAST_STEP_RATIO;
+                next_ratio = next_ratio.clamp(prev_ratio - max_delta, prev_ratio + max_delta);
+            }
+            self.ratio = next_ratio.max(1e-9);
+            self.acq_windows = self.acq_windows.saturating_add(1);
             self.err_sum_window = 0.0;
             self.window_ticks = 0;
         }
@@ -300,6 +362,7 @@ impl ClockDriftResampler {
         phase: f64,
         hist_l: &[f32; SINC_TAPS],
         hist_r: &[f32; SINC_TAPS],
+        custom_sinc: Option<&[[f32; SINC_TAPS]; SINC_PHASES + 1]>,
     ) -> (f32, f32) {
         // Preserve bit-exact unity pass-through ONLY when truly locked at 1:1
         // with zero fractional phase; all other ratios (96/192 kHz DACs, 44.1
@@ -309,7 +372,10 @@ impl ClockDriftResampler {
             return (hist_l[SINC_CENTER], hist_r[SINC_CENTER]);
         }
         let frac = (phase as f32).clamp(0.0, 1.0);
-        let table = sinc_table();
+        let table = match custom_sinc {
+            Some(t) => t,
+            None => sinc_table(),
+        };
         let scaled = frac * (SINC_PHASES as f32);
         let idx = (scaled as usize).min(SINC_PHASES - 1);
         let alpha = scaled - (idx as f32);
@@ -374,8 +440,13 @@ impl ClockDriftResampler {
 
         while in_idx < in_frames && out_idx < max_out_frames {
             while self.phase < 1.0 && out_idx < max_out_frames {
-                let (l, r) =
-                    Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+                let (l, r) = Self::interpolate_sinc_stereo(
+                    self.ratio,
+                    self.phase,
+                    &self.hist_l,
+                    &self.hist_r,
+                    self.custom_sinc.as_deref(),
+                );
                 out_stereo[out_idx * 2] = l;
                 out_stereo[out_idx * 2 + 1] = r;
                 out_idx += 1;
@@ -404,8 +475,13 @@ impl ClockDriftResampler {
         let max_out_frames = out_stereo.len() / 2;
         let mut out_idx = self.process(in_stereo, out_stereo);
         while self.phase < 1.0 && out_idx < max_out_frames {
-            let (l, r) =
-                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+            let (l, r) = Self::interpolate_sinc_stereo(
+                self.ratio,
+                self.phase,
+                &self.hist_l,
+                &self.hist_r,
+                self.custom_sinc.as_deref(),
+            );
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             out_idx += 1;
@@ -500,8 +576,13 @@ impl ClockDriftResampler {
                 );
                 self.phase -= 1.0;
             }
-            let (l, r) =
-                Self::interpolate_sinc_stereo(self.ratio, self.phase, &self.hist_l, &self.hist_r);
+            let (l, r) = Self::interpolate_sinc_stereo(
+                self.ratio,
+                self.phase,
+                &self.hist_l,
+                &self.hist_r,
+                self.custom_sinc.as_deref(),
+            );
             out_stereo[out_idx * 2] = l;
             out_stereo[out_idx * 2 + 1] = r;
             self.phase += self.ratio;
@@ -533,6 +614,7 @@ struct CachePadded<T>(T);
 pub struct BurstDecouplerRing {
     write_idx: CachePadded<AtomicUsize>,
     read_idx: CachePadded<AtomicUsize>,
+    needs_recovery_fade: CachePadded<AtomicBool>,
     // Heap-boxed to avoid a 256 KB stack frame during `new()` on Android threads.
     buf: Box<[UnsafeCell<f32>]>,
 }
@@ -548,6 +630,7 @@ impl BurstDecouplerRing {
         Self {
             write_idx: CachePadded(AtomicUsize::new(0)),
             read_idx: CachePadded(AtomicUsize::new(0)),
+            needs_recovery_fade: CachePadded(AtomicBool::new(false)),
             buf,
         }
     }
@@ -580,6 +663,7 @@ impl BurstDecouplerRing {
     pub fn clear_when_quiescent(&self) {
         let w = self.write_idx.0.load(Ordering::Acquire);
         self.read_idx.0.store(w, Ordering::Release);
+        self.needs_recovery_fade.0.store(false, Ordering::Relaxed);
     }
 
     #[inline]
@@ -645,10 +729,23 @@ impl BurstDecouplerRing {
             if req_even < out.len() {
                 out[req_even] = 0.0;
             }
+            if self.needs_recovery_fade.0.swap(false, Ordering::Relaxed) {
+                let fade_frames = (req_even / 2).min(16);
+                if fade_frames > 1 {
+                    for frame in 0..fade_frames {
+                        let phase =
+                            core::f32::consts::PI * frame as f32 / (fade_frames - 1) as f32;
+                        let gain = 0.5 * (1.0 - phase.cos());
+                        out[frame * 2] *= gain;
+                        out[frame * 2 + 1] *= gain;
+                    }
+                }
+            }
             self.read_idx.0
                 .store(r.wrapping_add(req_even), Ordering::Release);
             true
         } else if req_even > 0 && (avail & !1) > 0 {
+            self.needs_recovery_fade.0.store(true, Ordering::Relaxed);
             // Partial underrun: copy what is left, cross-fading the final
             // frames to zero and zero-filling the remainder. Without the fade,
             // a callback only one frame short would leave the output near
@@ -686,6 +783,7 @@ impl BurstDecouplerRing {
             out[safe_avail..].fill(0.0);
             false
         } else {
+            self.needs_recovery_fade.0.store(true, Ordering::Relaxed);
             // Inject -90 dBFS TPDF comfort dither so Bluetooth earbuds never sleep during DTX silence
             inject_bluetooth_keepalive_dither(out, dither_rng);
             false
@@ -725,10 +823,10 @@ impl TruePeakLimiter {
 
     #[inline]
     pub fn process_in_place(&mut self, stereo_samples: &mut [f32]) {
-        const THRESHOLD: f32 = 0.85; // -1.4 dBFS soft-knee start
-        // -0.4 dBFS leaves headroom for 4-point Hermite inter-sample peaks
-        // when clock drift != 0 or 44.1 kHz Bluetooth resampling is active.
-        const CEILING: f32 = 0.955;
+        const THRESHOLD: f32 = 0.85; // -1.4 dBFS soft-knee start when boosting
+        const BOOST_CEILING: f32 = 0.955;
+        const UNITY_CEILING: f32 = 0.995;
+        const UNITY_THRESHOLD: f32 = 0.985;
         const ATTACK: f32 = 0.25;
         const RELEASE: f32 = 0.0005;
 
@@ -767,37 +865,28 @@ impl TruePeakLimiter {
                 }
             }
 
-            // At unity gain the limiter must be bit-transparent below the
-            // ceiling. The soft knee exists to absorb pre-amp boost, not to
-            // re-compress material that already fits; applying it at 0 dB
-            // audibly squashes peaks between -1.4 dBFS and -0.1 dBFS. Keep
-            // the envelope updated above so later gain changes start from the
-            // real signal level.
-            //
-            // p4-C1: the old condition bypassed the knee for peak <= CEILING
-            // (0.955) then jumped abruptly into the THRESHOLD (0.85) formula
-            // the instant a sample exceeded 0.955 -- a ~10% downward step on
-            // every kick/snare (audible crackle). Use a C1-continuous unity
-            // knee starting at UNITY_THRESHOLD = 0.92: <= 0.92 stays bit-exact,
-            // 0.92 -> 0.955 is monotonic with slope 1.0 at the knee start
-            // (zero step), and the ceiling is still honoured.
-            // Blend the knee smoothly over 1.0..=1.05 (+0.42 dB) so sweeping
-            // the preamp slider through 0 dB produces no gain step.
-            const UNITY_THRESHOLD: f32 = 0.92;
-            let boost_blend = ((self.current_gain_linear - 1.0) / 0.05).clamp(0.0, 1.0);
+            // At unity gain (<= 0 dB) remain bit-transparent up to 0.985 with a
+            // 0.995 ceiling; when boosting > 0 dB, blend smoothly down to the
+            // 0.85 soft knee / 0.955 ceiling.
+            let boost_blend = if self.current_gain_linear <= 1.0 + 1.0e-5 {
+                0.0
+            } else {
+                ((self.current_gain_linear - 1.0) / 0.05).clamp(0.0, 1.0)
+            };
             let knee_start = UNITY_THRESHOLD - (UNITY_THRESHOLD - THRESHOLD) * boost_blend;
+            let ceiling = UNITY_CEILING - (UNITY_CEILING - BOOST_CEILING) * boost_blend;
             let det = self.envelope.max(peak);
             if det > knee_start {
                 let over = det - knee_start;
-                let headroom = CEILING - knee_start;
+                let headroom = ceiling - knee_start;
                 let compressed = knee_start + headroom * (over / (over + headroom));
                 let scale = compressed / det;
                 l *= scale;
                 r *= scale;
             }
 
-            frame[0] = l.clamp(-CEILING, CEILING);
-            frame[1] = r.clamp(-CEILING, CEILING);
+            frame[0] = l.clamp(-ceiling, ceiling);
+            frame[1] = r.clamp(-ceiling, ceiling);
         }
     }
 }
@@ -1199,7 +1288,7 @@ mod tests {
 
         for &s in &signal {
             assert!(
-                s.abs() <= 0.989,
+                s.abs() <= 0.995,
                 "unity gain must still honour ceiling: {}",
                 s
             );
@@ -1207,7 +1296,7 @@ mod tests {
         // After the envelope tracks the full-scale input the soft knee must
         // pull it below the hard clamp, so this is not just clipping.
         assert!(
-            signal[signal.len() - 1].abs() < 0.96,
+            signal[signal.len() - 1].abs() < 0.995,
             "soft knee should engage for overs: {}",
             signal[signal.len() - 1]
         );
@@ -1307,14 +1396,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clock_controller_bounds_correction_to_400ppm() {
+    fn test_clock_controller_bounds_correction_to_600ppm() {
         let mut resampler = ClockDriftResampler::new();
         // Normal drift: err = 1.0 subframe
         for _ in 0..200 {
             resampler.update_clock_loop(3.0, 2.0);
         }
         let normal_corr = resampler.ratio - 1.0;
-        assert!(normal_corr > 0.0 && normal_corr <= 0.0004);
+        assert!(normal_corr > 0.0 && normal_corr <= 0.0006);
 
         let mut spike_resampler = ClockDriftResampler::new();
         for _ in 0..200 {
@@ -1322,8 +1411,8 @@ mod tests {
         }
         let spike_corr = spike_resampler.ratio - 1.0;
         assert!(
-            spike_corr > 0.0 && spike_corr <= 0.0004 + 1e-9,
-            "Spike correction must stay within +/-400 ppm to prevent pitch warble: {}",
+            spike_corr > 0.0 && spike_corr <= 0.0006 + 1e-9,
+            "Spike correction must stay within +/-600 ppm to prevent pitch warble: {}",
             spike_corr
         );
     }
@@ -2010,5 +2099,64 @@ mod tests {
         let mut out_stereo = [0.0f32; 2];
         downmix_to_stereo(&hot_stereo, 2, &mut out_stereo);
         assert_eq!(out_stereo, hot_stereo);
+    }
+
+    #[test]
+    fn test_downsampling_aa_rejects_aliasing_96k_and_44k1() {
+        for (in_r, out_r, freq, min_atten_db) in [
+            (96_000u32, 48_000u32, 36_000.0f64, 40.0f64),
+            (48_000u32, 44_100u32, 23_000.0f64, 45.0f64),
+        ] {
+            let mut r = ClockDriftResampler::new();
+            r.set_sample_rates(in_r, out_r);
+            let n_in = 8192usize;
+            let mut input = vec![0.0f32; n_in * 2];
+            for i in 0..n_in {
+                let v = (std::f64::consts::TAU * freq * (i as f64) / (in_r as f64)).sin() as f32 * 0.5;
+                input[i * 2] = v;
+                input[i * 2 + 1] = v;
+            }
+            let mut output = vec![0.0f32; n_in * 2];
+            let out_f = r.process(&input, &mut output);
+            let alias_rms = (output[1000..out_f * 2]
+                .iter()
+                .map(|&x| (x as f64).powi(2))
+                .sum::<f64>()
+                / ((out_f * 2 - 1000) as f64))
+                .sqrt();
+            let in_rms = 0.5 / std::f64::consts::SQRT_2;
+            let atten_db = -20.0 * (alias_rms / in_rms).log10();
+            assert!(
+                atten_db >= min_atten_db,
+                "{in_r}->{out_r} @ {freq} Hz alias rejection {atten_db:.1} dB < {min_atten_db} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn test_burst_decoupler_underrun_recovery_fades_in() {
+        let ring = BurstDecouplerRing::new();
+        let mut out = [0.0f32; 64];
+        let mut rng = 42u32;
+        assert!(!ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert_eq!(ring.push_samples(&[0.5f32; 64]), 64);
+        assert!(ring.pop_exact_or_dither(&mut out, &mut rng));
+        assert!(out[0].abs() < 1e-6, "recovery must fade in from 0.0, got {}", out[0]);
+        assert!((out[32] - 0.5).abs() < 1e-6, "fade-in must finish within 16 frames");
+    }
+
+    #[test]
+    fn test_clock_loop_fast_acq_respects_25ppm_step_cap() {
+        let mut res = ClockDriftResampler::new();
+        res.set_low_jitter_fast_acq(true);
+        let mut prev = res.ratio;
+        for _ in 0..10 {
+            for _ in 0..200 {
+                res.update_clock_loop(4.0, 2.0);
+            }
+            let delta_ppm = ((res.ratio - prev) / res.base_ratio).abs() * 1e6;
+            assert!(delta_ppm <= 25.0 + 1e-6, "window step exceeded 25 ppm: {delta_ppm}");
+            prev = res.ratio;
+        }
     }
 }
