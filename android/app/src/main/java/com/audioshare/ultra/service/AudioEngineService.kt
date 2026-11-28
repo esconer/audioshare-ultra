@@ -75,6 +75,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         const val ACTION_TOGGLE_PARTY_MUTE = "ACTION_TOGGLE_PARTY_MUTE"
         const val ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE = "ACTION_SET_PARTY_LOCAL_SPEAKER_MUTE"
         const val ACTION_DEEP_LINK_HOST = "ACTION_DEEP_LINK_HOST"
+        const val ACTION_REMOTE_PLAY_PAUSE = "ACTION_REMOTE_PLAY_PAUSE"
         const val EXTRA_PHONE_MIC_ERROR = "PHONE_MIC_ERROR"
 
         @Volatile
@@ -104,6 +105,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             private set
         private val _isMicMutedFlow = MutableStateFlow(false)
         val isMicMutedFlow: StateFlow<Boolean> = _isMicMutedFlow.asStateFlow()
+
+        @Volatile
+        var isRemotePlayingState: Boolean = true
+            private set
+        private val _isRemotePlayingFlow = MutableStateFlow(true)
+        val isRemotePlayingFlow: StateFlow<Boolean> = _isRemotePlayingFlow.asStateFlow()
 
         // Process-wide single-thread executor and generation counters matching
         // the process-wide Rust statics (`GLOBAL_ANDROID_CLIENT` /
@@ -240,6 +247,11 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
     private var currentIsUsb: Boolean = false
     private var noisyReceiverRegistered: Boolean = false
     private var remoteMediaPlaying: Boolean = true
+        set(value) {
+            field = value
+            isRemotePlayingState = value
+            _isRemotePlayingFlow.value = value
+        }
     // Raw low-latency output is the default. `true` opts into the shared
     // mixer so OEM post-processing (Dolby Atmos, Dirac, system EQ) applies.
     private var dolbyEffects: Boolean = false
@@ -379,6 +391,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             releaseClientPlaybackResources()
             isStreaming = false
             isLocallyMuted = false
+            remoteMediaPlaying = true
             sleepHandler.removeCallbacks(sleepTickRunnable)
             stopSilenceWatchdog()
             broadcastSleepTimer(0)
@@ -593,7 +606,12 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             startForegroundNotification(currentHostAddr, currentIsUsb)
             return START_STICKY
         }
-        if (intent?.action == "ACTION_REMOTE_PLAY_PAUSE") {
+        if (intent?.action == ACTION_REMOTE_PLAY_PAUSE) {
+            if (!isStreaming && !isPartyCasting && !micCaptureActive) {
+                ensureForegroundBeforeStop()
+                stopSelf()
+                return START_NOT_STICKY
+            }
             updateMediaSessionPlaybackState(!remoteMediaPlaying)
             nativeSendMediaCommand(10)
             startForegroundNotification(currentHostAddr, currentIsUsb)
@@ -1374,7 +1392,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val playPauseIntent = Intent(this, AudioEngineService::class.java).apply {
-            action = "ACTION_REMOTE_PLAY_PAUSE"
+            action = ACTION_REMOTE_PLAY_PAUSE
         }
         val playPausePending = PendingIntent.getService(
             this, 2, playPauseIntent,
@@ -1643,6 +1661,7 @@ class AudioEngineService : Service(), AudioManager.OnAudioFocusChangeListener {
         isPartyCastMuted = false
         isMicMuted = false
         isLocallyMuted = false
+        remoteMediaPlaying = true
         runCatching { nativeSetPartyCastMuted(false) }
         partyMediaHandler.removeCallbacks(partyMediaPollRunnable)
         applyLocalPartySpeakerMute(false)

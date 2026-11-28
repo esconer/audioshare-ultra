@@ -80,6 +80,7 @@ private fun HeroStageSection(
     gamingLock: Boolean,
     latencyDebug: Boolean,
     isLocallyMuted: Boolean,
+    isRemotePlaying: Boolean,
     onPrev: () -> Unit,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
@@ -197,7 +198,11 @@ private fun HeroStageSection(
                         Icon(Icons.Rounded.SkipPrevious, "Previous", Modifier.size(18.dp))
                     }
                     FilledTonalIconButton(onClick = onPlayPause, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Rounded.PlayArrow, "Play / Pause", Modifier.size(18.dp))
+                        Icon(
+                            if (isRemotePlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                            if (isRemotePlaying) "Pause" else "Play",
+                            Modifier.size(18.dp)
+                        )
                     }
                     FilledTonalIconButton(onClick = onNext, modifier = Modifier.size(36.dp)) {
                         Icon(Icons.Rounded.SkipNext, "Next", Modifier.size(18.dp))
@@ -578,6 +583,7 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
     val state by vm.uiState.collectAsState()
     val isLocallyMuted by AudioEngineService.isLocallyMutedFlow.collectAsState()
     val isMicMuted by AudioEngineService.isMicMutedFlow.collectAsState()
+    val isRemotePlaying by AudioEngineService.isRemotePlayingFlow.collectAsState()
 
     /**
      * Reads are served from the collected [state] so Compose observes every
@@ -788,6 +794,19 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 putExtra("DOLBY_ENABLED", enabled)
             }
             sendServiceAction(context, intent)
+        }
+    }
+
+    fun toggleRemotePlayPause() {
+        if (isConnected) {
+            sendServiceAction(
+                context,
+                Intent(context, AudioEngineService::class.java).apply {
+                    action = AudioEngineService.ACTION_REMOTE_PLAY_PAUSE
+                }
+            )
+        } else {
+            AudioEngineService.nativeSendMediaCommand(10)
         }
     }
 
@@ -1208,8 +1227,9 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                 gamingLock = gamingLock,
                 latencyDebug = latencyDebug,
                 isLocallyMuted = isLocallyMuted,
+                isRemotePlaying = isRemotePlaying,
                 onPrev = { AudioEngineService.nativeSendMediaCommand(12) },
-                onPlayPause = { AudioEngineService.nativeSendMediaCommand(10) },
+                onPlayPause = { toggleRemotePlayPause() },
                 onNext = { AudioEngineService.nativeSendMediaCommand(11) },
                 onToggleMute = {
                     sendServiceAction(context, Intent(context, AudioEngineService::class.java).apply {
@@ -2151,12 +2171,15 @@ fun MainScreen(vm: AudioShareViewModel = viewModel()) {
                         Icon(Icons.Rounded.SkipPrevious, contentDescription = "Previous")
                     }
                     FilledTonalButton(
-                        onClick = { AudioEngineService.nativeSendMediaCommand(10) },
+                        onClick = { toggleRemotePlayPause() },
                         modifier = Modifier.weight(1.4f)
                     ) {
-                        Icon(Icons.Rounded.PlayArrow, contentDescription = "Play / Pause")
+                        Icon(
+                            if (isRemotePlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                            contentDescription = if (isRemotePlaying) "Pause" else "Play"
+                        )
                         Spacer(Modifier.width(4.dp))
-                        Text("Play / Pause")
+                        Text(if (isRemotePlaying) "Pause" else "Play")
                     }
                     OutlinedButton(
                         onClick = { AudioEngineService.nativeSendMediaCommand(11) },
