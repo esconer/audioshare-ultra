@@ -81,6 +81,9 @@ const MAX_STABILITY_OPUS_FLOOR_KBPS: u16 = 96;
 /// [`SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE`] required before Smart Auto may
 /// escalate from 5 ms (2 sf) to 10 ms (4 sf) framing.
 const SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS: u8 = 2;
+/// Single-window severe FEC threshold (25%) that bypasses the 2-window scan
+/// delay and arms 10 ms (4 sf) stability framing on the very first report.
+const SMART_AUTO_SEVERE_ESCALATION_PERMILLE: u16 = 250;
 /// Minimum spacing between distinct ~500 ms feedback observations. 350 ms
 /// collapses multi-client bursts inside one window without dropping a single
 /// client's 500 ms heartbeat that arrives a few ms early due to Wi-Fi jitter.
@@ -263,9 +266,14 @@ impl HighLossWindowGate {
         }
         self.last_observed_at = Some(now);
         if raw_loss_permille > SMART_AUTO_HIGH_LOSS_THRESHOLD_PERMILLE {
+            let step = if raw_loss_permille >= SMART_AUTO_SEVERE_ESCALATION_PERMILLE {
+                SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS
+            } else {
+                1
+            };
             self.consecutive_windows = self
                 .consecutive_windows
-                .saturating_add(1)
+                .saturating_add(step)
                 .min(SMART_AUTO_HIGH_LOSS_ESCALATION_WINDOWS);
         } else {
             self.consecutive_windows = 0;
@@ -7138,44 +7146,50 @@ mod tests {
         let t = Instant::now();
         let mut gate = HighLossWindowGate::new();
 
-        // One lossy window (e.g. a single Wi-Fi scan) is not enough.
-        assert!(!gate.observe(350, 350, t));
+        // One moderate high-loss window (180‰: e.g. a single Wi-Fi scan) is not enough.
+        assert!(!gate.observe(180, 180, t));
         assert!(!gate.allows_four_subframes());
         // Additional clients inside the same ~500 ms window do not count.
-        assert!(!gate.observe(350, 350, t + Duration::from_millis(100)));
+        assert!(!gate.observe(180, 180, t + Duration::from_millis(100)));
         // A second consecutive high-loss window arms 4 sf.
-        assert!(gate.observe(350, 350, t + Duration::from_millis(500)));
+        assert!(gate.observe(180, 180, t + Duration::from_millis(500)));
         assert!(gate.allows_four_subframes());
         // A clean raw window resets the counter but the governor still holds
         // the estimate high, so framing must not flap back to 2 sf yet.
-        assert!(gate.observe(0, 350, t + Duration::from_millis(1_000)));
+        assert!(gate.observe(0, 180, t + Duration::from_millis(1_000)));
         assert!(gate.allows_four_subframes());
         // Only after the paced estimate itself falls below the high-loss tier
         // does the gate disarm.
         assert!(!gate.observe(0, 40, t + Duration::from_millis(1_500)));
         assert!(!gate.allows_four_subframes());
 
-        // Two high windows separated by a clean window never arm the gate.
+        // Severe loss (>= 250‰) arms immediately on the first report without
+        // waiting for a second 500 ms window.
+        let mut severe = HighLossWindowGate::new();
+        assert!(severe.observe(250, 250, t));
+        assert!(severe.allows_four_subframes());
+
+        // Two moderate high windows separated by a clean window never arm the gate.
         let mut flapping = HighLossWindowGate::new();
-        assert!(!flapping.observe(350, 350, t));
+        assert!(!flapping.observe(180, 180, t));
         assert!(!flapping.observe(0, 0, t + Duration::from_millis(500)));
-        assert!(!flapping.observe(350, 350, t + Duration::from_millis(1_000)));
+        assert!(!flapping.observe(180, 180, t + Duration::from_millis(1_000)));
         assert!(!flapping.allows_four_subframes());
 
         // Jittered 2nd report at +480 ms (just under 500 ms, >= 350 ms window)
         // must be accepted and arm 4 sf.
         let mut jittered = HighLossWindowGate::new();
-        assert!(!jittered.observe(350, 350, t));
-        assert!(jittered.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(!jittered.observe(180, 180, t));
+        assert!(jittered.observe(180, 180, t + Duration::from_millis(480)));
         assert!(jittered.allows_four_subframes());
 
-        // sync_governor(350) after a single spike must NOT arm 4 sf, while
+        // sync_governor(180) after a single spike must NOT arm 4 sf, while
         // sync_governor(40) disarms an armed gate.
         let mut synced = HighLossWindowGate::new();
-        assert!(!synced.observe(350, 350, t));
-        synced.sync_governor(350);
+        assert!(!synced.observe(180, 180, t));
+        synced.sync_governor(180);
         assert!(!synced.allows_four_subframes());
-        assert!(synced.observe(350, 350, t + Duration::from_millis(480)));
+        assert!(synced.observe(180, 180, t + Duration::from_millis(480)));
         assert!(synced.allows_four_subframes());
         synced.sync_governor(40);
         assert!(!synced.allows_four_subframes());

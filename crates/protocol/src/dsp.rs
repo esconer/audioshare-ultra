@@ -312,7 +312,10 @@ impl ClockDriftResampler {
         self.window_ticks += 1;
 
         if self.window_ticks >= 200 {
-            let err = self.err_sum_window / (self.window_ticks as f64);
+            let raw_err = self.err_sum_window / (self.window_ticks as f64);
+            // Bound single-window error as anti-windup against AP clump dumps /
+            // transient backlog spikes.
+            let err = raw_err.clamp(-6.0, 6.0);
             let fast_acq = self.low_jitter_fast_acq && self.acq_windows < 20;
 
             // Hold the learned crystal offset inside the deadband rather than
@@ -2194,5 +2197,23 @@ mod tests {
             assert!(delta_ppm <= 25.0 + 1e-6, "window step exceeded 25 ppm: {delta_ppm}");
             prev = res.ratio;
         }
+    }
+
+    #[test]
+    fn test_clock_loop_clamps_extreme_single_window_error() {
+        let mut clamped = ClockDriftResampler::new();
+        let mut extreme = ClockDriftResampler::new();
+        clamped.set_low_jitter_fast_acq(false);
+        extreme.set_low_jitter_fast_acq(false);
+        for _ in 0..200 {
+            clamped.update_clock_loop(16.0, 10.0); // +6.0 sf error
+            extreme.update_clock_loop(110.0, 10.0); // +100.0 sf clump error -> clamped to +6.0 sf
+        }
+        assert!(
+            (clamped.ratio - extreme.ratio).abs() < 1e-12,
+            "extreme error must clamp identically to +6.0 sf ({} vs {})",
+            clamped.ratio,
+            extreme.ratio
+        );
     }
 }

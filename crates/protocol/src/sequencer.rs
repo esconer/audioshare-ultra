@@ -46,6 +46,7 @@ pub struct ZeroJitterSequencer {
     /// Continuation tail for smooth overlap-add when real packets resume after PLC
     plc_recovery_tail: [f32; CROSSFADE_FRAMES * 2],
     consecutive_plc_count: u32,
+    consecutive_external_plc_count: u32,
     /// True when the most recently popped subframe was an IMA-ADPCM FEC
     /// reconstruction. The next bit-exact primary frame is joined to it with
     /// a short linear correction so the codec switch cannot click.
@@ -72,6 +73,7 @@ impl ZeroJitterSequencer {
             last_played: [0.0; 2],
             plc_recovery_tail: [0.0; CROSSFADE_FRAMES * 2],
             consecutive_plc_count: 0,
+            consecutive_external_plc_count: 0,
             last_pop_was_fec: false,
             pending_fade_in: true,
             pending_declick: false,
@@ -93,6 +95,7 @@ impl ZeroJitterSequencer {
         self.last_played = [0.0; 2];
         self.plc_recovery_tail.fill(0.0);
         self.consecutive_plc_count = 0;
+        self.consecutive_external_plc_count = 0;
         self.last_pop_was_fec = false;
         self.pending_fade_in = true;
         self.pending_declick = false;
@@ -156,7 +159,31 @@ impl ZeroJitterSequencer {
             self.consecutive_plc_count = 0;
             self.pending_declick = false;
         }
-        let _ = is_plc;
+        if is_plc {
+            // Mirror WSOLA's 40..60 ms fade-to-silence window on sustained
+            // external CELT PLC runs so extended outages decay cleanly instead
+            // of looping residual buzz, and declick the first recovery frame.
+            self.consecutive_external_plc_count =
+                self.consecutive_external_plc_count.saturating_add(1);
+            let cnt = self.consecutive_external_plc_count;
+            if cnt > 24 {
+                out.fill(0.0);
+            } else if cnt > 16 {
+                let prev_gain = 1.0 - ((cnt - 17) as f32) / 8.0;
+                let next_gain = 1.0 - ((cnt - 16) as f32) / 8.0;
+                let denom = (SUBFRAME_FRAMES - 1).max(1) as f32;
+                for i in 0..SUBFRAME_FRAMES {
+                    let g = prev_gain + (next_gain - prev_gain) * ((i as f32) / denom);
+                    out[i * 2] *= g;
+                    out[i * 2 + 1] *= g;
+                }
+            }
+        } else if self.consecutive_external_plc_count > 0 {
+            if self.consecutive_external_plc_count > 16 {
+                self.pending_declick = true;
+            }
+            self.consecutive_external_plc_count = 0;
+        }
         self.apply_boundary_ramps(out);
         self.last_pop_was_fec = false;
         self.last_played = [
@@ -405,6 +432,10 @@ impl ZeroJitterSequencer {
                     }
 
                     self.last_pop_was_fec = cur_status == STATUS_HEALED_BY_FEC;
+                    if self.consecutive_external_plc_count > 16 {
+                        self.pending_declick = true;
+                    }
+                    self.consecutive_external_plc_count = 0;
                     self.apply_boundary_ramps(out);
                     self.last_played = [
                         out[SUBFRAME_STEREO_SAMPLES - 2],
@@ -1055,5 +1086,27 @@ mod tests {
         assert_eq!(seq.consecutive_plc_count(), 0);
         // Sample 0 must crossfade from active WSOLA tail rather than snapping to 0.0.
         assert!(celt_plc[0] > 0.4, "WSOLA->CELT PLC snapped to {}", celt_plc[0]);
+    }
+
+    #[test]
+    fn test_finalize_external_celt_plc_fades_to_silence_and_declicks_recovery() {
+        let mut seq = ZeroJitterSequencer::new();
+        let mut prime = [0.5f32; SUBFRAME_STEREO_SAMPLES];
+        seq.finalize_external_frame(&mut prime, false);
+        for tick in 1..=26u32 {
+            let mut plc = [0.5f32; SUBFRAME_STEREO_SAMPLES];
+            seq.finalize_external_frame(&mut plc, true);
+            if tick <= 16 {
+                assert!((plc[0] - 0.5).abs() < 1e-6);
+            } else if tick <= 24 {
+                assert!(plc[SUBFRAME_STEREO_SAMPLES - 1] < plc[0]);
+            } else {
+                assert!(plc.iter().all(|&s| s == 0.0));
+            }
+        }
+        let mut rec = [0.8f32; SUBFRAME_STEREO_SAMPLES];
+        seq.finalize_external_frame(&mut rec, false);
+        assert!(rec[0].abs() < 0.05, "expected recovery declick splice from 0.0, got {}", rec[0]);
+        assert!((rec[SUBFRAME_STEREO_SAMPLES - 1] - 0.8).abs() < 1e-6);
     }
 }

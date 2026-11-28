@@ -341,9 +341,10 @@ fn clock_loop_observation(net_subframes: f32, fifo_subframes: f32) -> f32 {
 /// 200-tick (500 ms) `obs` mean (clamped below at `base_half`) so lockstep
 /// packet/HAL phase differences do not bias `0 ppm` streams away from unity
 /// and deep post-resync watermarks do not pull the anchor above actual fill.
-/// Afterward, tracks downward cushion decay (`raw_setpoint < prev_raw - 0.1`)
-/// and upward queue growth via a 200-tick (`500 ms`) windowed `obs` mean
-/// (`WinObs2_5`: `mean > anchor + 2.5` while `raw_setpoint > anchor + 1.0`).
+/// Afterward, tracks downward cushion decay (`raw_setpoint < prev_raw - 0.1`),
+/// upward queue growth (`mean > anchor + 2.5` up to `wm_sf + max_backlog`),
+/// transient inflated anchors above `raw_setpoint`, and under-anchored expanded
+/// scan-shield cushions (`raw_setpoint > base_setpoint + 16.0`).
 #[derive(Clone, Copy)]
 struct ClockAnchorSample {
     obs: f32,
@@ -382,9 +383,18 @@ impl ClockSetpointAnchor {
         resampler: &mut ClockDriftResampler,
     ) -> Option<f32> {
         let lower_bound = (sample.base_setpoint - 0.5 * sample.hal_burst_sf - 1.0).max(1.0);
-        let upper_bound = sample.wm_sf + (sample.pkt_subframes.max(1) as f32);
+        let max_over = max_backlog_over_target_subframes(sample.pkt_subframes)
+            .max(sample.hal_burst_sf + (sample.pkt_subframes.max(1) as f32) + 1.0);
+        let upper_bound = sample.wm_sf + max_over;
         if self.anchored.is_none() {
             resampler.reset_clock_window();
+            if let Some(prev_raw) = self.prev_raw {
+                if (sample.raw_setpoint - prev_raw).abs() > 1.5 {
+                    self.obs_sum = 0.0;
+                    self.obs_count = 0;
+                }
+            }
+            self.prev_raw = Some(sample.raw_setpoint);
             if self.warmup_skip < 24 {
                 self.warmup_skip += 1;
                 return None;
@@ -401,22 +411,38 @@ impl ClockSetpointAnchor {
         }
         let mut anchor = self.anchored?;
         let prev_raw = self.prev_raw.unwrap_or(sample.raw_setpoint);
+        let inflated_above_raw =
+            anchor > sample.raw_setpoint + (sample.pkt_subframes.max(1) as f32) + 1.0;
+        let below_raw =
+            sample.raw_setpoint > sample.base_setpoint + 16.0 && anchor + 0.5 < sample.raw_setpoint;
         if sample.raw_setpoint < prev_raw - 0.1 {
             let delta = prev_raw - sample.raw_setpoint;
             anchor = (anchor - delta).max(sample.raw_setpoint.min(sample.base_setpoint));
             self.win_obs_sum = 0.0;
             self.win_obs_count = 0;
-        } else if sample.raw_setpoint > anchor + 1.0 {
+        } else if upper_bound > anchor + 1.0 || inflated_above_raw || below_raw {
             self.win_obs_sum += sample.obs as f64;
             self.win_obs_count += 1;
             if self.win_obs_count >= 200 {
                 let mean = (self.win_obs_sum / 200.0) as f32;
                 self.win_obs_sum = 0.0;
                 self.win_obs_count = 0;
-                if mean > anchor + 2.5 {
-                    let target_up = sample.raw_setpoint.min(mean).clamp(lower_bound, upper_bound);
+                if below_raw && mean >= sample.raw_setpoint - 2.5 && mean > anchor + 0.8 {
+                    let target_up = mean.clamp(lower_bound, upper_bound);
                     if target_up > anchor {
                         anchor = target_up;
+                        resampler.reset_clock_window();
+                    }
+                } else if mean > anchor + 2.5 && upper_bound > anchor + 1.0 {
+                    let target_up = mean.clamp(lower_bound, upper_bound);
+                    if target_up > anchor {
+                        anchor = target_up;
+                        resampler.reset_clock_window();
+                    }
+                } else if inflated_above_raw && mean < anchor - 0.6 {
+                    let target_down = mean.max(sample.raw_setpoint).clamp(lower_bound, upper_bound);
+                    if target_down < anchor {
+                        anchor = target_down;
                         resampler.reset_clock_window();
                     }
                 }
@@ -723,8 +749,10 @@ impl LossWindow {
 const STREAM_RESYNC_AHEAD_SUBFRAMES: i16 = 180;
 
 /// Radio-freeze threshold (50 ms) that arms the temporary scan-burst shield
-/// on Bluetooth and 10 ms 2.4 GHz streams.
+/// on Bluetooth and 10 ms 2.4 GHz streams, plus high-threshold (120 ms) shield
+/// for 2-sf non-BT Wi-Fi so prolonged scan blackouts stop resync cycling.
 const SCAN_SHIELD_TRIGGER_EMPTY_TICKS: u16 = 20;
+const SCAN_SHIELD_2SF_TRIGGER_EMPTY_TICKS: u16 = 48;
 const SCAN_SHIELD_MAX_SUBFRAMES: f32 = 110.0; // 275 ms
 const SCAN_SHIELD_HOLD: Duration = Duration::from_secs(25);
 
@@ -737,9 +765,12 @@ fn update_scan_shield(
     shield_until: &mut Option<Instant>,
     shield_subframes: &mut f32,
 ) -> bool {
-    if (bt_active || pkt_subframes >= 4)
-        && consecutive_empty_ticks >= SCAN_SHIELD_TRIGGER_EMPTY_TICKS
-    {
+    let trigger = if bt_active || pkt_subframes >= 4 {
+        consecutive_empty_ticks >= SCAN_SHIELD_TRIGGER_EMPTY_TICKS
+    } else {
+        consecutive_empty_ticks >= SCAN_SHIELD_2SF_TRIGGER_EMPTY_TICKS
+    };
+    if trigger {
         *shield_until = Some(now + SCAN_SHIELD_HOLD);
         let needed = (consecutive_empty_ticks as f32 + 12.0).min(SCAN_SHIELD_MAX_SUBFRAMES);
         *shield_subframes = shield_subframes.max(needed);
@@ -784,7 +815,7 @@ fn effective_wifi_ceiling(
         28.0 // 70 ms: non-BT 2-subframe Wi-Fi (down from 40 sf / 100 ms)
     };
     if let Some(until) = *shield_until {
-        if now < until && (bt_active || pkt_subframes >= 4) {
+        if now < until {
             return base_cap.max(*shield_subframes);
         }
         *shield_until = None;
@@ -2325,6 +2356,7 @@ impl ClientEngine {
 
         let mut last_feedback = Instant::now();
         let mut last_packet_instant = Instant::now();
+        let mut last_audio_rx_instant: Option<Instant> = None;
         #[cfg(target_os = "android")]
         let mut last_hw_latency_poll = Instant::now();
         #[cfg(target_os = "android")]
@@ -2880,6 +2912,12 @@ impl ClientEngine {
             // against the sender's 5 ms timestamp gap and invent ~5 ms of
             // "jitter" on a perfectly paced link.
             let mut audio_packets_drained = 0u8;
+            let pre_batch_empty_ticks = consecutive_empty_ticks;
+            let pre_batch_latest_rx_seq = latest_rx_seq;
+            let mut batch_packets = 0usize;
+            let mut batch_was_dtx = false;
+            let mut batch_min_seq: u16 = 0;
+            let mut batch_max_end_seq: u16 = 0;
 
             while let Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) {
                 // Accept audio only from the effective server. In ADB USB mode
@@ -2933,6 +2971,9 @@ impl ClientEngine {
                         // behind the 16-bit wrap point.
                         if parsed.header.mode == CodecMode::SilenceHeartbeat {
                             telemetry.server_dtx_silent.store(true, Ordering::Relaxed);
+                            last_audio_rx_instant = None;
+                            batch_was_dtx = true;
+                            batch_packets = 0;
                             telemetry.buffered_audio_us.store(0, Ordering::Relaxed);
                             telemetry.client_vu_peak_pct.store(0, Ordering::Relaxed);
                             // DTX means the burst is over: drop any expanded
@@ -2966,6 +3007,8 @@ impl ClientEngine {
                             }
                             continue;
                         }
+
+                        last_audio_rx_instant = Some(last_packet_instant);
 
                         // Log codec mode transitions when the first packet of a
                         // new mode arrives. The actual declick splice is armed
@@ -3007,6 +3050,9 @@ impl ClientEngine {
                             consecutive_empty_ticks,
                         );
                         let was_dtx = telemetry.server_dtx_silent.swap(false, Ordering::Relaxed);
+                        if was_dtx {
+                            batch_was_dtx = true;
+                        }
                         let backwards_out_of_window = !was_dtx && seq_delta < resync_behind;
                         let mut trigger_backwards_resync = false;
                         if backwards_out_of_window {
@@ -3041,83 +3087,6 @@ impl ClientEngine {
                         } else {
                             backwards_resync_candidate = None;
                         }
-                        // Recovering from a >=40 ms live-edge blackout where
-                        // `seq_delta` exceeds the current target FIFO cushion
-                        // (`next_play_seq..base_seq`): advance `next_play_seq`
-                        // cleanly to `base_seq` with `arm_declick()` without
-                        // wiping `sequencer`/`opus_decoder`, and arm
-                        // `scan_shield` from the observed stall span. Suppressed
-                        // while `scan_shield` is already active so deep-shield
-                        // jitter recovers smoothly instead of snapping the playhead.
-                        if !was_dtx && consecutive_empty_ticks >= 16 {
-                            let now_jump = Instant::now();
-                            let scan_shield_active =
-                                scan_shield_until.is_some_and(|until| now_jump < until);
-                            let current_target_fifo_subframes = fifo_target_subframes(
-                                adaptive_wifi_subframes.max(
-                                    last_hal_burst_sf
-                                        + hal_burst_margin_for_link(last_hal_burst_sf, usb_link),
-                                ),
-                            ) as i16;
-                            if should_jump_live_edge_blackout(
-                                consecutive_empty_ticks,
-                                latest_rx_seq.wrapping_sub(next_play_seq) as i16,
-                                seq_delta,
-                                current_target_fifo_subframes,
-                                resync_ahead,
-                                scan_shield_active,
-                            ) {
-                                if !usb_link {
-                                    let bt_now =
-                                        telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed)
-                                            > 0;
-                                    let stall_span = consecutive_empty_ticks.max(seq_delta as u16);
-                                    let shield_armed = update_scan_shield(
-                                        bt_now,
-                                        last_pkt_subframe_count,
-                                        stall_span,
-                                        now_jump,
-                                        &mut scan_shield_until,
-                                        &mut scan_shield_subframes,
-                                    );
-                                    if shield_armed {
-                                        let ceil = effective_link_ceiling(
-                                            usb_link,
-                                            bt_now,
-                                            last_pkt_subframe_count,
-                                            now_jump,
-                                            &mut scan_shield_until,
-                                            &mut scan_shield_subframes,
-                                            last_hal_burst_sf,
-                                            hal_burst_margin_for_link(last_hal_burst_sf, usb_link),
-                                        );
-                                        adaptive_wifi_subframes = adaptive_wifi_subframes
-                                            .max(scan_shield_subframes)
-                                            .min(ceil);
-                                    }
-                                }
-                                let mut s = next_play_seq;
-                                while s != base_seq {
-                                    sequencer.clear_slot(s);
-                                    let idx = (s as usize) & (RING_SLOTS - 1);
-                                    if opus_ring[idx].seq == Some(s) {
-                                        opus_ring[idx].seq = None;
-                                        opus_ring[idx].from_red = false;
-                                    }
-                                    if matches!(slot_codec_mode[idx], Some((seq_tag, _)) if seq_tag == s)
-                                    {
-                                        slot_codec_mode[idx] = None;
-                                    }
-                                    s = s.wrapping_add(1);
-                                }
-                                next_play_seq = base_seq;
-                                latest_rx_seq = base_seq;
-                                sequencer.arm_declick();
-                                consecutive_empty_ticks = 0;
-                                last_plc_emit = None;
-                                resampler.reset_clock_window();
-                            }
-                        }
                         if was_dtx || seq_delta > resync_ahead || trigger_backwards_resync {
                             if !was_dtx {
                                 // A DTX wake-up legitimately re-anchors the
@@ -3132,6 +3101,7 @@ impl ClientEngine {
                                     ),
                                 );
                             }
+                            batch_packets = 0;
                             sequencer.reset();
                             next_play_seq = base_seq;
                             latest_rx_seq = base_seq;
@@ -3142,6 +3112,7 @@ impl ClientEngine {
                             backwards_resync_candidate = None;
                             consecutive_fec_heals = 0;
                             prev_rx_us = None;
+                            last_audio_rx_instant = None;
                             opus_decoder = None;
                             last_played_codec_mode = None;
                             resampler.reset_clock_controller();
@@ -3161,6 +3132,20 @@ impl ClientEngine {
                         let pkt_end_seq = base_seq
                             .wrapping_add((parsed.header.subframe_count as u16).saturating_sub(1));
                         let pkt_is_late = (pkt_end_seq.wrapping_sub(next_play_seq) as i16) < 0;
+                        if !pkt_is_late {
+                            if batch_packets == 0 {
+                                batch_min_seq = base_seq;
+                                batch_max_end_seq = pkt_end_seq;
+                            } else {
+                                if (base_seq.wrapping_sub(batch_min_seq) as i16) < 0 {
+                                    batch_min_seq = base_seq;
+                                }
+                                if (pkt_end_seq.wrapping_sub(batch_max_end_seq) as i16) > 0 {
+                                    batch_max_end_seq = pkt_end_seq;
+                                }
+                            }
+                            batch_packets += 1;
+                        }
                         let pkt_is_duplicate = !pkt_is_late && {
                             let base_idx = (base_seq as usize) & (RING_SLOTS - 1);
                             sequencer.has_primary(base_seq)
@@ -3236,7 +3221,13 @@ impl ClientEngine {
                             } else {
                                 initial_wifi_floor
                             };
-                            if !usb_link && raw_spike_us >= 50_000.0 {
+                            let spike_triggers_shield = !usb_link
+                                && if bt_now || last_pkt_subframe_count >= 4 {
+                                    raw_spike_us >= 50_000.0
+                                } else {
+                                    raw_spike_us >= 140_000.0
+                                };
+                            if spike_triggers_shield {
                                 let shield_armed = update_scan_shield(
                                     bt_now,
                                     last_pkt_subframe_count,
@@ -3497,6 +3488,101 @@ impl ClientEngine {
                     break;
                 }
             }
+            // Recover from a >= 40 ms live-edge blackout AFTER draining the
+            // entire UDP batch so we jump cleanly to the newest buffered window
+            // (preserving `effective_target` frames of arriving clumps instead
+            // of stalling behind packet #1 of a burst).
+            if batch_packets > 0 && !batch_was_dtx && pre_batch_empty_ticks >= 16 {
+                let now_jump = Instant::now();
+                let scan_shield_active =
+                    scan_shield_until.is_some_and(|until| now_jump < until);
+                let hal_margin_jump = hal_burst_margin_for_link(last_hal_burst_sf, usb_link);
+                let current_target_fifo_subframes = fifo_target_subframes(
+                    adaptive_wifi_subframes.max(last_hal_burst_sf + hal_margin_jump),
+                ) as i16;
+                let fifo_now_subframes =
+                    resampler.samples_to_subframes(burst_fifo.available_samples()) as i16;
+                let resync_ahead = resync_ahead_subframes(fifo_now_subframes);
+                let seq_delta_min = batch_min_seq.wrapping_sub(next_play_seq) as i16;
+                let seq_delta_max = batch_max_end_seq.wrapping_sub(next_play_seq) as i16;
+                if should_jump_live_edge_blackout(
+                    pre_batch_empty_ticks,
+                    pre_batch_latest_rx_seq.wrapping_sub(next_play_seq) as i16,
+                    seq_delta_min.max(seq_delta_max),
+                    current_target_fifo_subframes,
+                    resync_ahead,
+                    scan_shield_active,
+                ) {
+                    if !usb_link {
+                        let bt_now =
+                            telemetry.downstream_bt_delay_ms.load(Ordering::Relaxed) > 0;
+                        let stall_span = pre_batch_empty_ticks.max(seq_delta_max.max(0) as u16);
+                        let shield_armed = update_scan_shield(
+                            bt_now,
+                            last_pkt_subframe_count,
+                            stall_span,
+                            now_jump,
+                            &mut scan_shield_until,
+                            &mut scan_shield_subframes,
+                        );
+                        if shield_armed {
+                            let ceil = effective_link_ceiling(
+                                usb_link,
+                                bt_now,
+                                last_pkt_subframe_count,
+                                now_jump,
+                                &mut scan_shield_until,
+                                &mut scan_shield_subframes,
+                                last_hal_burst_sf,
+                                hal_margin_jump,
+                            );
+                            adaptive_wifi_subframes = adaptive_wifi_subframes
+                                .max(scan_shield_subframes)
+                                .min(ceil);
+                        }
+                    }
+                    let effective_target = fifo_target_subframes(
+                        adaptive_wifi_subframes.max(last_hal_burst_sf + hal_margin_jump),
+                    ) as u16;
+                    let window_start = batch_max_end_seq.wrapping_sub(effective_target);
+                    let mut target = if (window_start.wrapping_sub(batch_min_seq) as i16) > 0 {
+                        window_start
+                    } else {
+                        batch_min_seq
+                    };
+                    let mut probe = target;
+                    loop {
+                        let idx = (probe as usize) & (RING_SLOTS - 1);
+                        let has_slot =
+                            !sequencer.is_slot_missing(probe) || opus_ring[idx].seq == Some(probe);
+                        if has_slot || probe == batch_max_end_seq {
+                            target = probe;
+                            break;
+                        }
+                        probe = probe.wrapping_add(1);
+                    }
+                    if (target.wrapping_sub(next_play_seq) as i16) > 0 {
+                        let mut s = next_play_seq;
+                        while s != target {
+                            sequencer.clear_slot(s);
+                            let idx = (s as usize) & (RING_SLOTS - 1);
+                            if opus_ring[idx].seq == Some(s) {
+                                opus_ring[idx].seq = None;
+                                opus_ring[idx].from_red = false;
+                            }
+                            if matches!(slot_codec_mode[idx], Some((seq_tag, _)) if seq_tag == s) {
+                                slot_codec_mode[idx] = None;
+                            }
+                            s = s.wrapping_add(1);
+                        }
+                        next_play_seq = target;
+                        sequencer.arm_declick();
+                        consecutive_empty_ticks = 0;
+                        last_plc_emit = None;
+                        resampler.reset_clock_window();
+                    }
+                }
+            }
             // The HAL burst must be known before the base target and the
             // prebuffer gate are decided: a Dolby/BT burst is many subframes
             // long, so draining it drops the decoupler far below the normal
@@ -3597,9 +3683,9 @@ impl ClientEngine {
             let target_fifo_subframes = fifo_target_subframes(target_buf);
             if target_fifo_subframes + 2 <= prev_clock_target_subframes {
                 // Group Sync exit or cushion shrink: reset the in-flight clock
-                // error window so the draining cushion cannot wind up the PI loop.
+                // error window while preserving `clock_anchor` so smooth
+                // exponential decay never loses its setpoint mid-step.
                 resampler.reset_clock_window();
-                clock_anchor.reset();
             }
             prev_clock_target_subframes = target_fifo_subframes;
 
@@ -4051,6 +4137,7 @@ impl ClientEngine {
                             // until the 16-bit sequence wraps (~82 s silence).
                             opus_decoder = None;
                             prev_rx_us = None;
+                            last_audio_rx_instant = None;
                             last_played_codec_mode = None;
                             resampler.reset_clock_controller();
                             clock_anchor.reset();
@@ -4221,11 +4308,16 @@ impl ClientEngine {
                         last_clock_sample = Instant::now();
                     }
                     let wm_subframes = resampler.samples_to_subframes(fifo_watermark);
-                    // Pause clock updates while a shrunken Group Sync cushion
-                    // is still draining down to the new watermark.
-                    if fifo_subframes > wm_subframes + 2.0 {
+                    let pkt_interval_ms = (last_pkt_subframe_count.max(1) as f32) * 2.5;
+                    let stall_thresh =
+                        Duration::from_secs_f32((pkt_interval_ms + 20.0).max(20.0) / 1000.0);
+                    let radio_stalled = !usb_link
+                        && last_audio_rx_instant.is_some_and(|rx_at| rx_at.elapsed() >= stall_thresh);
+                    // Pause clock updates while a shrunken cushion drains to the
+                    // new watermark OR while Wi-Fi packet arrival is stalled so
+                    // emptying FIFO during a scan never winds integral error negative.
+                    if fifo_subframes > wm_subframes + 2.0 || radio_stalled {
                         resampler.reset_clock_window();
-                        clock_anchor.reset();
                     } else {
                         let burst_subframes = resampler.samples_to_subframes(hal_burst_samples);
                         let bundle_mean_sf =
@@ -5671,9 +5763,14 @@ mod tests {
         let mut until = None;
         let mut shield = 0.0f32;
 
-        // Low-latency non-BT 2-sf stream caps at 28 sf (70 ms).
+        // Low-latency non-BT 2-sf stream ignores short < 120 ms stalls (caps at 28 sf / 70 ms),
+        // then arms scan shield at >= 48 ticks (120 ms) to absorb scan blackouts without resyncing.
         assert!(!update_scan_shield(false, 2, 40, now, &mut until, &mut shield));
         assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 28.0);
+        assert!(update_scan_shield(false, 2, 48, now, &mut until, &mut shield));
+        assert_eq!(effective_wifi_ceiling(false, 2, now, &mut until, &mut shield), 60.0);
+        until = None;
+        shield = 0.0;
 
         // Bluetooth stream with a 225 ms (90 sf) scan freeze arms the shield.
         assert!(update_scan_shield(true, 2, 90, now, &mut until, &mut shield));
@@ -6779,8 +6876,7 @@ mod tests {
             let a = win_anchor.update(win_sample(15.0, 20.0, 21.0), &mut resampler).unwrap();
             assert!((a - 13.0).abs() < 1e-4);
         }
-        // Interrupting raw_setpoint <= anchor + 1.0 (without >= 0.1 downward decay)
-        // resets the 200-tick window.
+        // Interrupting with downward decay (raw_setpoint drops >= 0.1) resets the 200-tick window.
         let mut reset_win_anchor = ClockSetpointAnchor::default();
         for _ in 0..224 {
             let _ = reset_win_anchor.update(win_sample(13.0, 14.05, 15.0), &mut resampler);
@@ -6789,21 +6885,45 @@ mod tests {
             let _ = reset_win_anchor.update(win_sample(17.0, 14.05, 20.0), &mut resampler);
         }
         let reset_a = reset_win_anchor
-            .update(win_sample(17.0, 14.0, 20.0), &mut resampler)
+            .update(win_sample(17.0, 13.85, 20.0), &mut resampler)
             .unwrap();
-        assert!((reset_a - 13.0).abs() < 1e-4);
-        // Now 199 ticks at obs = 17.0 (raw_setpoint = 18.0 > 14.0) stay at 13.0,
-        // and the 200th tick lifts anchor to raw_setpoint.min(mean) = 17.0.
+        assert!((reset_a - 12.8).abs() < 1e-4);
+        // Now 199 ticks at obs = 17.0 stay at 12.8,
+        // and the 200th tick lifts anchor cleanly to 17.0 (bounded by upper_bound).
         for _ in 0..199 {
             let a = reset_win_anchor
                 .update(win_sample(17.0, 18.0, 20.0), &mut resampler)
                 .unwrap();
-            assert!((a - 13.0).abs() < 1e-4);
+            assert!((a - 12.8).abs() < 1e-4);
         }
         let lifted_a = reset_win_anchor
             .update(win_sample(17.0, 18.0, 20.0), &mut resampler)
             .unwrap();
         assert!((lifted_a - 17.0).abs() < 1e-4);
+
+        // 2b2. Settling back down when an anchor got transiently inflated above raw_setpoint,
+        // and lifting an under-anchored expanded scan-shield cushion without affecting +-500 ppm drift.
+        let mut settle_anchor = ClockSetpointAnchor::default();
+        for _ in 0..224 {
+            let _ = settle_anchor.update(win_sample(114.0, 108.0, 110.0), &mut resampler);
+        }
+        for _ in 0..198 {
+            let a = settle_anchor.update(win_sample(111.0, 108.0, 110.0), &mut resampler).unwrap();
+            assert!((a - 114.0).abs() < 1e-4);
+        }
+        let settled = settle_anchor.update(win_sample(111.0, 108.0, 110.0), &mut resampler).unwrap();
+        assert!((settled - 111.015).abs() < 1e-3);
+
+        let mut shield_anchor = ClockSetpointAnchor::default();
+        for _ in 0..224 {
+            let _ = shield_anchor.update(win_sample(66.0, 69.5, 70.0), &mut resampler);
+        }
+        for _ in 0..198 {
+            let a = shield_anchor.update(win_sample(68.2, 69.5, 70.0), &mut resampler).unwrap();
+            assert!((a - 66.0).abs() < 1e-4);
+        }
+        let lifted_shield = shield_anchor.update(win_sample(68.2, 69.5, 70.0), &mut resampler).unwrap();
+        assert!((lifted_shield - 68.189).abs() < 1e-3);
 
         // 2c. base_half lower clamp: post-resync deep wm_sf=110 must NOT pull anchor
         // up to (110 - 8 - 1) = 101; low obs clamps to (base_setpoint - 0.5*hal_burst - 1).
