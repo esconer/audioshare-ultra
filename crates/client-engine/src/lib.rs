@@ -1140,9 +1140,41 @@ fn pending_hardware_delay_ms(
     Some(delay_ms)
 }
 
+/// Returns `true` when AAudio should start double-buffered (`2 * burst`) rather
+/// than using the single-burst raw low-latency floor:
+///
+/// - Always `true` when `normal_mixer_request` is enabled (Dolby / normal mixer).
+/// - `true` for raw Bluetooth routes (`bt_active && !normal_mixer_request`) when
+///   AAudio opened a non-MMAP stream (`mmap_used == Some(false)` on API 36+, or
+///   non-exclusive sharing mode on earlier Android APIs): shared AudioFlinger
+///   A2DP threads consume whole 10-20 ms bursts and starve when single-buffered,
+///   whereas `2 * burst` (`1764/2048` at 44.1 kHz) gives AudioFlinger scheduling
+///   headroom while keeping Exclusive MMAP (`is_mmap == true`) and non-BT paths
+///   untouched.
+#[inline]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn aaudio_should_double_buffer(
+    normal_mixer_request: bool,
+    bt_active: bool,
+    mmap_used: Option<bool>,
+    granted_exclusive: bool,
+) -> bool {
+    if normal_mixer_request {
+        return true;
+    }
+    if !bt_active {
+        return false;
+    }
+    match mmap_used {
+        Some(is_mmap) => !is_mmap,
+        None => !granted_exclusive,
+    }
+}
+
 /// AAudio buffer size for a granted profile. The raw low-latency path uses the
-/// burst policy below; the normal mixer (`PERFORMANCE_MODE_NONE`) gets exactly
-/// two bursts so its DMA never runs single-buffered on Dolby/A2DP routes.
+/// burst policy below; the normal mixer (`PERFORMANCE_MODE_NONE`) and non-MMAP
+/// Bluetooth routes get exactly two bursts so AudioFlinger DMA never runs
+/// single-buffered.
 #[inline]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn aaudio_buffer_frames_for_profile(burst: i32, capacity: i32, normal_mixer: bool) -> Option<i32> {
@@ -1347,6 +1379,13 @@ pub struct ClientTelemetry {
     /// Genuine stream resyncs (host restart / long stall / 80-PLC burst).
     /// DTX wake-ups re-anchor the playhead but are deliberately excluded.
     pub stream_resyncs: AtomicU64,
+    /// Number of post-stall AP-backlog trims that fast-forwarded `next_play_seq`.
+    pub backlog_trims: AtomicU64,
+    /// Subset of [`Self::plc_extrapolated_frames`] caused by live-edge FIFO dips.
+    pub plc_live_frames: AtomicU64,
+    /// Subset of [`Self::plc_extrapolated_frames`] caused by missing-sequence
+    /// network gaps behind `latest_rx_seq`.
+    pub plc_gap_frames: AtomicU64,
     /// High-water mark of consecutive STATUS_EMPTY (PLC) refill ticks.
     pub max_consecutive_plc: AtomicU16,
     /// AAudio underrun (XRun) count reported by the HAL since stream start.
@@ -1396,10 +1435,10 @@ impl ClientTelemetry {
              group_sync_extra_ms={:.2} hardware_delay_ms={} bluetooth_delay_ms={} \
              output_buffer_ms={:.2} codec_lookahead_ms={:.2} prebuffer_ready={} \
              codec_mode={} ({}) estimated_one_way_ms={:.1}\n\
-             Client Stream: late_subframes_dropped={} stream_resyncs={} \
+             Client Stream: late_subframes_dropped={} stream_resyncs={} trims={} \
              max_consecutive_plc={} subframes ({:.1}ms) aaudio_xrun_count={}\n\
              Client Recovery: fec_healed_frames={} plc_extrapolated_frames={} \
-             clock_drift_ppm={} auth_failures={}",
+             plc_live={} plc_gap={} clock_drift_ppm={} auth_failures={}",
             snap.packet_interval_ms,
             snap.network_jitter_ms,
             snap.adaptive_buffer_ms,
@@ -1416,11 +1455,14 @@ impl ClientTelemetry {
             snap.estimated_one_way_ms(),
             self.late_subframes_dropped.load(Ordering::Relaxed),
             self.stream_resyncs.load(Ordering::Relaxed),
+            self.backlog_trims.load(Ordering::Relaxed),
             max_plc,
             max_plc as f32 * 2.5,
             self.aaudio_xrun_count.load(Ordering::Relaxed),
             self.fec_healed_frames.load(Ordering::Relaxed),
             self.plc_extrapolated_frames.load(Ordering::Relaxed),
+            self.plc_live_frames.load(Ordering::Relaxed),
+            self.plc_gap_frames.load(Ordering::Relaxed),
             self.clock_drift_ppm.load(Ordering::Relaxed),
             self.auth_failures.load(Ordering::Relaxed),
         )
@@ -1917,6 +1959,9 @@ impl ClientEngine {
             client_vu_peak_pct: AtomicU8::new(0),
             late_subframes_dropped: AtomicU64::new(0),
             stream_resyncs: AtomicU64::new(0),
+            backlog_trims: AtomicU64::new(0),
+            plc_live_frames: AtomicU64::new(0),
+            plc_gap_frames: AtomicU64::new(0),
             max_consecutive_plc: AtomicU16::new(0),
             aaudio_xrun_count: AtomicU32::new(0),
         });
@@ -2618,6 +2663,7 @@ impl ClientEngine {
                     *aaudio_guard = android_aaudio::AAudioOutputGuard::open_with_mode(
                         Arc::clone(&burst_fifo),
                         want_dolby,
+                        bt_active,
                     );
                     // Re-anchor debounce AFTER the blocking HAL open completes so a
                     // 300+ ms open cannot expire its own 300 ms debounce window.
@@ -3842,6 +3888,7 @@ impl ClientEngine {
                     last_pkt_subframe_count,
                     hal_burst_sf,
                 ) {
+                    telemetry.backlog_trims.fetch_add(1, Ordering::Relaxed);
                     let mut s = old_play_seq;
                     while s != next_play_seq {
                         sequencer.clear_slot(s);
@@ -4108,6 +4155,11 @@ impl ClientEngine {
                         telemetry
                             .plc_extrapolated_frames
                             .fetch_add(1, Ordering::Relaxed);
+                        if was_live_edge {
+                            telemetry.plc_live_frames.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            telemetry.plc_gap_frames.fetch_add(1, Ordering::Relaxed);
+                        }
 
                         // If Host disconnected or Wi-Fi dropped for >1000ms (400 PLC
                         // subframes), suspend into clean standby. Allowing a full
@@ -4244,6 +4296,7 @@ impl ClientEngine {
                     last_pkt_subframe_count,
                     hal_burst_sf,
                 ) {
+                    telemetry.backlog_trims.fetch_add(1, Ordering::Relaxed);
                     // Invalidate every skipped slot in both `sequencer` and
                     // `opus_ring` so a 16-bit sequence wraparound (~2.73 min
                     // later) can never replay or collide with a skipped frame.
@@ -5450,6 +5503,32 @@ mod tests {
             aaudio_buffer_frames_for_profile(882, 1764, false),
             Some(882)
         );
+        // Non-MMAP Bluetooth (Dolby OFF, `bt_active = true`, `mmap = Some(false)`)
+        // must double-buffer at `2 * burst` (`1764/2048` for 44.1 kHz A2DP),
+        // matching AudioFlinger's scheduling headroom.
+        assert!(aaudio_should_double_buffer(false, true, Some(false), false));
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(
+                882,
+                2048,
+                aaudio_should_double_buffer(false, true, Some(false), false)
+            ),
+            Some(1764)
+        );
+        // Pre-API-36 Bluetooth (`mmap = None`) when downgraded off Exclusive also
+        // double-buffers; confirmed MMAP Bluetooth and non-BT wired/speaker routes
+        // stay untouched (`96`-frame MMAP remains `2 * 96 = 192`).
+        assert!(aaudio_should_double_buffer(false, true, None, false));
+        assert!(!aaudio_should_double_buffer(false, true, Some(true), true));
+        assert!(!aaudio_should_double_buffer(false, false, Some(false), false));
+        assert_eq!(
+            aaudio_buffer_frames_for_profile(
+                96,
+                2048,
+                aaudio_should_double_buffer(false, false, Some(true), true)
+            ),
+            Some(192)
+        );
         // The legacy wrapper must delegate with `normal_mixer = false`.
         assert_eq!(aaudio_buffer_frames_for_burst(1280, 3840), Some(1280));
     }
@@ -6426,6 +6505,7 @@ mod tests {
             .late_subframes_dropped
             .store(7, Ordering::Relaxed);
         client.telemetry.stream_resyncs.store(2, Ordering::Relaxed);
+        client.telemetry.backlog_trims.store(4, Ordering::Relaxed);
         client.telemetry.max_consecutive_plc.store(80, Ordering::Relaxed);
         client
             .telemetry
@@ -6439,17 +6519,22 @@ mod tests {
             .telemetry
             .plc_extrapolated_frames
             .store(13, Ordering::Relaxed);
+        client.telemetry.plc_live_frames.store(9, Ordering::Relaxed);
+        client.telemetry.plc_gap_frames.store(4, Ordering::Relaxed);
         client.telemetry.clock_drift_ppm.store(-42, Ordering::Relaxed);
         client.telemetry.auth_failures.store(5, Ordering::Relaxed);
 
         let summary = client.telemetry.diagnostics_summary(5.0);
         assert!(summary.contains("late_subframes_dropped=7"), "{summary}");
         assert!(summary.contains("stream_resyncs=2"), "{summary}");
+        assert!(summary.contains("trims=4"), "{summary}");
         assert!(summary.contains("max_consecutive_plc=80"), "{summary}");
         assert!(summary.contains("200.0ms"), "{summary}"); // 80 * 2.5 ms
         assert!(summary.contains("aaudio_xrun_count=3"), "{summary}");
         assert!(summary.contains("fec_healed_frames=11"), "{summary}");
         assert!(summary.contains("plc_extrapolated_frames=13"), "{summary}");
+        assert!(summary.contains("plc_live=9"), "{summary}");
+        assert!(summary.contains("plc_gap=4"), "{summary}");
         assert!(summary.contains("clock_drift_ppm=-42"), "{summary}");
         assert!(summary.contains("auth_failures=5"), "{summary}");
         // Latency snapshot fields (exact names from ClientLatencySnapshot).
@@ -7432,7 +7517,7 @@ pub mod android_aaudio {
         /// Raw low-latency path, kept for callers that do not expose the
         /// Dolby toggle.
         pub fn open_low_latency(fifo: Arc<BurstDecouplerRing>) -> Option<Self> {
-            Self::open_with_mode(fifo, false)
+            Self::open_with_mode(fifo, false, false)
         }
 
         /// Open the output stream in one of two deliberately different modes:
@@ -7448,38 +7533,52 @@ pub mod android_aaudio {
         pub fn open_with_mode(
             fifo: Arc<BurstDecouplerRing>,
             enable_dolby_effects: bool,
+            bt_active: bool,
         ) -> Option<Self> {
             if enable_dolby_effects {
-                Self::open_internal(Arc::clone(&fifo), DOLBY_PROFILE, AAUDIO_FORMAT_PCM_FLOAT)
-                    .or_else(|| {
-                        Self::open_internal(
-                            Arc::clone(&fifo),
-                            DOLBY_LOW_LATENCY_PROFILE,
-                            AAUDIO_FORMAT_PCM_FLOAT,
-                        )
-                    })
-                    .or_else(|| {
-                        Self::open_internal(fifo, DOLBY_PROFILE, AAUDIO_FORMAT_PCM_I16)
-                    })
+                Self::open_internal(
+                    Arc::clone(&fifo),
+                    DOLBY_PROFILE,
+                    AAUDIO_FORMAT_PCM_FLOAT,
+                    bt_active,
+                )
+                .or_else(|| {
+                    Self::open_internal(
+                        Arc::clone(&fifo),
+                        DOLBY_LOW_LATENCY_PROFILE,
+                        AAUDIO_FORMAT_PCM_FLOAT,
+                        bt_active,
+                    )
+                })
+                .or_else(|| {
+                    Self::open_internal(fifo, DOLBY_PROFILE, AAUDIO_FORMAT_PCM_I16, bt_active)
+                })
             } else {
-                Self::open_internal(Arc::clone(&fifo), RAW_PROFILE, AAUDIO_FORMAT_PCM_FLOAT)
-                    .or_else(|| {
-                        Self::open_internal(
-                            Arc::clone(&fifo),
-                            RAW_PROFILE,
-                            AAUDIO_FORMAT_PCM_I16,
-                        )
-                    })
-                    .or_else(|| {
-                        Self::open_internal(
-                            Arc::clone(&fifo),
-                            RAW_SHARED_PROFILE,
-                            AAUDIO_FORMAT_PCM_FLOAT,
-                        )
-                    })
-                    .or_else(|| {
-                        Self::open_internal(fifo, RAW_SHARED_PROFILE, AAUDIO_FORMAT_PCM_I16)
-                    })
+                Self::open_internal(
+                    Arc::clone(&fifo),
+                    RAW_PROFILE,
+                    AAUDIO_FORMAT_PCM_FLOAT,
+                    bt_active,
+                )
+                .or_else(|| {
+                    Self::open_internal(
+                        Arc::clone(&fifo),
+                        RAW_PROFILE,
+                        AAUDIO_FORMAT_PCM_I16,
+                        bt_active,
+                    )
+                })
+                .or_else(|| {
+                    Self::open_internal(
+                        Arc::clone(&fifo),
+                        RAW_SHARED_PROFILE,
+                        AAUDIO_FORMAT_PCM_FLOAT,
+                        bt_active,
+                    )
+                })
+                .or_else(|| {
+                    Self::open_internal(fifo, RAW_SHARED_PROFILE, AAUDIO_FORMAT_PCM_I16, bt_active)
+                })
             }
         }
 
@@ -7487,6 +7586,7 @@ pub mod android_aaudio {
             fifo: Arc<BurstDecouplerRing>,
             profile: AAudioProfile,
             requested_format: i32,
+            bt_active: bool,
         ) -> Option<Self> {
             unsafe {
                 let mut builder: *mut AAudioStreamBuilder = core::ptr::null_mut();
@@ -7591,16 +7691,34 @@ pub mod android_aaudio {
                 } else {
                     capacity_frames
                 };
-                // Trust the profile we *requested* for buffer-size doubling:
-                // only double-buffer (2x burst) when the user/path actually wants
-                // the normal/Dolby mixer (`normal_mixer_request`). On raw A2DP
-                // (LowLatency downgraded by Android to PERFORMANCE_MODE_NONE),
-                // starting at 1x burst cuts 20 ms off AAudio delay, while keeping
-                // `normal_mixer = false` lets the runtime LatencyTuner grow to
-                // 2x only if genuine XRuns occur.
+                // Trust the profile we *requested* for Dolby/normal-mixer mode,
+                // and also double-buffer (2x burst, e.g. 1764/2048 at 44.1 kHz
+                // A2DP) whenever Bluetooth is active on a non-MMAP stream so
+                // AudioFlinger gets scheduling headroom instead of running
+                // single-buffered. Exclusive MMAP hardware paths remain untouched.
                 let granted_sharing_mode = AAudioStream_getSharingMode(stream);
+                // API 36: AAudioStream_isMMapUsed is not in the API 26 NDK
+                // surface. Resolve it by dlsym ONLY so this library never
+                // carries a direct link dependency on a symbol absent on older
+                // devices. A missing symbol falls back to `!is_exclusive` for
+                // Bluetooth double-buffering and reports "unknown" in logs.
+                let mmap_used = if let Some(sym) =
+                    aaudio_builder_symbol(b"AAudioStream_isMMapUsed\0")
+                {
+                    let f: unsafe extern "C" fn(*mut AAudioStream) -> bool =
+                        core::mem::transmute(sym);
+                    Some(f(stream))
+                } else {
+                    None
+                };
+                let double_buffer = aaudio_should_double_buffer(
+                    normal_mixer_request,
+                    bt_active,
+                    mmap_used,
+                    granted_sharing_mode == AAUDIO_SHARING_MODE_EXCLUSIVE,
+                );
                 if let Some(target_frames) =
-                    aaudio_buffer_frames_for_profile(raw_burst, cap_for_burst, normal_mixer_request)
+                    aaudio_buffer_frames_for_profile(raw_burst, cap_for_burst, double_buffer)
                 {
                     AAudioStream_setBufferSizeInFrames(stream, target_frames);
                 }
@@ -7618,19 +7736,6 @@ pub mod android_aaudio {
                     return None;
                 }
 
-                // API 36: AAudioStream_isMMapUsed is not in the API 26 NDK
-                // surface. Resolve it by dlsym ONLY so this library never
-                // carries a direct link dependency on a symbol absent on older
-                // devices. A missing symbol simply reports "unknown".
-                let mmap_used = if let Some(sym) =
-                    aaudio_builder_symbol(b"AAudioStream_isMMapUsed\0")
-                {
-                    let f: unsafe extern "C" fn(*mut AAudioStream) -> bool =
-                        core::mem::transmute(sym);
-                    Some(f(stream))
-                } else {
-                    None
-                };
                 audioshare_protocol::diagnostics::info(
                     "aaudio",
                     format!(
